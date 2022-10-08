@@ -341,6 +341,8 @@ func NewFakeVolumeBinder(kubeClient kubernetes.Interface) *FakeVolumeBinder {
 		scInformer.Informer().HasSynced,
 		nodeInformer.Informer().HasSynced,
 		csiNodeInformer.Informer().HasSynced)
+
+	var capacityCheck volumescheduling.CapacityCheck
 	return &FakeVolumeBinder{
 		volumeBinder: volumescheduling.NewVolumeBinder(
 			kubeClient,
@@ -350,7 +352,7 @@ func NewFakeVolumeBinder(kubeClient kubernetes.Interface) *FakeVolumeBinder {
 			pvcInformer,
 			pvInformer,
 			scInformer,
-			nil,
+			capacityCheck,
 			30*time.Second,
 		),
 		Actions: make(map[string][]string),
