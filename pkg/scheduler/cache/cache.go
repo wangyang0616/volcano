@@ -534,10 +534,11 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 			DeleteFunc: sc.DeleteCSINode,
 		},
 	)
-
+	sc.csiDriverInformer = informerFactory.Storage().V1().CSIDrivers()
+	sc.csiStorageCapacityInformer = informerFactory.Storage().V1().CSIStorageCapacities()
 	capacityCheck := volumescheduling.CapacityCheck{
-		CSIDriverInformer:          informerFactory.Storage().V1().CSIDrivers(),
-		CSIStorageCapacityInformer: informerFactory.Storage().V1().CSIStorageCapacities(),
+		CSIDriverInformer:          sc.csiDriverInformer,
+		CSIStorageCapacityInformer: sc.csiStorageCapacityInformer,
 	}
 
 	sc.VolumeBinder = &defaultVolumeBinder{
