@@ -20,10 +20,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/component-helpers/storage/volume"
-	"k8s.io/utils/pointer"
 )
 
 type nodeBuilder struct {
@@ -64,82 +61,9 @@ func makePV(name, className string) pvBuilder {
 	}}
 }
 
-func (pvb pvBuilder) withNodeAffinity(keyValues map[string][]string) pvBuilder {
-	matchExpressions := make([]v1.NodeSelectorRequirement, 0)
-	for key, values := range keyValues {
-		matchExpressions = append(matchExpressions, v1.NodeSelectorRequirement{
-			Key:      key,
-			Operator: v1.NodeSelectorOpIn,
-			Values:   values,
-		})
-	}
-	pvb.PersistentVolume.Spec.NodeAffinity = &v1.VolumeNodeAffinity{
-		Required: &v1.NodeSelector{
-			NodeSelectorTerms: []v1.NodeSelectorTerm{
-				{
-					MatchExpressions: matchExpressions,
-				},
-			},
-		},
-	}
-	return pvb
-}
-
 func (pvb pvBuilder) withVersion(version string) pvBuilder {
 	pvb.PersistentVolume.ObjectMeta.ResourceVersion = version
 	return pvb
-}
-
-func (pvb pvBuilder) withCapacity(capacity resource.Quantity) pvBuilder {
-	pvb.PersistentVolume.Spec.Capacity = v1.ResourceList{
-		v1.ResourceName(v1.ResourceStorage): capacity,
-	}
-	return pvb
-}
-
-func (pvb pvBuilder) withPhase(phase v1.PersistentVolumePhase) pvBuilder {
-	pvb.PersistentVolume.Status = v1.PersistentVolumeStatus{
-		Phase: phase,
-	}
-	return pvb
-}
-
-type pvcBuilder struct {
-	*v1.PersistentVolumeClaim
-}
-
-func makePVC(name string, storageClassName string) pvcBuilder {
-	return pvcBuilder{PersistentVolumeClaim: &v1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: v1.NamespaceDefault,
-		},
-		Spec: v1.PersistentVolumeClaimSpec{
-			StorageClassName: pointer.StringPtr(storageClassName),
-		},
-	}}
-}
-
-func (pvcb pvcBuilder) withBoundPV(pvName string) pvcBuilder {
-	pvcb.PersistentVolumeClaim.Spec.VolumeName = pvName
-	metav1.SetMetaDataAnnotation(&pvcb.PersistentVolumeClaim.ObjectMeta, volume.AnnBindCompleted, "true")
-	return pvcb
-}
-
-func (pvcb pvcBuilder) withRequestStorage(request resource.Quantity) pvcBuilder {
-	pvcb.PersistentVolumeClaim.Spec.Resources = v1.ResourceRequirements{
-		Requests: v1.ResourceList{
-			v1.ResourceName(v1.ResourceStorage): request,
-		},
-	}
-	return pvcb
-}
-
-func (pvcb pvcBuilder) withPhase(phase v1.PersistentVolumeClaimPhase) pvcBuilder {
-	pvcb.PersistentVolumeClaim.Status = v1.PersistentVolumeClaimStatus{
-		Phase: phase,
-	}
-	return pvcb
 }
 
 type podBuilder struct {
