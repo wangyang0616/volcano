@@ -51,6 +51,7 @@ func TestAddFlags(t *testing.T) {
 		SchedulerNames:     []string{"volcano", "volcano2"},
 		MaxRequeueNum:      defaultMaxRequeueNum,
 		HealthzBindAddress: ":11252",
+		AssociatedOwnerReference:       true,
 	}
 
 	if !reflect.DeepEqual(expected, s) {
