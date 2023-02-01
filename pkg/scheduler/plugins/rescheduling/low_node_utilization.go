@@ -17,10 +17,11 @@ limitations under the License.
 package rescheduling
 
 import (
+	"reflect"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog"
-	"reflect"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
@@ -148,10 +149,14 @@ func lowThresholdFilter(usage *NodeUtilization, config interface{}) bool {
 		return false
 	}
 
+	klog.V(4).Infof("After parse, lowThresholdFilter: utilizationConfig: %+v", utilizationConfig)
+	klog.V(4).Infof("After parse, lowThresholdFilter: utilizationConfig Thresholds: %+v", utilizationConfig.Thresholds)
 	if usage.nodeInfo.Spec.Unschedulable {
 		return false
 	}
+	klog.V(4).Infof("lowThresholdFilter nodeInfo.Name: %v, usage.utilization: %+v", usage.nodeInfo.Name, usage.utilization)
 	for rName, usagePercent := range usage.utilization {
+		klog.V(4).Infof("lowThresholdFilter nodeInfo.Name: %v, rName: %v, usagePercent： %v, utilizationConfig.Thresholds: %+v", usage.nodeInfo.Name, rName, usagePercent, utilizationConfig.Thresholds)
 		if threshold, ok := utilizationConfig.Thresholds[string(rName)]; ok {
 			if usagePercent >= threshold {
 				return false
@@ -169,7 +174,11 @@ func highThresholdFilter(usage *NodeUtilization, config interface{}) bool {
 		return false
 	}
 
+	klog.V(4).Infof("After parse, highThresholdFilter: utilizationConfig: %+v", utilizationConfig)
+	klog.V(4).Infof("After parse, highThresholdFilter begin: utilizationConfig TargetThresholds: %+v", utilizationConfig.TargetThresholds)
+	klog.V(4).Infof("highThresholdFilter nodeInfo.Name: %v, usage.utilization: %+v", usage.nodeInfo.Name, usage.utilization)
 	for rName, usagePercent := range usage.utilization {
+		klog.V(4).Infof("highThresholdFilter nodeInfo.Name: %v, rName: %v, usagePercent: %v, utilizationConfig.TargetThresholds: %+v", usage.nodeInfo.Name, rName, usagePercent, utilizationConfig.TargetThresholds)
 		if threshold, ok := utilizationConfig.TargetThresholds[string(rName)]; ok {
 			if usagePercent > threshold {
 				return true

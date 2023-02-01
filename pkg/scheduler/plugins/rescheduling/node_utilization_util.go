@@ -41,6 +41,7 @@ func groupNodesByUtilization(nodeUtilizationList []*NodeUtilization, lowThreshol
 	lowNodes := make([]*NodeUtilization, 0)
 	highNodes := make([]*NodeUtilization, 0)
 
+	klog.V(4).Infof("groupNodesByUtilization nodeUtilizationList: %+v", nodeUtilizationList)
 	for _, nodeUtilization := range nodeUtilizationList {
 		if lowThresholdFilter(nodeUtilization, config) {
 			lowNodes = append(lowNodes, nodeUtilization)
