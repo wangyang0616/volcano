@@ -127,6 +127,7 @@ func TestReclaim(t *testing.T) {
 		option.RegisterOptions()
 		config, err := kube.BuildConfig(option.KubeClientOptions)
 		if err != nil {
+			t.Errorf("kube build config error, err: %v", err)
 			return
 		}
 

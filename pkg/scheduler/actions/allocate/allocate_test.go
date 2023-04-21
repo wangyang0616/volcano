@@ -250,6 +250,7 @@ func TestAllocate(t *testing.T) {
 			option.RegisterOptions()
 			config, err := kube.BuildConfig(option.KubeClientOptions)
 			if err != nil {
+				t.Errorf("kube build config error, err: %v", err)
 				return
 			}
 			sc := cache.New(config, option.SchedulerNames, option.DefaultQueue, option.NodeSelector)
@@ -425,6 +426,7 @@ func TestAllocateWithDynamicPVC(t *testing.T) {
 			option.RegisterOptions()
 			config, err := kube.BuildConfig(option.KubeClientOptions)
 			if err != nil {
+				t.Errorf("kube build config error, err: %v", err)
 				return
 			}
 

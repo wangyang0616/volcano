@@ -239,6 +239,7 @@ func Test_TDM(t *testing.T) {
 			option.RegisterOptions()
 			config, err := kube.BuildConfig(option.KubeClientOptions)
 			if err != nil {
+				t.Errorf("kube build config error, err: %v", err)
 				return
 			}
 
@@ -689,6 +690,7 @@ func Test_TDM_victimsFn(t *testing.T) {
 			option.RegisterOptions()
 			config, err := kube.BuildConfig(option.KubeClientOptions)
 			if err != nil {
+				t.Errorf("kube build config error, err: %v", err)
 				return
 			}
 

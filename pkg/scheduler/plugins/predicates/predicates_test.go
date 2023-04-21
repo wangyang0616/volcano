@@ -67,6 +67,7 @@ func TestEventHandler(t *testing.T) {
 
 	config, err := kube.BuildConfig(option.KubeClientOptions)
 	if err != nil {
+		t.Errorf("kube build config error, err: %v", err)
 		return
 	}
 
