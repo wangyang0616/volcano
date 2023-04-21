@@ -36,7 +36,6 @@ import (
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
-	"volcano.sh/volcano/pkg/kube"
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/cache"
@@ -111,6 +110,11 @@ func TestProportion(t *testing.T) {
 		return nil
 	})
 	defer patches.Reset()
+
+	patchUpdateQueueStatus := gomonkey.ApplyMethod(reflect.TypeOf(tmp), "UpdateQueueStatus", func(scCache *cache.SchedulerCache, queue *api.QueueInfo) error {
+		return nil
+	})
+	defer patchUpdateQueueStatus.Reset()
 
 	framework.RegisterPluginBuilder(PluginName, New)
 	framework.RegisterPluginBuilder(gang.PluginName, gang.New)
@@ -202,19 +206,16 @@ func TestProportion(t *testing.T) {
 			}
 		}()
 
-		option := options.NewServerOption()
-		option.RegisterOptions()
-		config, err := kube.BuildConfig(option.KubeClientOptions)
-		if err != nil {
-			return
+		schedulerCache := &cache.SchedulerCache{
+			Nodes:           make(map[string]*api.NodeInfo),
+			Jobs:            make(map[api.JobID]*api.JobInfo),
+			PriorityClasses: make(map[string]*schedulingv1.PriorityClass),
+			Queues:          make(map[api.QueueID]*api.QueueInfo),
+			Binder:          binder,
+			StatusUpdater:   &util.FakeStatusUpdater{},
+			VolumeBinder:    &util.FakeVolumeBinder{},
+			Recorder:        recorder,
 		}
-
-		sc := cache.New(config, option.SchedulerNames, option.DefaultQueue, option.NodeSelector)
-		schedulerCache := sc.(*cache.SchedulerCache)
-		schedulerCache.Binder = binder
-		schedulerCache.StatusUpdater = &util.FakeStatusUpdater{}
-		schedulerCache.VolumeBinder = &util.FakeVolumeBinder{}
-		schedulerCache.Recorder = recorder
 
 		// deletedJobs to DeletedJobs
 		schedulerCache.DeletedJobs = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
