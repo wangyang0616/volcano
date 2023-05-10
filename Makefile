@@ -128,7 +128,7 @@ generate-yaml: init manifests
 	./hack/generate-yaml.sh TAG=${RELEASE_VER} CRD_VERSION=${CRD_VERSION}
 
 generate-charts: init manifests
-	TAG=${RELEASE_VER} ./hack/generate-charts.sh 
+	./hack/generate-charts.sh 
 	
 release-env:
 	./hack/build-env.sh release

@@ -61,7 +61,7 @@ if [[ ! -f "${HELM_BIN_DIR}/version.helm.${HELM_VER}" ]] || [[ ! -f "${HELM_BIN_
 fi
 
 echo "generate chart"
-CHART_ORIGIN_PATH=${VK_ROOT}/installer/helm/chart/volcano
+CHART_ORIGIN_PATH=${VK_ROOT}/installer/helm/chart
 CHART_OUT_PATH=${RELEASE_FOLDER}/chart
 cp -r "${CHART_ORIGIN_PATH}" "${CHART_OUT_PATH}"
 sed -i "s|image_tag_version: \"latest\"|image_tag_version: \"${VOLCANO_IMAGE_TAG}\"|g" $(find ${CHART_OUT_PATH} -type f | grep values.yaml)
