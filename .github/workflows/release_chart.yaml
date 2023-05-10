@@ -28,21 +28,18 @@ jobs:
       - name: Get chart version
         run: |
           echo "chart_version=$(echo ${GITHUB_REF##*/v})" >> $GITHUB_ENV
-
+      
+      - name: Make charts
+        shell: bash
+        working-directory: volcano
+        run: |
+          TAG=${{ env.chart_version }} make generate-charts
+      
       - name: Install chart-releaser
         uses: helm/chart-releaser-action@v1.5.0
         with:
           install_only: true
 
-      - name: Make charts
-        shell: bash
-        working-directory: volcano
-        run: |
-          VERSION=${{ env.chart_version }} cr package ./installer/helm/chart/volcano/
-        env:
-          # Path to directory with chart packages (default ".cr-release-packages")
-          CR_PACKAGE_PATH: "out/"
-      
       # upload charts to helm-charts repos's release
       - name: Upload charts
         shell: bash
@@ -53,14 +50,14 @@ jobs:
           # GitHub repository
           CR_GIT_REPO: "volcano-helm-charts"
           # Path to directory with chart packages (default ".cr-release-packages")
-          CR_PACKAGE_PATH: "out/"
+          CR_PACKAGE_PATH: "_output/release/chart/"
           # use token for helm-charts repo
           CR_TOKEN: "${{ secrets.HELM_CHARTER_TOKEN }}"
 
       # copy artifacts to helm-charts repo, we need those for update index
       - name: Copy artifacts
         run: |
-          cp -r volcano/out/ volcano-helm-charts/
+          cp -r volcano/_output/ volcano-helm-charts/
 
       - name: Configure Git
         working-directory: volcano-helm-charts
@@ -82,6 +79,6 @@ jobs:
           # The GitHub pages branch (default "gh-pages")
           CR_PAGES_BRANCH: "main"
           # Path to directory with chart packages (default ".cr-release-packages")
-          CR_PACKAGE_PATH: "out/"
+          CR_PACKAGE_PATH: "_output/release/chart/"
           # use token for helm-charts repo
           CR_TOKEN: "${{ secrets.HELM_CHARTER_TOKEN }}"
