@@ -140,6 +140,14 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.",
 				task.Namespace, task.Name, n.Name)
 
+			nodeInfo, found := ssn.NodeMap[n.Name]
+			if !found {
+				klog.V(5).Infof("reclaim failed for task <%s/%s> on node <%s>: node is not found on nodeMap",
+					task.Namespace, task.Name, n.Name)
+				continue
+			}
+			podSum := len(nodeInfo.Pods)
+
 			var reclaimees []*api.TaskInfo
 			for _, task := range n.Tasks {
 				// Ignore non running task.
@@ -169,7 +177,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 			victims := ssn.Reclaimable(task, reclaimees)
 
-			if err := util.ValidateVictims(task, n, victims); err != nil {
+			if err := util.ValidateVictims(task, n, podSum, victims); err != nil {
 				klog.V(3).Infof("No validated victims on Node <%s>: %v", n.Name, err)
 				continue
 			}

@@ -171,7 +171,7 @@ func GetNodeList(nodes map[string]*api.NodeInfo, nodeList []string) []*api.NodeI
 }
 
 // ValidateVictims returns an error if the resources of the victims can't satisfy the preemptor
-func ValidateVictims(preemptor *api.TaskInfo, node *api.NodeInfo, victims []*api.TaskInfo) error {
+func ValidateVictims(preemptor *api.TaskInfo, node *api.NodeInfo, podSum int, victims []*api.TaskInfo) error {
 	// Victims should not be judged to be empty here.
 	// It is possible to complete the scheduling of the preemptor without evicting the task.
 	// In the first round, a large task (CPU: 8) is expelled, and a small task is scheduled (CPU: 2)
@@ -179,12 +179,13 @@ func ValidateVictims(preemptor *api.TaskInfo, node *api.NodeInfo, victims []*api
 	futureIdle := node.FutureIdle()
 	for _, victim := range victims {
 		futureIdle.Add(victim.Resreq)
+		podSum--
 	}
 	// Every resource of the preemptor needs to be less or equal than corresponding
 	// idle resource after preemption.
-	if !preemptor.InitResreq.LessEqual(futureIdle, api.Zero) {
-		return fmt.Errorf("not enough resources: requested <%v>, but future idle <%v>",
-			preemptor.InitResreq, futureIdle)
+	if !preemptor.InitResreq.LessEqual(futureIdle, api.Zero) || podSum >= node.Allocatable.MaxTaskNum {
+		return fmt.Errorf("not enough resources: requested <%v>, but future idle <%v>, pod number is %d",
+			preemptor.InitResreq, futureIdle, podSum)
 	}
 	return nil
 }

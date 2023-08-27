@@ -244,6 +244,7 @@ func preempt(
 		if !found {
 			return false, fmt.Errorf("node info for %s not found", node.Name)
 		}
+		podSum := len(nodeInfo.Pods)
 		var preemptees []*api.TaskInfo
 		for _, task := range node.Tasks {
 			if filter == nil {
@@ -255,7 +256,7 @@ func preempt(
 		victims := ssn.Preemptable(preemptor, preemptees)
 		metrics.UpdatePreemptionVictimsCount(len(victims))
 
-		if err := util.ValidateVictims(preemptor, node, victims); err != nil {
+		if err := util.ValidateVictims(preemptor, node, podSum, victims); err != nil {
 			klog.V(3).Infof("No validated victims on Node <%s>: %v", node.Name, err)
 			continue
 		}
@@ -278,7 +279,7 @@ func preempt(
 			// If reclaimed enough resources, break loop to avoid Sub panic.
 			// If preemptor's queue is overused, it means preemptor can not be allcated. So no need care about the node idle resourace
 			if !ssn.Overused(currentQueue) && preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) &&
-				len(nodeInfo.Pods) < node.Allocatable.MaxTaskNum {
+				podSum < node.Allocatable.MaxTaskNum {
 				break
 			}
 			preemptee := victimsQueue.Pop().(*api.TaskInfo)
@@ -290,6 +291,7 @@ func preempt(
 				continue
 			}
 			preempted.Add(preemptee.Resreq)
+			podSum--
 		}
 
 		metrics.RegisterPreemptionAttempts()
