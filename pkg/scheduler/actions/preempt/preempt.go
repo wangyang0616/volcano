@@ -204,6 +204,7 @@ func preempt(
 ) (bool, error) {
 	assigned := false
 	allNodes := ssn.NodeList
+	nodeMap := ssn.NodeMap
 	if err := ssn.PrePredicateFn(preemptor); err != nil {
 		return false, fmt.Errorf("PrePredicate for task %s/%s failed for: %v", preemptor.Namespace, preemptor.Name, err)
 	}
@@ -239,6 +240,10 @@ func preempt(
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.",
 			preemptor.Namespace, preemptor.Name, node.Name)
 
+		nodeInfo, found := nodeMap[node.Name]
+		if !found {
+			return false, fmt.Errorf("node info for %s not found", node.Name)
+		}
 		var preemptees []*api.TaskInfo
 		for _, task := range node.Tasks {
 			if filter == nil {
@@ -272,7 +277,8 @@ func preempt(
 		for !victimsQueue.Empty() {
 			// If reclaimed enough resources, break loop to avoid Sub panic.
 			// If preemptor's queue is overused, it means preemptor can not be allcated. So no need care about the node idle resourace
-			if !ssn.Overused(currentQueue) && preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
+			if !ssn.Overused(currentQueue) && preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) &&
+				len(nodeInfo.Pods) < node.Allocatable.MaxTaskNum {
 				break
 			}
 			preemptee := victimsQueue.Pop().(*api.TaskInfo)
