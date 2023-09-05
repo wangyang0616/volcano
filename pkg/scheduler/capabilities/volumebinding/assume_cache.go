@@ -197,7 +197,7 @@ func (c *assumeCache) add(obj interface{}) {
 	}
 }
 
-func (c *assumeCache) update(oldObj interface{}, newObj interface{}) {
+func (c *assumeCache) update(_ interface{}, newObj interface{}) {
 	c.add(newObj)
 }
 

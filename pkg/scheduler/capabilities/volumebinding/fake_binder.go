@@ -47,17 +47,17 @@ type FakeVolumeBinder struct {
 }
 
 // GetPodVolumes implements SchedulerVolumeBinder.GetPodVolumes.
-func (b *FakeVolumeBinder) GetPodVolumes(pod *v1.Pod) (boundClaims, unboundClaimsDelayBinding, unboundClaimsImmediate []*v1.PersistentVolumeClaim, err error) {
+func (b *FakeVolumeBinder) GetPodVolumes(_ *v1.Pod) (boundClaims, unboundClaimsDelayBinding, unboundClaimsImmediate []*v1.PersistentVolumeClaim, err error) {
 	return nil, nil, nil, nil
 }
 
 // FindPodVolumes implements SchedulerVolumeBinder.FindPodVolumes.
-func (b *FakeVolumeBinder) FindPodVolumes(pod *v1.Pod, _, _ []*v1.PersistentVolumeClaim, node *v1.Node) (podVolumes *PodVolumes, reasons ConflictReasons, err error) {
+func (b *FakeVolumeBinder) FindPodVolumes(_ *v1.Pod, _, _ []*v1.PersistentVolumeClaim, node *v1.Node) (podVolumes *PodVolumes, reasons ConflictReasons, err error) {
 	return nil, b.config.FindReasons, b.config.FindErr
 }
 
 // AssumePodVolumes implements SchedulerVolumeBinder.AssumePodVolumes.
-func (b *FakeVolumeBinder) AssumePodVolumes(assumedPod *v1.Pod, nodeName string, podVolumes *PodVolumes) (bool, error) {
+func (b *FakeVolumeBinder) AssumePodVolumes(_ *v1.Pod, _ string, _ *PodVolumes) (bool, error) {
 	b.AssumeCalled = true
 	return b.config.AllBound, b.config.AssumeErr
 }
@@ -66,7 +66,7 @@ func (b *FakeVolumeBinder) AssumePodVolumes(assumedPod *v1.Pod, nodeName string,
 func (b *FakeVolumeBinder) RevertAssumedPodVolumes(_ *PodVolumes) {}
 
 // BindPodVolumes implements SchedulerVolumeBinder.BindPodVolumes.
-func (b *FakeVolumeBinder) BindPodVolumes(ctx context.Context, assumedPod *v1.Pod, podVolumes *PodVolumes) error {
+func (b *FakeVolumeBinder) BindPodVolumes(_ context.Context, _ *v1.Pod, _ *PodVolumes) error {
 	b.BindCalled = true
 	return b.config.BindErr
 }

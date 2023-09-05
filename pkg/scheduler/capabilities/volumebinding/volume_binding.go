@@ -169,7 +169,7 @@ func (pl *VolumeBinding) podHasPVCs(pod *v1.Pod) (bool, error) {
 // PreFilter invoked at the prefilter extension point to check if pod has all
 // immediate PVCs bound. If not all immediate PVCs are bound, an
 // UnschedulableAndUnresolvable is returned.
-func (pl *VolumeBinding) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+func (pl *VolumeBinding) PreFilter(_ context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	// If pod does not reference any PVC, we don't need to do anything.
 	if hasPVC, err := pl.podHasPVCs(pod); err != nil {
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
@@ -225,7 +225,7 @@ func getStateData(cs *framework.CycleState) (*stateData, error) {
 //
 // The predicate returns true if all bound PVCs have compatible PVs with the node, and if all unbound
 // PVCs can be matched with an available and node-compatible PV.
-func (pl *VolumeBinding) Filter(ctx context.Context, cs *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (pl *VolumeBinding) Filter(_ context.Context, cs *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
 	node := nodeInfo.Node()
 	if node == nil {
 		return framework.NewStatus(framework.Error, "node not found")
@@ -262,7 +262,7 @@ func (pl *VolumeBinding) Filter(ctx context.Context, cs *framework.CycleState, p
 }
 
 // Score invoked at the score extension point.
-func (pl *VolumeBinding) Score(ctx context.Context, cs *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+func (pl *VolumeBinding) Score(_ context.Context, cs *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	if pl.scorer == nil {
 		return 0, nil
 	}
