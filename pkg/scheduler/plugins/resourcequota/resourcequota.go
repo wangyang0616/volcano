@@ -83,5 +83,5 @@ func (rq *resourceQuotaPlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 }
 
-func (rq *resourceQuotaPlugin) OnSessionClose(session *framework.Session) {
+func (rq *resourceQuotaPlugin) OnSessionClose(_ *framework.Session) {
 }

@@ -186,9 +186,8 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 		if _, found := taskNames[task.Name]; found {
 			msg += fmt.Sprintf(" duplicated task name %s;", task.Name)
 			break
-		} else {
-			taskNames[task.Name] = task.Name
 		}
+		taskNames[task.Name] = task.Name
 
 		if err := validatePolicies(task.Policies, field.NewPath("spec.tasks.policies")); err != nil {
 			msg += err.Error() + fmt.Sprintf(" valid events are %v, valid actions are %v;",

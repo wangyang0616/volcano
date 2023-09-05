@@ -70,7 +70,7 @@ func getDevicesIdleGPUs(gs *GPUDevices) []int {
 }
 
 // getUnhealthyGPUs returns all the unhealthy GPU id.
-func getUnhealthyGPUs(gs *GPUDevices, node *v1.Node) (unhealthyGPUs []int) {
+func getUnhealthyGPUs(_ *GPUDevices, node *v1.Node) (unhealthyGPUs []int) {
 	unhealthyGPUs = []int{}
 	devicesStr, ok := node.Annotations[UnhealthyGPUIDs]
 
@@ -201,10 +201,9 @@ func (g *GPUDevice) getUsedGPUMemory() uint {
 	for _, pod := range g.PodMap {
 		if pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
 			continue
-		} else {
-			gpuRequest := getGPUMemoryOfPod(pod)
-			res += gpuRequest
 		}
+		gpuRequest := getGPUMemoryOfPod(pod)
+		res += gpuRequest
 	}
 	return res
 }

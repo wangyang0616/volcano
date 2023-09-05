@@ -79,7 +79,7 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 	}
 }
 
-func (pg *pgcontroller) updateReplicaSet(oldObj, newObj interface{}) {
+func (pg *pgcontroller) updateReplicaSet(_, newObj interface{}) {
 	pg.addReplicaSet(newObj)
 }
 

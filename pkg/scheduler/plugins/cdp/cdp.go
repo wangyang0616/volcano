@@ -44,7 +44,7 @@ type CooldownProtectionPlugin struct {
 }
 
 // New return CooldownProtectionPlugin
-func New(arguments framework.Arguments) framework.Plugin {
+func New(_ framework.Arguments) framework.Plugin {
 	return &CooldownProtectionPlugin{}
 }
 
@@ -109,4 +109,4 @@ func (sp *CooldownProtectionPlugin) OnSessionOpen(ssn *framework.Session) {
 }
 
 // OnSessionClose implements framework.Plugin
-func (*CooldownProtectionPlugin) OnSessionClose(ssn *framework.Session) {}
+func (*CooldownProtectionPlugin) OnSessionClose(_ *framework.Session) {}

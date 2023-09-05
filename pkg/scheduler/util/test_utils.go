@@ -260,7 +260,7 @@ type FakeBinder struct {
 }
 
 // Bind used by fake binder struct to bind pods
-func (fb *FakeBinder) Bind(kubeClient kubernetes.Interface, tasks []*api.TaskInfo) ([]*api.TaskInfo, error) {
+func (fb *FakeBinder) Bind(_ kubernetes.Interface, tasks []*api.TaskInfo) ([]*api.TaskInfo, error) {
 	for _, p := range tasks {
 		key := fmt.Sprintf("%v/%v", p.Namespace, p.Name)
 		fb.Binds[key] = p.NodeName
@@ -284,7 +284,7 @@ func (fe *FakeEvictor) Evicts() []string {
 }
 
 // Evict is used by fake evictor to evict pods
-func (fe *FakeEvictor) Evict(p *v1.Pod, reason string) error {
+func (fe *FakeEvictor) Evict(p *v1.Pod, _ string) error {
 	fe.Lock()
 	defer fe.Unlock()
 
@@ -302,13 +302,13 @@ type FakeStatusUpdater struct {
 }
 
 // UpdatePodCondition is a empty function
-func (ftsu *FakeStatusUpdater) UpdatePodCondition(pod *v1.Pod, podCondition *v1.PodCondition) (*v1.Pod, error) {
+func (ftsu *FakeStatusUpdater) UpdatePodCondition(_ *v1.Pod, _ *v1.PodCondition) (*v1.Pod, error) {
 	// do nothing here
 	return nil, nil
 }
 
 // UpdatePodGroup is a empty function
-func (ftsu *FakeStatusUpdater) UpdatePodGroup(pg *api.PodGroup) (*api.PodGroup, error) {
+func (ftsu *FakeStatusUpdater) UpdatePodGroup(_ *api.PodGroup) (*api.PodGroup, error) {
 	// do nothing here
 	return nil, nil
 }

@@ -22,6 +22,6 @@ type failedState struct {
 	jobFlow *v1alpha1.JobFlow
 }
 
-func (p *failedState) Execute(action v1alpha1.Action) error {
+func (p *failedState) Execute(_ v1alpha1.Action) error {
 	return nil
 }

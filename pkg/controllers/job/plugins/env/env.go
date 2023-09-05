@@ -42,7 +42,7 @@ func (ep *envPlugin) Name() string {
 	return "env"
 }
 
-func (ep *envPlugin) OnPodCreate(pod *v1.Pod, job *batch.Job) error {
+func (ep *envPlugin) OnPodCreate(pod *v1.Pod, _ *batch.Job) error {
 	index := jobhelpers.GetPodIndexUnderTask(pod)
 
 	// add VK_TASK_INDEX and VC_TASK_INDEX env to each container
@@ -78,6 +78,6 @@ func (ep *envPlugin) OnJobDelete(job *batch.Job) error {
 	return nil
 }
 
-func (ep *envPlugin) OnJobUpdate(job *batch.Job) error {
+func (ep *envPlugin) OnJobUpdate(_ *batch.Job) error {
 	return nil
 }

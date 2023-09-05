@@ -25,10 +25,10 @@ func NewPolicyNone(numaNodes []int) Policy {
 	return &policyNone{numaNodes: numaNodes}
 }
 
-func (policy *policyNone) canAdmitPodResult(hint *TopologyHint) bool {
+func (policy *policyNone) canAdmitPodResult(_ *TopologyHint) bool {
 	return true
 }
 
-func (policy *policyNone) Predicate(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+func (policy *policyNone) Predicate(_ []map[string][]TopologyHint) (TopologyHint, bool) {
 	return TopologyHint{}, policy.canAdmitPodResult(nil)
 }

@@ -174,7 +174,7 @@ func (gs *GPUDevices) HasDeviceRequest(pod *v1.Pod) bool {
 	return false
 }
 
-func (gs *GPUDevices) Release(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func (gs *GPUDevices) Release(_ kubernetes.Interface, _ *v1.Pod) error {
 	// Nothing needs to be done here
 	return nil
 }

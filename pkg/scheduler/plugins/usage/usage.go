@@ -172,4 +172,4 @@ func (up *usagePlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddNodeOrderFn(up.Name(), nodeOrderFn)
 }
 
-func (up *usagePlugin) OnSessionClose(ssn *framework.Session) {}
+func (up *usagePlugin) OnSessionClose(_ *framework.Session) {}

@@ -51,12 +51,12 @@ func (f *Framework) SnapshotSharedLister() framework.SharedLister {
 }
 
 // IterateOverWaitingPods acquires a read lock and iterates over the WaitingPods map.
-func (f *Framework) IterateOverWaitingPods(callback func(framework.WaitingPod)) {
+func (f *Framework) IterateOverWaitingPods(_ func(framework.WaitingPod)) {
 	panic("not implemented")
 }
 
 // GetWaitingPod returns a reference to a WaitingPod given its UID.
-func (f *Framework) GetWaitingPod(uid types.UID) framework.WaitingPod {
+func (f *Framework) GetWaitingPod(_ types.UID) framework.WaitingPod {
 	panic("not implemented")
 }
 
@@ -96,31 +96,31 @@ func (f *Framework) EventRecorder() events.EventRecorder {
 	return nil
 }
 
-func (f *Framework) AddNominatedPod(pod *framework.PodInfo, nominatingInfo *framework.NominatingInfo) {
+func (f *Framework) AddNominatedPod(_ *framework.PodInfo, _ *framework.NominatingInfo) {
 	panic("implement me")
 }
 
-func (f *Framework) DeleteNominatedPodIfExists(pod *v1.Pod) {
+func (f *Framework) DeleteNominatedPodIfExists(_ *v1.Pod) {
 	panic("implement me")
 }
 
-func (f *Framework) UpdateNominatedPod(oldPod *v1.Pod, newPodInfo *framework.PodInfo) {
+func (f *Framework) UpdateNominatedPod(_ *v1.Pod, _ *framework.PodInfo) {
 	panic("implement me")
 }
 
-func (f *Framework) NominatedPodsForNode(nodeName string) []*framework.PodInfo {
+func (f *Framework) NominatedPodsForNode(_ string) []*framework.PodInfo {
 	panic("implement me")
 }
 
-func (f *Framework) RunPreScorePlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) *framework.Status {
+func (f *Framework) RunPreScorePlugins(_ context.Context, _ *framework.CycleState, _ *v1.Pod, nodes []*v1.Node) *framework.Status {
 	panic("implement me")
 }
 
-func (f *Framework) RunScorePlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) (framework.PluginToNodeScores, *framework.Status) {
+func (f *Framework) RunScorePlugins(_ context.Context, _ *framework.CycleState, _ *v1.Pod, _ []*v1.Node) (framework.PluginToNodeScores, *framework.Status) {
 	panic("implement me")
 }
 
-func (f *Framework) RunFilterPlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, info *framework.NodeInfo) framework.PluginToStatus {
+func (f *Framework) RunFilterPlugins(_ context.Context, _ *framework.CycleState, _ *v1.Pod, _ *framework.NodeInfo) framework.PluginToStatus {
 	panic("implement me")
 }
 
@@ -132,7 +132,7 @@ func (f *Framework) RunPreFilterExtensionRemovePod(ctx context.Context, state *f
 	panic("implement me")
 }
 
-func (f *Framework) RejectWaitingPod(uid types.UID) bool {
+func (f *Framework) RejectWaitingPod(_ types.UID) bool {
 	panic("implement me")
 }
 

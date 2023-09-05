@@ -348,7 +348,7 @@ func (sc *SchedulerCache) addNode(node *v1.Node) error {
 }
 
 // Assumes that lock is already acquired.
-func (sc *SchedulerCache) updateNode(oldNode, newNode *v1.Node) error {
+func (sc *SchedulerCache) updateNode(_, newNode *v1.Node) error {
 	if sc.Nodes[newNode.Name] != nil {
 		sc.Nodes[newNode.Name].SetNode(newNode)
 		sc.removeNodeImageStates(newNode)
@@ -860,7 +860,7 @@ func (sc *SchedulerCache) DeleteResourceQuota(obj interface{}) {
 }
 
 // UpdateResourceQuota update ResourceQuota to scheduler cache
-func (sc *SchedulerCache) UpdateResourceQuota(oldObj, newObj interface{}) {
+func (sc *SchedulerCache) UpdateResourceQuota(_, newObj interface{}) {
 	newR, ok := newObj.(*v1.ResourceQuota)
 	if !ok {
 		klog.Errorf("Cannot convert newObj to *v1.ResourceQuota: %v", newObj)
@@ -989,7 +989,7 @@ func (sc *SchedulerCache) AddNumaInfoV1alpha1(obj interface{}) {
 }
 
 // UpdateNumaInfoV1alpha1 update numa information to scheduler cache
-func (sc *SchedulerCache) UpdateNumaInfoV1alpha1(oldObj, newObj interface{}) {
+func (sc *SchedulerCache) UpdateNumaInfoV1alpha1(_, newObj interface{}) {
 	ss, ok := newObj.(*nodeinfov1alpha1.Numatopology)
 	if !ok {
 		klog.Errorf("Cannot convert oldObj to *nodeinfov1alpha1.Numatopology: %v", newObj)

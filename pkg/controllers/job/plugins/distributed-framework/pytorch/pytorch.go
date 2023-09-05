@@ -175,6 +175,6 @@ func (pp *pytorchPlugin) OnJobDelete(job *batch.Job) error {
 	return nil
 }
 
-func (pp *pytorchPlugin) OnJobUpdate(job *batch.Job) error {
+func (pp *pytorchPlugin) OnJobUpdate(_ *batch.Job) error {
 	return nil
 }

@@ -104,7 +104,7 @@ func (np NodePhase) String() string {
 }
 
 // validateStatusUpdate validates whether the status transfer is valid.
-func validateStatusUpdate(oldStatus, newStatus TaskStatus) error {
+func validateStatusUpdate(_, _ TaskStatus) error {
 	return nil
 }
 

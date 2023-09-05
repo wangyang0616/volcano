@@ -513,7 +513,7 @@ func (drf *drfPlugin) calculateShare(allocated, totalResource *api.Resource) (st
 	return dominantResource, res
 }
 
-func (drf *drfPlugin) OnSessionClose(session *framework.Session) {
+func (drf *drfPlugin) OnSessionClose(_ *framework.Session) {
 	// Clean schedule data.
 	drf.totalResource = api.EmptyResource()
 	drf.totalAllocated = api.EmptyResource()

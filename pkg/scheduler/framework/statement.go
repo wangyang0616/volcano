@@ -184,7 +184,7 @@ func (s *Statement) Pipeline(task *api.TaskInfo, hostname string) error {
 	return nil
 }
 
-func (s *Statement) pipeline(task *api.TaskInfo) {
+func (s *Statement) pipeline(_ *api.TaskInfo) {
 }
 
 func (s *Statement) unpipeline(task *api.TaskInfo) error {

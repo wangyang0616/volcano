@@ -22,6 +22,6 @@ type terminatingState struct {
 	jobFlow *v1alpha1.JobFlow
 }
 
-func (p *terminatingState) Execute(action v1alpha1.Action) error {
+func (p *terminatingState) Execute(_ v1alpha1.Action) error {
 	return nil
 }

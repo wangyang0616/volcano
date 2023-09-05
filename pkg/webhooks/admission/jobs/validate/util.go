@@ -90,9 +90,8 @@ func validatePolicies(policies []batchv1alpha1.LifecyclePolicy, fldPath *field.P
 					err = multierror.Append(err, fmt.Errorf("duplicate event %v  across different policy", event))
 					bFlag = true
 					break
-				} else {
-					policyEvents[event] = struct{}{}
 				}
+				policyEvents[event] = struct{}{}
 			}
 			if bFlag {
 				break
@@ -105,9 +104,8 @@ func validatePolicies(policies []batchv1alpha1.LifecyclePolicy, fldPath *field.P
 			if _, found := exitCodes[*policy.ExitCode]; found {
 				err = multierror.Append(err, fmt.Errorf("duplicate exitCode %v", *policy.ExitCode))
 				break
-			} else {
-				exitCodes[*policy.ExitCode] = struct{}{}
 			}
+			exitCodes[*policy.ExitCode] = struct{}{}
 		}
 	}
 

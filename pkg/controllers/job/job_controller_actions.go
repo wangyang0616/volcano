@@ -485,7 +485,7 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 	return nil
 }
 
-func (cc *jobcontroller) waitDependsOnTaskMeetCondition(taskName string, taskIndex int, podToCreateEachTask []*v1.Pod, job *batch.Job) bool {
+func (cc *jobcontroller) waitDependsOnTaskMeetCondition(_ string, taskIndex int, podToCreateEachTask []*v1.Pod, job *batch.Job) bool {
 	if job.Spec.Tasks[taskIndex].DependsOn == nil {
 		return true
 	}

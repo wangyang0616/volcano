@@ -100,16 +100,14 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		jobs, found := preemptorsMap[queue.UID]
 		if !found || jobs.Empty() {
 			continue
-		} else {
-			job = jobs.Pop().(*api.JobInfo)
-		}
+		} 
+		job = jobs.Pop().(*api.JobInfo)
 
 		// Found "high" priority task to reclaim others
 		if tasks, found := preemptorTasks[job.UID]; !found || tasks.Empty() {
 			continue
-		} else {
-			task = tasks.Pop().(*api.TaskInfo)
 		}
+		task = tasks.Pop().(*api.TaskInfo)
 
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)

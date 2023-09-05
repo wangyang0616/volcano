@@ -153,4 +153,4 @@ func (sp *slaPlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddJobPipelinedFn(sp.Name(), permitableFn)
 }
 
-func (sp *slaPlugin) OnSessionClose(ssn *framework.Session) {}
+func (sp *slaPlugin) OnSessionClose(_ *framework.Session) {}

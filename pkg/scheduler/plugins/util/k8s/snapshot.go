@@ -142,6 +142,6 @@ func (s *Snapshot) Get(nodeName string) (*framework.NodeInfo, error) {
 	return nil, fmt.Errorf("nodeinfo not found for node name %q", nodeName)
 }
 
-func (s *Snapshot) IsPVCUsedByPods(key string) bool {
+func (s *Snapshot) IsPVCUsedByPods(_ string) bool {
 	panic("not implemented")
 }

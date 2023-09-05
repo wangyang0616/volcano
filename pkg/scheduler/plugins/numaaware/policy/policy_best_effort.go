@@ -27,7 +27,7 @@ func NewPolicyBestEffort(numaNodes []int) Policy {
 	return &policyBestEffort{numaNodes: numaNodes}
 }
 
-func (p *policyBestEffort) canAdmitPodResult(hint *TopologyHint) bool {
+func (p *policyBestEffort) canAdmitPodResult(_ *TopologyHint) bool {
 	return true
 }
 
