@@ -81,6 +81,13 @@ func TestEventHandler(t *testing.T) {
 	w2.Spec.Affinity = getWorkerAffinity()
 	w3.Spec.Affinity = getWorkerAffinity()
 
+	//Affinity and anti-affinity verification
+	w4 := util.BuildPod("ns1", "worker-4", "", apiv1.PodPending, util.BuildResourceList("1", "1k"), "pg3", map[string]string{"role": "worker"}, map[string]string{})
+	w5 := util.BuildPod("ns1", "worker-5", "", apiv1.PodPending, util.BuildResourceList("1", "1k"), "pg4", map[string]string{"role": "worker"}, map[string]string{})
+	w6 := util.BuildPod("ns1", "worker-6", "", apiv1.PodPending, util.BuildResourceList("1", "1k"), "pg5", map[string]string{"role": "worker"}, map[string]string{})
+	w4.Spec.Affinity = getWorkerAffinity()
+	w5.Spec.Affinity = getWorkerAffinity()
+
 	// nodes
 	n1 := util.BuildNode("node1", util.BuildResourceList("4", "4k"), map[string]string{"selector": "worker"})
 	n2 := util.BuildNode("node2", util.BuildResourceList("3", "3k"), map[string]string{})
@@ -90,8 +97,11 @@ func TestEventHandler(t *testing.T) {
 	n2.Labels["kubernetes.io/hostname"] = "node2"
 
 	// priority
-	p1 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p1"}, Value: 1}
-	p2 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 2}
+	p1 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p1"}, Value: 11}
+	p2 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 12}
+	p3 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 3}
+	p4 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 4}
+	p5 := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "p2"}, Value: 5}
 	// podgroup
 	pg1 := &schedulingv1beta1.PodGroup{
 		ObjectMeta: metav1.ObjectMeta{
@@ -115,6 +125,39 @@ func TestEventHandler(t *testing.T) {
 			PriorityClassName: p1.Name,
 		},
 	}
+	pg3 := &schedulingv1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns1",
+			Name:      "pg3",
+		},
+		Spec: schedulingv1beta1.PodGroupSpec{
+			Queue:             "q1",
+			MinMember:         int32(1),
+			PriorityClassName: p3.Name,
+		},
+	}
+	pg4 := &schedulingv1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns1",
+			Name:      "pg4",
+		},
+		Spec: schedulingv1beta1.PodGroupSpec{
+			Queue:             "q1",
+			MinMember:         int32(1),
+			PriorityClassName: p4.Name,
+		},
+	}
+	pg5 := &schedulingv1beta1.PodGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns1",
+			Name:      "pg5",
+		},
+		Spec: schedulingv1beta1.PodGroupSpec{
+			Queue:             "q1",
+			MinMember:         int32(1),
+			PriorityClassName: p5.Name,
+		},
+	}
 	// queue
 	queue1 := &schedulingv1beta1.Queue{
 		ObjectMeta: metav1.ObjectMeta{
@@ -133,12 +176,14 @@ func TestEventHandler(t *testing.T) {
 	}{
 		{
 			name:  "pod-deallocate",
-			pods:  []*apiv1.Pod{w1, w2, w3},
+			pods:  []*apiv1.Pod{w1, w2, w3, w4, w5, w6},
 			nodes: []*apiv1.Node{n1, n2},
-			pcs:   []*schedulingv1.PriorityClass{p1, p2},
-			pgs:   []*schedulingv1beta1.PodGroup{pg1, pg2},
+			pcs:   []*schedulingv1.PriorityClass{p1, p2, p3, p4, p5},
+			pgs:   []*schedulingv1beta1.PodGroup{pg1, pg2, pg3, pg4, pg5},
 			expected: map[string]string{ // podKey -> node
 				"ns1/worker-3": "node1",
+				"ns1/worker-6": "node2",
+				"ns1/worker-5": "node2",
 			},
 		},
 	}
@@ -199,8 +244,17 @@ func TestEventHandler(t *testing.T) {
 		framework.CloseSession(ssn)
 
 		t.Logf("expected: %#v, got: %#v", test.expected, binder.Binds)
-		if !reflect.DeepEqual(test.expected, binder.Binds) {
-			t.Errorf("expected: %v, got %v ", test.expected, binder.Binds)
+		if len(test.expected) != len(binder.Binds) {
+			t.Errorf("expected node: %v, got %v ", test.expected, binder.Binds)
+		}
+		for pod, node := range test.expected {
+			if actualNode, ok := binder.Binds[pod]; ok {
+				if actualNode != node {
+					t.Errorf("pod is %s, expected node: %v, got %v ", node, actualNode)
+				}
+			} else {
+				t.Errorf("pod is %s, expected node: %v, got %v ", node, " ")
+			}
 		}
 	}
 }
