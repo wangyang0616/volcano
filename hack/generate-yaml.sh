@@ -81,8 +81,10 @@ fi
 HELM_TEMPLATES_DIR=${VK_ROOT}/installer/helm/chart/volcano/templates
 HELM_VOLCANO_CRD_DIR=${VK_ROOT}/installer/helm/chart/volcano/crd
 HELM_JOBFLOW_CRD_DIR=${VK_ROOT}/installer/helm/chart/volcano/charts/jobflow/crd
+HELM_JOBSET_CRD_DIR=${VK_ROOT}/installer/helm/chart/volcano/charts/jobset/crd
 VOLCANO_CRD_DIR=${VK_ROOT}/config/crd/volcano
 JOBFLOW_CRD_DIR=${VK_ROOT}/config/crd/jobflow
+JOBSET_CRD_DIR=${VK_ROOT}/config/crd/jobset
 echo Updating templates in $HELM_TEMPLATES_DIR
 # use tail because we should skip top two line
 # sync volcano bases
@@ -102,6 +104,10 @@ tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/nodeinfo.volcano.sh_numatopologies.yaml > 
 # sync jobflow bases
 tail -n +3 ${JOBFLOW_CRD_DIR}/bases/flow.volcano.sh_jobflows.yaml > ${HELM_JOBFLOW_CRD_DIR}/bases/flow.volcano.sh_jobflows.yaml
 tail -n +3 ${JOBFLOW_CRD_DIR}/bases/flow.volcano.sh_jobtemplates.yaml > ${HELM_JOBFLOW_CRD_DIR}/bases/flow.volcano.sh_jobtemplates.yaml
+
+# sync jobset bases
+tail -n +3 ${JOBSET_CRD_DIR}/bases/flow.volcano.sh_jobflows.yaml > ${HELM_JOBSET_CRD_DIR}/bases/flow.volcano.sh_jobflows.yaml
+tail -n +3 ${JOBSET_CRD_DIR}/bases/flow.volcano.sh_jobtemplates.yaml > ${HELM_JOBSET_CRD_DIR}/bases/flow.volcano.sh_jobtemplates.yaml
 
 # Step3. generate yaml in folder
 if [[ ! -d ${RELEASE_FOLDER} ]];then
@@ -143,6 +149,13 @@ ${HELM_BIN_DIR}/helm template ${VK_ROOT}/installer/helm/chart/volcano/charts/job
       -s templates/flow_v1alpha1_jobflows.yaml \
       -s templates/flow_v1alpha1_jobtemplates.yaml \
       >> ${DEPLOYMENT_FILE}
+
+# Jobset
+${HELM_BIN_DIR}/helm template ${VK_ROOT}/installer/helm/chart/volcano/charts/jobset --namespace volcano-system \
+      --name-template volcano --set basic.image_tag_version=${VOLCANO_IMAGE_TAG} --set basic.crd_version=${CRD_VERSION}\
+      -s templates/jobset_v1alpha1_jobsets.yaml \
+      >> ${DEPLOYMENT_FILE}
+
 
 # Monitoring
 ${HELM_BIN_DIR}/helm template ${VK_ROOT}/installer/helm/chart/volcano --namespace volcano-monitoring \
