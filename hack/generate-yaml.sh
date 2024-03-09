@@ -87,6 +87,7 @@ echo Updating templates in $HELM_TEMPLATES_DIR
 # use tail because we should skip top two line
 # sync volcano bases
 tail -n +3 ${VOLCANO_CRD_DIR}/bases/batch.volcano.sh_jobs.yaml > ${HELM_VOLCANO_CRD_DIR}/bases/batch.volcano.sh_jobs.yaml
+tail -n +3 ${VOLCANO_CRD_DIR}/bases/batch.volcano.sh_jobsets.yaml > ${HELM_VOLCANO_CRD_DIR}/bases/batch.volcano.sh_jobsets.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/bases/bus.volcano.sh_commands.yaml > ${HELM_VOLCANO_CRD_DIR}/bases/bus.volcano.sh_commands.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/bases/scheduling.volcano.sh_podgroups.yaml > ${HELM_VOLCANO_CRD_DIR}/bases/scheduling.volcano.sh_podgroups.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/bases/scheduling.volcano.sh_queues.yaml > ${HELM_VOLCANO_CRD_DIR}/bases/scheduling.volcano.sh_queues.yaml
@@ -94,6 +95,7 @@ tail -n +3 ${VOLCANO_CRD_DIR}/bases/nodeinfo.volcano.sh_numatopologies.yaml > ${
 
 # sync v1beta1
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobs.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobs.yaml
+tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobsets.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobsets.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/bus.volcano.sh_commands.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/bus.volcano.sh_commands.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_podgroups.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_podgroups.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_queues.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_queues.yaml
@@ -128,6 +130,7 @@ ${HELM_BIN_DIR}/helm template ${VK_ROOT}/installer/helm/chart/volcano --namespac
       --name-template volcano --set basic.image_tag_version=${VOLCANO_IMAGE_TAG} --set basic.crd_version=${CRD_VERSION}\
       -s templates/admission.yaml \
       -s templates/batch_v1alpha1_job.yaml \
+      -s templates/batch_v1alpha1_jobset.yaml \
       -s templates/bus_v1alpha1_command.yaml \
       -s templates/controllers.yaml \
       -s templates/scheduler.yaml \
