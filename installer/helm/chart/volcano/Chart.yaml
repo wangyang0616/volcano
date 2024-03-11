@@ -11,9 +11,6 @@ dependencies:
 - name: jobflow
   version: "1.0.0"
   repository: "file://../charts/jobflow"
-- name: jobset
-  version: "1.0.0"
-  repository: "file://../charts/jobset"
 maintainers:
   - name: k82cn
     email: klaus1982.cn@gmail.com
