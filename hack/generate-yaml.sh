@@ -95,6 +95,7 @@ tail -n +3 ${VOLCANO_CRD_DIR}/bases/nodeinfo.volcano.sh_numatopologies.yaml > ${
 
 # sync v1beta1
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobs.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobs.yaml
+tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobsets.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/batch.volcano.sh_jobsets.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/bus.volcano.sh_commands.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/bus.volcano.sh_commands.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_podgroups.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_podgroups.yaml
 tail -n +3 ${VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_queues.yaml > ${HELM_VOLCANO_CRD_DIR}/v1beta1/scheduling.volcano.sh_queues.yaml
