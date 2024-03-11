@@ -43,6 +43,8 @@ require (
 	volcano.sh/apis v1.8.0-alpha.0.0.20231028020234-1a5aa81107d7
 )
 
+require github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
+
 require (
 	github.com/NYTimes/gziphandler v1.1.1 // indirect
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df // indirect
@@ -170,5 +172,5 @@ replace (
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.29.0
 	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.29.0
 	k8s.io/sample-controller => k8s.io/sample-controller v0.29.0
-	volcano.sh/apis => github.com/wangyang0616/apis 83a25db7318a5bdebd13334b2c090c2f6c829ae0
+	volcano.sh/apis => github.com/wangyang0616/apis v0.0.0-20240311123541-440fffc8f50e
 )
