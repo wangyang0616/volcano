@@ -41,10 +41,6 @@ spec:
               minAvailable:
                 format: int32
                 type: integer
-              priorityClassName:
-                type: string
-              queue:
-                type: string
               replicatedJobs:
                 items:
                   properties:
@@ -3604,8 +3600,6 @@ spec:
                 required:
                 - operator
                 type: object
-              suspend:
-                type: boolean
             type: object
           status:
             properties:
@@ -3665,16 +3659,12 @@ spec:
                     succeeded:
                       format: int32
                       type: integer
-                    suspended:
-                      format: int32
-                      type: integer
                   required:
                   - active
                   - failed
                   - name
                   - ready
                   - succeeded
-                  - suspended
                   type: object
                 type: array
                 x-kubernetes-list-map-keys:
