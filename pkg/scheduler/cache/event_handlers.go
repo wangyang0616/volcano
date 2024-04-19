@@ -22,6 +22,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
@@ -77,6 +78,12 @@ func (sc *SchedulerCache) getOrCreateJob(pi *schedulingapi.TaskInfo) *scheduling
 // @Lily922 TODO: support counting shared volumes. Currently, if two different pods use the same attachable volume
 // and scheduled on the same nodes the volume will be count twice, but actually only use one attachable limit resource
 func (sc *SchedulerCache) addPodCSIVolumesToTask(pi *schedulingapi.TaskInfo) error {
+	startTime := time.Now()
+	defer func() {
+		subTime := time.Now().Sub(startTime)
+		klog.V(3).Infof("Pod <%v/%v> csi volume start time is %v, process csi volume run time is %v.", pi.Namespace, pi.Name, startTime, subTime)
+	}()
+
 	volumes, err := sc.getPodCSIVolumes(pi.Pod)
 	if err != nil {
 		klog.Errorf("got pod csi attachment persistent volumes count error: %s", err.Error())
@@ -235,6 +242,11 @@ func (sc *SchedulerCache) NewTaskInfo(pod *v1.Pod) (*schedulingapi.TaskInfo, err
 
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) addPod(pod *v1.Pod) error {
+	startTime := time.Now()
+	defer func() {
+		subTime := time.Now().Sub(startTime)
+		klog.V(3).Infof("Pod <%v/%v> start time is %v, add func run time is %v.", pod.Namespace, pod.Name, startTime, subTime)
+	}()
 	pi, err := sc.NewTaskInfo(pod)
 	if err != nil {
 		klog.Errorf("generate taskInfo for pod(%s) failed: %v", pod.Name, err)
