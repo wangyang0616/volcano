@@ -238,7 +238,7 @@ func (sc *SchedulerCache) addPod(pod *v1.Pod) error {
 	pi, err := sc.NewTaskInfo(pod)
 	if err != nil {
 		klog.Errorf("generate taskInfo for pod(%s) failed: %v", pod.Name, err)
-		sc.resyncTask(pi)
+		// sc.resyncTask(pi)
 	}
 
 	return sc.addTask(pi)
