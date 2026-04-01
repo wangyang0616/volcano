@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rt-index-job-001
+  namespace: pool-xxx
+  labels:
+    volcano.sh/job-id: "job-001"
+    volcano.sh/config-type: "ranktable" # ranktable or rootinfo
+    volcano.sh/ranktable-type: "index"  # index or shard
+    volcano.sh/ranktable-version: "1774020605" # monotonically increasing version
+data:
+  # --- 1) Control / version ---
+  ranktable_cur_version: "1774020605" # unix ms or monotonic sequence
+  ranktable_prev_version: "1774020501"      # previous complete version; empty for first publish
+  status: "completed"             # initializing | completed
+  protocol_version: "v1.0"        # index schema version
+
+  # --- 2) Encoding / integrity ---
+  # Full ranktable is compressed first, then sharded.
+  encoding: "zstd" # zstd | gzip | identity
+  chunk_size: "819200" # bytes (e.g. 800KiB)
+  total_shards: "5"
+  compressed_size: "286421"  # bytes of merged compressed payload
+  original_size: "4294967"   # bytes after decompress
+  compressed_sha256: "c0ffee...beef" # SHA256 of merged compressed stream
+  content_sha256: "af231...89b"      # SHA256 of final decompressed content
+
+  # Optional guardrails for consumer validation.
+  max_original_size: "52428800" # reject if decompressed content exceeds this limit
+
+  # --- 3) Discovery / incremental update ---
+  # Sidecar MAY use selector for discovery, but SHOULD verify against `shards` list.
+  selector: "volcano.sh/job-id=job-001,volcano.sh/ranktable-type=shard,volcano.sh/ranktable-version=1774020605"
+  changed_shards: "[0,3,4]" # shard ids changed from prev_version; empty means full refresh
+
+  # --- 4) Authoritative shard manifest ---
+  # This list is the source of truth for strict validation.
+  shards: |
+    [
+      {"id": 0, "namespace": "pool-xxx", "name": "rt-shard-job-001-v1774020605-0", "size": 819200, "sha256": "x1..."},
+      {"id": 1, "namespace": "pool-xxx", "name": "rt-shard-job-001-v1774020605-1", "size": 819200, "sha256": "x2..."},
+      ...
+      {"id": 4, "namespace": "pool-xxx", "name": "rt-shard-job-001-v1774020605-4", "size": 58121, "sha256": "x200..."}
+    ]

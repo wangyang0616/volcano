@@ -69,7 +69,7 @@ include Makefile.def
 
 .EXPORT_ALL_VARIABLES:
 
-all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-webhook-manager vc-agent vcctl command-lines
+all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-ranktable-aggregator vc-webhook-manager vc-agent vcctl command-lines
 
 init:
 	mkdir -p ${BIN_DIR}
@@ -91,6 +91,9 @@ vc-agent-scheduler: init
 
 vc-controller-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-controller-manager ./cmd/controller-manager
+
+vc-ranktable-aggregator: init
+	CC=${CC} CGO_ENABLED=0 GOFLAGS="-mod=mod" go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-ranktable-aggregator ./cmd/ranktable-aggregator
 
 vc-webhook-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-webhook-manager ./cmd/webhook-manager

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: configmap1980-job-001
+  namespace: pool-xxx
+  labels:
+    volcano.sh/job-id: "job-001"
+    volcano.sh/config-type: "ranktable" # ranktable or rootinfo
+    volcano.sh/ranktable-version: "1774020605"  # monotonically increasing version
+data:
+  jobstart_hccl.json: ""

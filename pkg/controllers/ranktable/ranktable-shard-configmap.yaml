@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rt-shard-job-001-v1774020605-0
+  namespace: pool-xxx
+  labels:
+    volcano.sh/job-id: "job-001"
+    volcano.sh/config-type: "ranktable" # ranktable or rootinfo
+    volcano.sh/ranktable-type: "shard"  # index or shard
+    volcano.sh/shard-index: "0"
+    volcano.sh/ranktable-version: "1774020605"
+data:
+  # compressed+sharded payload chunk.
+  # Keep this key stable so sidecar/init code can fetch it directly.
+  # If binaryData is used in your implementation, keep index schema aligned.
+  ranktable_shard_info: "BASE64_ENCODED_COMPRESSED_CHUNK_BYTES"
