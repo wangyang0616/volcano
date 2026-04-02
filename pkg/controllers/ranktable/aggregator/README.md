@@ -113,6 +113,9 @@ Log verbosity uses klog (e.g. `-v=4`).
 | `-startup-jitter` | `30s` | Random delay in `[0, jitter]` before first reconcile (init and sidecar). |
 | `-allow-plain-shard` | `false` | If true, shard payload may be raw bytes in the ConfigMap (not base64). **Debug/tests only.** |
 | `-metrics-addr` | (empty) | If set (e.g. `:9090`), serves Prometheus metrics at `/metrics`. |
+| `-exit-on-main-container-exit` | `false` | If true, sidecar exits when a local main-container exit signal file appears. |
+| `-main-container-exit-file` | `/etc/ranktable/main-container.exit` | Exit signal file path on shared volume, created by main container on exit. |
+| `-pod-poll-interval` | `2s` | Poll interval for checking the local exit signal file when exit-on-main-container-exit is enabled. |
 
 Decompression is **size-capped** during decode using `min(original_size, max_original_size, -max-original-size)` so gzip/zstd cannot expand past the configured bound before validation.
 
@@ -221,6 +224,8 @@ containers:
       - -poll-interval=30s
       - -startup-jitter=30s
       - -metrics-addr=:9090
+      - -exit-on-main-container-exit=true
+      - -main-container-exit-file=/etc/ranktable/main-container.exit
     volumeMounts:
       - name: ranktable-index
         mountPath: /etc/ranktable/index
@@ -229,6 +234,8 @@ containers:
 
   - name: workload
     image: <workload-image>
+    # Ensure the file is created on exit so sidecar can detect termination
+    command: ["sh", "-c", "trap 'touch /etc/ranktable/main-container.exit' EXIT; exec /your-workload-command"]
     volumeMounts:
       - name: ranktable-shared
         mountPath: /etc/ranktable

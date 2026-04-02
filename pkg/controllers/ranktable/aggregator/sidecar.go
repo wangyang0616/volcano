@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -16,6 +17,15 @@ type SidecarOptions struct {
 	OutputPath    string
 	PollInterval  time.Duration
 	StartupJitter time.Duration
+
+	// ExitOnMainContainerExit makes sidecar exit when the specified main container
+	// in the same Pod is terminated by detecting a local exit signal file on
+	// shared volume. This avoids apiserver polling and is fully in-container.
+	//
+	// The main container should create MainContainerExitSignalFile on exit.
+	ExitOnMainContainerExit     bool
+	MainContainerExitSignalFile string
+	PodPollInterval             time.Duration
 }
 
 // RunInit optionally waits up to startupJitter (spread) then runs a single ReconcileOnce.
@@ -39,6 +49,9 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 	if opt.PollInterval <= 0 {
 		opt.PollInterval = 30 * time.Second
 	}
+	if opt.PodPollInterval <= 0 {
+		opt.PodPollInterval = 2 * time.Second
+	}
 	if opt.StartupJitter > 0 {
 		delay := time.Duration(rand.Int63n(int64(opt.StartupJitter)))
 		klog.V(3).InfoS("Sidecar startup jitter", "delay", delay.String())
@@ -49,7 +62,15 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 		}
 	}
 
-	r.Start(ctx, opt.IndexFilePath, opt.OutputPath)
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if opt.ExitOnMainContainerExit {
+		runCtx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		go monitorMainContainerExitSignal(runCtx, cancel, opt)
+	}
+
+	r.Start(runCtx, opt.IndexFilePath, opt.OutputPath)
 
 	// Initial sync.
 	r.Trigger()
@@ -71,7 +92,7 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return nil
 		case err := <-watcher.Errors:
 			if err != nil {
@@ -90,6 +111,33 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 			}
 		case <-ticker.C:
 			r.Trigger()
+		}
+	}
+}
+
+func monitorMainContainerExitSignal(ctx context.Context, cancel context.CancelFunc, opt SidecarOptions) {
+	if opt.MainContainerExitSignalFile == "" {
+		klog.ErrorS(nil, "Exit-on-main-container enabled but main container exit signal file is missing")
+		return
+	}
+
+	ticker := time.NewTicker(opt.PodPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if _, err := os.Stat(opt.MainContainerExitSignalFile); err == nil {
+			klog.V(3).InfoS("Main container exit signal file detected; exiting sidecar",
+				"exitSignalFile", opt.MainContainerExitSignalFile)
+			cancel()
+			return
+		} else if !os.IsNotExist(err) {
+			klog.V(4).ErrorS(err, "Stat main container exit signal file failed",
+				"exitSignalFile", opt.MainContainerExitSignalFile)
 		}
 	}
 }

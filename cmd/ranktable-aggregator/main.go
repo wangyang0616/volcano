@@ -40,6 +40,10 @@ type options struct {
 	startupJitter   time.Duration
 	allowPlainShard bool
 	metricsAddr     string
+
+	exitOnMainContainerExit bool
+	mainContainerExitFile   string
+	podPollInterval         time.Duration
 }
 
 func main() {
@@ -59,6 +63,9 @@ func main() {
 	flag.DurationVar(&opt.startupJitter, "startup-jitter", 30*time.Second, "max startup jitter duration")
 	flag.BoolVar(&opt.allowPlainShard, "allow-plain-shard", false, "allow shard ConfigMap values that are not base64 (debug/tests only; not for production)")
 	flag.StringVar(&opt.metricsAddr, "metrics-addr", "", "if set (e.g. :9090), listen for Prometheus metrics on /metrics")
+	flag.BoolVar(&opt.exitOnMainContainerExit, "exit-on-main-container-exit", false, "exit sidecar when local main-container exit signal file appears")
+	flag.StringVar(&opt.mainContainerExitFile, "main-container-exit-file", "/etc/ranktable/main-container.exit", "path to main-container exit signal file on shared volume")
+	flag.DurationVar(&opt.podPollInterval, "pod-poll-interval", 2*time.Second, "poll interval for checking main-container exit signal file when exit-on-main-container-exit is enabled")
 	flag.Parse()
 
 	client, err := buildClient(opt.masterURL, opt.kubeConfig, float32(opt.qps), opt.workers*2)
@@ -96,10 +103,13 @@ func main() {
 		klog.Info("init reconcile completed")
 	case "sidecar":
 		err := aggregator.RunSidecar(ctx, reconciler, aggregator.SidecarOptions{
-			IndexFilePath: opt.indexFilePath,
-			OutputPath:    opt.outputPath,
-			PollInterval:  opt.pollInterval,
-			StartupJitter: opt.startupJitter,
+			IndexFilePath:               opt.indexFilePath,
+			OutputPath:                  opt.outputPath,
+			PollInterval:                opt.pollInterval,
+			StartupJitter:               opt.startupJitter,
+			ExitOnMainContainerExit:     opt.exitOnMainContainerExit,
+			MainContainerExitSignalFile: opt.mainContainerExitFile,
+			PodPollInterval:             opt.podPollInterval,
 		})
 		if err != nil {
 			klog.Exitf("sidecar failed: %v", err)
