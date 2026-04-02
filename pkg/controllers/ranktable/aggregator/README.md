@@ -270,8 +270,10 @@ go test ./test/e2e/ranktable -run TestE2E -v
 |------|------|
 | `doc.go` | Package docstring. |
 | `types.go` / `index.go` | Index metadata and parsing. |
-| `kube.go` | Shard ConfigMap GET (retries on transient API errors). |
-| `hash.go` / `io.go` / `limits.go` | SHA-256, bounded decompress, caps, atomic write. |
+| `shard_fetch.go` | Shard ConfigMap GET (retries on transient API errors). |
+| `hash.go` | SHA-256 and hash comparison helpers. |
+| `decompress.go` | Compute decompression limits and decode/decompress with bounds. |
+| `atomic_write.go` | Atomic file write (`tmp + fsync + rename`). |
 | `metrics.go` | Prometheus counters/histogram. |
 | `reconciler.go` | Fetch plan, cache/reuse, validate, write. |
 | `sidecar.go` | Init vs sidecar run loops, fsnotify + poll. |

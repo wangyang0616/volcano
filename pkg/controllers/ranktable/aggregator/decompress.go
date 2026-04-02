@@ -5,11 +5,26 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// EffectiveDecompressedLimit returns the smallest positive bound applied while decoding:
+// min(original_size, max_original_size if set, runtime MaxOriginalSize if set).
+// Used with DecodeAndDecompressLimited to cap expansion before full output is materialized.
+func EffectiveDecompressedLimit(meta *IndexMeta, runtimeMax int64) (int64, error) {
+	if meta.OriginalSize < 0 {
+		return 0, fmt.Errorf("original_size must be non-negative")
+	}
+	limit := meta.OriginalSize
+	if meta.MaxOriginalSize > 0 && meta.MaxOriginalSize < limit {
+		limit = meta.MaxOriginalSize
+	}
+	if runtimeMax > 0 && runtimeMax < limit {
+		limit = runtimeMax
+	}
+	return limit, nil
+}
 
 // DecodeAndDecompressLimited decodes at most maxDecompressed bytes of output. If the
 // codec would expand beyond that, an error is returned (mitigates zip bombs). For
@@ -57,35 +72,4 @@ func DecodeAndDecompressLimited(enc Encoding, in []byte, maxDecompressed int64) 
 	default:
 		return nil, fmt.Errorf("unsupported encoding: %q", enc)
 	}
-}
-
-// WriteFileAtomically writes data via a temp file in the same directory, fsyncs,
-// then renames into place so readers never see a partial file.
-func WriteFileAtomically(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir dir: %w", err)
-	}
-	tmp, err := os.CreateTemp(dir, ".ranktable-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename temp: %w", err)
-	}
-	return nil
 }
