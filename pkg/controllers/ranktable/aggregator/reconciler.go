@@ -60,9 +60,31 @@ func NewReconciler(client kubernetes.Interface, opts Options) *Reconciler {
 
 // CurrentVersion returns the last successfully reconciled ranktable_cur_version.
 func (r *Reconciler) CurrentVersion() string {
+	return r.getCurrentVersion()
+}
+
+func (r *Reconciler) getCurrentVersion() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.currentVersion
+}
+
+func (r *Reconciler) setCurrentVersionAndCache(version string, cache map[int]shardCacheEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.currentVersion = version
+	r.lastShardByID = cache
+}
+
+func (r *Reconciler) snapshotVersionAndCache() (string, map[int]shardCacheEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur := r.currentVersion
+	snap := make(map[int]shardCacheEntry, len(r.lastShardByID))
+	for id, e := range r.lastShardByID {
+		snap[id] = e
+	}
+	return cur, snap
 }
 
 // Start runs a single reconcile loop in the background. Trigger coalesces bursts via a
@@ -147,10 +169,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, indexPath, outputPath st
 		return err
 	}
 
-	r.mu.Lock()
-	r.currentVersion = meta.CurVersion
-	r.lastShardByID = cache
-	r.mu.Unlock()
+	r.setCurrentVersionAndCache(meta.CurVersion, cache)
 	klog.InfoS("RankTable reconciled", "version", meta.CurVersion, "outputPath", outputPath, "shards", meta.TotalShards)
 	return nil
 }
@@ -178,13 +197,7 @@ func (r *Reconciler) fetchAssemble(ctx context.Context, meta *IndexMeta) ([]byte
 	sem := make(chan struct{}, r.opts.Workers)
 	var wg sync.WaitGroup
 
-	cacheSnapshot := map[int]shardCacheEntry{}
-	r.mu.Lock()
-	curVersion := r.currentVersion
-	for id, e := range r.lastShardByID {
-		cacheSnapshot[id] = e
-	}
-	r.mu.Unlock()
+	curVersion, cacheSnapshot := r.snapshotVersionAndCache()
 
 	fetchOpt := FetchShardOptions{AllowPlainShard: r.opts.AllowPlainShard}
 
