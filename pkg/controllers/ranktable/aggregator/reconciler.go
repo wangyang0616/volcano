@@ -292,20 +292,24 @@ func (r *Reconciler) runLoop(ctx context.Context, indexPath, outputPath string) 
 			case <-ctx.Done():
 				return
 			case <-r.triggerCh:
-				// Drain any extra queued signals.
-				for {
-					select {
-					case <-r.triggerCh:
-					default:
-						goto drained
-					}
-				}
-			drained:
+				// Drain any extra queued signals so we run at most one extra reconcile.
+				r.drainTriggers()
 				time.Sleep(coalesceDelay)
 				continue
 			default:
 				return
 			}
+		}
+	}
+}
+
+func (r *Reconciler) drainTriggers() {
+	for {
+		select {
+		case <-r.triggerCh:
+			continue
+		default:
+			return
 		}
 	}
 }
