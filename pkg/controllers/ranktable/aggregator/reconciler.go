@@ -35,11 +35,12 @@ type Reconciler struct {
 	client kubernetes.Interface
 	opts   Options
 
-	mu              sync.Mutex
-	currentVersion  string
-	lastShardByID   map[int]shardCacheEntry
-	reconcileActive bool
-	dirty           bool
+	mu             sync.Mutex
+	currentVersion string
+	lastShardByID  map[int]shardCacheEntry
+
+	startOnce sync.Once
+	triggerCh chan struct{}
 }
 
 // NewReconciler returns a reconciler with defaulted Workers and RequestQPS if unset.
@@ -62,6 +63,31 @@ func (r *Reconciler) CurrentVersion() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.currentVersion
+}
+
+// Start runs a single reconcile loop in the background. Trigger coalesces bursts via a
+// buffered channel so at most one extra reconcile is queued while a run is active.
+//
+// Start is safe to call multiple times; only the first call starts the loop.
+func (r *Reconciler) Start(ctx context.Context, indexPath, outputPath string) {
+	r.startOnce.Do(func() {
+		r.triggerCh = make(chan struct{}, 1)
+		go r.runLoop(ctx, indexPath, outputPath)
+	})
+}
+
+// Trigger requests a reconcile. Calls coalesce: if a request is already pending,
+// Trigger returns without blocking.
+func (r *Reconciler) Trigger() {
+	ch := r.triggerCh
+	if ch == nil {
+		// Start was not called; ignore to keep call sites simple.
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 // ReconcileOnce loads the index, fetches missing shards, validates, decompresses, and
@@ -243,39 +269,43 @@ func shouldReuseShard(meta *IndexMeta, changed map[int]struct{}, currentVersion 
 	return e.version == currentVersion && EqualHash(e.sha, shard.SHA256) && int64(len(e.data)) == shard.Size
 }
 
-// Trigger schedules ReconcileOnce asynchronously. Concurrent triggers coalesce:
-// while a run is active, later calls set dirty for at most one follow-up run.
-func (r *Reconciler) Trigger(ctx context.Context, indexPath, outputPath string) {
-	r.mu.Lock()
-	if r.reconcileActive {
-		r.dirty = true
-		r.mu.Unlock()
-		return
-	}
-	r.reconcileActive = true
-	r.dirty = false
-	r.mu.Unlock()
-
-	go func() {
-		defer func() {
-			r.mu.Lock()
-			again := r.dirty
-			r.dirty = false
-			r.reconcileActive = false
-			r.mu.Unlock()
-			if again {
-				// Coalesce bursts into at most one extra run.
-				time.Sleep(300 * time.Millisecond)
-				r.Trigger(ctx, indexPath, outputPath)
-			}
-		}()
-
-		start := time.Now()
-		err := r.ReconcileOnce(ctx, indexPath, outputPath)
-		if err != nil {
-			klog.ErrorS(err, "RankTable reconcile failed")
+func (r *Reconciler) runLoop(ctx context.Context, indexPath, outputPath string) {
+	const coalesceDelay = 300 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-r.triggerCh:
 		}
-		klog.V(3).InfoS("RankTable reconcile succeeded", "elapsed", time.Since(start).String())
-	}()
+
+		for {
+			start := time.Now()
+			err := r.ReconcileOnce(ctx, indexPath, outputPath)
+			if err != nil {
+				klog.ErrorS(err, "RankTable reconcile failed")
+			} else {
+				klog.V(3).InfoS("RankTable reconcile succeeded", "elapsed", time.Since(start).String())
+			}
+
+			// If more triggers arrived during the reconcile, run once more after a short delay.
+			select {
+			case <-ctx.Done():
+				return
+			case <-r.triggerCh:
+				// Drain any extra queued signals.
+				for {
+					select {
+					case <-r.triggerCh:
+					default:
+						goto drained
+					}
+				}
+			drained:
+				time.Sleep(coalesceDelay)
+				continue
+			default:
+				return
+			}
+		}
+	}
 }

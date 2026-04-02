@@ -49,8 +49,10 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 		}
 	}
 
+	r.Start(ctx, opt.IndexFilePath, opt.OutputPath)
+
 	// Initial sync.
-	r.Trigger(ctx, opt.IndexFilePath, opt.OutputPath)
+	r.Trigger()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -84,10 +86,10 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 			}
 			if ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create) || ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) || ev.Has(fsnotify.Chmod) {
 				klog.V(4).InfoS("Index file event received", "event", ev.String())
-				r.Trigger(ctx, opt.IndexFilePath, opt.OutputPath)
+				r.Trigger()
 			}
 		case <-ticker.C:
-			r.Trigger(ctx, opt.IndexFilePath, opt.OutputPath)
+			r.Trigger()
 		}
 	}
 }
