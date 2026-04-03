@@ -111,9 +111,8 @@ Log verbosity uses klog (e.g. `-v=4`).
 | `-startup-jitter` | `30s` | Random delay in `[0, jitter]` before bootstrap/watch loop. |
 | `-allow-plain-shard` | `false` | If true, shard payload may be raw bytes in the ConfigMap (not base64). **Debug/tests only.** |
 | `-metrics-addr` | (empty) | If set (e.g. `:9090`), serves Prometheus metrics at `/metrics`. |
-| `-exit-on-main-container-exit` | `false` | If true, sidecar exits when a local main-container exit signal file appears. |
-| `-main-container-exit-file` | `/etc/ranktable/main-container.exit` | Exit signal file path on shared volume, created by main container on exit. |
-| `-pod-poll-interval` | `2s` | Poll interval for checking the local exit signal file when exit-on-main-container-exit is enabled. |
+
+Startup fails fast if `-index-file-path` or `-output-path` is empty (after trim).
 
 Decompression is **size-capped** during decode using `min(original_size, max_original_size, -max-original-size)` so gzip/zstd cannot expand past the configured bound before validation.
 
@@ -141,8 +140,7 @@ _output/bin/vc-ranktable-aggregator \
 1. **Volume:** mount only the index ConfigMap (e.g. `items` -> `index.yaml`).
 2. **Shared volume:** `emptyDir` for assembled output; aggregator sidecar + workload mount the same path.
 3. **ServiceAccount/RBAC:** grant `get` on `configmaps` in job namespace.
-4. **Native Sidecar:** one `initContainers` entry with `restartPolicy: Always` (Kubernetes 1.28+; default-on from 1.29). It runs **with** the workload, bootstraps when the output file is absent, then watches the index; on Pod shutdown the kubelet stops sidecars in order (SIGTERM).
-5. **Optional:** `--exit-on-main-container-exit` + shared exit file if you need explicit in-container exit coupling.
+4. **Native Sidecar:** one `initContainers` entry with `restartPolicy: Always` (Kubernetes 1.28+; default-on from 1.29). It runs **with** the workload, bootstraps when the output file is absent, then watches the index; when regular containers exit, the kubelet stops the sidecar (SIGTERM), which should cancel the process via the main binary’s signal handling.
 
 Regular **`containers`** list: workload only (do **not** duplicate the aggregator as a normal container when using Native Sidecar).
 
@@ -205,8 +203,6 @@ initContainers:
       - -poll-interval=30s
       - -startup-jitter=30s
       - -metrics-addr=:9090
-      - -exit-on-main-container-exit=true
-      - -main-container-exit-file=/etc/ranktable/main-container.exit
     volumeMounts:
       - name: ranktable-index
         mountPath: /etc/ranktable/index
@@ -216,7 +212,7 @@ initContainers:
 containers:
   - name: workload
     image: <workload-image>
-    command: ["sh", "-c", "trap 'touch /etc/ranktable/main-container.exit' EXIT; exec /your-workload-command"]
+    command: ["sh", "-c", "exec /your-workload-command"]
     volumeMounts:
       - name: ranktable-shared
         mountPath: /etc/ranktable
@@ -266,7 +262,7 @@ go test ./test/e2e/ranktable -run TestE2E -v
 | `atomic_write.go` | Atomic file write (`tmp + fsync + rename`). |
 | `metrics.go` | Prometheus counters/histogram. |
 | `reconciler.go` | Fetch plan, cache/reuse, validate, write. |
-| `sidecar.go` | Bootstrap when output missing; fsnotify + poll + background reconciler. |
+| `run.go` | Bootstrap when output missing; fsnotify + poll; wires `Reconciler.Start`. |
 
 ---
 

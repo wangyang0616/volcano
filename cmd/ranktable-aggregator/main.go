@@ -8,7 +8,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,14 +37,9 @@ type options struct {
 	startupJitter   time.Duration
 	allowPlainShard bool
 	metricsAddr     string
-
-	exitOnMainContainerExit bool
-	mainContainerExitFile   string
-	podPollInterval         time.Duration
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	klog.InitFlags(nil)
 
 	opt := &options{}
@@ -56,13 +50,10 @@ func main() {
 	flag.IntVar(&opt.workers, "workers", 4, "max concurrent shard fetch workers")
 	flag.Float64Var(&opt.qps, "kube-api-qps", 3.0, "kube client qps")
 	flag.Int64Var(&opt.maxOriginalSize, "max-original-size", aggregator.DefaultMaxOriginalSize, "max allowed decompressed bytes")
-	flag.DurationVar(&opt.pollInterval, "poll-interval", 30*time.Second, "sidecar fallback reconcile interval")
+	flag.DurationVar(&opt.pollInterval, "poll-interval", 30*time.Second, "periodic reconcile interval (fallback if fsnotify misses)")
 	flag.DurationVar(&opt.startupJitter, "startup-jitter", 30*time.Second, "max startup jitter duration")
 	flag.BoolVar(&opt.allowPlainShard, "allow-plain-shard", false, "allow shard ConfigMap values that are not base64 (debug/tests only; not for production)")
 	flag.StringVar(&opt.metricsAddr, "metrics-addr", "", "if set (e.g. :9090), listen for Prometheus metrics on /metrics")
-	flag.BoolVar(&opt.exitOnMainContainerExit, "exit-on-main-container-exit", false, "exit sidecar when local main-container exit signal file appears")
-	flag.StringVar(&opt.mainContainerExitFile, "main-container-exit-file", "/etc/ranktable/main-container.exit", "path to main-container exit signal file on shared volume")
-	flag.DurationVar(&opt.podPollInterval, "pod-poll-interval", 2*time.Second, "poll interval for checking main-container exit signal file when exit-on-main-container-exit is enabled")
 	flag.Parse()
 
 	client, err := buildClient(opt.masterURL, opt.kubeConfig, float32(opt.qps), opt.workers*2)
@@ -92,14 +83,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := aggregator.RunSidecar(ctx, reconciler, aggregator.SidecarOptions{
-		IndexFilePath:               opt.indexFilePath,
-		OutputPath:                  opt.outputPath,
-		PollInterval:                opt.pollInterval,
-		StartupJitter:               opt.startupJitter,
-		ExitOnMainContainerExit:     opt.exitOnMainContainerExit,
-		MainContainerExitSignalFile: opt.mainContainerExitFile,
-		PodPollInterval:             opt.podPollInterval,
+	if err := aggregator.Run(ctx, reconciler, aggregator.RunOptions{
+		IndexFilePath: opt.indexFilePath,
+		OutputPath:    opt.outputPath,
+		PollInterval:  opt.pollInterval,
+		StartupJitter: opt.startupJitter,
 	}); err != nil {
 		klog.Exitf("ranktable aggregator exited: %v", err)
 	}

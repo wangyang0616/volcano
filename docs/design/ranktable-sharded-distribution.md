@@ -215,7 +215,7 @@ Build/deploy notes for the reference consumer:
 
 - Build: `make vc-ranktable-aggregator` (or `go build ./cmd/ranktable-aggregator`).
 - Container image: build from source binary and deploy as a **single Native Sidecar** (`initContainers` + `restartPolicy: Always`, Kubernetes 1.28+; default-on from 1.29). The kubelet runs it with app containers and **terminates it during Pod shutdown** (SIGTERM ordering). On older clusters, fall back to the same binary under regular `containers` (no kube-managed sidecar ordering).
-- `--exit-on-main-container-exit` plus a local signal file remains optional for explicit in-container exit coupling.
+- The aggregator process listens for `SIGINT`/`SIGTERM` and exits cleanly; Native Sidecar placement is the supported way to get kubelet-driven termination after app containers finish.
 - Runtime flags usually tuned per cluster: `--workers`, `--kube-api-qps`, `--poll-interval`, `--startup-jitter`.
 - Expose metrics with `--metrics-addr` and scrape `/metrics`.
 

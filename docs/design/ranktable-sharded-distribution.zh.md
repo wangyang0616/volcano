@@ -215,7 +215,7 @@ Pod 内 init/sidecar 的 ServiceAccount 需要在作业 namespace 内读取 Conf
 
 - 编译：`make vc-ranktable-aggregator`（或 `go build ./cmd/ranktable-aggregator`）。
 - 镜像：由源码二进制打包；推荐 **单个 Native Sidecar**（唯一 `initContainers` 项且 `restartPolicy: Always`，Kubernetes 1.28+，1.29 起默认开启）。kubelet 在 Pod 清理阶段对 sidecar 发 SIGTERM。详见 `aggregator/README.md`。
-- 旧集群可仅把同一二进制放在 `containers`；`--exit-on-main-container-exit` + 本地信号文件可选。
+- 旧集群可仅把同一二进制放在普通 `containers`（无 Native Sidecar 时，侧车终止顺序由集群与 Pod 生命周期决定，而非 kubelet 侧车规则）。
 - 运行参数按集群调优：`--workers`、`--kube-api-qps`、`--poll-interval`、`--startup-jitter`。
 - 通过 `--metrics-addr` 暴露 `/metrics` 供 Prometheus 抓取。
 

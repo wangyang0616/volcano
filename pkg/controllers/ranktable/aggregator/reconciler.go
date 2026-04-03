@@ -325,6 +325,7 @@ func (r *Reconciler) runLoop(ctx context.Context, indexPath, outputPath string) 
 				time.Sleep(coalesceDelay)
 				continue
 			default:
+				// No pending work; leave inner loop and wait on triggerCh at outer select.
 				return
 			}
 		}
