@@ -28,23 +28,10 @@ type SidecarOptions struct {
 	PodPollInterval             time.Duration
 }
 
-// RunInit optionally waits up to startupJitter (spread) then runs a single ReconcileOnce.
-// Intended for use as an initContainer before the workload starts.
-func RunInit(ctx context.Context, r *Reconciler, indexFilePath, outputPath string, startupJitter time.Duration) error {
-	if startupJitter > 0 {
-		delay := time.Duration(rand.Int63n(int64(startupJitter)))
-		klog.V(3).InfoS("Init reconcile startup jitter", "delay", delay.String())
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return r.ReconcileOnce(ctx, indexFilePath, outputPath)
-}
-
-// RunSidecar watches the index file’s directory (ConfigMap volume updates), polls on
-// a ticker, and triggers reconciliation after optional startup jitter.
+// RunSidecar runs the only supported consumer loop: after optional startup jitter it
+// performs a synchronous bootstrap reconcile if the output file is absent (so the file
+// appears as soon as the index is completed), starts the background reconcile loop, then
+// watches the index directory (ConfigMap updates), and polls on a ticker.
 func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 	if opt.PollInterval <= 0 {
 		opt.PollInterval = 30 * time.Second
@@ -70,9 +57,16 @@ func RunSidecar(ctx context.Context, r *Reconciler, opt SidecarOptions) error {
 		go monitorMainContainerExitSignal(runCtx, cancel, opt)
 	}
 
+	if _, err := os.Stat(opt.OutputPath); err != nil && os.IsNotExist(err) {
+		klog.InfoS("RankTable output absent; bootstrap reconcile before watch loop", "outputPath", opt.OutputPath)
+		if err := r.ReconcileOnce(runCtx, opt.IndexFilePath, opt.OutputPath); err != nil {
+			klog.ErrorS(err, "Bootstrap reconcile failed; watch loop will retry")
+		}
+	}
+
 	r.Start(runCtx, opt.IndexFilePath, opt.OutputPath)
 
-	// Initial sync.
+	// Kick the loop (covers version/index changes and retries after bootstrap failure).
 	r.Trigger()
 
 	watcher, err := fsnotify.NewWatcher()

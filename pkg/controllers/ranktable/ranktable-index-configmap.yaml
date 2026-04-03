@@ -26,7 +26,7 @@ data:
   content_sha256: "af231...89b"      # SHA256 of final decompressed content
 
   # Optional guardrails for consumer validation.
-  max_original_size: "52428800" # reject if decompressed content exceeds this limit
+  max_original_size: "209715200" # 200 MiB; must be >= original_size and align with --max-original-size
 
   # --- 3) Discovery / incremental update ---
   # Sidecar MAY use selector for discovery, but SHOULD verify against `shards` list.

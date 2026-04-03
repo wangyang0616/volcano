@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -113,7 +114,8 @@ func (r *Reconciler) Trigger() {
 }
 
 // ReconcileOnce loads the index, fetches missing shards, validates, decompresses, and
-// atomically writes outputPath. No-op if status is not completed or version unchanged.
+// atomically writes outputPath. No-op if status is not completed, or if the index version
+// matches the last successful reconcile and outputPath still exists (recreates file if missing).
 func (r *Reconciler) ReconcileOnce(ctx context.Context, indexPath, outputPath string) (err error) {
 	start := time.Now()
 	skipped := false
@@ -127,9 +129,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context, indexPath, outputPath st
 		return fmt.Errorf("index not completed, status=%s", meta.Status)
 	}
 	if meta.CurVersion == r.CurrentVersion() {
-		skipped = true
-		klog.V(4).InfoS("Skip reconcile for unchanged version", "version", meta.CurVersion)
-		return nil
+		if _, err := os.Stat(outputPath); err == nil {
+			skipped = true
+			klog.V(4).InfoS("Skip reconcile for unchanged version", "version", meta.CurVersion)
+			return nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("stat output file: %w", err)
+		}
+		klog.InfoS("Output file missing; reconciling despite unchanged version", "outputPath", outputPath, "version", meta.CurVersion)
 	}
 
 	payload, cache, err := r.fetchAssemble(ctx, meta)
@@ -193,8 +201,12 @@ func (r *Reconciler) fetchAssemble(ctx context.Context, meta *IndexMeta) ([]byte
 		err  error
 	}
 
+	// Each shard contributes exactly one result. Buffer capacity len(shards) so synchronous
+	// sends for cache reuse (below) cannot block waiting for the consumer, and concurrent
+	// workers are less likely to block on send when many finish together.
 	out := make(chan result, len(shards))
 	sem := make(chan struct{}, r.opts.Workers)
+	// wg counts only fetch goroutines; reused shards send on out in this goroutine and do not use wg.
 	var wg sync.WaitGroup
 
 	curVersion, cacheSnapshot := r.snapshotVersionAndCache()
@@ -235,6 +247,9 @@ func (r *Reconciler) fetchAssemble(ctx context.Context, meta *IndexMeta) ([]byte
 		}(s)
 	}
 
+	// Close out after all fetch goroutines have sent so: (1) no send-on-closed-channel panic,
+	// (2) for-range below terminates once buffered values are drained. Closing while the
+	// receiver is still reading is normal in Go: buffered data remains readable until empty.
 	go func() {
 		wg.Wait()
 		close(out)

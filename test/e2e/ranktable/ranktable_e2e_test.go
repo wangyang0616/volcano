@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"volcano.sh/volcano/pkg/controllers/ranktable/aggregator"
 	e2eutil "volcano.sh/volcano/test/e2e/util"
@@ -140,7 +141,7 @@ data:
 		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		By("create pod with init+sidecar and workload")
+		By("create pod with native sidecar (single process) + workload")
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ctx.Namespace},
 			Spec: corev1.PodSpec{
@@ -163,15 +164,17 @@ data:
 				},
 				InitContainers: []corev1.Container{
 					{
-						Name:    "ranktable-init",
-						Image:   aggImage,
-						Command: []string{aggCmd},
+						Name:          "ranktable-aggregator",
+						RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+						Image:         aggImage,
+						Command:       []string{aggCmd},
 						Args: []string{
-							"-mode=init",
 							"-index-file-path=" + indexPath,
 							"-output-path=" + outputPath,
 							"-kube-api-qps=3",
 							"-workers=2",
+							"-poll-interval=15s",
+							"-startup-jitter=0s",
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "ranktable-index", MountPath: "/etc/ranktable/index"},
@@ -181,26 +184,10 @@ data:
 				},
 				Containers: []corev1.Container{
 					{
-						Name:    "ranktable-sidecar",
-						Image:   aggImage,
-						Command: []string{aggCmd},
-						Args: []string{
-							"-mode=sidecar",
-							"-index-file-path=" + indexPath,
-							"-output-path=" + outputPath,
-							"-poll-interval=15s",
-							"-startup-jitter=0s",
-						},
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "ranktable-index", MountPath: "/etc/ranktable/index"},
-							{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
-						},
-					},
-					{
 						Name:  "workload",
 						Image: e2eutil.DefaultBusyBoxImage,
 						Command: []string{"sh", "-c",
-							"test -s " + outputPath + " && grep -q '\"rank\":0' " + outputPath + " && sleep 3600",
+							"while ! test -s " + outputPath + "; do sleep 1; done; grep -q '\"rank\":0' " + outputPath + " && sleep 3600",
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
@@ -286,7 +273,7 @@ data:
 		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		By("create pod with init+sidecar and workload logger")
+		By("create pod with native sidecar + workload logger")
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ctx.Namespace},
 			Spec: corev1.PodSpec{
@@ -299,28 +286,13 @@ data:
 					}}},
 					{Name: "ranktable-shared", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				},
-				InitContainers: []corev1.Container{{
-					Name:    "ranktable-init",
-					Image:   aggImage,
-					Command: []string{aggCmd},
-					Args: []string{
-						"-mode=init",
-						"-index-file-path=" + indexPath,
-						"-output-path=" + outputPath,
-						"-startup-jitter=0s",
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "ranktable-index", MountPath: "/etc/ranktable/index"},
-						{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
-					},
-				}},
-				Containers: []corev1.Container{
+				InitContainers: []corev1.Container{
 					{
-						Name:    "ranktable-sidecar",
-						Image:   aggImage,
-						Command: []string{aggCmd},
+						Name:          "ranktable-aggregator",
+						RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+						Image:         aggImage,
+						Command:       []string{aggCmd},
 						Args: []string{
-							"-mode=sidecar",
 							"-index-file-path=" + indexPath,
 							"-output-path=" + outputPath,
 							"-poll-interval=2s",
@@ -331,6 +303,8 @@ data:
 							{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
 						},
 					},
+				},
+				Containers: []corev1.Container{
 					{
 						Name:    "workload",
 						Image:   e2eutil.DefaultBusyBoxImage,
@@ -481,7 +455,7 @@ data:
 		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		By("create pod with init+sidecar and workload logger")
+		By("create pod with native sidecar + workload logger")
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ctx.Namespace},
 			Spec: corev1.PodSpec{
@@ -494,28 +468,13 @@ data:
 					}}},
 					{Name: "ranktable-shared", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				},
-				InitContainers: []corev1.Container{{
-					Name:    "ranktable-init",
-					Image:   aggImage,
-					Command: []string{aggCmd},
-					Args: []string{
-						"-mode=init",
-						"-index-file-path=" + indexPath,
-						"-output-path=" + outputPath,
-						"-startup-jitter=0s",
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "ranktable-index", MountPath: "/etc/ranktable/index"},
-						{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
-					},
-				}},
-				Containers: []corev1.Container{
+				InitContainers: []corev1.Container{
 					{
-						Name:    "ranktable-sidecar",
-						Image:   aggImage,
-						Command: []string{aggCmd},
+						Name:          "ranktable-aggregator",
+						RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+						Image:         aggImage,
+						Command:       []string{aggCmd},
 						Args: []string{
-							"-mode=sidecar",
 							"-index-file-path=" + indexPath,
 							"-output-path=" + outputPath,
 							"-poll-interval=2s",
@@ -526,6 +485,8 @@ data:
 							{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
 						},
 					},
+				},
+				Containers: []corev1.Container{
 					{
 						Name:    "workload",
 						Image:   e2eutil.DefaultBusyBoxImage,
@@ -587,7 +548,7 @@ data:
 
 		By("verify sidecar logs parse changed_shards error")
 		Eventually(func() string {
-			req := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "ranktable-sidecar"})
+			req := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "ranktable-aggregator"})
 			rc, e := req.Stream(context.TODO())
 			if e != nil {
 				return ""
@@ -672,7 +633,7 @@ data:
 		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
-		By("create pod with init+sidecar and workload logger")
+		By("create pod with native sidecar + workload logger")
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ctx.Namespace},
 			Spec: corev1.PodSpec{
@@ -685,28 +646,13 @@ data:
 					}}},
 					{Name: "ranktable-shared", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 				},
-				InitContainers: []corev1.Container{{
-					Name:    "ranktable-init",
-					Image:   aggImage,
-					Command: []string{aggCmd},
-					Args: []string{
-						"-mode=init",
-						"-index-file-path=" + indexPath,
-						"-output-path=" + outputPath,
-						"-startup-jitter=0s",
-					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "ranktable-index", MountPath: "/etc/ranktable/index"},
-						{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
-					},
-				}},
-				Containers: []corev1.Container{
+				InitContainers: []corev1.Container{
 					{
-						Name:    "ranktable-sidecar",
-						Image:   aggImage,
-						Command: []string{aggCmd},
+						Name:          "ranktable-aggregator",
+						RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
+						Image:         aggImage,
+						Command:       []string{aggCmd},
 						Args: []string{
-							"-mode=sidecar",
 							"-index-file-path=" + indexPath,
 							"-output-path=" + outputPath,
 							"-poll-interval=2s",
@@ -717,6 +663,8 @@ data:
 							{Name: "ranktable-shared", MountPath: "/etc/ranktable"},
 						},
 					},
+				},
+				Containers: []corev1.Container{
 					{
 						Name:    "workload",
 						Image:   e2eutil.DefaultBusyBoxImage,
@@ -778,7 +726,7 @@ data:
 
 		By("verify sidecar logs index not completed error")
 		Eventually(func() string {
-			req := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "ranktable-sidecar"})
+			req := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "ranktable-aggregator"})
 			rc, e := req.Stream(context.TODO())
 			if e != nil {
 				return ""

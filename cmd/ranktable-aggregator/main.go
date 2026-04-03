@@ -1,7 +1,7 @@
 // Command ranktable-aggregator (vc-ranktable-aggregator) loads a mounted RankTable
 // index, fetches shard ConfigMaps from the API, assembles and validates the payload,
-// and writes the decompressed RankTable for the workload. Modes: init (one-shot) or
-// sidecar (watch + poll).
+// and writes the decompressed RankTable for the workload. Single run loop: bootstrap
+// when the output file is missing, then watch + poll for updates.
 package main
 
 import (
@@ -25,8 +25,6 @@ import (
 )
 
 type options struct {
-	mode string
-
 	indexFilePath string
 	outputPath    string
 
@@ -51,14 +49,13 @@ func main() {
 	klog.InitFlags(nil)
 
 	opt := &options{}
-	flag.StringVar(&opt.mode, "mode", "sidecar", "run mode: init or sidecar")
 	flag.StringVar(&opt.indexFilePath, "index-file-path", "/etc/ranktable/index/index.yaml", "path to mounted ranktable index file")
 	flag.StringVar(&opt.outputPath, "output-path", "/etc/ranktable/jobstart_hccl.json", "path to write assembled ranktable file")
 	flag.StringVar(&opt.kubeConfig, "kubeconfig", "", "path to kubeconfig; empty means in-cluster config")
 	flag.StringVar(&opt.masterURL, "master", "", "kubernetes apiserver address override")
 	flag.IntVar(&opt.workers, "workers", 4, "max concurrent shard fetch workers")
 	flag.Float64Var(&opt.qps, "kube-api-qps", 3.0, "kube client qps")
-	flag.Int64Var(&opt.maxOriginalSize, "max-original-size", 52428800, "max allowed decompressed bytes")
+	flag.Int64Var(&opt.maxOriginalSize, "max-original-size", aggregator.DefaultMaxOriginalSize, "max allowed decompressed bytes")
 	flag.DurationVar(&opt.pollInterval, "poll-interval", 30*time.Second, "sidecar fallback reconcile interval")
 	flag.DurationVar(&opt.startupJitter, "startup-jitter", 30*time.Second, "max startup jitter duration")
 	flag.BoolVar(&opt.allowPlainShard, "allow-plain-shard", false, "allow shard ConfigMap values that are not base64 (debug/tests only; not for production)")
@@ -95,27 +92,16 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	switch opt.mode {
-	case "init":
-		if err := aggregator.RunInit(ctx, reconciler, opt.indexFilePath, opt.outputPath, opt.startupJitter); err != nil {
-			klog.Exitf("init reconcile failed: %v", err)
-		}
-		klog.Info("init reconcile completed")
-	case "sidecar":
-		err := aggregator.RunSidecar(ctx, reconciler, aggregator.SidecarOptions{
-			IndexFilePath:               opt.indexFilePath,
-			OutputPath:                  opt.outputPath,
-			PollInterval:                opt.pollInterval,
-			StartupJitter:               opt.startupJitter,
-			ExitOnMainContainerExit:     opt.exitOnMainContainerExit,
-			MainContainerExitSignalFile: opt.mainContainerExitFile,
-			PodPollInterval:             opt.podPollInterval,
-		})
-		if err != nil {
-			klog.Exitf("sidecar failed: %v", err)
-		}
-	default:
-		klog.Exitf("invalid --mode: %s (want init|sidecar)", opt.mode)
+	if err := aggregator.RunSidecar(ctx, reconciler, aggregator.SidecarOptions{
+		IndexFilePath:               opt.indexFilePath,
+		OutputPath:                  opt.outputPath,
+		PollInterval:                opt.pollInterval,
+		StartupJitter:               opt.startupJitter,
+		ExitOnMainContainerExit:     opt.exitOnMainContainerExit,
+		MainContainerExitSignalFile: opt.mainContainerExitFile,
+		PodPollInterval:             opt.podPollInterval,
+	}); err != nil {
+		klog.Exitf("ranktable aggregator exited: %v", err)
 	}
 }
 

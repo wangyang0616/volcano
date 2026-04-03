@@ -70,6 +70,21 @@ func TestReconcileOnce_IdentitySingleShard(t *testing.T) {
 	if string(got) != string(plain) {
 		t.Fatalf("got %q want %q", got, plain)
 	}
+
+	// Same version in memory but output deleted — must rewrite file.
+	if err := os.Remove(outPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReconcileOnce(context.Background(), indexPath, outPath); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2) != string(plain) {
+		t.Fatalf("after delete, got %q want %q", got2, plain)
+	}
 }
 
 func TestShouldReuseShard(t *testing.T) {

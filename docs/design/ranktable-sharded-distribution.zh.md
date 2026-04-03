@@ -8,7 +8,7 @@
 
 - 先压缩后分片存储到 ConfigMap，
 - 使用一个 index ConfigMap 作为控制面信号，
-- 在每个 Pod 内通过 initContainer + sidecar 完成本地聚合与刷新。
+- 在每个 Pod 内使用 **单一 Native Sidecar 进程**（`initContainers` + `restartPolicy: Always`）：输出文件不存在时 **bootstrap 聚合**，否则进入监听与定时刷新；kubelet 在 Pod 退出阶段管理 sidecar 生命周期。
 
 本方案假设 **每个 Pod 独立从 kube-apiserver 拉取分片**，不依赖共享存储。
 
@@ -44,20 +44,17 @@ AI/HPC 大作业的 RankTable 可能明显超过 1 MiB，无法安全放入单�
 1. **Producer（控制器侧）**  
    生成完整 RankTable -> 压缩 -> 分片 -> 写入 shard ConfigMap -> 最后写 index ConfigMap（完成信号）。
 
-2. **initContainer（启动路径）**  
-   读取挂载的 index，按需拉分片并校验，聚合解压后原子写本地文件。
+2. **聚合器 / Native Sidecar**  
+   可选启动抖动后：若本地 RankTable **不存在**则同步做一次 bootstrap reconcile；再进入常驻循环（后台 reconcile + index 目录 `fsnotify` + 定时轮询）。仅当 index 版本与内存一致 **且输出文件仍在** 时跳过；文件被删则按同版本重新写出。
 
-3. **sidecar（运行时更新路径）**  
-   监听挂载 index 文件变化，触发本地 RankTable 重建与切换。
-
-4. **业务容器**  
-   仅读取 Pod 本地目标文件，不感知分片细节。
+3. **业务容器**  
+   仅读本地文件；与 sidecar 并行启动，宜 **重试等待** 文件出现。
 
 ### 数据流
 
 1. 控制器先发布全部 shard ConfigMap；
 2. 控制器最后更新 index 为 `status=completed`；
-3. init/sidecar 检测到 index 后，从 apiserver 拉取 shard；
+3. 聚合器检测到 index（或 bootstrap）后，从 apiserver 拉取 shard；
 4. 在 Pod 内生成并原子替换目标文件。
 
 ## ConfigMap 协议
@@ -131,27 +128,22 @@ Producer 必须遵循：
 - sidecar 监听 index 文件变化（`fsnotify`）+ 周期兜底检查；
 - shard 不挂载，按 index 清单通过 apiserver 获取。
 
-### initContainer（启动阶段）
+### 聚合步骤（bootstrap 与刷新共用）
 
 1. 读取并校验 index 协议；
-2. 必须 `status=completed`；
-3. 生成分片拉取计划；
-4. 并发拉取（有上限）；
-5. 校验每片 `size` / `sha256`；
-6. 按 `id` 顺序拼接；
-7. 校验压缩流 `compressed_sha256` / `compressed_size`；
-8. 按 `encoding` 解压，解码过程使用 **输出上限**  
-   `min(original_size, max_original_size（若设）, 运行时参数上限)`，以流式方式限制膨胀，缓解压缩炸弹（须在完整输出物化前生效，而非仅事后比对长度）；
-9. 校验最终内容 `content_sha256` / `original_size`（含上限）；
-10. 原子写文件（tmp + fsync + rename）。
+2. 须 `status=completed`（否则报错，由 watch 循环重试）；
+3. 若内存版本与 index 一致且输出文件存在则跳过；
+4. 生成分片拉取计划；
+5. 并发拉取（有上限）；
+6. 校验每片 `size` / `sha256`；
+7. 按 `id` 顺序拼接；
+8. 校验压缩流 `compressed_sha256` / `compressed_size`；
+9. 按 `encoding` 解压，解码过程使用 **输出上限**  
+   `min(original_size, max_original_size（若设）, 运行时参数上限)`，缓解压缩炸弹；
+10. 校验最终内容 `content_sha256` / `original_size`（含上限）；
+11. 原子写文件（tmp + fsync + rename）。
 
-### sidecar（运行时）
-
-沿用 init 同一条流水线，并增加：
-
-- 版本未变化直接跳过；
-- 同一时刻只允许一个 reconcile 在跑；
-- 失败保留旧文件；下一次由定时轮询或新的 index 事件触发。**分片 ConfigMap 的 GET** 对可重试错误采用 **指数退避 + 抖动**（见 `aggregator` 实现）。
+**常驻循环：** 合并触发信号、单路 reconcile；`fsnotify` + 定时轮询；失败保留旧文件；分片 **GET** 可重试错误上 **指数退避 + 抖动**（见 `aggregator`）。
 
 ## 大规模场景下的 apiserver 压力控制
 
@@ -163,7 +155,7 @@ Producer 必须遵循：
 4. **抖动削峰**：启动/更新触发增加随机延迟；
 5. **事件防抖**：合并短时间内重复 index 变更；
 6. **指数退避重试**：对分片 **GET** 在限流、超时、连接重置、5xx 等可重试错误上退避（参考实现已做）；
-7. **版本幂等**：同版本不重复重建；
+7. **版本幂等**：同版本且输出文件仍在则不重复重建；输出缺失则重建；
 8. **增量优化**：在 `changed_shards` 为合法 JSON 且与 `ranktable_prev_version` 匹配时，可跳过已缓存的未变更分片。
 
 ## 完整性与安全
@@ -222,7 +214,8 @@ Pod 内 init/sidecar 的 ServiceAccount 需要在作业 namespace 内读取 Conf
 参考消费者编译/部署建议：
 
 - 编译：`make vc-ranktable-aggregator`（或 `go build ./cmd/ranktable-aggregator`）。
-- 镜像：由源码二进制打包，同一镜像同时用于 initContainer 与 sidecar。
+- 镜像：由源码二进制打包；推荐 **单个 Native Sidecar**（唯一 `initContainers` 项且 `restartPolicy: Always`，Kubernetes 1.28+，1.29 起默认开启）。kubelet 在 Pod 清理阶段对 sidecar 发 SIGTERM。详见 `aggregator/README.md`。
+- 旧集群可仅把同一二进制放在 `containers`；`--exit-on-main-container-exit` + 本地信号文件可选。
 - 运行参数按集群调优：`--workers`、`--kube-api-qps`、`--poll-interval`、`--startup-jitter`。
 - 通过 `--metrics-addr` 暴露 `/metrics` 供 Prometheus 抓取。
 
@@ -244,7 +237,7 @@ Pod 内 init/sidecar 的 ServiceAccount 需要在作业 namespace 内读取 Conf
    - N Pod × M 分片，验证 apiserver QPS 在预算内；
    - 同步更新场景验证抖动与防抖有效。
 
-4. **E2E 用例**（建议新增 suite：`test/e2e/ranktable/`）
+4. **E2E 用例**（`test/e2e/ranktable/`）— Pod 使用 **Native Sidecar**（`restartPolicy: Always` 的 init）；集群需 Kubernetes **1.28+**。
    - 启动成功：发布 V1 后 init 生成本地文件，业务容器可读取；
    - 运行时刷新：V1 -> V2，sidecar 触发原子更新；
    - 分片损坏：hash 不匹配时保留旧文件并打失败指标/日志；

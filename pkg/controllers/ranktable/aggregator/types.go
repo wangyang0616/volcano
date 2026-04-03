@@ -10,6 +10,10 @@ const (
 	StatusCompleted    = "completed"
 	// ProtocolV10 is the only supported value for protocol_version in the index.
 	ProtocolV10 = "v1.0"
+
+	// DefaultMaxOriginalSize is the default --max-original-size (bytes) and matches the
+	// example index max_original_size. Larger payloads can be allowed by raising both.
+	DefaultMaxOriginalSize int64 = 200 * 1024 * 1024 // 200 MiB
 )
 
 // Encoding names the compression applied to the full RankTable before sharding.

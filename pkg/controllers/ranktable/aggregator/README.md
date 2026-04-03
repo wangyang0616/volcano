@@ -17,9 +17,8 @@ A full RankTable can exceed the Kubernetes ConfigMap size limit (~1 MiB). We sto
 | Role | Responsibility |
 |------|----------------|
 | **Producer** (your controller) | Build RankTable → compress → shard → create/update shard ConfigMaps → set index to `status=completed` last. |
-| **initContainer** | One-shot reconcile after optional startup jitter so the main container sees a valid file at startup. |
-| **sidecar** | Watch index path + periodic poll; re-run reconcile when the index or version changes. |
-| **Workload** | Read only the output file (e.g. JSON). |
+| **Aggregator (single process)** | If the output file is **missing**, run a **bootstrap** reconcile; then watch the index path + periodic poll and reconcile on index/version changes. Deploy as a **Native Sidecar** (`initContainers` + `restartPolicy: Always`) so the kubelet ties lifecycle to the workload (see Deployment). |
+| **Workload** | Read only the output file (e.g. JSON). **Startup race:** the sidecar starts together with app containers—retry or delay reads until the file exists (or until your readiness logic allows). |
 
 ### Data flow
 
@@ -101,16 +100,15 @@ Log verbosity uses klog (e.g. `-v=4`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-mode` | `sidecar` | `init` — single reconcile then exit; `sidecar` — watch + poll. |
 | `-index-file-path` | `/etc/ranktable/index/index.yaml` | Path to the mounted index (file name should match your volume `items` key, often `index.yaml` or full ConfigMap YAML). |
 | `-output-path` | `/etc/ranktable/jobstart_hccl.json` | Decompressed RankTable output path (shared `emptyDir` or volume with workload). |
 | `-kubeconfig` | (empty) | Kubeconfig path; empty uses in-cluster config when `-master` is also empty. |
 | `-master` | | Apiserver override (optional). |
 | `-workers` | `4` | Max concurrent shard `GET` workers. |
 | `-kube-api-qps` | `3` | REST client QPS; burst is `2 * workers`. |
-| `-max-original-size` | `52428800` | Reject decompressed payload larger than this (bytes). |
-| `-poll-interval` | `30s` | Sidecar periodic reconcile trigger. |
-| `-startup-jitter` | `30s` | Random delay in `[0, jitter]` before first reconcile (init and sidecar). |
+| `-max-original-size` | `209715200` (200 MiB) | Reject decompressed payload larger than this (bytes). |
+| `-poll-interval` | `30s` | Periodic reconcile trigger (watch loop fallback). |
+| `-startup-jitter` | `30s` | Random delay in `[0, jitter]` before bootstrap/watch loop. |
 | `-allow-plain-shard` | `false` | If true, shard payload may be raw bytes in the ConfigMap (not base64). **Debug/tests only.** |
 | `-metrics-addr` | (empty) | If set (e.g. `:9090`), serves Prometheus metrics at `/metrics`. |
 | `-exit-on-main-container-exit` | `false` | If true, sidecar exits when a local main-container exit signal file appears. |
@@ -127,16 +125,10 @@ Prometheus (when `-metrics-addr` is set; counters/histogram also register on the
 
 **Tests:** `go test ./pkg/controllers/ranktable/aggregator/...`
 
-Examples:
+Example:
 
 ```bash
-# Init container: assemble once, then exit successfully
-_output/bin/vc-ranktable-aggregator -mode=init \
-  -index-file-path=/etc/ranktable/index/index.yaml \
-  -output-path=/shared/ranktable.json
-
-# Sidecar: keep watching index and refreshing output
-_output/bin/vc-ranktable-aggregator -mode=sidecar \
+_output/bin/vc-ranktable-aggregator \
   -index-file-path=/etc/ranktable/index/index.yaml \
   -output-path=/shared/ranktable.json \
   -kube-api-qps=3 -workers=4
@@ -147,10 +139,12 @@ _output/bin/vc-ranktable-aggregator -mode=sidecar \
 ## Deployment (Kubernetes)
 
 1. **Volume:** mount only the index ConfigMap (e.g. `items` -> `index.yaml`).
-2. **Shared volume:** `emptyDir` for assembled output; initContainer + sidecar + workload mount the same path.
+2. **Shared volume:** `emptyDir` for assembled output; aggregator sidecar + workload mount the same path.
 3. **ServiceAccount/RBAC:** grant `get` on `configmaps` in job namespace.
-4. **initContainer:** `-mode=init` to guarantee startup file.
-5. **sidecar:** `-mode=sidecar` to handle refresh.
+4. **Native Sidecar:** one `initContainers` entry with `restartPolicy: Always` (Kubernetes 1.28+; default-on from 1.29). It runs **with** the workload, bootstraps when the output file is absent, then watches the index; on Pod shutdown the kubelet stops sidecars in order (SIGTERM).
+5. **Optional:** `--exit-on-main-container-exit` + shared exit file if you need explicit in-container exit coupling.
+
+Regular **`containers`** list: workload only (do **not** duplicate the aggregator as a normal container when using Native Sidecar).
 
 Minimal RBAC example:
 
@@ -186,7 +180,7 @@ subjects:
     namespace: <job-namespace>
 ```
 
-Pod snippet (init + sidecar):
+Pod snippet (**Native Sidecar** only + workload):
 
 ```yaml
 volumes:
@@ -200,27 +194,14 @@ volumes:
     emptyDir: {}
 
 initContainers:
-  - name: ranktable-init
+  - name: ranktable-aggregator
+    restartPolicy: Always
     image: <registry>/vc-ranktable-aggregator:<tag>
     args:
-      - -mode=init
       - -index-file-path=/etc/ranktable/index/index.yaml
       - -output-path=/etc/ranktable/jobstart_hccl.json
       - -kube-api-qps=3
       - -workers=4
-    volumeMounts:
-      - name: ranktable-index
-        mountPath: /etc/ranktable/index
-      - name: ranktable-shared
-        mountPath: /etc/ranktable
-
-containers:
-  - name: ranktable-sidecar
-    image: <registry>/vc-ranktable-aggregator:<tag>
-    args:
-      - -mode=sidecar
-      - -index-file-path=/etc/ranktable/index/index.yaml
-      - -output-path=/etc/ranktable/jobstart_hccl.json
       - -poll-interval=30s
       - -startup-jitter=30s
       - -metrics-addr=:9090
@@ -232,9 +213,9 @@ containers:
       - name: ranktable-shared
         mountPath: /etc/ranktable
 
+containers:
   - name: workload
     image: <workload-image>
-    # Ensure the file is created on exit so sidecar can detect termination
     command: ["sh", "-c", "trap 'touch /etc/ranktable/main-container.exit' EXIT; exec /your-workload-command"]
     volumeMounts:
       - name: ranktable-shared
@@ -248,9 +229,11 @@ containers:
 
 Yes, this should be covered by e2e. Suggested suite location: `test/e2e/ranktable/`.
 
+The e2e Pod specs use **Native Sidecar** (`initContainers` entry with `restartPolicy: Always`). The test cluster must run Kubernetes **1.28+** with the Sidecar Containers feature available (default-on from 1.29).
+
 Recommended scenarios:
 
-1. **bootstrap success**: publish `V1` index+shards, Pod starts, init writes output file, workload reads expected content.
+1. **bootstrap success**: publish `V1` index+shards, Pod starts, native sidecar writes output file, workload reads expected content (workload may need to retry until file exists).
 2. **sidecar refresh**: update to `V2`, sidecar detects index update and refreshes local file atomically.
 3. **corrupted shard**: one shard hash mismatch, sidecar must keep old file and report failure metric/log.
 4. **invalid changed_shards**: set malformed JSON in index, reconcile fails loudly and does not switch file.
@@ -283,7 +266,7 @@ go test ./test/e2e/ranktable -run TestE2E -v
 | `atomic_write.go` | Atomic file write (`tmp + fsync + rename`). |
 | `metrics.go` | Prometheus counters/histogram. |
 | `reconciler.go` | Fetch plan, cache/reuse, validate, write. |
-| `sidecar.go` | Init vs sidecar run loops, fsnotify + poll. |
+| `sidecar.go` | Bootstrap when output missing; fsnotify + poll + background reconciler. |
 
 ---
 
@@ -293,7 +276,7 @@ go test ./test/e2e/ranktable -run TestE2E -v
 
 **发布顺序：** 先写齐某版本 `V` 的全部分片 ConfigMap，最后再把 index 设为 `status=completed` 且 `ranktable_cur_version=V`。消费者仅信任 `completed`。
 
-**二进制两种模式：** `init` 启动时聚合一次（可选抖动）；`sidecar` 监听 index 所在目录变更并定时兜底轮询，触发重新聚合。
+**单一运行路径：** 输出文件不存在时先做 **bootstrap 聚合**（可选抖动），再监听 index 变更并定时兜底轮询。**部署上使用 Native Sidecar**（唯一一个带 `restartPolicy: Always` 的 init 容器），与业务容器并行启动，由 kubelet 在 Pod 退出时结束 sidecar；业务宜对缺失文件做重试。详见上文 Deployment。
 
 **构建：** 仓库根目录执行 `make vc-ranktable-aggregator`，产物在 `_output/bin/vc-ranktable-aggregator`。
 
