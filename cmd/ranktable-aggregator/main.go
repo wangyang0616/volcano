@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Command ranktable-aggregator (vc-ranktable-aggregator) loads a mounted RankTable
 // index, fetches shard ConfigMaps from the API, assembles and validates the payload,
 // and writes the decompressed RankTable for the workload. Single run loop: bootstrap
@@ -5,117 +21,22 @@
 package main
 
 import (
-	"context"
 	"flag"
-	"fmt"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
-	"volcano.sh/volcano/pkg/controllers/ranktable/aggregator"
+	"volcano.sh/volcano/cmd/ranktable-aggregator/app"
+	"volcano.sh/volcano/cmd/ranktable-aggregator/app/options"
 )
-
-const (
-	// CLI defaults are centralized here to keep flag wiring and runtime setup consistent.
-	defaultWorkers       = 4
-	defaultKubeAPIQPS    = 3.0
-	defaultPollInterval  = 30 * time.Second
-	defaultStartupJitter = 30 * time.Second
-	// kubeBurstMultiplier derives REST burst from worker concurrency.
-	kubeBurstMultiplier  = 2
-)
-
-type options struct {
-	indexFilePath string
-	outputPath    string
-
-	kubeConfig string
-	masterURL  string
-
-	workers         int
-	qps             float64
-	maxOriginalSize int64
-	pollInterval    time.Duration
-	startupJitter   time.Duration
-	allowPlainShard bool
-	metricsAddr     string
-}
 
 func main() {
 	klog.InitFlags(nil)
 
-	opt := &options{}
-	flag.StringVar(&opt.indexFilePath, "index-file-path", "/etc/ranktable/index/index.yaml", "path to mounted ranktable index file")
-	flag.StringVar(&opt.outputPath, "output-path", "/etc/ranktable/jobstart_hccl.json", "path to write assembled ranktable file")
-	flag.StringVar(&opt.kubeConfig, "kubeconfig", "", "path to kubeconfig; empty means in-cluster config")
-	flag.StringVar(&opt.masterURL, "master", "", "kubernetes apiserver address override")
-	flag.IntVar(&opt.workers, "workers", defaultWorkers, "max concurrent shard fetch workers")
-	flag.Float64Var(&opt.qps, "kube-api-qps", defaultKubeAPIQPS, "kube client qps")
-	flag.Int64Var(&opt.maxOriginalSize, "max-original-size", aggregator.DefaultMaxOriginalSize, "max allowed decompressed bytes")
-	flag.DurationVar(&opt.pollInterval, "poll-interval", defaultPollInterval, "periodic reconcile interval (fallback if fsnotify misses)")
-	flag.DurationVar(&opt.startupJitter, "startup-jitter", defaultStartupJitter, "max startup jitter duration")
-	flag.BoolVar(&opt.allowPlainShard, "allow-plain-shard", false, "allow shard ConfigMap values that are not base64 (debug/tests only; not for production)")
-	flag.StringVar(&opt.metricsAddr, "metrics-addr", "", "if set (e.g. :9090), listen for Prometheus metrics on /metrics")
+	opt := options.NewServerOption()
+	opt.AddFlags(flag.CommandLine)
 	flag.Parse()
 
-	client, err := buildClient(opt.masterURL, opt.kubeConfig, float32(opt.qps), opt.workers*kubeBurstMultiplier)
-	if err != nil {
-		klog.Exitf("build kube client: %v", err)
+	if err := app.Run(opt); err != nil {
+		klog.Exitf("%v", err)
 	}
-
-	reconciler := aggregator.NewReconciler(client, aggregator.Options{
-		Workers:         opt.workers,
-		RequestQPS:      opt.qps,
-		MaxOriginalSize: opt.maxOriginalSize,
-		AllowPlainShard: opt.allowPlainShard,
-	})
-
-	if opt.metricsAddr != "" {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		srv := &http.Server{Addr: opt.metricsAddr, Handler: mux}
-		go func() {
-			klog.InfoS("metrics server listening", "addr", opt.metricsAddr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				klog.ErrorS(err, "metrics server exited")
-			}
-		}()
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	if err := aggregator.Run(ctx, reconciler, aggregator.RunOptions{
-		IndexFilePath: opt.indexFilePath,
-		OutputPath:    opt.outputPath,
-		PollInterval:  opt.pollInterval,
-		StartupJitter: opt.startupJitter,
-	}); err != nil {
-		klog.Exitf("ranktable aggregator exited: %v", err)
-	}
-}
-
-// buildClient uses kubeconfig/master or in-cluster config and sets REST QPS/burst.
-func buildClient(master, kubeconfig string, qps float32, burst int) (kubernetes.Interface, error) {
-	var cfg *rest.Config
-	var err error
-	if kubeconfig != "" || master != "" {
-		cfg, err = clientcmd.BuildConfigFromFlags(master, kubeconfig)
-	} else {
-		cfg, err = rest.InClusterConfig()
-	}
-	if err != nil {
-		return nil, fmt.Errorf("build rest config: %w", err)
-	}
-	cfg.QPS = qps
-	cfg.Burst = burst
-	return kubernetes.NewForConfig(cfg)
 }
