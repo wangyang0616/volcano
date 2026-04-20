@@ -13,6 +13,11 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	// defaultPollInterval is used when -poll-interval is unset or invalid.
+	defaultPollInterval = 30 * time.Second
+)
+
 // RunOptions configures the long-running ranktable consumer: paths, polling, and startup jitter.
 type RunOptions struct {
 	IndexFilePath string
@@ -23,7 +28,7 @@ type RunOptions struct {
 
 func applyRunDefaults(opt *RunOptions) {
 	if opt.PollInterval <= 0 {
-		opt.PollInterval = 30 * time.Second
+		opt.PollInterval = defaultPollInterval
 	}
 }
 

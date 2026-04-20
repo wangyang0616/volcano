@@ -23,6 +23,16 @@ import (
 	"volcano.sh/volcano/pkg/controllers/ranktable/aggregator"
 )
 
+const (
+	// CLI defaults are centralized here to keep flag wiring and runtime setup consistent.
+	defaultWorkers       = 4
+	defaultKubeAPIQPS    = 3.0
+	defaultPollInterval  = 30 * time.Second
+	defaultStartupJitter = 30 * time.Second
+	// kubeBurstMultiplier derives REST burst from worker concurrency.
+	kubeBurstMultiplier  = 2
+)
+
 type options struct {
 	indexFilePath string
 	outputPath    string
@@ -47,16 +57,16 @@ func main() {
 	flag.StringVar(&opt.outputPath, "output-path", "/etc/ranktable/jobstart_hccl.json", "path to write assembled ranktable file")
 	flag.StringVar(&opt.kubeConfig, "kubeconfig", "", "path to kubeconfig; empty means in-cluster config")
 	flag.StringVar(&opt.masterURL, "master", "", "kubernetes apiserver address override")
-	flag.IntVar(&opt.workers, "workers", 4, "max concurrent shard fetch workers")
-	flag.Float64Var(&opt.qps, "kube-api-qps", 3.0, "kube client qps")
+	flag.IntVar(&opt.workers, "workers", defaultWorkers, "max concurrent shard fetch workers")
+	flag.Float64Var(&opt.qps, "kube-api-qps", defaultKubeAPIQPS, "kube client qps")
 	flag.Int64Var(&opt.maxOriginalSize, "max-original-size", aggregator.DefaultMaxOriginalSize, "max allowed decompressed bytes")
-	flag.DurationVar(&opt.pollInterval, "poll-interval", 30*time.Second, "periodic reconcile interval (fallback if fsnotify misses)")
-	flag.DurationVar(&opt.startupJitter, "startup-jitter", 30*time.Second, "max startup jitter duration")
+	flag.DurationVar(&opt.pollInterval, "poll-interval", defaultPollInterval, "periodic reconcile interval (fallback if fsnotify misses)")
+	flag.DurationVar(&opt.startupJitter, "startup-jitter", defaultStartupJitter, "max startup jitter duration")
 	flag.BoolVar(&opt.allowPlainShard, "allow-plain-shard", false, "allow shard ConfigMap values that are not base64 (debug/tests only; not for production)")
 	flag.StringVar(&opt.metricsAddr, "metrics-addr", "", "if set (e.g. :9090), listen for Prometheus metrics on /metrics")
 	flag.Parse()
 
-	client, err := buildClient(opt.masterURL, opt.kubeConfig, float32(opt.qps), opt.workers*2)
+	client, err := buildClient(opt.masterURL, opt.kubeConfig, float32(opt.qps), opt.workers*kubeBurstMultiplier)
 	if err != nil {
 		klog.Exitf("build kube client: %v", err)
 	}

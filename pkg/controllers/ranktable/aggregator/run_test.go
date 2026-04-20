@@ -8,6 +8,13 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+const (
+	// testDefaultPollInterval mirrors runtime default in applyRunDefaults.
+	testDefaultPollInterval = 30 * time.Second
+	// testNoopEventMask represents an fsnotify event with no operation bits set.
+	testNoopEventMask       = fsnotify.Op(0)
+)
+
 func TestShouldTriggerReconcileFromIndexDirEvent(t *testing.T) {
 	index := "/mnt/index/index.yaml"
 	parent := "/mnt/index"
@@ -32,7 +39,7 @@ func TestShouldTriggerReconcileFromIndexDirEvent(t *testing.T) {
 	}
 	if shouldTriggerReconcileFromIndexDirEvent(fsnotify.Event{
 		Name: index,
-		Op:   0,
+		Op:   testNoopEventMask,
 	}, index, parent) != false {
 		t.Fatal("no-op event mask should not trigger")
 	}
@@ -47,7 +54,7 @@ func TestShouldTriggerReconcileFromIndexDirEvent(t *testing.T) {
 func TestApplyRunDefaults(t *testing.T) {
 	opt := RunOptions{}
 	applyRunDefaults(&opt)
-	if opt.PollInterval != 30*time.Second {
+	if opt.PollInterval != testDefaultPollInterval {
 		t.Fatalf("defaults: poll=%v", opt.PollInterval)
 	}
 }
