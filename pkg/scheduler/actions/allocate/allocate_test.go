@@ -5735,3 +5735,52 @@ func BenchmarkHyperNodeGradientFnPerformance(b *testing.B) {
 		testStruct.Close()
 	}
 }
+
+func TestFilterGradientsByMinResource(t *testing.T) {
+	hn := api.NewHyperNodeInfo(api.BuildHyperNode("hn-1", 1, nil))
+	gradients := [][]*api.HyperNodeInfo{{hn}}
+
+	ssn := &framework.Session{
+		HyperNodeResourceStatus: api.HyperNodeResourceStatusMap{
+			"hn-1": {
+				Idle:       &api.Resource{MilliCPU: 1000},
+				FutureIdle: &api.Resource{MilliCPU: 1000},
+			},
+		},
+	}
+	alloc := &Action{session: ssn}
+
+	newJob := func(cpu string) *api.JobInfo {
+		q := resource.MustParse(cpu)
+		return &api.JobInfo{
+			UID: "job-1",
+			PodGroup: &api.PodGroup{
+				PodGroup: scheduling.PodGroup{
+					Spec: scheduling.PodGroupSpec{
+						MinResources: &v1.ResourceList{
+							v1.ResourceCPU: q,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("sufficient resources", func(t *testing.T) {
+		got := alloc.filterGradientsByMinResource(newJob("500m"), nil, gradients)
+		assert.Len(t, got, 1)
+		assert.Equal(t, "hn-1", got[0][0].Name)
+	})
+
+	t.Run("insufficient resources", func(t *testing.T) {
+		got := alloc.filterGradientsByMinResource(newJob("5"), nil, gradients)
+		assert.Empty(t, got)
+	})
+
+	t.Run("skip when job partially allocated", func(t *testing.T) {
+		job := newJob("5")
+		job.AllocatedHyperNode = "hn-1"
+		got := alloc.filterGradientsByMinResource(job, nil, gradients)
+		assert.Len(t, got, 1)
+	})
+}

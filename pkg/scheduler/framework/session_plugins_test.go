@@ -24,8 +24,11 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/cache"
+	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
@@ -135,4 +138,46 @@ func TestFilterOutPreemptMayNotHelpNodes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHyperNodeGradientForJobFnMultiPluginIntersection(t *testing.T) {
+	trueValue := true
+	hnLow := api.NewHyperNodeInfo(api.BuildHyperNode("low", 1, nil))
+	hnHigh := api.NewHyperNodeInfo(api.BuildHyperNode("high", 2, nil))
+	root := api.NewHyperNodeInfo(api.BuildHyperNode("root", 3, nil))
+
+	ssn := &Session{
+		Tiers: []conf.Tier{{
+			Plugins: []conf.PluginOption{
+				{Name: "plugin-a", EnabledHyperNodeGradient: &trueValue},
+				{Name: "plugin-b", EnabledHyperNodeGradient: &trueValue},
+			},
+		}},
+		HyperNodes: api.HyperNodeInfoMap{
+			"low":  hnLow,
+			"high": hnHigh,
+			"root": root,
+		},
+		hyperNodeGradientForJobFns: map[string]api.HyperNodeGradientForJobFn{},
+	}
+
+	ssn.AddHyperNodeGradientForJobFn("plugin-a", func(_ *api.JobInfo, _ *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+		return [][]*api.HyperNodeInfo{{hnLow, hnHigh}}
+	})
+	ssn.AddHyperNodeGradientForJobFn("plugin-b", func(_ *api.JobInfo, _ *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+		return [][]*api.HyperNodeInfo{{hnHigh}}
+	})
+
+	job := &api.JobInfo{UID: "job-1"}
+	result := ssn.HyperNodeGradientForJobFn(job, root)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "high", result[0][0].Name)
+
+	names := sets.New[string]()
+	for _, layer := range result {
+		for _, hn := range layer {
+			names.Insert(hn.Name)
+		}
+	}
+	assert.Equal(t, sets.New("high"), names)
 }

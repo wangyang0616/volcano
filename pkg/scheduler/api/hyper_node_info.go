@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -806,4 +807,110 @@ func (hnim HyperNodeInfoMap) GetLCAHyperNode(hypernode, jobHyperNode string) str
 		}
 	}
 	return ""
+}
+
+// HyperNodeResourceStatusMap stores per-HyperNode resource accounting for allocate pre-filtering.
+type HyperNodeResourceStatusMap map[string]*HyperNodeResourceStatus
+
+// HyperNodeResourceStatus is the session-readable HyperNode resource ledger.
+type HyperNodeResourceStatus struct {
+	Allocatable *Resource
+	Used        *Resource
+	Idle        *Resource
+	FutureIdle  *Resource
+}
+
+// SatisfiesMinResource reports whether minResource fits in idle or futureIdle capacity.
+// Missing status entries are treated as satisfiable (same as legacy network-topology-aware behavior).
+func (status *HyperNodeResourceStatus) SatisfiesMinResource(minResource *Resource) bool {
+	if status == nil || minResource == nil || minResource.IsEmpty() {
+		return true
+	}
+	if minResource.LessEqual(status.Idle, Zero) || minResource.LessEqual(status.FutureIdle, Zero) {
+		return true
+	}
+	return false
+}
+
+// Clone returns a deep copy of HyperNodeResourceStatus.
+func (status *HyperNodeResourceStatus) Clone() *HyperNodeResourceStatus {
+	if status == nil {
+		return nil
+	}
+	return &HyperNodeResourceStatus{
+		Allocatable: status.Allocatable.Clone(),
+		Used:        status.Used.Clone(),
+		Idle:        status.Idle.Clone(),
+		FutureIdle:  status.FutureIdle.Clone(),
+	}
+}
+
+// UnionGradientHyperNodeNames returns the set of HyperNode names appearing in any gradient layer.
+func UnionGradientHyperNodeNames(gradients [][]*HyperNodeInfo) sets.Set[string] {
+	names := sets.New[string]()
+	for _, layer := range gradients {
+		for _, hn := range layer {
+			if hn != nil {
+				names.Insert(hn.Name)
+			}
+		}
+	}
+	return names
+}
+
+// IntersectHyperNodeGradients returns HyperNode names eligible under all plugin gradients:
+// for each plugin, union its layers, then intersect across plugins.
+func IntersectHyperNodeGradients(perPlugin [][][]*HyperNodeInfo) sets.Set[string] {
+	if len(perPlugin) == 0 {
+		return sets.New[string]()
+	}
+	result := UnionGradientHyperNodeNames(perPlugin[0])
+	for i := 1; i < len(perPlugin); i++ {
+		result = result.Intersection(UnionGradientHyperNodeNames(perPlugin[i]))
+	}
+	return result
+}
+
+// RebuildGradientsByTier groups eligible HyperNodes into ascending tier layers.
+func RebuildGradientsByTier(hyperNodes HyperNodeInfoMap, eligible sets.Set[string]) [][]*HyperNodeInfo {
+	if eligible.Len() == 0 {
+		return nil
+	}
+
+	byTier := make(map[int][]*HyperNodeInfo)
+	for name := range eligible {
+		hn := hyperNodes[name]
+		if hn == nil {
+			continue
+		}
+		byTier[hn.Tier()] = append(byTier[hn.Tier()], hn)
+	}
+
+	tiers := make([]int, 0, len(byTier))
+	for tier := range byTier {
+		tiers = append(tiers, tier)
+	}
+	sort.Ints(tiers)
+
+	result := make([][]*HyperNodeInfo, 0, len(tiers))
+	for _, tier := range tiers {
+		layer := dedupeHyperNodesByName(byTier[tier])
+		if len(layer) > 0 {
+			result = append(result, layer)
+		}
+	}
+	return result
+}
+
+func dedupeHyperNodesByName(hyperNodes []*HyperNodeInfo) []*HyperNodeInfo {
+	seen := sets.New[string]()
+	deduped := make([]*HyperNodeInfo, 0, len(hyperNodes))
+	for _, hn := range hyperNodes {
+		if hn == nil || seen.Has(hn.Name) {
+			continue
+		}
+		seen.Insert(hn.Name)
+		deduped = append(deduped, hn)
+	}
+	return deduped
 }
