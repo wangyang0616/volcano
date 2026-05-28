@@ -1,28 +1,28 @@
-# PodGroup / SubGroup 组间拓扑亲和设计（group-topology-affinity）
+# Group Topology Affinity（组间拓扑亲和）设计提案
 
 | 项 | 内容 |
 |----|------|
-| Status | Draft |
+| Authors | wangyang0616 |
+| 关联 Issue | [volcano-sh/volcano#5347](https://github.com/volcano-sh/volcano/issues/5347) |
 | 插件 | `group-topology-affinity`（组间）+ `network-topology-aware`（组内） |
 | 关联设计 | [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)、[Preempt Action Support Topology](./preempt-action-support-topology.md) |
 
-## 文档结构
+本文档为 **Volcano 社区 design proposal**：在现有组内网络拓扑调度之上，增加 **PodGroup / SubJob 级组间拓扑** 的 API 与调度实现说明。
+
+## 目录
 
 | 章节 | 内容 |
 |------|------|
-| [概述](#概述) | 背景、设计目标、范围 |
-| [分离层级：tierName 与 tier 整数](#分离层级separationtiername-与-separationtier-tier-整数) | `separationTierName` / `separationTier` 双写法、对照表 |
-| [用户场景与能力对照](#用户场景与能力对照) | 实例 1–7、配置示例 |
-| [API Design](#api-design) | PodGroup 字段、类型、HyperNode 层级详述 |
-| [Plugin Architecture](#plugin-architecture) | 插件职责、gradient 聚合、资源预筛 |
-| [架构与时序图](#架构与时序图) | 端到端流程与时序 |
-| [竞品与标准对齐](#竞品与标准对齐) | 友商洞察、用法示例、字段映射 |
-| [Implementation Phases](#implementation-phases) | 分阶段交付 |
-| [Validation Rules (Webhook)](#validation-rules-webhook) | Admission 校验 |
-| [Status (Optional)](#status-optional) | 不可满足 Condition |
-| [References](#references) | 外部文档链接 |
+| [概述](#概述) | 背景、社区现状、目标、范围 |
+| [用户故事](#用户故事) | 典型诉求（对应实例 1–7）；[设计决策一览](#设计决策一览) |
+| [用户场景与能力对照](#用户场景与能力对照) | 实例 1–7 与完整 YAML |
+| [API 设计](#api-设计) | 类型、能力边界、HyperNode、附录 |
+| [设计决策](#设计决策) | 设计决策 1～6 |
+| [调度实现](#调度实现) | 插件、Framework、allocate |
+| [架构与时序图](#架构与时序图) | 总览图与 allocate 路径 |
+| [校验规则](#校验规则webhook)、[交付阶段](#交付阶段)、[状态](#状态可选)、[参考](#参考) | Webhook、Phase、Condition |
 
-> 正文中的对象与插件名均使用 **全称**（如 PodGroup、SubGroup、`network-topology-aware`），不使用 PG、GTA 等缩写。
+> 对象与插件名使用 **全称**（PodGroup、SubGroup、`network-topology-aware`、`group-topology-affinity` 等）；**不使用** NTA、GTA、PG 等缩写。设计决策编号为「设计决策-1」～「设计决策-6」。与外部调度对照 **仅** 引用 **kube-scheduler** 的 Pod 级 `affinity` / `topologySpreadConstraints`。
 
 # 概述
 
@@ -32,55 +32,126 @@ Volcano 在 [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20S
 
 - 基于 **HyperNode 树** 的多级网络拓扑；
 - **PodGroup / SubGroup** Gang 与 `subGroupPolicy`、`matchLabelKeys` 拆 SubJob；
-- **`networkTopology`**：在 Job 或 SubJob **内部** 做域内聚合（不跨 tier）。
+- **`networkTopology`**：在 SubJob / 通信子组 **底层** 域内聚合，并在 PodGroup / Job **更高层** 拓扑上收束整负载（不跨 `highestTierAllowed` 所定义的 tier）。
 
-上述能力解决的是「**一组 Pod 聚在同一拓扑域**」。生产中还普遍存在另一类诉求：**多组之间** 要「尽量靠近」或「刻意拆开」——且分组单位是 **PodGroup（多副本 instance）** 或 **同一 PodGroup 内的不同 SubGroup（如 prefill / decode、多分片）**，而不是单个 Pod 的 `podAffinity`。
+上述能力已覆盖：**通信密集型** Pod 在子组内共域、整负载在更高层拓扑域内聚合，并配合 **多维 Gang** 成组调度。生产中还普遍存在另一类诉求：**多组之间** 要「尽量靠近」或「刻意拆开」——且分组单位是 **PodGroup（多副本 instance）** 或 **同一 PodGroup 内的不同 SubGroup（如 prefill / decode、多分片）**，而不是单个 Pod 的 `podAffinity`。
 
 | 现状缺口 | 典型后果 |
 |----------|----------|
 | 无声明式 **跨 PodGroup** 拓扑 **反亲和**（互斥） | 多个 inference instance 落在同一超节点，单点故障拖垮全部在线副本 |
-| 无声明式 **同 PodGroup 内跨 SubGroup** 拓扑关系 | Prefill-Decode 分片无法「分片分机柜、整体共超节点」；只能靠人工拆多个 PodGroup 或 Pod 级规则凑 |
-| 组内与组间规则混在一处 | 用 Pod `topologySpread` / 注解难以表达 Gang + 多级 HyperNode + SubJob 语义，运维成本高 |
+| 无声明式 **同 PodGroup 内跨 SubGroup** 拓扑关系 | Prefill-Decode 分片无法「分片分机柜、整体共超节点」；只能拆多个 PodGroup 或在 PodGroup 外硬凑规则 |
+| **组内与组间未分层** | 组间诉求与 `networkTopology` 混写或靠运维约定，与 HyperNode 组内调度 **不在同一配置面**，难验收 |
 
 本设计在 **不替代** 现有 `network-topology-aware` 的前提下，补齐 **组间（inter-group）** 拓扑调度能力：
 
-- **跨 PodGroup**：仅 **`topologyAffinity.podGroupAntiAffinity`**（实例 2/5，多 instance 故障域隔离）；**不做** `podGroupAffinity`（跨 PodGroup 共域无当前场景，见 [#跨-podgroup仅反亲和](#跨-podgroup仅反亲和)）。
-- **同 PodGroup 内跨 SubGroup**：`subGroupTopologyAffinity` 的 **亲和 + 反亲和**（实例 4/6/7）。
+- **跨 PodGroup**：仅 **`topologyAffinity.podGroupAntiAffinity`**（实例 2/5）；**不做** `podGroupAffinity`（见 [设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)）。
+- **同 PodGroup 内跨 SubGroup**：`subGroupTopologyAffinity`（实例 4/6/7）。
 
-配置示例见 [#用户场景与能力对照](#用户场景与能力对照)；实现与流程见 [Plugin Architecture](#plugin-architecture)、[#架构与时序图](#架构与时序图)。
+配置示例 → [#用户场景与能力对照](#用户场景与能力对照)；实现 → [#调度实现](#调度实现)；总览图 → [#架构与时序图](#架构与时序图)。
 
+## 社区现状与本案要补什么
+
+### Volcano 已具备（组内）
+
+| 能力 | 配置 / 组件 |
+|------|-------------|
+| 多级网络拓扑 | HyperNode CRD |
+| Gang / SubJob 拆分 | PodGroup、`subGroupPolicy`、`matchLabelKeys` |
+| **组内** 拓扑聚合 + Gang | `networkTopology` + `network-topology-aware`，配合 `minMember` / `subGroupPolicy` / `subGroupSize` 等 |
+
+**已覆盖（组内）：** 面向 **训练、推理** 等通信密集型负载——在 **SubJob（或通信子组）** 粒度，将一批 Pod **聚合在同一底层拓扑域**（如机柜内高带宽域）；在 **PodGroup / Job** 粒度，将 **整份负载收束在更高层拓扑域**（如 `highestTierAllowed` 定义的超节点 envelope，整机不跨域）；并与 **多维 Gang**（PodGroup `minMember`、`subGroupPolicy` + `subGroupSize` / `minSubGroups`、`matchLabelKeys` 拆 SubJob 等）协同，**成组满足资源与拓扑后再绑定**。详见 [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)。
+
+### Volcano 尚不具备（组间）
+
+| 缺口 | 典型场景（本文实例） | 用户侧后果 |
+|------|----------------------|------------|
+| **跨 PodGroup 拓扑反亲和** | [实例 2](#实例-2多-inference-instance故障隔离)、[5](#实例-5多-instance--pd-组合) | 多个 inference **instance** 可能落在同一超节点，单点故障影响面大 |
+| **同 PodGroup 内跨 SubJob 拓扑边** | [实例 4](#实例-4分布式-prefill-decode-推理推荐)、[6](#实例-6可选prefill-与-decode-跨角色分机柜)、[7](#实例-7subgroup-软性反亲和可选) | 多分片 Prefill-Decode 难以声明「分片分机柜、整机共超节点」等组合 |
+| **组内 + 组间统一调度链** | 上述组合 | 只能拆多个 PodGroup 或依赖 Pod 模板外挂规则，与 HyperNode **整组模拟** 脱节，Pending 难排查 |
+
+> SubJob **内部** 逐 Pod 打散仍可用 Pod 模板上的 spread 等（见 [范围 · SubJob 内逐 Pod spread](#目标外)）；**本设计不替代** 该能力，只补 **PodGroup / SubJob 之间** 的拓扑关系。
+
+### 本案要做什么
+
+| 交付项 | 作用 |
+|--------|------|
+| **`topologyAffinity.podGroupAntiAffinity`** | 跨 PodGroup：按 **整组** 在指定 tier（如 supernode）**互斥** |
+| **`subGroupTopologyAffinity`** | 同 PodGroup：跨 `subGroupPolicy` 拆出的 SubJob **亲和 / 反亲和** |
+| **插件 `group-topology-affinity`** | 组间 hard gradient + soft order；与 `network-topology-aware` **Framework 交集** |
+| **allocate 资源预筛 + Webhook** | 与现有拓扑调度同路径；配置可校验 |
+| **分阶段 P1 → P2** | P1 主路径调度；P2 preempt/backfill 与占用一致（见 [交付阶段](#交付阶段)） |
+
+### 目标示意（Volcano 视角）
+
+**三层能力（组内 + 组间）：**
+
+```mermaid
+flowchart TB
+    subgraph layer_intra_group ["组内 · 已有 network-topology-aware"]
+        network_topology_field["PodGroup / SubJob networkTopology"]
+    end
+    subgraph layer_same_podgroup ["同 PodGroup 组间 · 本设计"]
+        sub_group_topology_affinity_field["subGroupTopologyAffinity"]
+    end
+    subgraph layer_cross_podgroup ["跨 PodGroup · 本设计"]
+        topology_affinity_anti["topologyAffinity.podGroupAntiAffinity"]
+    end
+    hypernode_tree["HyperNode 树 + Domain_T"] --> layer_intra_group
+    hypernode_tree --> layer_same_podgroup
+    hypernode_tree --> layer_cross_podgroup
+```
+
+**图 · 多 instance 各占一超节点（实例 2）：**
+
+```mermaid
+flowchart TB
+    cluster_root[Cluster]
+    cluster_root --> supernode_a["supernode SN-A<br/>PodGroup instance-0"]
+    cluster_root --> supernode_b["supernode SN-B<br/>PodGroup instance-1"]
+    cluster_root --> supernode_c["supernode SN-C<br/>PodGroup instance-2"]
+```
+
+**图 · 单 instance 内多分片（实例 4）：** 分片 **分机柜**，整机 **共超节点**。
+
+```mermaid
+flowchart TB
+    supernode_one["supernode SN-1 · 一个 inference instance"]
+    supernode_one --> cabinet_prefill_shard_0["cabinet-1 · prefill 分片 0"]
+    supernode_one --> cabinet_prefill_shard_1["cabinet-2 · prefill 分片 1"]
+    supernode_one --> cabinet_prefill_shard_2["cabinet-3 · prefill 分片 2"]
+    supernode_one --> cabinet_prefill_shard_3["cabinet-4 · prefill 分片 3"]
+    supernode_one --> cabinet_decode_shard_0["cabinet-5 · decode 分片 0"]
+    supernode_one --> cabinet_decode_shard_1["cabinet-6 · decode 分片 1"]
+```
+
+**图 · 组内 + 组间同一条调度链：**
+
+```mermaid
+flowchart TB
+    network_topology["networkTopology"] --> gradient_intersect["Framework 拓扑 gradient 交集"]
+    group_topology_affinity["topologyAffinity /<br/>subGroupTopologyAffinity"] --> gradient_intersect
+    gradient_intersect --> allocate_sim["allocate 整组模拟 · 资源预筛 · 绑 Node"]
+```
+
+---
 ## 设计目标
 
 | 目标 | 说明 |
 |------|------|
 | **组间可声明** | **跨 PodGroup 反亲和**（`topologyAffinity.podGroupAntiAffinity`）+ **同 PodGroup 跨 SubGroup** 亲和/反亲和（`subGroupTopologyAffinity`）；分离层级与组内 `networkTopology` 一样支持 `separationTierName` / `separationTier` |
 | **作用域清晰** | 跨 PodGroup 与跨 SubGroup 分字段；组内仍用 `networkTopology`，不与组间混用 |
-| **Hard / Soft 可区分** | 组间 hard/soft 由 `required` / `preferred` 列表表达（对齐 K8s PodAffinity）；`networkTopology` 单独使用 `mode` |
+| **Hard / Soft 可区分** | 组间 hard/soft 由 `required` / `preferred` 列表表达；`networkTopology` 单独使用 `mode` |
 | **与 network-topology-aware 可组合** | 新插件 `group-topology-affinity` 负责组间；hard 拓扑 gradient **多插件交集** 后统一分层；容量在 allocate **资源预筛** |
-| **可验证、可演进** | Admission Webhook 校验；API 以 optional 字段 additive 扩展；Phase 1 交付主路径（见 [Implementation Phases](#implementation-phases)） |
+| **可验证、可演进** | Admission Webhook 校验；API 以 optional 字段 additive 扩展；Phase 1 交付主路径（见 [交付阶段](#交付阶段)） |
 
-```mermaid
-flowchart TB
-    subgraph L1 ["组内 · network-topology-aware"]
-        A1["PodGroup / SubJob networkTopology"]
-    end
-    subgraph L2 ["同 PodGroup 组间 · group-topology-affinity"]
-        A2["subGroupTopologyAffinity"]
-    end
-    subgraph L3 ["跨 PodGroup 反亲和 · group-topology-affinity"]
-        A3["topologyAffinity.podGroupAntiAffinity"]
-    end
-    R["HyperNode 树 + Domain_T"] --> L1
-    R --> L2
-    R --> L3
-```
+能力分层示意见 [目标示意（Volcano 视角）](#目标示意volcano-视角)。
 
 ## 范围
 
 ### 目标内
 
 - **PodGroup API**（作用域分离）：
-  - `topologyAffinity.podGroupAntiAffinity`：**跨 PodGroup 反亲和**（`topologyGroup` / `podGroupSelector`）
+  - `topologyAffinity.podGroupAntiAffinity`：**跨 PodGroup 反亲和**（`podGroupSelector`，标准 `metav1.LabelSelector`）
   - `subGroupTopologyAffinity`：**同一 PodGroup 内、跨 `subGroupPolicy`（SubJob）** 的亲和与反亲和；**不**跨 PodGroup
 - **插件**：`group-topology-affinity`（组间 hard gradient + soft order）+ 现有 `network-topology-aware`（组内 Gang / binpack）
 - **Framework**：拓扑类 `HyperNodeGradient` 多插件 **集合交集 + 按 tier 重分层**（不含资源判断）
@@ -93,141 +164,50 @@ flowchart TB
 | 项 | 说明 |
 |----|------|
 | 组内 Gang / 不跨 tier | 继续由 `PodGroupSpec.networkTopology`、`subGroupPolicy[].networkTopology` + network-topology-aware 承担 |
-| SubJob 内逐 Pod spread | 使用组内 `networkTopology` 或 K8s Pod 拓扑，不在此设计扩展 |
+| SubJob 内逐 Pod spread | 使用组内 `networkTopology` 或 Pod 模板上的 `topologySpreadConstraints` / `podAffinity`（kube-scheduler），不在此设计扩展 |
 | 跨 Namespace 的 SubGroup 对等 | 不支持 |
-| 用 `topologyGroup` 表达同 PodGroup 内 prefill/decode | 应使用 `subGroupTopologyAffinity` |
 | `preempt` / `backfill` 拓扑一致 | Phase 2+ |
 | Batch Job API 与 `PartitionPolicy` 同步 | Phase 2+，可后续同路径接入 |
-| PodGroup `TopologyUnsatisfiable` Condition | Phase 2（可选，见 [Status](#status-optional)） |
-| **跨 PodGroup 亲和** `topologyAffinity.podGroupAffinity` | **不做**（无场景；共域用 `PodGroupSpec.networkTopology` 或 `subGroupAffinity`，见下节） |
+| PodGroup `TopologyUnsatisfiable` Condition | Phase 2（可选，见 [状态（可选）](#状态可选)） |
+| **跨 PodGroup 亲和** `topologyAffinity.podGroupAffinity` | **不做**（见 [设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)） |
 
-### 跨 PodGroup：仅反亲和
+设计决策见 [#设计决策](#设计决策)；交付里程碑见 [#交付阶段](#交付阶段)。
 
-| 能力 | Phase 1 | 说明 |
-|------|---------|------|
-| `topologyAffinity.podGroupAntiAffinity`（hard / soft） | **做** | 多 inference instance 等于不同 `Domain_T`（实例 2、5）；`TopologyOccupancyIndex` + Job 级 gradient |
-| `topologyAffinity.podGroupAffinity` | **不做** | 见下文「为何不做跨 PodGroup 亲和」；CRD 字段保留、Webhook 拒绝写入 |
-| `subGroupTopologyAffinity`（含 `subGroupAffinity`） | **做** | **仅同 PodGroup 内**；跨 PodGroup 共域 **不** 经 `topologyAffinity` |
+---
 
-#### 为何要做跨 PodGroup **反亲和**
+# 用户故事
 
-**1. 有明确、可验证的生产场景**
+以下故事与 [#用户场景与能力对照](#用户场景与能力对照) 中的实例一一对应。
 
-- **实例 2 / 5**：同一模型（`topologyGroup` 相同）部署 **多个 inference instance**（多个 PodGroup），业务要求是 **故障域隔离**——任意 **单个超节点（或指定 tier）故障** 至多影响一个 instance，其余 instance 继续 serving。
-- 这是 **「刻意拆开」** 诉求：在 `separationTier` 上要求 `Domain_T(本 PodGroup) ≠ Domain_T(已放置的 peer PodGroup)`，无法用组内 `networkTopology` 表达（组内 API 只约束 **一个** PodGroup 内部的 Pod/SubJob，不管其它 PodGroup）。
-- 若仅靠运维手工把 instance 分到不同节点池/集群，调度器无法在 **Gang + 多级 HyperNode** 语义下 **声明式保证** 互斥，扩容新 instance 时也容易与已有 instance **撞域**。
+1. **训练 / 单组 Gang（实例 1、3）**  
+   作为平台用户，我希望整 Job 的 Worker 在机柜或超节点内成组调度，以便通信密集型训练获得稳定带宽；组内能力由现有 `networkTopology` 满足，**本提案不重复实现**。
 
-**2. 与现有能力正交、且竞品普遍缺失**
+2. **多 inference instance 故障隔离（实例 2、5）**  
+   作为推理服务运维，我希望多个 PodGroup（instance）**各占不同超节点**，避免单点故障拖垮全部在线副本；需要 **PodGroup 级** `podGroupSelector` 反亲和，而非在 Pod 模板上堆规则。
 
-- K8s Pod topology spread、Kueue TAS、Koordinator gather 等多为 **单工作组共域** 或 **Pod 级打散**，缺少「**多个 PodGroup 在 HyperNode 某 tier 上 hard 互斥**」的一等 API（见 [#竞品与标准对齐](#竞品与标准对齐)）。
-- Volcano 用 `topologyGroup` + `podGroupAntiAffinity.required` 补齐该缺口，与 **同 PodGroup 内** `subGroupTopologyAffinity`（实例 4 Prefill-Decode）分工清晰。
+3. **Prefill–Decode 多分片（实例 4、6、7）**  
+   作为 Prefill-Decode 推理用户，我希望同一 instance 内：分片 **分机柜**、整机 **共超节点**、片内仍 Gang；并可选「prefill 与 decode 强制分机柜」或「尽量分机柜、资源紧时可降级」；需要 **`subGroupTopologyAffinity`** 与 `matchLabelKeys` 协同。
 
-**3. 实现成本可接受且边界清楚**
+---
 
-- 反亲和需要 `TopologyOccupancyIndex`（Session 内记录已占用 `Domain_T`）+ Job 级 `HyperNodeGradientForJobFn` 剪枝，成本 **高于** 仅 SubJob 路径，但 **只服务「互斥」一种谓词**，索引语义单一：「该 tier 上哪些域已被某 PodGroup 占用」。
-- Phase 1 接受该成本，因为 **有实例 2/5 的硬需求**；preempt/backfill 与索引一致性放在 Phase 2+。
+## 设计决策一览
 
-#### 为何不做跨 PodGroup **亲和**
+| 设计决策 | 议题 | 结论 |
+|----------|------|------|
+| [决策-1](#ad-1跨-podgroup-仅做反亲和) | 跨 PodGroup | **仅** `podGroupAntiAffinity` |
+| [决策-2](#ad-2phase-1-不声明-podgroupaffinity) | `podGroupAffinity` | Phase 1 **CRD 不声明** |
+| [决策-3](#ad-3subgroup-反亲和双-selector) | SubGroup 反亲和 term | **双 selector** |
+| [决策-4](#ad-4subgrouptopologyaffinity-在-podgroup-顶层) | 组间边放哪 | **PodGroup 顶层** |
+| [决策-5](#ad-5组间-hardsoft) | 组间 hard/soft | **`required` / `preferred`**，term 禁止 `mode` |
+| [决策-6](#ad-6tiername-与-tier-整数二选一) | 分离层级 | **`separationTierName` 与 `separationTier` 二选一** |
 
-**1. 当前无独立产品场景（共域已有更合适的 API）**
+论证见 [#设计决策](#设计决策)。
 
-「跨 PodGroup 亲和」语义是：强制 **多个 PodGroup** 在某一 `separationTier` 上落在 **同一** `Domain_T`（例如两个 instance **必须** 挤在同一 supernode）。这与生产中的典型布局 **相反**，且与下列 **已有、更贴切** 的表达方式重复：
-
-| 真实诉求 | 正确 API | 为何不用 `podGroupAffinity` |
-|----------|----------|------------------------------|
-| **一个** inference instance 整体不跨 supernode | `PodGroupSpec.networkTopology`（实例 4 方式一） | 作用域是 **本 PodGroup 内** 全部 workload，无需引用其它 PodGroup |
-| 同一 instance 内 prefill + decode 共超节点 | `subGroupAffinity` 或 `networkTopology`（实例 4） | 关系在 **同 PodGroup、跨 SubGroup**，不是跨 PodGroup |
-| 多个 Pod 副本共 rack（无多 PodGroup） | `subGroupPolicy[].networkTopology` + NTA | 组内 Gang，非 PodGroup 间关系 |
-| 希望两个 **独立** instance 「尽量靠近」 | 无硬需求 | 属优化项；若未来需要可用 **soft** 反亲和的反面或运维 colocation，不构成 Phase 1 硬约束 |
-
-历史上 **没有**「必须把两个独立 PodGroup 绑在同一 supernode 才能跑」的立项场景；若出现，应优先评估是否实为 **一个 PodGroup**（合并 instance）或 **同 PodGroup 的 subGroupAffinity**，而不是引入跨 PodGroup 共域。
-
-**2. API 语义易混淆，增加误配与测试面**
-
-- 容器名 `topologyAffinity` 同时挂 `podGroupAffinity` / `podGroupAntiAffinity` 时，用户易与 **`subGroupAffinity`（同 PodGroup 内共域）** 混淆，或误以为 `topologyGroup` 表示「多 PodGroup 共域」——而 `topologyGroup` 在 Phase 1 的设计意图是 **反亲和分组键**（实例 2：同组内 instance **互斥**）。
-- 跨 PodGroup **共域** 与 **异域** 在调度器内部会走不同推理（共域需「与 peer 同域」、异域需「避开 peer 域」），实现两条路径但仅一条有需求，不利于 Phase 1 收敛。
-
-**3. 实现与性能：不做亲和并不能省掉反亲和成本，但可避免无效扩张**
-
-- **不做** `podGroupAffinity` **不会** 取消 `TopologyOccupancyIndex` / Job 级 gradient——反亲和仍需要它们。
-- 若实现跨 PodGroup **亲和**，通常还需：共域 peer 已放置时的 **等待/顺序**、与反亲和同时配置时的 **冲突检测**、多 PodGroup **clique 共域**（N 个 PodGroup 同域）等，复杂度和 Session 状态维护 **不低于** 反亲和，却 **无对应场景** 验收。
-- 因此 Phase 1 **刻意** 只实现 `podGroupAntiAffinity`；`podGroupAffinity` 在 CRD 中 **保留字段** 便于将来 additive 扩展，Webhook **拒绝非空**，避免用户误用。
-
-#### 小结
-
-```text
-跨 PodGroup 拓扑：
-  反亲和（podGroupAntiAffinity）→ 做：多 instance 故障域（实例 2/5），有场景、有索引、有 Job 级 gradient
-  亲和（podGroupAffinity）     → 不做：无独立场景，共域由 networkTopology / subGroupAffinity 覆盖，且易混淆
-同 PodGroup 内：
-  subGroupAffinity + subGroupAntiAffinity → 做：Prefill-Decode 等（实例 4/6/7）
-```
-
-> 若后续出现「多 PodGroup 必须共域」的 **已落地** 业务（且无法合并为单 PodGroup），再以 **Phase 2+ additive** 方式实现 `podGroupAffinity`，并复用同一 `TopologyOccupancyIndex` 的共域查询路径；**不改变** Phase 1 反亲和语义。
-
-# 分离层级：separationTierName 与 separationTier（tier 整数）
-
-组间拓扑 term（`topologyAffinity` / `subGroupTopologyAffinity`）与组内 `networkTopology` 一样，在 HyperNode 树上指定 **在哪一层** 比较 `Domain_T`。每个 term 的 `TopologySeparationSpec` **必须二选一、不可同时填写**：
-
-| 写法 | PodGroup 字段 | 对齐 HyperNode CR | 组内等价字段（域内 Gang） |
-|------|---------------|-------------------|---------------------------|
-| **字符串（tierName）** | `separationTierName: supernode` | `spec.tierName` | `highestTierName: supernode` |
-| **整数（tier）** | `separationTier: 2` | `spec.tier` | `highestTierAllowed: 2` |
-
-**示例集群约定（下文实例常用；以 `kubectl get hypernodes` 为准）：**
-
-| 物理层 | `spec.tierName` | `spec.tier`（示例） |
-|--------|-----------------|---------------------|
-| 超节点 | `supernode` | `2` |
-| 机柜 | `cabinet` | `1` |
-
-**等价 YAML（跨 PodGroup 反亲和 @ 超节点，二选一）：**
-
-```yaml
-topologyAffinity:
-  podGroupAntiAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      # 写法 A：tierName（运维推荐）
-      - topologyGroup: llama-70b-serving
-        separationTierName: supernode
-      # 写法 B：tier 整数（模板/控制器生成）
-      # - topologyGroup: llama-70b-serving
-      #   separationTier: 2
-```
-
-```yaml
-subGroupTopologyAffinity:
-  subGroupAntiAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      # 写法 A
-      - subGroupSelector:
-          matchSubGroupPolicyNames: [prefill]
-        antiSubGroupSelector:
-          matchSubGroupPolicyNames: [prefill]
-        separationTierName: cabinet
-      # 写法 B（当 cabinet 对应 spec.tier == 1）
-      # - subGroupSelector: { matchSubGroupPolicyNames: [prefill] }
-      #   antiSubGroupSelector: { matchSubGroupPolicyNames: [prefill] }
-      #   separationTier: 1
-```
-
-**规则摘要：**
-
-- 同一 `TopologySeparationSpec` 内 **`separationTierName` 与 `separationTier` 互斥**；Webhook 校验 name 存在于 `HyperNodeTierNameMap`、整数存在于 `HyperNodeTierSet`。
-- **推荐**：人工运维、多集群对齐用 **tierName**；由 tier 序号驱动的 Helm/Operator 用 **tier 整数**。
-- 下文 **用户场景** YAML 为可读性多写 **tierName**；与 **`separationTier: <int>`** 等价关系见下表；HyperNode CR 示例、Domain_T 解析、填写步骤见 [API Design — HyperNode 层级](#hypernode-层级与-separationtier--separationtiername)。
-
-| 业务说法 | `separationTierName` | `separationTier`（示例） | 常用 API |
-|----------|----------------------|--------------------------|----------|
-| 多 instance 不占同一超节点 | `supernode` | `2` | `topologyAffinity.podGroupAntiAffinity` |
-| 分片彼此分机柜 | `cabinet` | `1` | `subGroupTopologyAffinity.subGroupAntiAffinity` |
-| 整机共超节点（组内） | `highestTierName: supernode` | `highestTierAllowed: 2` | `PodGroupSpec.networkTopology` |
-
-调度器在 Session 内维护 **`HyperNodeTierNameMap`**（`tierName → tier`）与 **`HyperNodeTierSet`**（集群出现过的 `spec.tier` 集合）；`network-topology-aware` 与 `group-topology-affinity` **共用** 上述映射，保证 `separationTierName: supernode` 与 `separationTier: 2`（当 supernode 对应 `spec.tier==2`）指向 **同一物理层**。
+---
 
 # 用户场景与能力对照
 
-本章按 **场景 → 业务价值 → 配置能力 → HyperNode 调度结果** 组织，便于对照选型。所有图示使用同一套 **多级 HyperNode 树**（与集群 CR 一致；`tierName` 以实际为准，下文用 `supernode` / `cabinet` 作示例）。
+按 **场景 → 业务价值 → 配置能力 → HyperNode 调度结果** 组织。图示使用同一套 **多级 HyperNode 树**（与集群 CR 一致；`tierName` 以实际为准，示例 tier 名为 `supernode` / `cabinet`）。
 
 ## 三类能力与作用域
 
@@ -238,20 +218,20 @@ subGroupTopologyAffinity:
 | 组间互斥 / 共域（同 PodGroup） | `subGroupTopologyAffinity` | 不同 `subGroupPolicy` 拆出的 SubJob 之间 | 分片 **互斥**、角色间 **共域**（见实例 4） |
 | 跨 PodGroup | `topologyAffinity.podGroupAntiAffinity` | 不同 PodGroup（多 instance） | 多副本服务 **故障域** 隔离 |
 
-> **分离层级双写法：** `separationTierName` ↔ `spec.tierName`，**或** `separationTier` ↔ `spec.tier` **整数**（二选一、互斥）。下文 YAML 示例多写 **tierName**；同一语义可用 **tier 整数**（示例：`supernode`↔`2`，`cabinet`↔`1`），见上一章 [#分离层级](#分离层级separationtiername-与-separationtier-tier-整数) 与 [API — HyperNode 层级](#hypernode-层级与-separationtier--separationtiername)。
+> **分离层级：** 示例 YAML 多写 `separationTierName`；等价 `separationTier` 整数见 [设计决策-6](#ad-6tiername-与-tier-整数二选一) 与 [HyperNode 层级](#hypernode-层级与-separationtier--separationtiername)。
 
 ## 如何阅读调度结果图
 
-图中 **方框 = HyperNode**（按 `tierName` 分层），**最底层 = Node / Pod**；**虚线框 = 同一 `Domain_T`**（在该 tier 上被视为同一调度域）。
+图中 **方框 = HyperNode**（按 `tierName` 分层），**最底层 = Node / Pod**；**虚线框 = 同一 `Domain_T`**（在该 tier 上被视为同一调度域）。Mermaid **节点 ID** 使用语义化蛇形命名（如 `cluster_root`、`supernode_instance_0`、`cabinet_prefill_shard_0`），与图中显示含义一致。
 
 ```mermaid
 flowchart TB
-    ROOT["Cluster 根"]
-    ROOT --> SN["HyperNode · tierName=supernode<br/>Domain_supernode 在此层比较"]
-    SN --> C1["HyperNode · tierName=cabinet<br/>Domain_cabinet 在此层比较"]
-    SN --> C2["HyperNode · tierName=cabinet"]
-    C1 --> N1["Node → Pod"]
-    C2 --> N2["Node → Pod"]
+    cluster_root["Cluster 根"]
+    cluster_root --> hypernode_supernode["HyperNode · tierName=supernode<br/>Domain_supernode 在此层比较"]
+    hypernode_supernode --> hypernode_cabinet_a["HyperNode · tierName=cabinet<br/>Domain_cabinet 在此层比较"]
+    hypernode_supernode --> hypernode_cabinet_b["HyperNode · tierName=cabinet"]
+    hypernode_cabinet_a --> node_pods_a["Node → Pod"]
+    hypernode_cabinet_b --> node_pods_b["Node → Pod"]
 ```
 
 **图例：**
@@ -314,13 +294,13 @@ spec:
 
 ```mermaid
 flowchart TB
-    ROOT[Cluster]
-    ROOT --> SN[supernode SN-train]
-    SN --> C1["cabinet-1 · SubJob workers-0<br/>8 Pods Gang"]
-    SN --> C2["cabinet-2 · SubJob workers-1<br/>8 Pods Gang"]
-    SN --> C3["cabinet-3 · SubJob workers-2"]
-    SN --> C4["cabinet-4 · SubJob workers-3"]
-    C1 --> N1[Nodes]
+    cluster_root[Cluster]
+    cluster_root --> supernode_train["supernode SN-train"]
+    supernode_train --> cabinet_workers_0["cabinet-1 · SubJob workers-0<br/>8 Pods Gang"]
+    supernode_train --> cabinet_workers_1["cabinet-2 · SubJob workers-1<br/>8 Pods Gang"]
+    supernode_train --> cabinet_workers_2["cabinet-3 · SubJob workers-2"]
+    supernode_train --> cabinet_workers_3["cabinet-4 · SubJob workers-3"]
+    cabinet_workers_0 --> nodes_workers_0[Nodes]
 ```
 
 **差异：** 无组间拓扑 API；若需多 Job 互斥，另见实例 2。
@@ -331,17 +311,25 @@ flowchart TB
 
 **场景：** 同一模型 `llama-70b` 起 3 个 PodGroup（instance-0/1/2），同时 serving。  
 **业务价值：** 任意 **单个超节点故障** 只影响一个 instance，其余 instance 仍可服务。  
-**能力：** `topologyAffinity.podGroupAntiAffinity` @ `supernode` + `topologyGroup` label。
+**能力：** `topologyAffinity.podGroupAntiAffinity` @ `supernode` + `podGroupSelector`（匹配其它 PodGroup 的 `metadata.labels`）。
+
+`metadata.labels` 与 `podGroupSelector` 中的键值须 **一致**；通常 **一个** label 即可界定 peer 集合（仅当需要 AND/OR 组合时再增加 `matchLabels` 项或改用 `matchExpressions`）。
 
 ```yaml
 metadata:
   labels:
-    volcano.sh/topology-group: llama-70b-serving
+    # 【用户设置】Volcano 不会自动生成；在创建 PodGroup 时由平台/业务方写入。
+    # 【赋值原则】凡应在该 separationTier 上彼此「异域」的 PodGroup，对此键使用相同取值；
+    #   本例 llama-70b-prod = 同一生产模型服务的多 instance 池（instance-0/1/2 互斥占不同 supernode）。
+    #   不同环境/流量池用不同值（如 llama-70b-staging）；与 instance 名、Pod 模板 label 无关。
+    topology.volcano.sh/spread-group: llama-70b-prod
 spec:
   topologyAffinity:
     podGroupAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyGroup: llama-70b-serving
+        - podGroupSelector:
+            matchLabels:
+              topology.volcano.sh/spread-group: llama-70b-prod
           separationTierName: supernode
           # separationTier: 2   # 与 separationTierName: supernode 二选一
 ```
@@ -350,13 +338,13 @@ spec:
 
 ```mermaid
 flowchart TB
-    ROOT[Cluster]
-    ROOT --> SN0["supernode SN-A<br/>PodGroup instance-0"]
-    ROOT --> SN1["supernode SN-B<br/>PodGroup instance-1"]
-    ROOT --> SN2["supernode SN-C<br/>PodGroup instance-2"]
-    SN0 --> C0A[cabinet · Pods]
-    SN1 --> C1A[cabinet · Pods]
-    SN2 --> C2A[cabinet · Pods]
+    cluster_root[Cluster]
+    cluster_root --> supernode_instance_0["supernode SN-A<br/>PodGroup instance-0"]
+    cluster_root --> supernode_instance_1["supernode SN-B<br/>PodGroup instance-1"]
+    cluster_root --> supernode_instance_2["supernode SN-C<br/>PodGroup instance-2"]
+    supernode_instance_0 --> cabinet_instance_0["cabinet · Pods"]
+    supernode_instance_1 --> cabinet_instance_1["cabinet · Pods"]
+    supernode_instance_2 --> cabinet_instance_2["cabinet · Pods"]
 ```
 
 **差异：** 约束 **PodGroup 之间**；instance 内 Prefill-Decode 拓扑见实例 4。
@@ -387,10 +375,10 @@ spec:
 
 ```mermaid
 flowchart TB
-    ROOT[Cluster]
-    ROOT --> SN[supernode SN-1]
-    SN --> CAB["cabinet-1 · 全部 8 Pods"]
-    CAB --> N[Nodes]
+    cluster_root[Cluster]
+    cluster_root --> supernode_one["supernode SN-1"]
+    supernode_one --> cabinet_all_pods["cabinet-1 · 全部 8 Pods"]
+    cabinet_all_pods --> nodes[Nodes]
 ```
 
 **差异：** 仅 1 条 policy 且无组间诉求时，**不要**配 `subGroupTopologyAffinity`。
@@ -524,14 +512,14 @@ spec:
 
 ```mermaid
 flowchart TB
-    ROOT[Cluster]
-    ROOT --> SN["supernode SN-1 · 本 inference instance"]
-    SN --> PA["cabinet-A · prefill 分片 0 · 8 Pods"]
-    SN --> PB["cabinet-B · prefill 分片 1 · 8 Pods"]
-    SN --> PC["cabinet-C · prefill 分片 2 · 8 Pods"]
-    SN --> PD["cabinet-D · prefill 分片 3 · 8 Pods"]
-    SN --> EA["cabinet-E · decode 分片 0 · 6 Pods"]
-    SN --> EB["cabinet-F · decode 分片 1 · 6 Pods"]
+    cluster_root[Cluster]
+    cluster_root --> supernode_inference["supernode SN-1 · 本 inference instance"]
+    supernode_inference --> cabinet_prefill_shard_0["cabinet-A · prefill 分片 0 · 8 Pods"]
+    supernode_inference --> cabinet_prefill_shard_1["cabinet-B · prefill 分片 1 · 8 Pods"]
+    supernode_inference --> cabinet_prefill_shard_2["cabinet-C · prefill 分片 2 · 8 Pods"]
+    supernode_inference --> cabinet_prefill_shard_3["cabinet-D · prefill 分片 3 · 8 Pods"]
+    supernode_inference --> cabinet_decode_shard_0["cabinet-E · decode 分片 0 · 6 Pods"]
+    supernode_inference --> cabinet_decode_shard_1["cabinet-F · decode 分片 1 · 6 Pods"]
 ```
 
 | 在集群里看到 | 配置含义 |
@@ -555,12 +543,14 @@ flowchart TB
 ```yaml
 metadata:
   labels:
-    volcano.sh/topology-group: llama-70b-serving
+    topology.volcano.sh/spread-group: llama-70b-prod   # 同实例 2：用户设置，多 instance 共用同一取值
 spec:
   topologyAffinity:
     podGroupAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyGroup: llama-70b-serving
+        - podGroupSelector:
+            matchLabels:
+              topology.volcano.sh/spread-group: llama-70b-prod
           separationTierName: supernode
           # separationTier: 2
   # subGroupPolicy + 共超节点 + subGroupAntiAffinity：同实例 4（推荐方式一）
@@ -571,11 +561,11 @@ spec:
 
 ```mermaid
 flowchart TB
-    ROOT[Cluster]
-    ROOT --> SN0["supernode SN-A · instance-0"]
-    ROOT --> SN1["supernode SN-B · instance-1"]
-    SN0 --> P0A[cabinet prefill/decode 分片…]
-    SN1 --> P1A[cabinet prefill/decode 分片…]
+    cluster_root[Cluster]
+    cluster_root --> supernode_instance_0["supernode SN-A · instance-0"]
+    cluster_root --> supernode_instance_1["supernode SN-B · instance-1"]
+    supernode_instance_0 --> cabinets_instance_0["cabinet prefill/decode 分片…"]
+    supernode_instance_1 --> cabinets_instance_1["cabinet prefill/decode 分片…"]
 ```
 
 **差异：** `podGroupAntiAffinity` 保证 SN-A ≠ SN-B；**每个 supernode 内部** 复现实例 4 的六柜结构。
@@ -611,17 +601,17 @@ spec:
 
 ```mermaid
 flowchart LR
-    subgraph I4 ["实例 4 默认"]
+    subgraph layout_instance_4 ["实例 4 默认"]
         direction TB
-        SN4[supernode]
-        SN4 --> P4[prefill 分片 · 多 cabinet]
-        SN4 --> D4[decode 分片 · 可与 prefill 同柜域]
+        supernode_instance_4["supernode"]
+        supernode_instance_4 --> prefill_shards_multi_cabinet["prefill 分片 · 多 cabinet"]
+        supernode_instance_4 --> decode_shards_shared_cabinet["decode 分片 · 可与 prefill 同柜域"]
     end
-    subgraph I6 ["实例 6 可选"]
+    subgraph layout_instance_6 ["实例 6 可选"]
         direction TB
-        SN6[supernode]
-        SN6 --> BP[cabinet 区 P · 仅 prefill]
-        SN6 --> BD[cabinet 区 D · 仅 decode]
+        supernode_instance_6["supernode"]
+        supernode_instance_6 --> cabinet_zone_prefill_only["cabinet 区 P · 仅 prefill"]
+        supernode_instance_6 --> cabinet_zone_decode_only["cabinet 区 D · 仅 decode"]
     end
 ```
 
@@ -703,15 +693,15 @@ spec:
 
 ```mermaid
 flowchart LR
-    subgraph ideal ["优先达到（与实例 4 一致）"]
-        SN1[supernode SN-1]
-        SN1 --> C1[cabinet-A]
-        SN1 --> C2[cabinet-B]
-        SN1 --> C6[cabinet-F · 六柜各一分片]
+    subgraph layout_ideal ["优先达到（与实例 4 一致）"]
+        supernode_ideal["supernode SN-1"]
+        supernode_ideal --> cabinet_a["cabinet-A"]
+        supernode_ideal --> cabinet_b["cabinet-B"]
+        supernode_ideal --> cabinet_f["cabinet-F · 六柜各一分片"]
     end
-    subgraph fallback ["机柜不足时的可接受结果"]
-        SN2[supernode SN-1]
-        SN2 --> CX[cabinet-X · 多分片同柜]
+    subgraph layout_fallback ["机柜不足时的可接受结果"]
+        supernode_fallback["supernode SN-1"]
+        supernode_fallback --> cabinet_shared["cabinet-X · 多分片同柜"]
     end
 ```
 
@@ -725,9 +715,9 @@ flowchart LR
 
 ---
 
-# API Design
+# API 设计
 
-本章定义 PodGroup API 与能力边界。场景 YAML 见 [#用户场景与能力对照](#用户场景与能力对照)；HyperNode 层级填写见 [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)。
+PodGroup 字段、Go 类型与能力边界。配置示例见 [#用户场景与能力对照](#用户场景与能力对照)；tier 填写见 [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)；API 取舍见 **附录**。
 
 ## PodGroupSpec 新增字段
 
@@ -735,22 +725,24 @@ flowchart LR
 type PodGroupSpec struct {
     // ... existing fields ...
 
-    // TopologyAffinity expresses topology affinity/anti-affinity between THIS PodGroup and OTHER PodGroups
-    // (selected by topologyGroup label or podGroupSelector). Evaluated at Job / HyperNodeGradientForJob scope.
-    // Does NOT apply to relationships between subGroupPolicy entries within the same PodGroup;
-    // use SubGroupTopologyAffinity for that.
+    // TopologyAffinity: cross-PodGroup topology vs OTHER PodGroups (podGroupSelector).
+    // Phase 1 CRD exposes only podGroupAntiAffinity under this object; podGroupAffinity is not declared (see design doc).
+    // Intra-PodGroup SubJob relationships: use SubGroupTopologyAffinity.
+    // Evaluated at Job scope (HyperNodeGradientForJobFn).
     // +optional
     TopologyAffinity *PodGroupTopologyAffinitySpec `json:"topologyAffinity,omitempty"`
 
     // SubGroupTopologyAffinity expresses topology affinity/anti-affinity between SubGroupPolicies
     // defined in THIS PodGroup's subGroupPolicy list only. Evaluated per SubJob at
     // HyperNodeGradientForSubJob scope; peers are other SubJobs of the same JobInfo (same PodGroup UID).
-    // Cannot reference PodGroups in other namespaces or other topologyGroups.
+    // Cannot reference PodGroups in other namespaces; peers matched via podGroupSelector on PodGroup labels.
     // Requires subGroupPolicy; ignored (webhook reject) if subGroupPolicy is empty.
     // +optional
     SubGroupTopologyAffinity *SubGroupTopologyAffinitySpec `json:"subGroupTopologyAffinity,omitempty"`
 }
 ```
+
+> **`podGroupAffinity`：** Phase 1 不在 CRD 中声明该字段，理由见 [设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)。实现时在 `PodGroupTopologyAffinitySpec` 的 godoc 中引用设计决策-2 即可。
 
 ## 核心类型
 
@@ -797,7 +789,7 @@ type NetworkTopologySpec struct {
 
 调度器在 Session 内维护 **`HyperNodeTierNameMap`**（`tierName → tier`）与 **`HyperNodeTierSet`**（集群出现过的 `spec.tier` 集合）；`network-topology-aware` 与 `group-topology-affinity` **共用** 上述映射解析层级，保证同一 Job 上 `highestTierName: supernode` 与 `separationTierName: supernode`（或 `highestTierAllowed: 2` 与 `separationTier: 2`）指向 **同一物理层**。
 
-**推荐：** 与现有 NTA 文档一致，运维侧优先 **`tierName`**（跨集群对照表友好）；自动化/模板生成可用 **`tier` 整数**（与 CR 中 `spec.tier` 一一对应，不依赖字符串命名）。
+**推荐：** 与现有 [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md) 设计文档一致，运维侧优先 **`tierName`**（跨集群对照表友好）；自动化/模板生成可用 **`tier` 整数**（与 CR 中 `spec.tier` 一一对应，不依赖字符串命名）。
 
 ### `required` / `preferred` 与 `mode`（不重复）
 
@@ -822,7 +814,9 @@ type NetworkTopologySpec struct {
 topologyAffinity:
   podGroupAntiAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
-      - topologyGroup: llama-70b-serving
+      - podGroupSelector:
+            matchLabels:
+              topology.volcano.sh/spread-group: llama-70b-prod
         separationTierName: supernode   # A
         # separationTier: 2             # B（与 A 等价，当 supernode 对应 spec.tier==2）
 
@@ -838,16 +832,21 @@ subGroupTopologyAffinity:
 ```
 
 ```go
-// PodGroupTopologyAffinitySpec: cross-PodGroup scope only.
+// PodGroupTopologyAffinitySpec expresses topology constraints between THIS PodGroup and OTHER PodGroups
+// podGroupSelector (metav1.LabelSelector). Evaluated at Job scope (HyperNodeGradientForJobFn).
+//
+// Phase 1 scope: ONLY PodGroupAntiAffinity is implemented and exposed in the CRD.
+//
+// podGroupAffinity (cross-PodGroup colocation) is intentionally NOT declared on this struct in Phase 1:
+//   - No product scenario requires forcing multiple PodGroups into the same Domain_T at a given tier.
+//   - Single-instance colocation: use PodGroupSpec.networkTopology.
+//   - Prefill/decode or other roles in one instance: use SubGroupTopologyAffinity.subGroupAffinity.
+//   - Peers: other PodGroups whose metadata.labels match podGroupSelector (kube-scheduler labelSelector semantics).
+// Phase 2+ may add: PodGroupAffinity *TopologyAffinitySpec `json:"podGroupAffinity,omitempty"` additively.
 type PodGroupTopologyAffinitySpec struct {
-    // PodGroupAntiAffinity: Phase 1 — hard/soft anti-affinity vs other PodGroups (topologyGroup / podGroupSelector).
+    // PodGroupAntiAffinity: hard/soft anti-affinity vs other PodGroups at separationTier(/Name).
+    // +optional
     PodGroupAntiAffinity *TopologyAntiAffinitySpec `json:"podGroupAntiAffinity,omitempty"`
-
-    // PodGroupAffinity: RESERVED — not implemented in Phase 1; webhook MUST reject non-empty value.
-    // Cross-PodGroup colocation is not a product requirement; use PodGroupSpec.networkTopology or
-    // subGroupTopologyAffinity.subGroupAffinity within a single PodGroup instead.
-    // +kubebuilder:validation:Schemaless
-    PodGroupAffinity *TopologyAffinitySpec `json:"podGroupAffinity,omitempty"`
 }
 
 // SubGroupTopologyAffinitySpec: intra-PodGroup, cross-subGroupPolicy scope only.
@@ -872,25 +871,30 @@ type TopologyAntiAffinitySpec struct {
     PreferredDuringSchedulingIgnoredDuringExecution []WeightedTopologyAntiAffinityTerm `json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
 }
 
-type TopologyAffinitySpec struct {
-    RequiredDuringSchedulingIgnoredDuringExecution  []TopologyAffinityTerm `json:"requiredDuringSchedulingIgnoredDuringExecution,omitempty"`
-    PreferredDuringSchedulingIgnoredDuringExecution []WeightedTopologyAffinityTerm `json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
-}
-
-// Cross-PodGroup terms
+// Cross-PodGroup terms (anti-affinity; Phase 1)
 type TopologyAntiAffinityTerm struct {
-    PodGroupSelector    *metav1.LabelSelector `json:"podGroupSelector,omitempty"`
-    TopologyGroup       string                `json:"topologyGroup,omitempty"`
-    NamespaceSelector   *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
-    SeparationTier      TopologySeparationSpec `json:"separationTier"`
-}
-
-type TopologyAffinityTerm struct {
-    PodGroupSelector  *metav1.LabelSelector `json:"podGroupSelector,omitempty"`
-    TopologyGroup     string                `json:"topologyGroup,omitempty"`
+    // PodGroupSelector: match OTHER PodGroups by metadata.labels (same semantics as kube-scheduler labelSelector).
+    // +required
+    PodGroupSelector  *metav1.LabelSelector `json:"podGroupSelector"`
+    // NamespaceSelector: optional scope for peer PodGroups (same role as in PodAntiAffinityTerm).
+    // +optional
     NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
     SeparationTier    TopologySeparationSpec `json:"separationTier"`
 }
+
+// --- Phase 2+ only (NOT in Phase 1 CRD): cross-PodGroup affinity / colocation ---
+// When podGroupAffinity is added to PodGroupTopologyAffinitySpec, use these types (same shape as anti).
+//
+// type TopologyAffinitySpec struct {
+//     RequiredDuringSchedulingIgnoredDuringExecution  []TopologyAffinityTerm `json:"requiredDuringSchedulingIgnoredDuringExecution,omitempty"`
+//     PreferredDuringSchedulingIgnoredDuringExecution []WeightedTopologyAffinityTerm `json:"preferredDuringSchedulingIgnoredDuringExecution,omitempty"`
+// }
+//
+// type TopologyAffinityTerm struct {
+//     PodGroupSelector  *metav1.LabelSelector `json:"podGroupSelector"`
+//     NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
+//     SeparationTier    TopologySeparationSpec `json:"separationTier"`
+// }
 
 // Cross-SubGroup terms (intra-PodGroup only).
 // matchSubGroupPolicyNames ALWAYS refers to subGroupPolicy[].name (policy name), NOT shard suffixes in SubJobID.
@@ -929,9 +933,11 @@ type WeightedSubGroupTopologyAffinityTerm struct {
 }
 ```
 
+## 附录：API 设计取舍
+
 ### API 设计取舍：`subGroupSelector` 与 `antiSubGroupSelector` 为何不合并
 
-`subGroupAntiAffinity` 的每条 term 使用 **两个** `SubGroupSelectorSpec`（`subGroupSelector`、`antiSubGroupSelector`），而不是像 `subGroupAffinity` 那样只用一个 `matchSubGroupPolicyNames` 列表。本节说明原因、与亲和的差异，以及曾考虑的替代方案。
+`subGroupAntiAffinity` 的每条 term 使用 **两个** `SubGroupSelectorSpec`（`subGroupSelector`、`antiSubGroupSelector`），而不是像 `subGroupAffinity` 那样只用一个 `matchSubGroupPolicyNames` 列表。本节说明定稿形状的原因及与亲和的差异。
 
 #### 调度语义：有向规则，不是「列表内任意两两互斥」
 
@@ -948,14 +954,14 @@ type WeightedSubGroupTopologyAffinityTerm struct {
 
 #### 为何不合并为单个 `matchSubGroupPolicyNames`
 
-曾讨论过在反亲和 term 上只保留一个 policy 名列表（与亲和 term 形状一致）。**未采用**，主要原因如下。
+反亲和 term **不** 采用与亲和相同的单列表 `matchSubGroupPolicyNames`，主要原因如下。
 
 **1. 单列表语义无法同时覆盖「policy 内互斥」与「跨 policy 互斥」**
 
 若写成：
 
 ```yaml
-# 假设（未采用）的单一列表
+# 反例：单一列表（不支持）
 matchSubGroupPolicyNames: [prefill, decode]
 ```
 
@@ -978,31 +984,22 @@ matchSubGroupPolicyNames: [prefill, decode]
 
 亲和用单列表表示「大家一起挤进同一个域」是自然且无歧义的；反亲和若强行共用同一形状，容易与亲和 **配反**（例如误把 `[prefill, decode]` 写成反亲和列表）。
 
-**3. 对齐 Kubernetes PodAffinity / PodAntiAffinity 的双端建模**
+**3. 对齐 kube-scheduler 的 PodAffinity / PodAntiAffinity 双端建模**
 
-K8s `PodAntiAffinityTerm` 通过 `labelSelector`（及可选 `namespaceSelector`）指明 **要避免的 Pod 集合**；**当前待调度 Pod** 作为 subject 隐含存在。Volcano 在 SubJob / `subGroupPolicy.name` 粒度上显式写出 subject 与 peer，便于：
+kube-scheduler 处理的 `PodAntiAffinityTerm` 通过 `labelSelector`（及可选 `namespaceSelector`）指明 **要避免的 Pod 集合**；**当前待调度 Pod** 作为 subject 隐含存在（见 [Kubernetes Pod affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity)）。Volcano 在 SubJob / `subGroupPolicy.name` 粒度上显式写出 subject 与 peer，便于：
 
-- Webhook 校验：跨 policy 时两侧 `matchSubGroupPolicyNames` **不相交**；policy 内互斥时 **允许相同**（见 [Validation Rules](#validation-rules-webhook) 规则 7）；
-- 调度顺序：`subGroupSelector` 侧 policy 对应 SubJob **优先** 调度，再调度依赖其 peer 域信息的 SubJob（见架构章 §10.1）；
-- 后续扩展单向规则（仅 A 避开 B，不要求 B 避开 A）时，无需改 term 顶层形状。
+- Webhook 校验：跨 policy 时两侧 `matchSubGroupPolicyNames` **不相交**；policy 内互斥时 **允许相同**（见 [校验规则](#校验规则webhook) 规则 8）；
+- 调度顺序：`subGroupSelector` 侧 policy 对应 SubJob **优先** 调度，再调度依赖其 peer 域信息的 SubJob（见 [#allocate-action其它](#allocate-action其它) 中 `organizeJobWorksheet`）；
+- 显式 subject / peer 便于 Webhook 校验与调度顺序，term 顶层形状固定。
 
-#### 曾考虑的替代方案
+#### 配置示例
 
-| 方案 | 说明 | 结论 |
-|------|------|------|
-| **A. 维持双 selector（当前）** | `subGroupSelector` + `antiSubGroupSelector` | **采用**；policy 内 / 跨 policy 统一表达 |
-| **B. 改名为 `from` / `to`** | 语义与 A 相同，仅改名 | 可读性更好，可作为文档别名说明；CRD 字段名仍可与 K8s「selector」族一致 |
-| **C. 单 policy 简写** | 仅写一个 policy 名时，Webhook/控制器展开为两侧相同 | **可选语法糖**（实现阶段）；YAML 仍允许显式写两遍 `[prefill]` 以保持清晰 |
-| **D. 单列表 + `scope` 枚举** | 如 `IntraPolicyPairwise` / `CrossPolicyOnly` | **不采用**；枚举难记，且 D 仍无法简洁表达「prefill 互斥 + decode 互斥」需 **两条 term** 的常见写法 |
-
-#### 配置建议（减少重复感）
-
-**policy 内两两互斥（实例 4、7）** — 两侧写 **相同** policy 名即可；若实现支持方案 C，下列等价：
+**policy 内两两互斥（实例 4、7）** — `subGroupSelector` 与 `antiSubGroupSelector` **均必填**；policy 内互斥时两侧写 **相同** policy 名：
 
 ```yaml
 subGroupAntiAffinity:
   requiredDuringSchedulingIgnoredDuringExecution:
-    # 显式（推荐在文档/评审中保留，语义一目了然）
+    # 两侧 policy 名相同：prefill 分片互斥
     - subGroupSelector:
         matchSubGroupPolicyNames: [prefill]
       antiSubGroupSelector:
@@ -1020,27 +1017,26 @@ subGroupAntiAffinity:
       separationTierName: cabinet
 ```
 
-**小结：** 双 selector 不是为了「多写一个字段」，而是为了在 **不引入歧义枚举** 的前提下，同时支持 **policy 内分片互斥** 与 **跨 policy 角色互斥**；与 `subGroupAffinity` 单列表共域形成对称、互补的 API 面。若后续 CRD 演进，优先考虑 **方案 C 简写** 或 **方案 B 文档别名**，而不是去掉 peer 侧选择能力。
+**小结：** 双 selector 在 **不引入歧义枚举** 的前提下，同时支持 **policy 内分片互斥** 与 **跨 policy 角色互斥**；与 `subGroupAffinity` 单列表共域形成对称、互补的 API 面。`antiSubGroupSelector` 为 **必选字段**，不提供「省略 peer 侧」或「单 policy 名简写」等等价写法。
 
 ### API 设计取舍：`subGroupTopologyAffinity` 为何在 PodGroup 顶层，而非挂在每条 `subGroupPolicy` 上
 
-有人提出：把组间拓扑（尤其反亲和）写到 **各 `subGroupPolicy` 条目内**，会更像 K8s 在 **每个 Pod（模板）** 上声明 `affinity` / `antiAffinity`。当前设计把 **同 PodGroup、跨 SubGroup** 的关系集中在 **`PodGroupSpec.subGroupTopologyAffinity`**。对比如下。
+**同 PodGroup、跨 SubGroup** 的拓扑关系集中在 **`PodGroupSpec.subGroupTopologyAffinity`**，**不** 挂在各 `subGroupPolicy` 上。
 
-#### 与 K8s 原生模型的相似与不同
+#### 与「挂在 Pod 模板 / 各 policy 上」的差异
 
-| 维度 | K8s `podAffinity` / `podAntiAffinity` | Volcano 本设计 |
-|------|--------------------------------------|----------------|
-| 声明位置 | **Pod spec**（每个副本一份相同规则） | **PodGroup spec** 顶层 `subGroupTopologyAffinity` |
-| 比较对象 | **Pod** ↔ 已调度 Pod（labelSelector） | **SubJob**（由 `subGroupPolicy` + `matchLabelKeys` 拆出）↔ 已分配 `Domain_T` |
-| 拓扑域 | `topologyKey`（Node label） | HyperNode 树 `separationTier` / `separationTierName` |
-| 组内共域 | PodGroup TAS **一条** `schedulingConstraints.topology` | `subGroupPolicy[].networkTopology` **按 policy 一条**（已类似「分角色模板」） |
+| 维度 | kube-scheduler /「每条 policy 各写组间规则」 | 本设计（PodGroup 顶层） |
+|------|---------------------------------------------|-------------------------|
+| 声明位置 | Pod `spec`，或每条 `subGroupPolicy` 各写一份 | **`PodGroupSpec.subGroupTopologyAffinity`** 一处声明 |
+| 比较对象 | **Pod** ↔ Pod | **SubJob**（`subGroupPolicy` + `matchLabelKeys`）↔ 已分配 `Domain_T` |
+| 拓扑域 | 多依赖 Node label 等外挂约定 | HyperNode `separationTier` / `separationTierName` |
+| 组内 vs 组间 | 易与组内规则拆在两处、难统一校验 | `subGroupPolicy[].networkTopology`（组内）+ 顶层字段（组间），同一调度链 **AND** |
 
-因此：**仅把字段挪到 `subGroupPolicy` 并不会更接近 K8s 语义**，因为 K8s 的粒度是 **Pod**；Volcano Gang/SubJob 的粒度是 **一组 Pod 的调度单元**。更接近 K8s 体验的是 **Pod 级** spread/affinity（本设计 **不替代**，见范围「SubJob 内逐 Pod spread」）。
+调度单元是 **SubJob（一组 Pod）**，不是单个 Pod；SubJob 内逐 Pod 打散仍用 Pod 模板上的 spread 等（见 [范围 · SubJob 内逐 Pod spread](#目标外)），**不由** 本字段承担。
 
-#### 若挂在 `subGroupPolicy` 上，YAML 可能长什么样
+#### 反例：组间规则写在各 `subGroupPolicy` 内（不支持）
 
 ```yaml
-# 假设（未采用）— 每条 policy 自带「对外」拓扑边
 subGroupPolicy:
   - name: prefill
     networkTopology: { mode: hard, highestTierName: cabinet }
@@ -1056,15 +1052,13 @@ subGroupPolicy:
         separationTierName: cabinet
 ```
 
-这与 K8s「每个工作负载模板带自己的 antiAffinity」**形式相似**，但会带来下面问题。
+上述写法在 **形式上** 接近 kube-scheduler「每个 Pod 模板在 `spec` 里写 `podAntiAffinity`」；在 Volcano 中 **不采用**，原因如下（故定稿为 PodGroup 顶层 `subGroupTopologyAffinity`）。
 
-#### 为何仍采用 PodGroup 顶层的 `subGroupTopologyAffinity`
-
-**1. 组内 vs 组间字段已按作用域拆开**
+**1. 组内与组间职责已在不同字段拆分**
 
 | 作用域 | 配置位置 | 语义 |
 |--------|----------|------|
-| **同一 SubJob 内** Pod 聚在同一拓扑域 | `subGroupPolicy[].networkTopology` | 与 KAI SubGroup `topologyConstraint`、Koordinator 组内 gather **同层** |
+| **同一 SubJob 内** Pod 聚在同一拓扑域 | `subGroupPolicy[].networkTopology` | 组内 Gang / 域内聚合（`network-topology-aware`） |
 | **不同 SubJob / policy 之间** | `subGroupTopologyAffinity` | 分片互斥、跨角色共域/异域 |
 
 `networkTopology` **已经在每个 policy 上**；再加一层 per-policy 的「组间」字段，会与 `networkTopology` 并列，用户需记住两个块都在 policy 内、职责不同，**并不更简单**。
@@ -1074,7 +1068,7 @@ subGroupPolicy:
 | 场景 | 为何不适合只写在一侧 policy |
 |------|------------------------------|
 | `subGroupAffinity`：`[prefill, decode]` @ supernode（实例 4 方式二） | 一条约束涉及 **两个** policy 的 **并集**；写在 prefill 或 decode 任一侧都不完整，写两侧则 **重复且易漂移** |
-| 实例 4：prefill 分片互斥 | 可写成仅 prefill policy 上 `peer: [prefill]`（**per-policy 可行**） |
+| 实例 4：prefill 分片互斥 | 若拆到单侧 policy 配置，无法与「跨 policy 边」统一表达，且易与 `networkTopology` 混放 |
 | 实例 6：prefill ↔ decode 异域 | 需 prefill→decode **或** 两侧各写一条；对称配置 **冗余** |
 
 顶层 `subGroupTopologyAffinity` 把 **所有 SubJob↔SubJob 的边** 收在一处，Webhook 可统一做 tier 一致性、与 `topologyAffinity`（跨 PodGroup 反亲和）对称。
@@ -1082,25 +1076,15 @@ subGroupPolicy:
 **3. `matchLabelKeys`：一个 policy 名 → 多个 SubJob**
 
 实例 4 用 **一条** `name: prefill` + `matchLabelKeys` 得到 `prefill-0…3`。互斥发生在 **这些 SubJob 之间**，不是「prefill 这条 policy 配置块」与「decode 块」之间的键值对。  
-在顶层用 `subGroupSelector` / `antiSubGroupSelector` 均为 `[prefill]`，表达的是 **「任意 prefill SubJob 与任意其它 prefill SubJob」**；若写在 prefill policy 内，也需额外语义：`peerSubGroupPolicyNames: [prefill]` == **同 policy 下其它 SubJob**，与 K8s「同 label 的其它 Pod」类似，但 Volcano 仍要在实现里按 **SubJobID / policyName** 解析，**并不会少实现复杂度**。
+在顶层用 `subGroupSelector` / `antiSubGroupSelector` 均为 `[prefill]`，表达的是 **「任意 prefill SubJob 与任意其它 prefill SubJob」**；若写在 prefill policy 内，也需额外语义：`peerSubGroupPolicyNames: [prefill]` == **同 policy 下其它 SubJob**，与 kube-scheduler 在 Pod 反亲和里「同 label 的其它 Pod」类似，但 Volcano 仍要在实现里按 **SubJobID / policyName** 解析，**并不会少实现复杂度**。
 
-**4. 与 KAI「每条 SubGroup 一个 topologyConstraint」的差异**
+**4. per-policy 组间字段易弱化「跨 policy 边」**
 
-KAI Hierarchical PodGroup 在 **每个 SubGroup** 上挂 `topologyConstraint`（多为 **该子组内部** 不跨 rack/block），跨子组关系靠 **父层 constraint** 或分层树表达，**并非** 完整的 pairwise `antiAffinity` Term。  
-Volcano 用 **顶层 `subGroupTopologyAffinity`** 显式表达 **policy 间边**（含 policy 内两两互斥），是为 Prefill-Decode **实例 4/6** 准备的；若改为 per-policy，更接近 KAI **组内** 约束风格，反而弱化 **跨 policy 边** 的一等表达。
+若组间规则分散在各 `subGroupPolicy` 上，配置面更易退化为「每个 policy 只描述本块属性」，而不利于在 **一处** 声明 prefill↔decode、多分片互斥等 **SubJob↔SubJob** 关系（实例 4/6）。顶层 `subGroupTopologyAffinity` 将 **policy 间边**（含同 policy 内两两互斥）作为一等公民。
 
 **5. 调度实现与顺序**
 
-组间 hard 规则需要 **SubJob 调度顺序**（如先调度 `subGroupSelector` 侧）。规则集中在 PodGroup 顶层时，`organizeJobWorksheet` / GTA 插件只需读 **一处**；分散在各 policy 上要 **合并** 成同一有向图，避免循环依赖（prefill 依赖 decode、decode 又依赖 prefill）。
-
-#### 何时 per-policy 写法更合适（本设计不排斥未来扩展）
-
-下列情况 **适合** 挂在 `subGroupPolicy` 上（可作为将来 **optional 语法糖**，由控制器 **展开** 为顶层 term，而非第二套语义）：
-
-- 仅 **「本 policy 下的 SubJob 彼此互斥 @ tier」**（实例 4 的单边写法）；
-- 仅 **「本 policy 的 SubJob 避开 policy X @ tier」** 且 **无** 多方 `subGroupAffinity`。
-
-Phase 1 不引入该糖，是为避免 **两套配置面** 与 Webhook 重复校验；**不表示** per-policy 模型更「正确」。
+组间 hard 规则需要 **SubJob 调度顺序**（如先调度 `subGroupSelector` 侧）。规则集中在 PodGroup 顶层时，`organizeJobWorksheet` / `group-topology-affinity` 插件只需读 **一处**；分散在各 policy 上要 **合并** 成同一有向图，避免循环依赖（prefill 依赖 decode、decode 又依赖 prefill）。
 
 #### 小结
 
@@ -1110,7 +1094,7 @@ PodGroupSpec.subGroupTopologyAffinity → 组间边（SubJob↔SubJob，含同 p
 PodGroupSpec.topologyAffinity         → 跨 PodGroup 反亲和（仅 podGroupAntiAffinity）
 ```
 
-与 K8s **最像** 的是 Pod 级 `affinity`/`topologySpread`；与 Volcano Gang **最像** 的是 **PodGroup/SubJob 级** 声明。把 `subGroupTopologyAffinity` 放在 PodGroup 顶层，是为了表达 **边（关系）** 而非 **点（单个 policy 的属性）**，并与 `topologyAffinity`、Webhook 分层一致。
+与 **kube-scheduler** 侧最接近的是 Pod 级 `affinity` / `topologySpreadConstraints`（比较对象是 Pod↔Pod）；本提案在 Volcano 侧对应 **PodGroup/SubJob 级** 声明（比较对象是 SubJob↔SubJob 的 `Domain_T`）。把 `subGroupTopologyAffinity` 放在 PodGroup 顶层，是为了表达 **边（关系）** 而非 **点（单个 policy 的属性）**，并与 `topologyAffinity`、Webhook 分层一致。
 
 ---
 
@@ -1148,7 +1132,7 @@ PodGroupSpec.topologyAffinity         → 跨 PodGroup 反亲和（仅 podGroupA
 
 | 作用域 | `PodGroupSpec` 字段 | 内层子字段 |
 |--------|---------------------|------------|
-| 跨 PodGroup | `topologyAffinity` | **`podGroupAntiAffinity` only**（Phase 1）；`podGroupAffinity` 保留字段、拒绝写入 |
+| 跨 PodGroup | `topologyAffinity` | **`podGroupAntiAffinity` only**（Phase 1）；**CRD 不含** `podGroupAffinity` |
 | 跨 SubGroup（**仅同 PodGroup**） | `subGroupTopologyAffinity` | `subGroupAffinity` / `subGroupAntiAffinity` |
 
 > 详细能力范围、非目标与 Webhook 规则见 [#subgrouptopologyaffinity-能力范围同-podgroup跨-subgroup](#subgrouptopologyaffinity-能力范围同-podgroup跨-subgroup)。
@@ -1159,16 +1143,14 @@ PodGroupSpec.topologyAffinity         → 跨 PodGroup 反亲和（仅 podGroupA
 |------|------|
 | `PodGroupSpec.networkTopology` | **Job 级别** 域内聚合（整 Job 不跨 tier） |
 | `subGroupPolicy[].networkTopology` | **组内** Gang：不跨越 `highestTierAllowed`（域内聚合） |
-| `topologyAffinity.podGroupAntiAffinity` | **跨 PodGroup**：在 `separationTier` 上 **异域** |
+| `topologyAffinity.podGroupAntiAffinity` | **跨 PodGroup**：在 `separationTier` 上 **异域**；peer 由 `podGroupSelector`（+ 可选 `namespaceSelector`）指定 |
 | `subGroupTopologyAffinity` | **同 PodGroup 跨 SubGroup**：在 `separationTier` 上同域或异域 |
 
-Go 类型：`SubGroupTopologyAffinitySpec`（容器）与 `SubGroupTopologyAffinityTerm`（单条亲和 term）并存，与 K8s `PodAffinity` / `PodAffinityTerm` 命名方式一致。
+Go 类型：`SubGroupTopologyAffinitySpec`（容器）与 `SubGroupTopologyAffinityTerm`（单条亲和 term）并存，与 kube-scheduler 所消费的 `PodAffinity` / `PodAffinityTerm` 命名方式一致。
 
-> 曾用名 `subGroupTopologyConstraints` 已废弃，统一为 `subGroupTopologyAffinity`，与 `topologyAffinity` 对称。
+## API 能力与边界
 
-## 能力边界：多层级拓扑关系
-
-Volcano 在本特性下将拓扑关系划分为 **四个互不替代的作用域**。配置时必须先确认需求落在哪一层，再选用对应字段。
+按作用域选用 PodGroup / SubJob 拓扑字段。
 
 | 层级 | API | 比较对象 | 典型场景 | 调度锚点 |
 |------|-----|----------|----------|----------|
@@ -1179,55 +1161,36 @@ Volcano 在本特性下将拓扑关系划分为 **四个互不替代的作用域
 
 ```mermaid
 flowchart TB
-    subgraph PodGroupNode["PodGroup (一个 inference instance)"]
+    subgraph podgroup_current["PodGroup (一个 inference instance)"]
         direction TB
-        SG1["subGroupPolicy: prefill<br/>networkTopology 组内"]
-        SG2["subGroupPolicy: decode<br/>networkTopology 组内"]
-        SGA["subGroupTopologyAffinity<br/>prefill ↔ decode"]
-        SG1 --- SGA
-        SG2 --- SGA
+        sub_group_policy_prefill["subGroupPolicy: prefill<br/>networkTopology 组内"]
+        sub_group_policy_decode["subGroupPolicy: decode<br/>networkTopology 组内"]
+        sub_group_topology_edges["subGroupTopologyAffinity<br/>prefill ↔ decode"]
+        sub_group_policy_prefill --- sub_group_topology_edges
+        sub_group_policy_decode --- sub_group_topology_edges
     end
-    PodGroup2["其它 PodGroup (instance-1)"]
-    PGA["topologyAffinity<br/>podGroupAntiAffinity @ supernode"]
-    PodGroupNode -.->|跨 PodGroup 反亲和| PGA
-    PodGroup2 -.-> PGA
+    podgroup_peer["其它 PodGroup (instance-1)"]
+    topology_affinity_cross["topologyAffinity<br/>podGroupAntiAffinity @ supernode"]
+    podgroup_current -.->|跨 PodGroup 反亲和| topology_affinity_cross
+    podgroup_peer -.-> topology_affinity_cross
 ```
 
----
+### `topologyAffinity`（跨 PodGroup）
 
-## `topologyAffinity` 能力范围（跨 PodGroup）
+| 项 | 说明 |
+|----|------|
+| Phase 1 | **仅** `podGroupAntiAffinity`（[设计决策-1](#ad-1跨-podgroup-仅做反亲和)、[设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)） |
+| 作用 | 本 PodGroup 与其它 PodGroup 在 `separationTier(*)` 上 **异域**（`podGroupSelector`，标准 `metav1.LabelSelector`） |
+| 调度 | `TopologyOccupancyIndex` + Job 级 `HyperNodeGradientForJobFn`；hard/soft 见 [设计决策-5](#ad-5组间-hardsoft) |
+| 跨 PodGroup 共域 | **不支持** → `networkTopology` / `subGroupAffinity` |
 
-**Phase 1 仅实现 `podGroupAntiAffinity`。** 容器名仍为 `topologyAffinity`（与 K8s `affinity` / `antiAffinity` 并列命名），但 **不实现、不接受** `podGroupAffinity`。
+### `subGroupTopologyAffinity`（同 PodGroup、跨 SubGroup）
 
-**做什么（In scope）：** 描述 **本 PodGroup** 与 **集群内其它 PodGroup** 在 `separationTier` 上 **必须或优先异域**（`podGroupAntiAffinity`）。
+**语义：** 约束本 PodGroup 内各 `subGroupPolicy` 拆出的 **SubJob** 在 `Domain_T` 上的同域/异域（**非** Pod 级 affinity，**非** 跨 PodGroup）。
 
-- 通过 `metadata.labels[volcano.sh/topology-group]` 或 `podGroupSelector` / `namespaceSelector` 选中对端 PodGroup；
-- Hard / soft（`required` / `preferred` + `weight`）；
-- `TopologyOccupancyIndex` 记录已调度 PodGroup 占用的 `Domain_T`；
-- 在 **Job 级别** `allocateForJob` 之前参与 `HyperNodeGradientForJobFn` 剪枝。
+**前置：** `subGroupPolicy` ≥ 2 条；term 中只写 policy **name**（非 `prefill-0` 等后缀）。
 
-**明确不做（Out of scope for `topologyAffinity`）：**
-
-| 诉求 | 应使用 |
-|------|--------|
-| 跨 PodGroup **共域**（多 PodGroup 挤同一 supernode） | **不支持** `podGroupAffinity`；单 instance 用 `PodGroupSpec.networkTopology`；同 PodGroup 角色共域用 `subGroupAffinity` |
-
-原因说明见 [#跨-podgroup仅反亲和](#跨-podgroup仅反亲和)（「为何不做跨 PodGroup 亲和」）。
-
-| 其它诉求 | 应使用 |
-|----------|--------|
-| 同 PodGroup 内 prefill / decode 等 SubGroup 关系 | `subGroupTopologyAffinity` |
-| SubGroup 内 Gang / `highestTierAllowed` | `subGroupPolicy[].networkTopology` |
-
----
-
-## `subGroupTopologyAffinity` 能力范围（同 PodGroup、跨 SubGroup）
-
-**做什么：** 描述 **当前 PodGroup 内**，由 `subGroupPolicy` 划分的 **多个 SubGroup（SubJob）之间** 在 HyperNode 树 `separationTier` 上的拓扑亲和或反亲和。
-
-**核心语义：** 调度器为每个 `subGroupPolicy` 生成一个 **SubJob**；`subGroupTopologyAffinity` 约束的是这些 SubJob 的 `AllocatedHyperNode` 在 `Domain_T(·)` 上的关系，**不是** Pod 级 `podAffinity`，也 **不是** 跨 PodGroup 关系。
-
-### 能力范围（In scope）
+#### 能力一览（In scope）
 
 | 能力 | 说明 |
 |------|------|
@@ -1238,7 +1201,7 @@ flowchart TB
 | prefill 与 decode 无要求 | 不写跨角色 `subGroupAntiAffinity` | 实例 4 仅 prefill↔prefill、decode↔decode |
 | Hard / soft | Hard → `HyperNodeGradientForSubJobFn` 剪枝；Soft → `HyperNodeOrderFn`（见 [实例 7](#实例-7subgroup-软性反亲和可选)） |
 | 与组内 Gang 叠加 | 各 SubGroup 仍可独立配置 `networkTopology.highestTierAllowed` |
-| SubJob 调度顺序 | Hard `subGroupAntiAffinity` 时，被引用为 `subGroupSelector` 的 policy 对应 SubJob **优先** 调度（见 §10.1） |
+| SubJob 调度顺序 | Hard `subGroupAntiAffinity` 时，被引用为 `subGroupSelector` 的 policy 对应 SubJob **优先** 调度（见 [#allocate-action其它](#allocate-action其它)） |
 | 部分调度 | 一方 SubJob 已分配 `AllocatedHyperNode` 后，另一方须满足 `Domain_T` 关系再选 HyperNode |
 
 ### 非目标（Out of scope）
@@ -1251,7 +1214,7 @@ flowchart TB
 | 选择「任意其它 PodGroup」的 SubGroup | **不支持**；selector 仅解析本 PodGroup 的 `subGroupPolicy` |
 | 跨 Namespace 的 SubGroup 对等 | **不支持** |
 | 无 `subGroupPolicy` 时定义 SubGroup 间关系 | **无效**；Webhook 拒绝 |
-| 用 `topologyGroup` 表达同 PodGroup 内 prefill/decode | **错误**；`topologyGroup` 仅用于跨 PodGroup |
+| 用 `podGroupAntiAffinity` 表达同 PodGroup 内 prefill/decode | **错误**；同 PodGroup 内应使用 `subGroupTopologyAffinity` |
 
 ### 前置条件
 
@@ -1295,11 +1258,22 @@ subGroupTopologyAffinity:
 
 ---
 
-## Label 常量
+### `podGroupSelector` 匹配语义
 
-```go
-const TopologyGroupLabelKey = GroupName + "/topology-group" // volcano.sh/topology-group
-```
+与 kube-scheduler 的 `labelSelector` 一致：在集群已缓存的 **其它 PodGroup** 上，用 `metadata.labels` 做匹配（支持 `matchLabels` / `matchExpressions`）；可选 `namespaceSelector` 限制命名空间。  
+**不** 在 CRD 中引入 Volcano 专用 `topologyGroup` 字符串字段；peer 完全由用户在 PodGroup 上打的 label 界定。
+
+#### Label 由谁设置、如何取值
+
+| 项 | 说明 |
+|----|------|
+| **谁写入** | **用户/平台** 在创建或更新 PodGroup 时设置 `metadata.labels`；Volcano **不会** 根据 `podGroupAntiAffinity` 自动补写该 label。 |
+| **与 selector 的关系** | `podGroupSelector.matchLabels`（或 `matchExpressions`）必须与目标 PodGroup 上的 label **一致**；通常 **一个键** 即可表达「同一互斥组」（示例键 `topology.volcano.sh/spread-group`，键名可自定）。 |
+| **赋值原则** | 凡需要在某个 `separationTier` 上 **彼此异域** 的 PodGroup，对该键使用 **相同取值**；该取值应表示 **故障域/容量池** 等业务含义（如 `llama-70b-prod` = 同一生产模型多 instance），**不是** PodGroup 名、SubJob 名或 Pod 模板 label 的拷贝。 |
+| **与其它 label 分工** | `app` / `model` 等可用于运维筛选；**是否互为 anti-affinity peer** 只由 `podGroupSelector` 选中与否决定。不要把无关 label 写进 selector，以免误伤其它 PodGroup。 |
+| **环境隔离** | 不同环境、租户、流量池使用 **不同取值**（如 `…-staging` vs `…-prod`），避免跨环境互斥。 |
+
+调度实现：peer 集合 = 满足 selector 的其它 PodGroup（排除本 PodGroup UID）；`TopologyOccupancyIndex` 按 `(separationTier, Domain_T)` 记录已占用域，结合 peer 的已分配 HyperNode 做剪枝。
 
 ## HyperNode 层级与 separationTier / separationTierName
 
@@ -1425,7 +1399,7 @@ kind: PodGroup
 metadata:
   name: pd-instance-0
   labels:
-    volcano.sh/topology-group: llama-70b-serving
+    topology.volcano.sh/spread-group: llama-70b-prod
 spec:
   minMember: 8
   queue: default
@@ -1433,7 +1407,9 @@ spec:
   topologyAffinity:
     podGroupAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyGroup: llama-70b-serving
+        - podGroupSelector:
+            matchLabels:
+              topology.volcano.sh/spread-group: llama-70b-prod
           separationTierName: supernode
 
   subGroupPolicy:
@@ -1452,7 +1428,87 @@ spec:
   # 若需 prefill 与 decode 整机柜分离：另见实例 6
 ```
 
-# Plugin Architecture
+# 设计决策
+
+### 设计决策-1：跨 PodGroup 仅做反亲和
+
+**结论：** 实现 `topologyAffinity.podGroupAntiAffinity`（**必填** `podGroupSelector` + `separationTier(*)`），配合 `TopologyOccupancyIndex` 与 Job 级 gradient。
+
+**理由（摘要）：**
+
+- **Peer 表达：** 使用 **`metav1.LabelSelector`**（`matchLabels` / `matchExpressions`）匹配其它 PodGroup 的 `metadata.labels`，语义对齐 kube-scheduler；**不** 增加 CRD 专用 `topologyGroup` 字段，便于复用业务既有 label 与表达式。
+- **有场景：** 多 inference instance 需在 supernode（等）层 **互斥**（实例 2、5）；组内 `networkTopology` 无法表达「相对其它 PodGroup」。
+- **社区缺口：** Volcano 尚无 PodGroup 级 **组间** hard 异域 API（组内 `networkTopology` 不表达「相对其它 PodGroup」）。
+- **成本可接受：** 索引语义单一（记录已占用 `Domain_T`）；preempt/backfill 一致性交 [Phase 2](#交付阶段)。
+
+---
+
+### 设计决策-2：Phase 1 不声明 `podGroupAffinity`
+
+**结论：** `PodGroupTopologyAffinitySpec` **仅** 含 `PodGroupAntiAffinity`；**不** 在 Go/CRD 中声明 `PodGroupAffinity`。用户若提交未知字段 `topologyAffinity.podGroupAffinity`，由 API Server 按 schema 拒绝（无需 Webhook「必须为空」）。
+
+| 方案 | CRD 是否暴露 `podGroupAffinity` | 结论 |
+|------|--------------------------------|------|
+| 保留字段 + Webhook 拒绝 | 是 | 未采用 |
+| **不声明字段** | **否** | **采用** |
+
+**不做跨 PodGroup 亲和的理由（采纳「不声明字段」）：**
+
+1. **无独立场景** — 共域已由下表 API 覆盖：
+
+| 诉求 | 使用 |
+|------|------|
+| 单 instance 整机共 supernode | `PodGroupSpec.networkTopology` |
+| 同 instance 内 prefill + decode 共域 | `subGroupAffinity` 或 `networkTopology`（实例 4） |
+| 多 Pod 副本共 rack | `subGroupPolicy[].networkTopology` |
+
+2. **易混淆** — 跨 PodGroup 共域若再引入 `podGroupAffinity`，与 `subGroupAffinity`、共域类 `networkTopology` 职责重叠。
+3. **实现不划算** — 不做亲和 **不能** 省掉反亲和的 OccupancyIndex/Job gradient；若做亲和还需共域 clique、冲突检测、调度顺序等，**无验收场景**。
+
+**演进：** 若有已落地需求，Phase 2+ **additive** 增加 `PodGroupAffinity *TopologyAffinitySpec`（类型形状见 [API 设计](#api-设计) 注释块），**不改变** 反亲和语义。
+
+---
+
+### 设计决策-3：SubGroup 反亲和双 selector
+
+**结论：** `subGroupAntiAffinity` 使用 `subGroupSelector` + `antiSubGroupSelector`（有向 subject→peer），**不** 用单列表 `matchSubGroupPolicyNames`。
+
+**理由（摘要）：** 单列表形态无法同时表达「policy 内分片互斥」（两侧均为 `[prefill]`）与「跨 policy 互斥」（`[prefill]` vs `[decode]`）而不引入歧义枚举。详见 [API 附录：双 selector](#api-设计取舍subgroupselector-与-antisubgroupselector-为何不合并)。
+
+---
+
+### 设计决策-4：`subGroupTopologyAffinity` 在 PodGroup 顶层
+
+**结论：** 同 PodGroup 内 SubJob 间拓扑边集中在 `PodGroupSpec.subGroupTopologyAffinity`，**不** 挂在各 `subGroupPolicy` 上；**不** 提供 per-policy 组间字段或语法糖。
+
+**理由（摘要）：** 多方共域（`[prefill, decode]`）、统一 Webhook、与 `topologyAffinity` 对称等需求要求 PodGroup 顶层一处声明。详见 [API 附录：顶层放置](#api-设计取舍subgrouptopologyaffinity-为何在-podgroup-顶层-而非挂在每条-subgrouppolicy-上)。
+
+---
+
+### 设计决策-5：组间 hard/soft
+
+**结论：** 组间用 `requiredDuringSchedulingIgnoredDuringExecution` / `preferredDuringSchedulingIgnoredDuringExecution` + `weight`；**禁止** 在 `TopologySeparationSpec` 内写 `mode`。组内仍用 `networkTopology.mode`。
+
+---
+
+### 设计决策-6：tierName 与 tier 整数二选一
+
+**结论：** 组间 `separationTierName` ↔ `HyperNode.spec.tierName`，`separationTier` ↔ `spec.tier`；与组内 `highestTierName` / `highestTierAllowed` 共用 `HyperNodeTierNameMap`、`HyperNodeTierSet`。
+
+**示例集群约定（实例 YAML 注释亦采用）：** `supernode` ↔ `2`，`cabinet` ↔ `1`（以 `kubectl get hypernodes` 为准）。
+
+| 业务说法 | tierName | tier（示例） |
+|----------|----------|--------------|
+| 多 instance 互斥 @ 超节点 | `supernode` | `2` |
+| 分片互斥 @ 机柜 | `cabinet` | `1` |
+| 整机共超节点（组内） | `highestTierName: supernode` | `highestTierAllowed: 2` |
+
+填写步骤、HyperNode CR 示例、Domain_T 解析 → [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)。实例 YAML 多写 tierName，旁注等价整数。
+
+---
+
+
+# 调度实现
 
 ## 职责划分
 
@@ -1484,25 +1540,25 @@ Hard / Soft 分工：
 ```mermaid
 flowchart TB
     subgraph plugins [拓扑插件 - 仅拓扑]
-        G1["network-topology-aware: [][]HyperNode"]
-        G2["group-topology-affinity: [][]HyperNode"]
+        network_topology_aware_plugin["network-topology-aware: [][]HyperNode"]
+        group_topology_affinity_plugin["group-topology-affinity: [][]HyperNode"]
     end
-    subgraph fw [Framework Session]
-        U1["eligible_p = ⋃_k gradient_p[k]"]
-        I["topologyEligible = ⋂_p eligible_p"]
-        R["rebuildGradientsByTier"]
+    subgraph framework_session [Framework Session]
+        union_per_plugin["eligible_p = ⋃_k gradient_p[k]"]
+        intersect_plugins["topologyEligible = ⋂_p eligible_p"]
+        rebuild_by_tier["rebuildGradientsByTier"]
     end
-    subgraph alc [allocate.go - 与 Gradient 回调解耦]
-        RES["filterGradientsByMinResource\n(job/subJob, gradients)"]
-        DRY["按 tier 升序 dry-run / predicate 选 Node"]
+    subgraph allocate_action [allocate.go - 与 Gradient 回调解耦]
+        resource_filter["filterGradientsByMinResource\n(job/subJob, gradients)"]
+        dry_run_bind["按 tier 升序 dry-run / predicate 选 Node"]
     end
 
-    G1 --> U1
-    G2 --> U1
-    U1 --> I
-    I --> R
-    R --> RES
-    RES --> DRY
+    network_topology_aware_plugin --> union_per_plugin
+    group_topology_affinity_plugin --> union_per_plugin
+    union_per_plugin --> intersect_plugins
+    intersect_plugins --> rebuild_by_tier
+    rebuild_by_tier --> resource_filter
+    resource_filter --> dry_run_bind
 ```
 
 **Framework 侧（仅拓扑，不含资源）：**
@@ -1557,7 +1613,7 @@ func (ssn *Session) HyperNodeGradientForJobFn(job *api.JobInfo, root *api.HyperN
     var perPlugin [][]*api.HyperNodeInfo
     for _, plugin := range ssn.enabledGradientPlugins() {
         g, err := ssn.hyperNodeGradientForJobFns[plugin](job, root)
-        if err != nil { /* 记录错误，该插件视为 ∅ 或整 Job 失败，策略可配置 */ }
+        if err != nil { /* 记录错误；该插件 eligible_p = ∅ */ }
         perPlugin = append(perPlugin, g)
     }
     if len(perPlugin) == 0 {
@@ -1705,22 +1761,43 @@ tiers:
   - name: predicates
   - name: group-topology-affinity
     arguments:
-      group-topology-affinity.weight: 10
+      weight: 10
   - name: network-topology-aware
     arguments:
       weight: 10
+      # 组内 binpack 等扩展项仅 network-topology-aware 使用，见该插件文档
+      # hypernode.binpack.cpu: 5
+      # hypernode.binpack.memory: 1
 ```
 
 两者均开启 `enabledHyperNodeGradient` 与 `enabledHyperNodeOrder`（与现有 e2e 配置一致）。tier 内插件顺序不影响交集交换律，但影响 **Order 分数相加顺序**（加法可交换，无影响）。
+
+### 插件 `arguments` 约定（与 `network-topology-aware` 一致）
+
+`group-topology-affinity` 的 Scheduler 插件配置 **对齐** `network-topology-aware`：在 `plugins[].arguments` 下使用 **短键名** `weight`，**不**使用 `group-topology-affinity.weight` 等带插件名前缀的键（与 `binpack.weight` 风格不同，与 `network-topology-aware` 相同）。
+
+| 键 | 类型 | 默认 | 作用 |
+|----|------|------|------|
+| `weight` | int | `1` | 将本插件 `HyperNodeOrderFn` 产出的分数 **整体缩放**（与 `network-topology-aware` 的 `GlobalWeight` 同语义）；实现读取键名建议与现网一致：`const PluginWeight = "weight"` |
+| `hypernode.binpack.*` | — | — | **不属于** `group-topology-affinity`；组内 HyperNode binpack / tier 打分仍由 `network-topology-aware` 承担 |
+
+**与 PodGroup API 中 `preferred` term 的 `weight` 区分：**
+
+| 配置面 | 字段 | 含义 |
+|--------|------|------|
+| Scheduler `arguments.weight` | 插件级 | 多个 `HyperNodeOrderFn` 插件之间的 **相对权重**（Framework 对各插件 Order 分数相加前的倍率） |
+| `subGroupTopologyAffinity` / `topologyAffinity` 的 `preferred[].weight` | term 级 | 单条 soft 组间规则 **内部的** 偏好强度（kube-scheduler `preferredDuringScheduling` 同义） |
+
+实现上：`HyperNodeOrderFn` 对某 HyperNode 的原始分 `score ∈ [0,1]`（或插件内部归一化分）乘以 `arguments.weight`，再参与 Framework 与其它拓扑/优先级插件的 Order **累加**——与 `network-topology-aware` 在 `hyperNodeOrderFn` 末尾 `scaledScores[name] = MaxNodeScore * weight * score` 的模式一致。
 
 ## group-topology-affinity 扩展点
 
 | 扩展点 | 用途 |
 |--------|------|
-| `OnSessionOpen` | 构建 `TopologyOccupancyIndex` |
+| `OnSessionOpen` | 构建 `TopologyOccupancyIndex`；解析 `arguments` 中的 `weight`（默认 `1`，键名与 `network-topology-aware` 相同） |
 | `AddHyperNodeGradientForJobFn` | Hard 跨 PodGroup 约束下的 Job 级别梯度 |
 | `AddHyperNodeGradientForSubJobFn` | Hard 跨 SubGroup 约束下的 SubJob 级别梯度（含同 Job 已分配 SubJob 域） |
-| `AddHyperNodeOrderFn` | Soft 跨组拓扑亲和/反亲和偏好 |
+| `AddHyperNodeOrderFn` | Soft 跨组拓扑亲和/反亲和偏好；分数 × `arguments.weight` 后参与 Framework Order 累加 |
 | `AddJobValidFn`（可选 P2） | 全局域耗尽预检 |
 
 ## network-topology-aware 改动（最小）
@@ -1760,1219 +1837,87 @@ tiers:
 
 # 架构与时序图
 
-本章给出端到端调度路径的**流程图**与**时序图**，便于实现与评审时对齐模块边界。图中 **Framework** = Framework Session；**network-topology-aware**、**group-topology-affinity**、**allocate** 均使用插件/模块全称。时序图里 `allocateAction` 的**自环**表示 allocate 模块内部步骤，不是跨参与者的递归调用。
+两张总览图概括配置准入与 allocate 拓扑路径；模块职责、聚合规则、插件扩展点与代码锚点见 [#调度实现](#调度实现)。
 
-**阅读顺序建议：** 图例与分层 → §4 Framework gradient 聚合 → §5 `allocateForJob` → §6–§8 SubJob / 跨 PodGroup 示例。
+| 想了解… | 阅读 |
+|--------|------|
+| Framework 拓扑 gradient 交集、allocate 资源预筛 | [框架约束 · HyperNode Gradient 聚合](#框架约束hypernode-gradient-多插件聚合)、[聚合流程](#聚合流程拓扑插件交集--allocate-资源预筛) |
+| `group-topology-affinity` / 占用索引 | [调度实现 · group-topology-affinity 扩展点](#group-topology-affinity-扩展点) |
+| 实例 2 / 4 / 5 在调度链上的含义 | [用户场景](#用户场景与能力对照)、[概述 · 目标示意](#目标示意volcano-视角) |
 
-## 图例与分层
+**符号：** `Domain_T(H)` = HyperNode H 在分离 tier T 上的祖先域。
+
+---
+
+## 总览图 1：分层与调度周期
+
+配置经 Webhook 进入 Cache；每个 Session 内插件初始化 → allocate（拓扑路径）→ Close 写回 Status。
 
 ```mermaid
-flowchart LR
-    subgraph L1 [配置与准入]
-        API[PodGroup API]
-        WH[Admission Webhook]
-        Cache[Scheduler Cache / JobInfo]
+flowchart TB
+    subgraph config_admission [配置与准入]
+        podgroup_api[PodGroup API]
+        admission_webhook[Admission Webhook]
+        scheduler_cache[Scheduler Cache / JobInfo]
     end
-    subgraph L2 [Session 周期]
-        Open[Session Open]
-        Plugins[Plugins OnSessionOpen]
-        Actions[Actions Execute]
-        Close[Session Close / JobUpdater]
+    subgraph session_cycle [Session 周期]
+        session_open[Session Open]
+        network_topology_aware["network-topology-aware<br/>HyperNode 资源账面"]
+        group_topology_affinity["group-topology-affinity<br/>TopologyOccupancyIndex"]
+        scheduler_actions[allocate / enqueue / backfill]
+        session_close[Session Close · JobUpdater]
     end
-    subgraph L3 [allocate 拓扑路径]
-        Grad[HyperNodeGradient 聚合]
-        ResF[filterGradientsByMinResource]
-        DryRun[dry-run + Statement]
-        NodeP[predicate + Bind]
-    end
-    API --> WH --> Cache --> Open --> Plugins --> Actions
-    Actions --> Grad --> ResF --> DryRun --> NodeP --> Close
+    podgroup_api --> admission_webhook --> scheduler_cache --> session_open
+    session_open --> network_topology_aware
+    session_open --> group_topology_affinity
+    session_open --> scheduler_actions --> session_close
 ```
 
-| 符号 | 含义 |
+---
+
+## 总览图 2：allocate 拓扑路径（组内 + 组间）
+
+Hard 约束：各拓扑插件产出 gradient → Framework **集合交集 + 按 tier 重分层** → allocate **`filterGradientsByMinResource`** → SubJob dry-run → Node predicate。Soft 约束仅走 `HyperNodeOrderFn`，不参与交集。
+
+```mermaid
+flowchart TB
+    allocate_entry([allocateForJob / allocateForSubJob]) --> requires_hypernode{RequiresHyperNodeAllocate?}
+    requires_hypernode -->|否| node_allocate_path[allocateResourcesForTasks<br/>Node predicate]
+    requires_hypernode -->|是| network_topology_aware_grad["network-topology-aware<br/>HyperNodeGradient"]
+    network_topology_aware_grad --> group_topology_affinity_grad["group-topology-affinity<br/>HyperNodeGradient + Order"]
+    group_topology_affinity_grad --> framework_intersect["Framework: ⋂ 插件 eligible<br/>rebuildGradientsByTier"]
+    framework_intersect --> gradients_empty{交集或资源过滤后为空?}
+    gradients_empty -->|是| job_pending[Job/SubJob Pending<br/>可选 TopologyUnsatisfiable]
+    gradients_empty -->|否| resource_filter[filterGradientsByMinResource]
+    resource_filter --> dry_run[dry-run 选 HyperNode<br/>Statement 模拟 Gang]
+    dry_run --> bind_pods[allocateResourcesForTasks<br/>predicate + Bind]
+    bind_pods --> update_state["group-topology-affinity 更新 OccupancyIndex<br/>network-topology-aware 更新资源账面"]
+    node_allocate_path --> allocate_done([本周期结束或继续 SubJob])
+    update_state --> allocate_done
+    job_pending --> allocate_done
+```
+
+**场景与总览图的对应：**
+
+- **跨 PodGroup 反亲和（实例 2、5）：** Job 级 `HyperNodeGradientForJobFn` 剪枝；`TopologyOccupancyIndex` 记录 `Domain_T` 已占用；见调度实现 [设计决策-1](#ad-1跨-podgroup-仅做反亲和) 与 `group-topology-affinity` 插件节。
+- **跨 SubJob 亲和/反亲和（实例 4、6、7）：** SubJob 级 `HyperNodeGradientForSubJobFn`；policy 内互斥 vs 跨 policy 由双 selector 区分；见 [API 设计 · subGroupTopologyAffinity](#subgrouptopologyaffinity同-podgroup跨-subgroup)。
+- **组内 Gang（实例 1、3）：** 仅 `network-topology-aware` 参与 gradient（无组间 term 时 `group-topology-affinity` 可不注册 gradient）；与组间 term 同时存在时 **AND** 交集。
+
+---
+
+## 代码锚点（实现对照）
+
+| 步骤 | 路径 |
 |------|------|
-| 实线箭头 | 同步调用 / 顺序执行 |
-| 虚线箭头 | 可选路径或条件分支 |
-| `Domain_T(H)` | HyperNode H 在分离 tier T 上的祖先域 |
+| allocate 入口 / 资源预筛 | `pkg/scheduler/actions/allocate/allocate.go` |
+| Gradient 多插件交集 | `pkg/scheduler/framework/session_plugins.go` |
+| 组间插件 | `pkg/scheduler/plugins/group-topology-affinity/` |
+| 组内拓扑插件 | `pkg/scheduler/plugins/network-topology-aware/network_topology_aware.go` |
+| 占用索引 | `pkg/scheduler/api/topology_occupancy.go` |
 
 ---
 
-## 1. 调度周期总览
-
-Volcano 一个 scheduling cycle 内，与本文相关的组件协作关系如下。
-
-```mermaid
-flowchart TB
-    Start([Scheduler RunOnce]) --> CacheSync[Cache 同步 PodGroup / Pod / HyperNode]
-    CacheSync --> OpenSession[framework.OpenSession]
-    OpenSession --> PluginOpen[各 Plugin OnSessionOpen]
-    PluginOpen --> NTAInit[network-topology-aware: 初始化 HyperNode 资源账面]
-    PluginOpen --> GTAInit[group-topology-affinity: 构建 TopologyOccupancyIndex]
-    PluginOpen --> Actions[按序执行 Actions]
-    Actions --> Enqueue[enqueue 可选]
-    Enqueue --> Allocate[allocate]
-    Allocate --> Backfill[backfill 可选]
-    Backfill --> CloseSession[Session Close]
-    CloseSession --> JobUpdater[JobUpdater 写回 PodGroup Status / Annotation]
-    JobUpdater --> End([周期结束])
-```
-
----
-
-## 2. Session Open 时序图
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Sch as Volcano Scheduler
-    participant Cache as SchedulerCache
-    participant Framework as Framework Session
-    participant network-topology-aware as network-topology-aware
-    participant group-topology-affinity as group-topology-affinity
-    participant Gang as gang
-
-    Sch->>Cache: 构建 Jobs / Nodes / HyperNodes
-    Sch->>Framework: OpenSession(cache)
-    Framework->>network-topology-aware: OnSessionOpen(ssn)
-    network-topology-aware->>network-topology-aware: initHyperNodeResourceCache<br/>汇总 Node → HyperNode 资源
-    network-topology-aware->>Framework: 写入 ssn.HyperNodeResourceCache
-    network-topology-aware->>Framework: Register HyperNodeOrderFn / GradientFn / EventHandler
-    Framework->>group-topology-affinity: OnSessionOpen(ssn)
-    group-topology-affinity->>group-topology-affinity: TopologyOccupancyIndex.Build<br/>已运行 Job 的 Domain 占用
-    group-topology-affinity->>Framework: Register HyperNodeGradientFn / OrderFn
-    Framework->>Gang: OnSessionOpen(ssn)
-    Note over Framework: 其他插件略
-    Sch->>Framework: Execute allocate action
-```
-
----
-
-## 3. allocate Action 总流程
-
-```mermaid
-flowchart TB
-    Start([allocate.Execute]) --> BuildCtx[buildAllocateContext<br/>按 Queue 组织 JobWorksheet]
-    BuildCtx --> PopQueue{queues 非空?}
-    PopQueue -->|否| End([结束])
-    PopQueue -->|是| PopJob[取 Job]
-    PopJob --> CheckPath{RequiresHyperNodeAllocate?<br/>hard topology / subGroupPolicy<br/>/ hard cross topology}
-    CheckPath -->|否| NormalPath[tasksNoHardTopology 队列<br/>allocateResourcesForTasks 直调]
-    CheckPath -->|是| TopoPath[allocateForJob]
-    NormalPath --> PushQueue[queue 重新入队]
-    TopoPath --> PushQueue
-    PushQueue --> PopQueue
-```
-
-**`RequiresHyperNodeAllocate()` 判定（流程图）：**
-
-```mermaid
-flowchart LR
-    J[JobInfo] --> A{ContainsHardTopology?}
-    A -->|是| Y[走 allocateForJob]
-    A -->|否| B{ContainsSubJobPolicy?}
-    B -->|是| Y
-    B -->|否| C{ContainsHardCrossPodGroupTopology<br/>or SubGroupPolicy?}
-    C -->|是| Y
-    C -->|否| N[走普通 Node 分配路径]
-```
-
----
-
-## 4. Framework：HyperNodeGradient 聚合
-
-### 4.1 聚合流程图
-
-```mermaid
-flowchart TB
-    Entry([HyperNodeGradientForJobFn<br/>或 ForSubJobFn]) --> LoopP[遍历 enabledHyperNodeGradient 插件]
-    LoopP --> CallP[调用 plugin.gradientFn<br/>得到 gradients_p]
-    CallP --> UnionP["eligible_p = ⋃_k gradients_p[k]"]
-    UnionP --> MoreP{还有插件?}
-    MoreP -->|是| LoopP
-    MoreP -->|否| OneP{仅 1 个插件?}
-    OneP -->|是| RetSingle[直接返回该 gradients]
-    OneP -->|否| Intersect["topologyEligible = ⋂_p eligible_p"]
-    Intersect --> Empty{交集为空?}
-    Empty -->|是| RetNil[返回 nil / 空 gradient]
-    Empty -->|否| Rebuild[rebuildGradientsByTier<br/>按 tier 升序分层]
-    Rebuild --> RetGrad[返回 [][]HyperNode]
-```
-
-### 4.2 聚合时序图（Job 级别示例）
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant allocateAction as allocate.allocateForJob
-    participant Framework as Framework Session
-    participant network-topology-aware as network-topology-aware
-    participant group-topology-affinity as group-topology-affinity
-
-    allocateAction->>Framework: HyperNodeGradientForJobFn(job, clusterRoot)
-    Framework->>network-topology-aware: gradientJob(job, root)
-    network-topology-aware->>network-topology-aware: hyperNodeGradientFn BFS<br/>tier / highestTierAllowed
-    network-topology-aware-->>Framework: gradients_network_topology_aware
-    Framework->>group-topology-affinity: gradientJob(job, root)
-    group-topology-affinity->>group-topology-affinity: 剪枝: 跨 PodGroup antiAffinity 等
-    group-topology-affinity-->>Framework: gradients_group_topology_affinity
-    Framework->>Framework: eligible_network_topology_aware = ⋃ gradients_network_topology_aware
-    Framework->>Framework: eligible_group_topology_affinity = ⋃ gradients_group_topology_affinity
-    Framework->>Framework: eligible = eligible_network_topology_aware ∩ eligible_group_topology_affinity
-    Framework->>Framework: rebuildGradientsByTier(eligible)
-    Framework-->>allocateAction: hyperNodeGradients
-```
-
----
-
-## 5. allocateForJob 完整流程
-
-### 5.1 流程图
-
-```mermaid
-flowchart TB
-    Start([allocateForJob]) --> Snap[SnapshotSubJobStatus]
-    Snap --> G1[HyperNodeGradientForJobFn<br/>拓扑聚合]
-    G1 --> R1[filterGradientsByMinResource<br/>job, nil, gradients]
-    R1 --> EmptyR{过滤后为空?}
-    EmptyR -->|是| FailJob([返回 nil<br/>Job 不可调度])
-    EmptyR -->|否| LoopGrad[遍历 gradient 层 g]
-    LoopGrad --> LoopHN[遍历该层每个 hyperNode H]
-    LoopHN --> Reset[ResetFitErr + Clone jobWorksheet]
-    Reset --> LoopSJ[遍历 subJobs<br/>organizeJobWorksheet 顺序]
-    LoopSJ --> AFSJ[allocateForSubJob<br/>subJob, worksheet, H]
-    AFSJ --> Merge{stmt 非空?}
-    Merge -->|是| AccScore[累计分数 / 检查 JobReady]
-    Merge -->|否| LoopSJ
-    AccScore --> Recover[RecoverSubJobStatus]
-    Recover --> DryDiscard[Statement Discard<br/>dry-run 不落库]
-    DryDiscard --> LoopHN
-    LoopHN --> HasSol{本层有可行解?}
-    HasSol -->|否| LoopGrad
-    HasSol -->|是| BestJob[selectBestHyperNodeForJob]
-    BestJob --> Commit[RecoverOperations + Commit]
-    Commit --> Recorder[Recorder 更新 AllocatedHyperNode]
-    Recorder --> RetStmt([返回 Statement])
-```
-
-### 5.2 时序图
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant allocateAction as allocateForJob
-    participant Framework as Framework Session
-    participant network-topology-aware as network-topology-aware
-    participant group-topology-affinity as group-topology-affinity
-    participant AFSJ as allocateForSubJob
-
-    allocateAction->>allocateAction: SnapshotSubJobStatus(job)
-    allocateAction->>Framework: HyperNodeGradientForJobFn(job, root)
-    Note over Framework,group-topology-affinity: 见「4.2 聚合时序图」
-    Framework-->>allocateAction: jobGradients
-    allocateAction->>allocateAction: filterGradientsByMinResource(job, nil, jobGradients)
-    allocateAction->>Framework: 读 HyperNodeResourceCache
-    loop 每个 gradient 层 / 每个 hyperNode H
-        allocateAction->>allocateAction: jobWorksheetCopy = Clone()
-        loop 每个 subJob
-            allocateAction->>AFSJ: allocateForSubJob(subJob, ws, H)
-            AFSJ-->>allocate: stmt, score
-            allocateAction->>allocateAction: Discard(stmt) dry-run
-        end
-        allocateAction->>allocateAction: selectBestHyperNodeForJob(scores)
-    end
-    allocateAction->>allocateAction: Commit 最优 Statement
-    allocateAction->>allocateAction: Recorder.UpdateDecisionToJob
-```
-
----
-
-## 6. HyperNode 最小资源预筛（allocate）
-
-与 `HyperNodeGradientFor*Fn` **解耦**，在 allocate 内完成。
-
-### 6.1 流程图
-
-```mermaid
-flowchart TB
-    Start([filterGradientsByMinResource]) --> Partial{job/subJob 已有<br/>AllocatedHyperNode?}
-    Partial -->|是| Skip[跳过资源过滤<br/>返回原 gradients]
-    Partial -->|否| MinR[minResource = job 或 subJob<br/>.GetMinResources]
-    MinR --> LoopG[遍历每层 gradient]
-    LoopG --> LoopH[遍历层内每个 hn]
-    LoopH --> Read[读 ssn.HyperNodeResourceCache hn]
-    Read --> Check{minResource <= idle<br/>OR <= futureIdle?}
-    Check -->|是| Keep[保留 hn]
-    Check -->|否| Drop[剔除 hn]
-    Keep --> LoopH
-    Drop --> LoopH
-    LoopH --> PruneEmpty[剔除空层]
-    PruneEmpty --> Ret([返回过滤后 gradients])
-```
-
-### 6.2 时序图
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant allocateAction as allocate action
-    participant Framework as Framework Session
-    participant Cache as HyperNodeResourceCache
-
-    allocateAction->>allocateAction: 若 AllocatedHyperNode 非空则直接返回
-    allocateAction->>allocateAction: minResource = GetMinResources()
-    loop 每个 hyperNode hn in gradients
-        allocateAction->>Framework: HyperNodeResourceCache[hn]
-        Framework->>Cache: idle / futureIdle
-        Cache-->>allocate: 资源账面
-        allocateAction->>allocateAction: HyperNodeSatisfiesMinResource?
-    end
-    allocate-->>allocate: 返回过滤后的 gradients
-```
-
----
-
-## 7. allocateForSubJob 与选优
-
-### 7.1 流程图
-
-```mermaid
-flowchart TB
-    Start([allocateForSubJob]) --> G2[HyperNodeGradientForSubJobFn<br/>subJob, hyperNodeForJob]
-    G2 --> R2[filterGradientsByMinResource<br/>job, subJob, gradients]
-    R2 --> LoopG2[遍历 gradient / hyperNode 候选]
-    LoopG2 --> ARF[allocateResourcesForTasks<br/>tasks, hyperNode]
-    ARF --> HasStmt{有分配操作?}
-    HasStmt -->|是| Backup[stmtBackup + worksheetBackup]
-    HasStmt -->|否| LoopG2
-    Backup --> Discard2[Discard dry-run]
-    Discard2 --> LoopG2
-    LoopG2 --> Select[selectBestHyperNodeForSubJob<br/>HyperNodeOrderMapFn 分数累加]
-    Select --> LCA[更新 subJob.AllocatedHyperNode<br/>LCA 合并]
-    LCA --> Ret([返回 bestStmt, score])
-```
-
-### 7.2 时序图（含 HyperNodeOrder）
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant AFSJ as allocateForSubJob
-    participant Framework as Framework Session
-    participant network-topology-aware as network-topology-aware
-    participant group-topology-affinity as group-topology-affinity
-    participant ARF as allocateResourcesForTasks
-
-    AFSJ->>Framework: HyperNodeGradientForSubJobFn(subJob, parentHN)
-    Framework-->>AFSJ: subJobGradients
-    AFSJ->>AFSJ: filterGradientsByMinResource(job, subJob, ...)
-    loop 每个候选 hyperNode
-        AFSJ->>ARF: allocateResourcesForTasks(subJob, tasks, hn)
-        ARF-->>AFSJ: stmt / empty
-        AFSJ->>AFSJ: stmt.Discard()
-    end
-    AFSJ->>Framework: HyperNodeOrderMapFn(subJob, candidateNodes)
-    Framework->>network-topology-aware: HyperNodeOrderFn → scores_network_topology_aware
-    Framework->>group-topology-affinity: HyperNodeOrderFn → scores_group_topology_affinity
-    Framework->>Framework: 分数相加
-    Framework-->>AFSJ: bestHyperNode, score
-    AFSJ->>AFSJ: RecoverOperations(bestStmt)
-```
-
----
-
-## 8. Task 级：allocateResourcesForTasks 与 Node predicate
-
-HyperNode 选定后的 **Node 级**路径（与 HyperNode 资源预筛分层）。
-
-```mermaid
-flowchart TB
-    Start([allocateResourcesForTasks]) --> Nodes[RealNodesList hyperNode]
-    Nodes --> PopT{tasks 非空?}
-    PopT -->|否| RetStmt([返回 Statement])
-    PopT -->|是| PopTask[Pop Task]
-    PopTask --> QueueOK{ssn.Allocatable?}
-    QueueOK -->|否| PopT
-    PopTask --> PrePred[PrePredicateFn]
-    PrePred --> PredRes[predicate: InitResreq vs<br/>node.FutureIdle]
-    PredRes --> PredPlugins[PredicateForAllocateAction<br/>各插件]
-    PredPlugins --> HasNode{有可行 Node?}
-    HasNode -->|否| FitErr[记录 FitErrors]
-    HasNode -->|是| Order[prioritizeNodes / NodeOrderFn]
-    Order --> Pipeline[Statement.Pipeline / Commit op]
-    Pipeline --> SubReady{SubJobReady?}
-    SubReady -->|是| PopT
-    SubReady -->|否| PopT
-```
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant ARF as allocateResourcesForTasks
-    participant Framework as Framework Session
-    participant Pred as predicates 等
-
-    loop 每个 Task
-        ARF->>Framework: Allocatable(queue, task)
-        ARF->>Framework: PrePredicateFn(task)
-        ARF->>ARF: predicate(task, node)
-        Note over ARF: 先 FutureIdle 资源判断
-        ARF->>Framework: PredicateForAllocateAction(task, node)
-        Framework->>Pred: 插件 Predicate
-        ARF->>Framework: prioritizeNodes
-        ARF->>ARF: allocateResourcesForTask → Pipeline
-    end
-```
-
----
-
-## 9. group-topology-affinity：占用索引与跨 PodGroup 反亲和
-
-### 9.1 OccupancyIndex 构建（Session Open）
-
-```mermaid
-flowchart LR
-    subgraph Input
-        Jobs[Running/Inqueue Jobs]
-        Ann[job.AllocatedHyperNode]
-        PGSpec[topologyAffinity terms]
-    end
-    subgraph Build
-        TierMap[解析 separationTier]
-        Domain[Domain_T AllocatedHN]
-        Idx[topologyGroup → domain → Set JobUID]
-    end
-    Jobs --> Ann --> Domain --> Idx
-    PGSpec --> TierMap --> Idx
-```
-
-### 9.2 跨 PodGroup 反亲和判定（hard）
-
-```mermaid
-flowchart TB
-    Start([候选 HyperNode H<br/>调度 Job J]) --> TG{J 配置了<br/>topologyGroup / selector?}
-    TG -->|否| Pass[eligible]
-    TG -->|是| DomH[计算 Domain_T(H)]
-    DomH --> Lookup[OccupancyIndex 查询<br/>同 topologyGroup 已占用 domain]
-    Lookup --> Conflict{存在其他 Job<br/>且 domain 相同?}
-    Conflict -->|是| Reject[从 gradient 剔除 H]
-    Conflict -->|否| Pass
-```
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant group-topology-affinity as group-topology-affinity
-    participant Idx as TopologyOccupancyIndex
-    participant Framework as HyperNodes
-
-    group-topology-affinity->>Framework: gradientJob(job, root)
-    loop BFS 每个候选 hn
-        group-topology-affinity->>group-topology-affinity: Domain_T(hn) at separationTier
-        group-topology-affinity->>Idx: IsDomainOccupied(topologyGroup, domain, job.UID)
-        Idx-->>group-topology-affinity: occupied / free
-    end
-    group-topology-affinity-->>group-topology-affinity: 输出剪枝后 gradients_group_topology_affinity
-```
-
----
-
-## 10. 跨 SubGroup 约束（SubJob 之间）
-
-> **作用域提醒：** 约束在 **SubJob** 之间；同一 `subGroupPolicy.name` 下可有多个 SubJob（`matchLabelKeys`）。**policy 内**互斥：selector 同名（实例 4）；**跨 policy**互斥：selector 不同名（实例 6）。**不**涉及 `topologyAffinity`。
-
-### 10.1 SubJob 调度顺序（organizeJobWorksheet）
-
-含 hard `subGroupAntiAffinity` 时，**被依赖方先调度**（如先 prefill，再 decode）。
-
-```mermaid
-flowchart LR
-    WS[JobWorksheet.subJobs 优先队列] --> Req[未满足 minSubGroups 的 GID 优先]
-    Req --> Anti[antiAffinity 中作为 SubGroupSelector<br/>的 policy 对应 subJob 优先]
-    Anti --> Order[SubJobOrderFn gang ready]
-```
-
-### 10.2 跨 SubGroup 亲和 / 反亲和判定
-
-```mermaid
-flowchart TB
-    Start([SubJob S 候选 hn]) --> Aff{hard subGroupAffinity?}
-    Aff -->|是| PeerA[取 peer subJobs 已分配<br/>AllocatedHyperNode]
-    PeerA --> SameDom{Domain_T(hn) ==<br/>Domain_T(peer)?}
-    SameDom -->|否| RejA[剔除]
-    SameDom -->|是| Anti
-    Aff -->|否| Anti{hard subGroupAntiAffinity?}
-    Anti -->|是| PeerB[取 antiSubGroupSelector<br/>对应已分配 peer]
-    PeerB --> DiffDom{Domain_T(hn) !=<br/>Domain_T(peer)?}
-    DiffDom -->|否| RejB[剔除]
-    DiffDom -->|是| OK[保留]
-    Anti -->|否| OK
-```
-
-### 10.3 时序示例：实例 6（prefill 与 decode 跨角色分机柜）
-
-仅当配置了 prefill↔decode 的 `subGroupTopologyAffinity` 时适用。
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant allocateAction as allocateForJob
-    participant AFSJ as allocateForSubJob
-    participant group-topology-affinity as group-topology-affinity
-
-    allocateAction->>AFSJ: allocateForSubJob(prefill)
-    AFSJ->>AFSJ: 选定 SubJob prefill，Domain_cabinet=A
-    allocateAction->>AFSJ: allocateForSubJob(decode)
-    group-topology-affinity->>group-topology-affinity: subGroupAntiAffinity: Domain_cabinet(decode) != A
-    group-topology-affinity->>group-topology-affinity: subGroupAffinity: Domain_super(decode) == Domain_super(prefill)
-```
-
-### 10.4 拓扑结构对照
-
-**实例 4（Prefill-Decode 默认）：** prefill 分片占不同 cabinet，decode 分片占不同 cabinet，prefill 与 decode 无柜级约束。
-
-```mermaid
-flowchart TB
-    subgraph PF[prefill 副本]
-        P0[prefill-0 @ cabinet-1]
-        P1[prefill-1 @ cabinet-2]
-        P2[prefill-2 @ cabinet-3]
-        P3[prefill-3 @ cabinet-4]
-    end
-    subgraph DC[decode 副本]
-        D0[decode-0 @ cabinet-5]
-        D1[decode-1 @ cabinet-6]
-    end
-```
-
-**实例 6（可选）：** prefill 柜组与 decode 柜组分离，仍共 supernode。
-
-```mermaid
-flowchart TB
-    subgraph SN[supernode S]
-        CA[cabinet A — prefill SubJob 4 Pods]
-        CB[cabinet B — decode SubJob 4 Pods]
-    end
-```
-
-| 场景 | 约束 |
-|------|------|
-| 实例 4：prefill 分片互斥 | `subGroupAntiAffinity` @ cabinet，selector 均为 `[prefill]` |
-| 实例 4：prefill vs decode | **无** |
-| 实例 6：prefill vs decode | `Domain_cabinet` 互异且 `Domain_super` 相同 |
-
----
-
-## 11. 多 Instance：跨 PodGroup 反亲和
-
-```mermaid
-flowchart TB
-    subgraph Cluster
-        subgraph SN1[超节点 SN-1]
-            PG1[PodGroup instance-0]
-        end
-        subgraph SN2[超节点 SN-2]
-            PG2[PodGroup instance-1]
-        end
-        subgraph SN3[超节点 SN-3]
-            PG3[PodGroup instance-2]
-        end
-    end
-    PG1 -.->|topologyGroup 相同<br/>Domain 互斥| PG2
-    PodGroup2 -.->|Domain 互斥| PG3
-```
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant PodGroup1 as PodGroup inst-0
-    participant PodGroup2 as PodGroup inst-1
-    participant group-topology-affinity as group-topology-affinity
-    participant Idx as OccupancyIndex
-
-    PodGroup1->>group-topology-affinity: 调度完成 Domain_T=SN-1
-    group-topology-affinity->>Idx: Register(inst-0, SN-1)
-    PodGroup2->>group-topology-affinity: gradient 候选
-    group-topology-affinity->>Idx: SN-1 occupied by inst-0
-    group-topology-affinity->>group-topology-affinity: 仅尝试 SN-2, SN-3, ...
-    PodGroup2->>PodGroup2: 落入 SN-2
-    group-topology-affinity->>Idx: Register(inst-1, SN-2)
-```
-
----
-
-## 12. Hard 约束综合决策（单候选 HyperNode）
-
-对单个候选 `hn` 在进入 dry-run 前的逻辑合并视图（实现可分散在 group-topology-affinity / network-topology-aware / allocate，语义如下）。
-
-```mermaid
-flowchart TB
-    H[候选 HyperNode hn] --> R1{allocate:<br/>minResource 满足?}
-    R1 -->|否| X[剔除]
-    R1 -->|是| R2{network-topology-aware:<br/>tier / highestTierAllowed?}
-    R2 -->|否| X
-    R2 -->|是| R3{group-topology-affinity:<br/>跨 PodGroup antiAffinity?}
-    R3 -->|冲突| X
-    R3 -->|否| R4{group-topology-affinity:<br/>跨 SubGroup affinity / antiAffinity?}
-    R4 -->|不满足| X
-    R4 -->|满足| OK[进入 dry-run]
-```
-
----
-
-## 13. 失败路径与 Status 回写
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant allocateAction as allocate action
-    participant Framework as Framework
-    participant Gang as gang OnSessionClose
-    participant JU as JobUpdater
-    participant PodGroupAPI as PodGroup API
-
-    allocateAction->>allocateAction: gradient 交集为空 / 资源过滤为空
-    allocate-->>Framework: 本周期未 Commit
-    Framework->>Gang: OnSessionClose
-    Gang->>PodGroupAPI: 可选 Unschedulable Condition
-    Framework->>JU: UpdateAll
-    JU->>PodGroupAPI: Phase / Conditions<br/>TopologyUnsatisfiable 等
-    JU->>PodGroupAPI: Annotation job-allocated-hypernode
-```
-
----
-
-## 14. 与现有实现对齐说明
-
-| 图中步骤 | 代码锚点（当前/目标） |
-|----------|----------------------|
-| allocate.Execute | `pkg/scheduler/actions/allocate/allocate.go` |
-| HyperNodeGradientForJobFn | `pkg/scheduler/framework/session_plugins.go`（目标：多插件交集） |
-| filterGradientsByMinResource | `allocate.go`（**待实现**） |
-| hyperNodeGradientFn BFS | `pkg/scheduler/plugins/network-topology-aware/network_topology_aware.go` |
-| isEligibleHyperNode 资源分支 | 同上（**待迁出**至 allocate） |
-| allocateResourcesForTasks + predicate | `allocate.go` |
-| HyperNodeOrderMapFn | `session_plugins.go` + `util.PrioritizeHyperNodes` |
-
----
-
-# 竞品与标准对齐
-
-本章从 **友商产品用法**、**与本设计的能力差距**、**字段映射** 三方面展开，便于对外沟通、迁移评估与 API 对齐。各小节均附 **官方资料链接**；文中 YAML 为从文档摘录的 **示意配置**（层级名、label 需与目标集群一致）。
-
-## 能力总览
-
-| 能力维度 | kube-scheduler | Kueue | KAI Scheduler | Koordinator | Volcano（现状） | Volcano（本设计） |
-|----------|----------------|-------|---------------|-------------|-----------------|-------------------|
-| Gang / PodGroup | PodGroup `gang.minCount` | Workload + PodSet 准入 | PodGroup + pod-grouper | Coscheduling PodGroup | PodGroup + gang | 不变 |
-| 组内拓扑共域 | `schedulingConstraints.topology` | PodSet 注解 `podset-required-topology` | `TopologyConstraint` / Job 注解 | PodGroup 注解 `network-topology-spec` | `networkTopology` + HyperNode | 不变 |
-| 组内 SubGroup | 无（Workload 多模板） | `podset-group-name` 多 PodSet | Hierarchical `subGroups[]` | 多 PodGroup + `groups` 注解 | `subGroupPolicy` | 不变 |
-| 跨 PodGroup / 多 instance 打散 | Pod `topologySpreadConstraints` | 多 Workload / 多 PodSet 组 | 多 PodGroup + 各 constraint | 多 PodGroup `groups` + gather | 无 | `topologyAffinity.podGroupAntiAffinity` |
-| 同 PodGroup 内分片互斥 | Pod spread | slice 注解（单层/多层） | 多 SubGroup + 各层 constraint | 单 PodGroup gather | `matchLabelKeys` + policy 内 anti | 实例 4 |
-| 同 PodGroup 跨角色拓扑 | Pod affinity 组合 | 多 PodSet 同域注解 | 父/子 SubGroup 层级共域 | `groups` + MustGather | 无 | `subGroupTopologyAffinity` |
-| 拓扑数据源 | Node label | Node label 层级 | Topology CRD 树 | `ClusterNetworkTopology` + Node label | HyperNode CRD | HyperNode CRD |
-| 组间 hard 反亲和 API | 无（Pod 级 spread） | 无 | 无一等字段 | 无（gather 语义） | 无 | `required` + `separationTierName` 或 `separationTier` |
-
----
-
-## 友商洞察（详细）
-
-### Kubernetes（kube-scheduler）
-
-**定位：** 在 **标准 PodGroup Gang** 上增加 **Workload 级拓扑共域**；跨副本打散仍主要依赖 **Pod 级** `topologySpreadConstraints` / `podAffinity`，**没有** PodGroup 级「拓扑组互斥」或「同 PodGroup 内 SubGroup 互斥」API。
-
-| 资料 | 链接 |
-|------|------|
-| Topology-Aware Workload Scheduling（TAS 概念） | https://kubernetes.io/docs/concepts/workloads/workload-api/topology-aware-scheduling/ |
-| PodGroup API（`scheduling.k8s.io/v1alpha2`） | https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-group-v1alpha2/ |
-| Pod Topology Spread | https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/ |
-| Pod Affinity / Anti-Affinity | https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
-| Gang 调度算法（placement-based） | https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling/pod-group-scheduling/ |
-
-#### 用法 1：PodGroup Gang + 单条拓扑共域（TAS）
-
-**适用：** 分布式训练等「整组必须落在同一 rack/zone label 域」。
-
-**要点（v1.36 alpha）：**
-
-- `schedulingPolicy.gang.minCount`：整组 **一次性模拟** 放置，满足 `minCount` 才 commit。
-- `schedulingConstraints.topology`：**每个 PodGroup 仅允许一条** topology；`key` 为 **Node label**（非 CRD 树）。
-- 语义是 **共域（colocation）**，不是「子组互斥」或「多 PodGroup 互斥」。
-- TAS **不支持** 为拓扑触发抢占；无可行域则整组 Unschedulable。
-
-```yaml
-apiVersion: scheduling.k8s.io/v1alpha2
-kind: PodGroup
-metadata:
-  name: example-podgroup
-spec:
-  schedulingPolicy:
-    gang:
-      minCount: 4
-  schedulingConstraints:
-    topology:
-      - key: topology.example.com/rack   # 全部 Pod 共享同一 rack label 值
-```
-
-**与本设计：** 近似 Volcano `PodGroupSpec.networkTopology`（Job 级 envelope），但 Volcano 用 HyperNode `tierName` 而非任意 node label；且 Volcano 可叠加 **组间** `topologyAffinity` / `subGroupTopologyAffinity`。
-
-#### 用法 2：Pod Topology Spread（副本打散）
-
-**适用：** Deployment / 无 Gang 的副本 **尽量均匀** 分布在 zone/rack。
-
-```yaml
-spec:
-  topologySpreadConstraints:
-    - maxSkew: 1
-      topologyKey: topology.kubernetes.io/zone
-      whenUnsatisfiable: DoNotSchedule
-      labelSelector:
-        matchLabels:
-          app: llama-70b
-```
-
-**局限：**
-
-- **Pod 级**、逐 Pod 调度；与 PodGroup Gang **混用困难**（先绑定的 Pod 会锁定 spread 域）。
-- 无 `topologyGroup` 概念；多 **独立 PodGroup instance** 的「各占不同超节点」需靠 label + spread **间接** 表达，运维成本高。
-
-#### 用法 3：Pod Affinity / Anti-Affinity
-
-**适用：** 细粒度「跟某 Pod 同节点/同 hostname」。
-
-**局限（Gang 场景）：** KAI 拓扑设计文档明确指出：带 PodAffinity 的 PodGroup 在调度第一个 Pod 后会把 label 域 **锁死**，后续 Pod 无法回退尝试其它节点，易导致 **整组无解**。Volcano / KAI 均倾向 **PodGroup 级拓扑插件 + 整组模拟**，而非 Pod 级 affinity 链式锁定。
-
-#### 与本设计差距（摘要）
-
-| 本设计诉求 | Kubernetes 常见写法 | 差距 |
-|------------|---------------------|------|
-| 多 inference instance 各占不同超节点 | spread + 统一 app label | Pod 级；无 PodGroup `topologyGroup` |
-| Prefill-Decode 分片分机柜 + 共超节点 | 多条 Pod 规则或无法表达 | 无 SubGroup / 无组间 Term |
-| 同 PodGroup 内 prefill-0 vs prefill-1 互斥 | 需自建 label + spread | 无 `subGroupAntiAffinity` |
-
----
-
-### Kueue
-
-**定位：** **队列 + 准入（admission）** 阶段的拓扑感知；用 **Node label 层级** 描述数据中心结构，用户通过 **Job PodTemplate 注解** 声明 PodSet 共域/偏好，**不是** Volcano 式 HyperNode CRD，也 **没有** PodGroup 级跨 Workload 反亲和 API。
-
-| 资料 | 链接 |
-|------|------|
-| Topology Aware Scheduling（概念与注解） | https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/ |
-| `Topology` / `ResourceFlavor` API | 同上（Admin-facing APIs） |
-| TAS 与 Cluster Autoscaler | 同上（Provisioning AdmissionCheck） |
-| v0.17 多层 slice（alpha） | 同上（`TASMultiLayerTopology`） |
-
-#### 管理员：定义拓扑层级
-
-```yaml
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: Topology
-metadata:
-  name: default
-spec:
-  levels:
-    - nodeLabel: cloud.provider.com/topology-block
-    - nodeLabel: cloud.provider.com/topology-rack
-    - nodeLabel: kubernetes.io/hostname
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata:
-  name: tas-flavor
-spec:
-  topologyName: default
-  nodeLabels:
-    cloud.provider.com/node-group: tas-group
-```
-
-调度前 Kueue 按层级计算各域 **空闲容量**（扣除已准入 TAS Workload 与其它 Pod 占用）。
-
-#### 用户：PodSet 拓扑注解（Job `template.metadata.annotations`）
-
-| 注解 | 语义 |
-|------|------|
-| `kueue.x-k8s.io/podset-required-topology` | **Hard**：该 PodSet 全部 Pod 必须在注解值所指 **同一拓扑域**（如 rack）；放不下则不准入 |
-| `kueue.x-k8s.io/podset-preferred-topology` | **Soft**：优先共域；不行则向上一层扩散，最终可跨域准入 |
-| `kueue.x-k8s.io/podset-unconstrained-topology` | 参与 TAS 容量计算，但不强制共域（减碎片） |
-| `kueue.x-k8s.io/podset-group-name` | 多个 PodSet **共享** 同一 flavor 与拓扑域（类似「绑在一起准入」） |
-| `kueue.x-k8s.io/podset-slice-required-topology-constraints` | 多层 slice（最多 3 层，需 feature gate） |
-
-**示例（preferred @ block）：**
-
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  generateName: tas-sample-preferred
-  labels:
-    kueue.x-k8s.io/queue-name: tas-user-queue
-spec:
-  parallelism: 40
-  template:
-    metadata:
-      annotations:
-        kueue.x-k8s.io/podset-preferred-topology: cloud.provider.com/topology-block
-    spec:
-      containers:
-        - name: worker
-          image: registry.k8s.io/e2e-test-images/agnhost:2.53
-          resources:
-            requests:
-              cpu: "1"
-              memory: 200Mi
-```
-
-**多层 slice 示例（64 Pod：block 内 32、rack 内 16）：**
-
-```yaml
-metadata:
-  annotations:
-    kueue.x-k8s.io/podset-slice-required-topology-constraints: |
-      [
-        {"topology": "cloud.provider.com/topology-block", "size": 32},
-        {"topology": "cloud.provider.com/topology-rack", "size": 16}
-      ]
-```
-
-#### 与本设计关系
-
-| 维度 | Kueue | Volcano 本设计 |
-|------|-------|----------------|
-| 调度阶段 | **准入前** 选域，再交给 kube-scheduler 绑 Node | Volcano Session 内 HyperNode gradient + allocate |
-| 多 PodGroup 互斥 | 靠多个 Workload / 运维约定，**无** `podGroupAntiAffinity` | `topologyAffinity` + `topologyGroup` |
-| 同 PodGroup 内 prefill/decode | `podset-group-name` 绑多个 PodSet **共域**；**无** policy 内 pairwise 反亲和 | `subGroupTopologyAffinity` + `matchLabelKeys` |
-| 拓扑模型 | Node label 链 | HyperNode 树 + `separationTierName` |
-
-KAI 拓扑插件 **显式参考 Kueue Topology CRD**（见下节），Volcano 与 Kueue **路径不同**（HyperNode vs label），但 **required/preferred 分层思想** 与 Volcano `networkTopology.mode` / 组间 `required`·`preferred` 可对齐理解。
-
----
-
-### KAI Scheduler（NVIDIA）
-
-**定位：** AI 训练/推理场景下的 **Gang + 独立 topology 插件**；**分层 PodGroup（SubGroups）** 表达组件差异；拓扑通过 **Job 注解 → PodGroup.TopologyConstraint** 注入。与 Volcano 本设计 **架构最接近**，但 **缺少** 跨 PodGroup hard 反亲和、同 PodGroup 内显式 `subGroupAntiAffinity` Term。
-
-| 资料 | 链接 |
-|------|------|
-| Topology Aware Scheduling 设计 | https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/topology-awareness/README.md |
-| Hierarchical PodGroup / SubGroups | https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/hierarchical-podgroup/README.md |
-| PodGroup CRD 类型（v2alpha2） | https://github.com/kai-scheduler/KAI-scheduler/blob/main/pkg/apis/scheduling/v2alpha2/podgroup_types.go |
-| 跨 Workload 手写 PodGroup 讨论 | https://github.com/kai-scheduler/kai-scheduler/issues/1420 |
-| Run:ai 用户文档（TAS 概念） | https://run-ai-docs.nvidia.com/saas/platform-management/aiinitiatives/resources/topology-aware-scheduling |
-| Kueue Topology（KAI 对齐参考） | https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/ |
-
-#### 用法 1：Job 注解 → PodGroup 拓扑约束
-
-`pod-grouper` 从 **顶层 Owner** 读取注解并写入 PodGroup：
-
-| 注解 | 含义 |
-|------|------|
-| `kai.scheduler/topology` | 使用的 Topology CRD 名称 |
-| `kai.scheduler/topology-required-placement` | **Hard**：整 Job 不得跨越该层级（如 `zone`） |
-| `kai.scheduler/topology-preferred-placement` | **Soft**：优先该层级（如 `rack`） |
-
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: topology-aware-job
-  annotations:
-    kai.scheduler/topology: network
-    kai.scheduler/topology-required-placement: zone
-    kai.scheduler/topology-preferred-placement: rack
-```
-
-对应 PodGroup 字段（设计草案）：
-
-```yaml
-spec:
-  topologyConstraint:
-    topology: network
-    requiredTopologyLevel: zone
-    preferredTopologyLevel: rack
-```
-
-**调度实现（两阶段）：**
-
-1. **Stage 1**：维护 `TopologyInfo` 树，按域汇总资源；`NodeOrder` / `Predicate` 按距离排序（解决 PodAffinity 在 Gang 下锁死问题）。
-2. **Stage 2**：`FeasibleNodes(PodGroup) [][]Node` **枚举**可行拓扑域并 simulation（精度高、大集群成本高）。
-
-#### 用法 2：分层 SubGroup（Prefill / Decode 等）
-
-**资料：** [Hierarchical PodGroup README](https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/hierarchical-podgroup/README.md)
-
-Pod 通过 label `kai.scheduler/subgroup-name` 归属 **叶子 SubGroup**；父 SubGroup 可设 `minSubGroup` 与 **自己的** `topologyConstraint`。
-
-**示例（User Story 3：decode / prefill 各在 block 内，rack 上 Gang）：**
-
-```yaml
-spec:
-  minSubGroup: 2
-  subGroups:
-    - name: decode
-      minSubGroup: 2
-      topologyConstraint:
-        topology: cluster-topology
-        requiredTopologyLevel: block
-    - name: decode-workers
-      parent: decode
-      minMember: 4
-      topologyConstraint:
-        requiredTopologyLevel: rack
-    - name: prefill
-      minSubGroup: 2
-      topologyConstraint:
-        requiredTopologyLevel: block
-    - name: prefill-workers
-      parent: prefill
-      minMember: 4
-      topologyConstraint:
-        requiredTopologyLevel: rack
-```
-
-**表达力对比：**
-
-| 诉求 | KAI 典型写法 | Volcano 本设计 |
-|------|--------------|----------------|
-| prefill 与 decode **可** 不同 block | 父 SubGroup 各 `requiredTopologyLevel: block` | 默认 **不** 配跨角色 anti；共超节点用 Job `networkTopology` 或 `subGroupAffinity` |
-| 4 个 prefill **分片** 各在不同 rack | 需 **多个叶子 SubGroup** 或副本 SubGroup 集（见 Example 3/4） | **一条** `subGroupPolicy` + `matchLabelKeys` + policy 内 `[prefill]` anti（实例 4） |
-| 多 instance 各占不同超节点 | **多个 PodGroup**，各自 topology；无 `topologyGroup` | `topologyAffinity.podGroupAntiAffinity` @ `supernode` |
-| prefill vs decode **强制分机柜** | 无 `antiSubGroupSelector`；靠层级与 placement 间接实现 | 实例 6：`subGroupAntiAffinity` 跨 policy |
-
-#### 与本设计差距（摘要）
-
-- **有：** 拓扑树、`required`/`preferred` level、分层 SubGroup、独立 topology 插件、Gang 整组模拟。
-- **无：** `topologyGroup`；`podGroupAntiAffinity`；`subGroupAntiAffinity` 的 **policy 内两两互斥** Term；`separationTierName` 与 HyperNode 统一（KAI 用 Topology CRD level 字符串）。
-
----
-
-### Koordinator
-
-**定位：** 在 **scheduler-plugins Coscheduling** 上扩展 **网络拓扑感知**；通过 **`ClusterNetworkTopology` CR** + **PodGroup/Pod 注解 JSON** 配置 **PreferGather / MustGather**；支持 **多 PodGroup 编组**（`groups` 注解）做联合 gather，仍 **不是** 声明式「A 与 B 在 tier T 上必须异域」。
-
-| 资料 | 链接 |
-|------|------|
-| Network Topology Aware Scheduling（用户手册） | https://koordinator.sh/docs/user-manuals/network-topology-aware-scheduling |
-| Coscheduling 插件（scheduler-plugins） | https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/site/content/en/docs/plugins/coscheduling.md |
-| `ClusterNetworkTopology` API（v1alpha1） | https://koordinator.sh/docs/user-manuals/network-topology-aware-scheduling#configure-network-topology |
-
-**启用条件（文档要求）：**
-
-- `koord-scheduler` 启动参数：`--enable-network-topology-manager=true`
-- Coscheduling 插件配置：`awareNetworkTopology: true`（可选 `enablePreemption: true`）
-
-#### 管理员：拓扑 CR + Node label
-
-```yaml
-apiVersion: scheduling.koordinator.sh/v1alpha1
-kind: ClusterNetworkTopology
-metadata:
-  name: default
-spec:
-  networkTopologySpec:
-    - labelKey:
-        - network.topology.nvidia.com/spine
-      topologyLayer: SpineLayer
-    - labelKey:
-        - network.topology.nvidia.com/block
-      parentTopologyLayer: SpineLayer
-      topologyLayer: BlockLayer
-    - parentTopologyLayer: BlockLayer
-      topologyLayer: NodeTopologyLayer
-```
-
-Node 示例：`network.topology.nvidia.com/block`、`.../spine` 等 label（可用 NVIDIA topograph 等工具打标）。
-
-#### 用户：PodGroup `network-topology-spec`（gather 策略）
-
-**PreferGather（尽量聚合，资源紧时仍可调度）：**
-
-```yaml
-apiVersion: scheduling.sigs.k8s.io/v1alpha1
-kind: PodGroup
-metadata:
-  name: topology-demo-job
-  annotations:
-    gang.scheduling.koordinator.sh/network-topology-spec: |
-      {
-        "gatherStrategy": [
-          { "layer": "BlockLayer", "strategy": "PreferGather" },
-          { "layer": "SpineLayer", "strategy": "PreferGather" }
-        ]
-      }
-spec:
-  minMember: 4
-```
-
-Pod 需：`schedulerName: koord-scheduler`、label `pod-group.scheduling.sigs.k8s.io: <pg名>`、注解 `gang.scheduling.koordinator.sh/network-topology-index: "0"`…（建立组内通信序号）。
-
-**MustGather（硬共域，不满足则 Pending / 拓扑感知抢占）：**
-
-```yaml
-annotations:
-  gang.scheduling.koordinator.sh/network-topology-spec: |
-    {
-      "gatherStrategy": [
-        { "layer": "SpineLayer", "strategy": "MustGather" }
-      ]
-    }
-```
-
-文档场景：4 Pod 训练 Job 必须落在 **同一 Spine**；资源不足时 **按拓扑约束抢占** 低优先级 Pod，并用 `nominatedNodeName` 预留节点。
-
-| 策略 | 语义 | 近似 Volcano |
-|------|------|--------------|
-| `PreferGather` | 优先聚合到同一 layer 域 | `networkTopology.mode: soft` |
-| `MustGather` | 必须整组落在同一 layer 域 | `networkTopology.mode: hard` 或 Job 级 envelope |
-| `podCountMultiple` | Block 层按 Pod 数倍聚集（TP 训练） | 组内 `subGroupSize` + Gang |
-
-#### 用法：多 PodGroup 联合拓扑（`groups`）
-
-适用于 **master + worker** 等多 PodGroup 必须 **一起** MustGather 到同一 Spine：
-
-```yaml
-apiVersion: scheduling.sigs.k8s.io/v1alpha1
-kind: PodGroup
-metadata:
-  annotations:
-    gang.scheduling.koordinator.sh/groups: |
-      ["default/llm-master", "default/llm-worker"]
-    gang.scheduling.koordinator.sh/network-topology-spec: |
-      {
-        "gatherStrategy": [
-          { "layer": "SpineLayer", "strategy": "MustGather" }
-        ]
-      }
-```
-
-**与本设计：** `groups` 表达 **多个 PodGroup 共域**（MustGather）；Volcano Phase 1 **仅实现** 共享 `topologyGroup` + **`podGroupAntiAffinity`（异域）**，跨 PodGroup 共域 **不做**（由单 PodGroup `networkTopology` / `subGroupAffinity` 承担）。Koordinator **无** policy 内 pairwise 分机柜 API。
-
----
-
-### scheduler-plugins（Kubernetes SIG）
-
-**定位：** 提供 **Coscheduling**（PodGroup `minMember` + Permit），**不包含** 拓扑亲和/反亲和 CRD；拓扑能力在 **Koordinator 发行版** 中通过 Coscheduling 扩展实现。
-
-| 资料 | 链接 |
-|------|------|
-| Coscheduling 插件文档 | https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/site/content/en/docs/plugins/coscheduling.md |
-| 仓库首页 | https://github.com/kubernetes-sigs/scheduler-plugins |
-
-**典型用法（仅 Gang）：**
-
-```yaml
-apiVersion: scheduling.x-k8s.io/v1alpha1
-kind: PodGroup
-metadata:
-  name: pg1
-spec:
-  minMember: 3
-  scheduleTimeoutSeconds: 10
-```
-
-拓扑需另接 Koordinator 注解或 kube-scheduler TAS / Pod spread。
-
----
-
-### Volcano（现状与本补丁）
-
-| 资料 | 链接 |
-|------|------|
-| Network Topology Aware Scheduling（组内） | [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md) |
-| Preempt 与拓扑 | [Preempt Action Support Topology](./preempt-action-support-topology.md) |
-| 本设计（组间） | 本文档 |
-
-**已有（`network-topology-aware`）：** HyperNode 树、`PodGroupSpec.networkTopology`、`subGroupPolicy` + `matchLabelKeys`、`subGroupPolicy[].networkTopology`、`allocateForJob` / SubJob 两级 Gang。
-
-**本设计新增（`group-topology-affinity`）：** `topologyAffinity`（跨 PodGroup）、`subGroupTopologyAffinity`（同 PodGroup 跨 SubGroup）；Framework 拓扑 gradient **交集**；allocate **资源预筛** 与拓扑解耦。
-
----
-
-## 场景对照：友商写法 vs 本设计
-
-| 业务场景 | Kubernetes | Kueue | KAI | Koordinator | Volcano 本设计 |
-|----------|------------|-------|-----|-------------|----------------|
-| 训练 Job 整组同 rack | PodGroup `topology.key=rack` | `podset-required-topology: rack` | `topology-required-placement: rack` | MustGather @ BlockLayer | `networkTopology` @ cabinet/rack tier |
-| 40 副本尽量同 block | Pod spread | `podset-preferred-topology` | `preferredTopologyLevel` | PreferGather | `networkTopology.mode: soft` |
-| 多 inference instance 分超节点 | spread + label | 多 Job / 运维隔离 | 多 PodGroup | 多 PodGroup + 不同 gather | `topologyGroup` + `podGroupAntiAffinity` |
-| PD：分片分机柜 + 共超节点 | 难 | `podset-group-name` 仅共域 | 多 SubGroup + 父级 block | 单 PG gather + 多 PG groups | **实例 4** |
-| PD：prefill/decode 强制分柜 | Pod anti-affinity | 难 | 层级 constraint 组合 | 多 layer gather | **实例 6** |
-| 分片尽量分柜、可降级 | spread `ScheduleAnyway` | `podset-preferred-topology` | preferred level | PreferGather | **实例 7** `preferred` + `weight` |
-
----
-
-## Volcano 差异化（相对友商）
-
-1. **组间与组内 API 分离：** `networkTopology`（组内 Gang）vs `topologyAffinity` / `subGroupTopologyAffinity`（组间），避免 Koordinator 式「全写进注解 JSON」或 K8s 式「只有共域一条 topology」。
-2. **HyperNode 层级双写法：** 组间 `separationTierName` / `separationTier` 与组内 `highestTierName` / `highestTierAllowed` 共用同一 HyperNode 映射；对齐运维 CR，而非 node label。
-3. **同 PodGroup 内 policy 级 Term：** `subGroupSelector` / `antiSubGroupSelector` 支持 **policy 内两两互斥**（实例 4），无需 KAI 式为每个分片复制 SubGroup 树。
-4. **跨 PodGroup 显式反亲和（不做跨 PodGroup 亲和）：** `topologyGroup` + `podGroupAntiAffinity.required`，补 KAI/Koordinator/Kueue 在「多 instance 互斥」上的缺口。
-5. **插件分工：** `network-topology-aware` + `group-topology-affinity`；hard 拓扑 gradient **多插件交集**（借鉴 KAI 多约束思想，接口与 Volcano Framework 一致）。
-
----
-
-## 字段映射表
-
-### 表 1：组内拓扑共域（Colocation / Gang 域内）
-
-| 语义 | Volcano（已有） | Volcano（本设计，不变） | K8s PodGroup TAS | KAI PodGroup |
-|------|-----------------|-------------------------|------------------|--------------|
-| 约束模式 | `networkTopology.mode` hard/soft | 同左 | 隐含 hard（共域） | required + preferred |
-| 不跨越的 tier 上限 | `highestTierAllowed` / `highestTierName` | 同左 | `topology[].key`（node label） | `requiredTopologyLevel`（最大层级） |
-| 拓扑数据源 | HyperNode CRD | 同左 | Node labels | Topology CRD |
-| 组内 Gang | `minMember` + `subGroupSize` / `minSubGroups` | 同左 | `gang.minCount` | `minMember` / SubGroup `minMember` |
-
-**映射说明：**
-
-- K8s `topology[].key` ≈ 在某一 **label 域** 内共域；Volcano `highestTierAllowed` ≈ 在 HyperNode 树 **某 tier 祖先** 内共域。
-- KAI `requiredTopologyLevel: rack` ≈ Volcano `highestTierAllowed` 指向 tierName=`rack` 的 HyperNode 层（需集群 tier 命名一致）。
-
-### 表 2：跨 PodGroup / 多 Instance（组间拓扑 **反亲和**）
-
-| 语义 | Volcano（本设计） | K8s 近似 | KAI 近似 |
-|------|-------------------|----------|----------|
-| 逻辑分组 | `topologyGroup` 或 `podGroupSelector` | `topologySpreadConstraints.labelSelector` + 工作负载 label | 多个 PodGroup + 相同 queue/label |
-| 分离边界 | `separationTier` / `separationTierName` | `topologySpreadConstraints.topologyKey` | 各 PodGroup 的 `requiredTopologyLevel`（共域式，非互斥） |
-| Hard 互斥（**跨 PodGroup，Phase 1 仅此**） | `podGroupAntiAffinity.required[]` | `whenUnsatisfiable: DoNotSchedule` + skew | **无直接等价** |
-| Soft 互斥偏好 | `podGroupAntiAffinity.preferred[]` + weight | `ScheduleAnyway` + skew | `preferredTopologyLevel` |
-| 跨 PodGroup 共域 | **不支持** `podGroupAffinity` | N/A | 多 PodGroup 各自 topology / gather |
-
-**迁移示例（概念）：**
-
-K8s 多副本跨 zone 打散（Deployment）：
-
-```yaml
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: DoNotSchedule
-    labelSelector:
-      matchLabels:
-        app: llama-70b
-```
-
-Volcano 多 PodGroup instance（Gang + 超节点互斥）：
-
-```yaml
-metadata:
-  labels:
-    volcano.sh/topology-group: llama-70b
-spec:
-  topologyAffinity:
-    podGroupAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyGroup: llama-70b
-          separationTierName: supernode
-```
-
-### 表 3：跨 SubGroup（**仅同 PodGroup 内**，Prefill-Decode 等）
-
-> API 容器：`subGroupTopologyAffinity`。**不**跨 PodGroup；多 instance 互斥见表 2 `topologyAffinity`。
-
-| 语义 | Volcano（本设计） | KAI Hierarchical PodGroup | K8s |
-|------|-------------------|---------------------------|-----|
-| 子组识别 | `subGroupPolicy[].name` + `matchSubGroupPolicyNames` | `subGroups[].name` + `kai.scheduler/subgroup-name` label | 无 |
-| 组间拓扑 API 容器 | `subGroupTopologyAffinity` | 无（各 SubGroup 独立 constraint） | 无 |
-| 子组间共域（亲和） | `subGroupAffinity` 或 `PodGroupSpec.networkTopology`（见实例 4） | 父 SubGroup `topologyConstraint.requiredTopologyLevel`（如 block） | Pod affinity |
-| 子组间互斥（反亲和） | `subGroupTopologyAffinity.subGroupAntiAffinity` + `subGroupSelector` / `antiSubGroupSelector` | **无显式字段**；Story 3 靠不同子树 placement | `podAntiAffinity` |
-| 子组内 Gang | `subGroupPolicy.networkTopology` + `subGroupSize` | SubGroup `minMember` + `topologyConstraint` | 单条 PodGroup topology |
-
-**Prefill-Decode 场景映射：**
-
-| 诉求 | Volcano | 说明 |
-|------|---------|------|
-| 4+2 分片、2 条 policy、共超节点 | **实例 4** | 共超节点写法见实例 4 方式一/二；分片反亲和 |
-| 多 instance + 实例 4 | **实例 5** | `topologyAffinity` @ supernode |
-| 仅需分机柜、无共超节点 | 省略 Job 级别 `networkTopology` 与 `subGroupAffinity` | 仅 subGroupPolicy 内反亲和 |
-| 分片尽量分机柜、允许降级 | **实例 7** | `subGroupAntiAffinity.preferred` + `weight` |
-| prefill 与 decode 无要求 | 省略跨角色 antiAffinity | 实例 4 仍可用 Job 级别 `networkTopology` 共 supernode |
-| 仅 2 条 policy 整块角色分机柜+共超节点 | 实例 6 | |
-
-> **结论**：`subGroupTopologyAffinity` 表达 **SubJob（policy）之间** 关系；推荐 **一条 policy + matchLabelKeys**（实例 4），无需按分片拆多条 policy。
-
-### 表 4：插件与调度路径
-
-| 语义 | Volcano | KAI | kube-scheduler |
-|------|---------|-----|----------------|
-| 域内 Gang + gradient | `network-topology-aware` | topology 插件 Stage 2 simulation | PodGroup placement algorithm |
-| 域间组间拓扑亲和 | `group-topology-affinity`（新） | topology 插件 Stage 1 filter/order | `PodTopologySpread` plugin |
-| 占用索引 | `TopologyOccupancyIndex` | `TopologyInfo` 树 | `PodTopologySpread` PreFilter 状态 |
-| HyperNode 候选 | 拓扑：多插件 gradient 交集 + 重分层；容量：**allocate 资源预筛**（非 Gradient 回调） | `FeasibleNodes(PodGroup)` 规划 | N/A |
-
-### 表 5：tier / level 命名对齐（运维配置）
-
-**前提：** 组内 `highestTierName` / `highestTierAllowed` 与组间 `separationTierName` / `separationTier` 均来自本集群 HyperNode，**不是** Volcano 内置枚举。见 [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)。
-
-建议流程：部署 HyperNode → 维护 **tier ↔ tierName** 对照表 → PodGroup 组内/组间 **各选一种** 写法（name 或 int）→ Webhook 校验映射存在。
-
-| 物理含义（示例） | `spec.tierName` | `spec.tier`（示例） | 组内 | 组间 |
-|------------------|-----------------|---------------------|------|------|
-| 超节点 | `supernode` | `2` | `highestTierName` / `highestTierAllowed` | `separationTierName` / `separationTier` |
-| 机柜 | `cabinet` | `1` | 同上 | 同上 |
-| 节点 | （常为叶子层） | `0` | 组内常用；组间一般用更高层 | 同上 |
-
-| KAI `requiredTopologyLevel` | 对齐 Volcano `separationTierName`（需集群 tier 命名一致） |
-|-----------------------------|--------------------------------------------------------|
-| `block` / `zone` | `supernode` 等 |
-| `rack` | `cabinet` / `rack` |
-
-> 复制文档 YAML 前执行：`kubectl get hypernodes -o custom-columns=NAME:.metadata.name,TIER:.spec.tier,TIERNAME:.spec.tierName`，确认 `TIERNAME` 列与 PodGroup 中填写一致。
-
----
-
-## 标准对齐建议
-
-1. **术语**：`separationTierName` / `separationTier` 分别对齐 HyperNode `spec.tierName` / `spec.tier`，与组内 `highestTierName` / `highestTierAllowed` 同源；`topologyGroup` 对齐 topology spread 的 “同一 spread 组”。
-2. **硬/软**：组间拓扑用 **`required` / `preferred`** 对齐 K8s PodAffinity；`networkTopology.mode` 对齐 K8s `whenUnsatisfiable` 与域内 Gang 的 hard/soft。
-3. **IgnoredDuringExecution**：与 PodAffinity / KAI 一致，已调度 Pod 不因约束变化驱逐（与现有 Volcano 拓扑调度一致）。
-4. **后续可选**：提供转换工具或文档，将 KAI 注解 `kai.scheduler/topology-required-placement` 映射为 Volcano `TopologySeparationSpec`（只读文档即可，非必须代码）。
-
----
-
-## 竞品结论（摘要）
-
-| 问题 | 结论 |
-|------|------|
-| 是否有完全相同的 API？ | **无**。K8s：PodGroup 单条 topology 共域 + Pod spread；Kueue：准入阶段 PodSet 注解；KAI：SubGroup `topologyConstraint`；Koordinator：gather/MustGather 注解。均 **无** Volcano 式 `subGroupAntiAffinity` policy 内互斥 + `topologyGroup` 跨 PodGroup hard 反亲和。 |
-| 最接近方案？ | **KAI Scheduler**（拓扑树 + 分层 SubGroup + 独立 topology 插件 + Gang 模拟）。其次 **Koordinator**（Gang + 多级 gather，偏共域与抢占）。 |
-| 迁移时优先对照谁？ | 组内 Gang → K8s TAS / Kueue required / Koordinator MustGather / KAI required level；多 instance → Kueue 多 Workload 或本设计 `topologyAffinity`；PD 分片 → KAI 多 SubGroup 或本设计 **实例 4**。 |
-| Volcano 差异化？ | 见 [Volcano 差异化（相对友商）](#volcano-差异化相对友商)。 |
-| 插件拆分是否合理？ | **是**；与 KAI 多 topology 插件思路一致；Framework **Gradient 交集 + 统一分层**，与 `HyperNodeOrderFn` 累加对称。 |
-
-## 外部参考资料索引
-
-按产品分类，便于评审时跳转（与上文 [友商洞察（详细）](#友商洞察详细) 一致）。
-
-**Kubernetes**
-
-- [Topology-Aware Workload Scheduling](https://kubernetes.io/docs/concepts/workloads/workload-api/topology-aware-scheduling/)
-- [PodGroup API (v1alpha2)](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-group-v1alpha2/)
-- [Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
-- [Assign Pods to Nodes — Affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity)
-
-**Kueue**
-
-- [Topology Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/)
-
-**KAI Scheduler**
-
-- [Topology Awareness Design](https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/topology-awareness/README.md)
-- [Hierarchical PodGroup Design](https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/hierarchical-podgroup/README.md)
-- [Issue #1420 — Cross-workload PodGroup](https://github.com/kai-scheduler/kai-scheduler/issues/1420)
-- [Run:ai — Topology Aware Scheduling](https://run-ai-docs.nvidia.com/saas/platform-management/aiinitiatives/resources/topology-aware-scheduling)
-
-**Koordinator / scheduler-plugins**
-
-- [Koordinator — Network Topology Aware Scheduling](https://koordinator.sh/docs/user-manuals/network-topology-aware-scheduling)
-- [scheduler-plugins — Coscheduling](https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/site/content/en/docs/plugins/coscheduling.md)
-
-**Volcano**
-
-- [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)
-- [Preempt Action Support Topology](./preempt-action-support-topology.md)
-
----
-
-# Validation Rules (Webhook)
+# 校验规则（Webhook）
 
 **通用**
 
@@ -2980,15 +1925,15 @@ spec:
 
 **`topologyAffinity`（跨 PodGroup）**
 
-2. **`podGroupAffinity` 必须为空**（Phase 1 未实现；写入则 Webhook **拒绝**）。
-3. 配置 `podGroupAntiAffinity` term 时，`topologyGroup` 与 `podGroupSelector` 至少其一。
+2. Phase 1 CRD **无** `topologyAffinity.podGroupAffinity`（见 [设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)）；**无** `topologyGroup` 字段；提交未知字段由 API Server 拒绝。
+3. 每条 `podGroupAntiAffinity` term 的 `podGroupSelector` **必填**（`metav1.LabelSelector`：支持 `matchLabels` / `matchExpressions`）；可选 `namespaceSelector` 限制 peer PodGroup 命名空间（语义对齐 kube-scheduler）。
 4. `podGroupSelector` 不得仅匹配本 PodGroup 自身来模拟 SubGroup 关系（应使用 `subGroupTopologyAffinity`）。
 
 **`subGroupTopologyAffinity`（同 PodGroup、跨 SubGroup）**
 
 5. 若 `subGroupTopologyAffinity` 非空，则 `subGroupPolicy` 非空且 `len(subGroupPolicy) >= 2`。
 6. 所有 `matchSubGroupPolicyNames` 必须是 **本 PodGroup** `subGroupPolicy[].name`（**禁止**写 SubJobID 分片后缀如 `prefill-0`）。
-7. `subGroupTopologyAffinity` term 中 **禁止** 出现 `topologyGroup`、`podGroupSelector`、`namespaceSelector`（跨 PodGroup 字段仅属于 `topologyAffinity.podGroupAntiAffinity`）。
+7. `subGroupTopologyAffinity` term 中 **禁止** 出现 `podGroupSelector`、`namespaceSelector`（跨 PodGroup 字段仅属于 `topologyAffinity.podGroupAntiAffinity`）。
 8. `subGroupAntiAffinity`：**跨 policy** 时 `subGroupSelector` 与 `antiSubGroupSelector` 的 policy name 集合 **不相交**；**policy 内两两互斥** 时允许两侧填写 **相同** policy name（如均为 `[prefill]`，实例 4）。
 9. `subGroupAffinity.required` 中每条 `matchSubGroupPolicyNames` 至少包含 **2 个不同** policy name（如 `[prefill, decode]`，覆盖其下全部 SubJob）。
 10. 使用 policy 内互斥时，该 policy 应配置 `matchLabelKeys` 且运行时 SubJob 数量 ≥ 2（否则 Webhook 警告）。
@@ -3002,7 +1947,7 @@ spec:
 
 ---
 
-# Status (Optional)
+# 状态（可选）
 
 ```go
 const PodGroupTopologyUnsatisfiable PodGroupConditionType = "TopologyUnsatisfiable"
@@ -3016,22 +1961,21 @@ const PodGroupTopologyUnsatisfiable PodGroupConditionType = "TopologyUnsatisfiab
 
 ---
 
-# Implementation Phases
+# 交付阶段
+
+**交付范围：P1 + P2。**
 
 | Phase | 内容 |
 |-------|------|
-| P1 | API、Framework **拓扑** gradient 交集/重分层、allocate **资源预筛**、group-topology-affinity、webhook、e2e |
-| P2 | preempt/backfill、enqueue 预检、SubJob annotation |
-| P3 | Node 级 Predicate 兜底、动态 occupancy、gradient 聚合错误策略可配置 |
+| **P1** | API、`group-topology-affinity`、Framework gradient 交集、allocate 资源预筛、Webhook、e2e |
+| **P2** | preempt/backfill 与 occupancy 一致、enqueue 预检、SubJob annotation、可选 `TopologyUnsatisfiable` |
+
+与 [#调度实现](#调度实现)、[#架构与时序图](#架构与时序图) 中的实现路径一致。
 
 ---
 
-# References
+# 参考
 
-完整分类索引见 [#外部参考资料索引](#外部参考资料索引)。以下为常用入口：
-
-- Kubernetes: [Topology-Aware Workload Scheduling](https://kubernetes.io/docs/concepts/workloads/workload-api/topology-aware-scheduling/) · [PodGroup Scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling/pod-group-scheduling/)
-- Kueue: [Topology Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/)
-- KAI: [Topology Awareness](https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/topology-awareness/README.md) · [Hierarchical PodGroup](https://github.com/kai-scheduler/KAI-scheduler/blob/main/docs/developer/designs/hierarchical-podgroup/README.md)
-- Koordinator: [Network Topology Aware Scheduling](https://koordinator.sh/docs/user-manuals/network-topology-aware-scheduling)
-- Volcano: [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)
+- Volcano：[Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)（组内拓扑与 HyperNode，本提案前置依赖）
+- Volcano：[Preempt Action Support Topology](./preempt-action-support-topology.md)（Phase 2 抢占与拓扑一致性参考）
+- Kubernetes / **kube-scheduler**：[Pod affinity and anti-affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity)（组间 `required` / `preferred` 命名与双端 selector 语义对齐参考；本提案作用域为 PodGroup/SubJob，**非** kube-scheduler 实现路径）
