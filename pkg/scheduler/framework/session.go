@@ -110,6 +110,8 @@ type Session struct {
 	RealNodesList             map[string][]*api.NodeInfo
 	RealNodesSet              map[string]sets.Set[string]
 	HyperNodesReadyToSchedule bool
+	// HyperNodeResourceStatus is the session-readable HyperNode resource ledger (maintained by network-topology-aware).
+	HyperNodeResourceStatus api.HyperNodeResourceStatusMap
 
 	plugins             map[string]Plugin
 	eventHandlers       []*EventHandler
@@ -224,6 +226,7 @@ func openSession(cache cache.Cache) *Session {
 		subJobOrderFns:                map[string]api.CompareFn{},
 		hyperNodeGradientForJobFns:    map[string]api.HyperNodeGradientForJobFn{},
 		hyperNodeGradientForSubJobFns: map[string]api.HyperNodeGradientForSubJobFn{},
+		HyperNodeResourceStatus:       api.HyperNodeResourceStatusMap{},
 	}
 
 	snapshot := cache.Snapshot()

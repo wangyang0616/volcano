@@ -1045,46 +1045,114 @@ func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map
 	return nodeScoreMap, nil
 }
 
-// HyperNodeGradientForJobFn group hyperNodes into several gradients,
-// and discard hyperNodes that unmatched the job topology requirements.
-// The result is determined by the first plugin that registered this fn.
-func (ssn *Session) HyperNodeGradientForJobFn(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
-	for _, tier := range ssn.Tiers {
-		for _, plugin := range tier.Plugins {
-			if !isEnabled(plugin.EnabledHyperNodeGradient) {
-				continue
-			}
-			fn, found := ssn.hyperNodeGradientForJobFns[plugin.Name]
-			if !found {
-				continue
-			}
-			return fn(job, hyperNode)
-		}
+// HyperNodeSatisfiesMinResource reports whether a HyperNode can satisfy minResource using session ledger data.
+func (ssn *Session) HyperNodeSatisfiesMinResource(hyperNodeName string, minResource *api.Resource) bool {
+	if minResource == nil || minResource.IsEmpty() {
+		return true
 	}
-
-	// If there is no hyperNode gradient functions, only the input hyperNode is returned.
-	return [][]*api.HyperNodeInfo{{hyperNode}}
+	status, ok := ssn.HyperNodeResourceStatus[hyperNodeName]
+	if !ok {
+		return true
+	}
+	return status.SatisfiesMinResource(minResource)
 }
 
-// HyperNodeGradientForSubJobFn group hyperNodes into several gradients,
-// and discard hyperNodes that unmatched the subJob topology requirements.
-// The result is determined by the first plugin that registered this fn.
+// SetHyperNodeResourceStatus replaces the session HyperNode resource ledger (used by network-topology-aware).
+func (ssn *Session) SetHyperNodeResourceStatus(status api.HyperNodeResourceStatusMap) {
+	ssn.HyperNodeResourceStatus = status
+}
+
+// UpdateHyperNodeResourceUsed adjusts Used/Idle/FutureIdle for a HyperNode after task allocation changes.
+func (ssn *Session) UpdateHyperNodeResourceUsed(hyperNodeName string, delta *api.Resource, add bool) {
+	status, ok := ssn.HyperNodeResourceStatus[hyperNodeName]
+	if !ok || status == nil || delta == nil {
+		return
+	}
+	if add {
+		status.Used.Add(delta)
+		status.Idle.Sub(delta)
+		status.FutureIdle.Sub(delta)
+		return
+	}
+	status.Used.Sub(delta)
+	status.Idle.Add(delta)
+	status.FutureIdle.Add(delta)
+}
+
+// HyperNodeGradientForJobFn groups HyperNodes into gradients by aggregating all topology plugins:
+// union layers per plugin, intersect across plugins, then rebuild by tier.
+func (ssn *Session) HyperNodeGradientForJobFn(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+	return ssn.aggregateHyperNodeGradients(hyperNode, func(pluginName string) [][]*api.HyperNodeInfo {
+		return ssn.hyperNodeGradientForJobFns[pluginName](job, hyperNode)
+	}, ssn.enabledHyperNodeGradientJobPlugins())
+}
+
+// HyperNodeGradientForSubJobFn groups HyperNodes into gradients by aggregating all topology plugins.
 func (ssn *Session) HyperNodeGradientForSubJobFn(subJob *api.SubJobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+	return ssn.aggregateHyperNodeGradients(hyperNode, func(pluginName string) [][]*api.HyperNodeInfo {
+		return ssn.hyperNodeGradientForSubJobFns[pluginName](subJob, hyperNode)
+	}, ssn.enabledHyperNodeGradientSubJobPlugins())
+}
+
+func (ssn *Session) enabledHyperNodeGradientJobPlugins() []string {
+	var plugins []string
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledHyperNodeGradient) {
 				continue
 			}
-			fn, found := ssn.hyperNodeGradientForSubJobFns[plugin.Name]
-			if !found {
+			if _, found := ssn.hyperNodeGradientForJobFns[plugin.Name]; !found {
 				continue
 			}
-			return fn(subJob, hyperNode)
+			plugins = append(plugins, plugin.Name)
 		}
 	}
+	return plugins
+}
 
-	// If there is no hyperNode gradient functions, only the input hyperNode is returned.
-	return [][]*api.HyperNodeInfo{{hyperNode}}
+func (ssn *Session) enabledHyperNodeGradientSubJobPlugins() []string {
+	var plugins []string
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledHyperNodeGradient) {
+				continue
+			}
+			if _, found := ssn.hyperNodeGradientForSubJobFns[plugin.Name]; !found {
+				continue
+			}
+			plugins = append(plugins, plugin.Name)
+		}
+	}
+	return plugins
+}
+
+func (ssn *Session) aggregateHyperNodeGradients(
+	hyperNode *api.HyperNodeInfo,
+	gradientFn func(pluginName string) [][]*api.HyperNodeInfo,
+	plugins []string,
+) [][]*api.HyperNodeInfo {
+	if len(plugins) == 0 {
+		return [][]*api.HyperNodeInfo{{hyperNode}}
+	}
+
+	var perPlugin [][][]*api.HyperNodeInfo
+	for _, pluginName := range plugins {
+		gradients := gradientFn(pluginName)
+		if len(gradients) == 0 {
+			return nil
+		}
+		perPlugin = append(perPlugin, gradients)
+	}
+
+	if len(perPlugin) == 1 {
+		return perPlugin[0]
+	}
+
+	eligible := api.IntersectHyperNodeGradients(perPlugin)
+	if eligible.Len() == 0 {
+		return nil
+	}
+	return api.RebuildGradientsByTier(ssn.HyperNodes, eligible)
 }
 
 // BuildVictimsPriorityQueue returns a priority queue with victims sorted by:

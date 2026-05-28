@@ -266,6 +266,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	}()
 	nta.hyperNodesTier.init(ssn.HyperNodesTiers)
 	nta.initHyperNodeResourceCache(ssn)
+	nta.syncHyperNodeResourceCacheToSession(ssn)
 
 	ssn.AddHyperNodeOrderFn(nta.Name(), func(subJob *api.SubJobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]float64, error) {
 		return nta.HyperNodeOrderFn(ssn, subJob, hyperNodes)
@@ -277,8 +278,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 
 	ssn.AddHyperNodeGradientForJobFn(nta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
 		if hardMode, highestAllowedTier := job.IsHardTopologyMode(); hardMode {
-			jobMinResource := job.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, job.AllocatedHyperNode, jobMinResource)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, job.AllocatedHyperNode)
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "job", job.UID, "hyperNode", hyperNode.Name,
 					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", job.AllocatedHyperNode)
@@ -294,8 +294,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 			return [][]*api.HyperNodeInfo{{hyperNode}} // it is unnecessary to try child hyperNode when there is no actual subJob
 		}
 		if hardMode, highestAllowedTier := subJob.IsHardTopologyMode(); hardMode {
-			subJobMinResource := subJob.GetMinResources()
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, subJob.AllocatedHyperNode, subJobMinResource)
+			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, subJob.AllocatedHyperNode)
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "subJob", subJob.UID, "hyperNode", hyperNode.Name,
 					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", subJob.AllocatedHyperNode)
@@ -312,12 +311,8 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 			node := task.NodeName
 			for hyperNode := range ssn.HyperNodes {
 				if ssn.RealNodesSet[hyperNode].Has(node) {
-					status, ok := nta.hyperNodeResourceCache[hyperNode]
-					if !ok {
-						klog.Warningf("plugin %s failed to find the resource status cache of hyperNode %s, which should not happen", PluginName, hyperNode)
-						continue
-					}
-					status.used.Add(task.Resreq)
+					nta.addTaskUsage(hyperNode, task.Resreq)
+					ssn.UpdateHyperNodeResourceUsed(hyperNode, task.Resreq, true)
 				}
 			}
 		},
@@ -326,12 +321,8 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 			node := task.NodeName
 			for hyperNode := range ssn.HyperNodes {
 				if ssn.RealNodesSet[hyperNode].Has(node) {
-					status, ok := nta.hyperNodeResourceCache[hyperNode]
-					if !ok {
-						klog.Warningf("plugin %s failed to find the resource status cache of hyperNode %s, which should not happen", PluginName, hyperNode)
-						continue
-					}
-					status.used.Sub(task.Resreq)
+					nta.subTaskUsage(hyperNode, task.Resreq)
+					ssn.UpdateHyperNodeResourceUsed(hyperNode, task.Resreq, false)
 				}
 			}
 		},
@@ -560,8 +551,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 //   - hyperNode: starting HyperNode for the search, typically the root of available HyperNode subtree
 //   - highestAllowedTier: maximum allowed topology tier to limit search scope
 //   - allocatedHyperNode: previously allocated HyperNode name for partially running scenarios (empty for initial scheduling)
-//   - minResource: minimum resource requirements for resource pre-filtering (nil to skip resource checks)
-func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string, minResource *api.Resource) ([][]*api.HyperNodeInfo, error) {
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string) ([][]*api.HyperNodeInfo, error) {
 	enqueued := set.New[string]()
 	var processQueue []*api.HyperNodeInfo
 
@@ -579,7 +569,7 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 		current := processQueue[0]
 		processQueue = processQueue[1:]
 
-		if nta.isEligibleHyperNode(current, highestAllowedTier, allocatedHyperNode, minResource) {
+		if nta.isEligibleHyperNode(current, highestAllowedTier, allocatedHyperNode) {
 			eligibleHyperNodes[current.Tier()] = append(eligibleHyperNodes[current.Tier()], current)
 		}
 
@@ -608,24 +598,46 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 	return result, nil
 }
 
-func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string, minResource *api.Resource) bool {
+func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string) bool {
 	if hn.Tier() > highestAllowedTier {
-		return false // the tier should not exceed the highest allowed
+		return false
 	}
+	return true
+}
 
-	if allocatedHyperNode != "" {
-		return true // skip pre-filtering in partially running scenarios
+func (nta *networkTopologyAwarePlugin) addTaskUsage(hyperNode string, res *api.Resource) {
+	status, ok := nta.hyperNodeResourceCache[hyperNode]
+	if !ok {
+		klog.Warningf("plugin %s failed to find the resource status cache of hyperNode %s, which should not happen", PluginName, hyperNode)
+		return
 	}
+	status.used.Add(res)
+	status.idle.Sub(res)
+	status.futureIdle.Sub(res)
+}
 
-	hnResourceStatus, found := nta.hyperNodeResourceCache[hn.Name]
-	if !found {
-		return true // Resource status for hypernode not found in cache, skipping pre-filtering for it.
+func (nta *networkTopologyAwarePlugin) subTaskUsage(hyperNode string, res *api.Resource) {
+	status, ok := nta.hyperNodeResourceCache[hyperNode]
+	if !ok {
+		klog.Warningf("plugin %s failed to find the resource status cache of hyperNode %s, which should not happen", PluginName, hyperNode)
+		return
 	}
+	status.used.Sub(res)
+	status.idle.Add(res)
+	status.futureIdle.Add(res)
+}
 
-	if minResource.LessEqual(hnResourceStatus.idle, api.Zero) || minResource.LessEqual(hnResourceStatus.futureIdle, api.Zero) {
-		return true
+func (nta *networkTopologyAwarePlugin) syncHyperNodeResourceCacheToSession(ssn *framework.Session) {
+	statusMap := make(api.HyperNodeResourceStatusMap, len(nta.hyperNodeResourceCache))
+	for hyperNode, status := range nta.hyperNodeResourceCache {
+		statusMap[hyperNode] = &api.HyperNodeResourceStatus{
+			Allocatable: status.allocatable.Clone(),
+			Used:        status.used.Clone(),
+			Idle:        status.idle.Clone(),
+			FutureIdle:  status.futureIdle.Clone(),
+		}
 	}
-	return false
+	ssn.SetHyperNodeResourceStatus(statusMap)
 }
 
 // getSearchRoot first computes the maximum allowable HyperNode subtree for the Job/SubJob based on `allocatedHyperNode`,
