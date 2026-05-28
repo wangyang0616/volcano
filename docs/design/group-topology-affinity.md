@@ -138,7 +138,7 @@ flowchart TB
 
 | 目标 | 说明 |
 |------|------|
-| **组间可声明** | **跨 PodGroup 反亲和**（`topologyAffinity.podGroupAntiAffinity`）+ **同 PodGroup 跨 SubGroup** 亲和/反亲和（`subGroupTopologyAffinity`）；分离层级与组内 `networkTopology` 一样支持 `separationTierName` / `separationTier` |
+| **组间可声明** | **跨 PodGroup 反亲和**（`topologyAffinity.podGroupAntiAffinity`）+ **同 PodGroup 跨 SubGroup** 亲和/反亲和（`subGroupTopologyAffinity`）；拓扑比较层级与组内 `networkTopology` 一样支持 `topologyTierName` / `topologyTier`（置于 `topologyDomain`） |
 | **作用域清晰** | 跨 PodGroup 与跨 SubGroup 分字段；组内仍用 `networkTopology`，不与组间混用 |
 | **Hard / Soft 可区分** | 组间 hard/soft 由 `required` / `preferred` 列表表达；`networkTopology` 单独使用 `mode` |
 | **与 network-topology-aware 可组合** | 新插件 `group-topology-affinity` 负责组间；hard 拓扑 gradient **多插件交集** 后统一分层；容量在 allocate **资源预筛** |
@@ -199,7 +199,8 @@ flowchart TB
 | [决策-3](#ad-3subgroup-反亲和双-selector) | SubGroup 反亲和 term | **双 selector** |
 | [决策-4](#ad-4subgrouptopologyaffinity-在-podgroup-顶层) | 组间边放哪 | **PodGroup 顶层** |
 | [决策-5](#ad-5组间-hardsoft) | 组间 hard/soft | **`required` / `preferred`**，term 禁止 `mode` |
-| [决策-6](#ad-6tiername-与-tier-整数二选一) | 分离层级 | **`separationTierName` 与 `separationTier` 二选一** |
+| [决策-6](#ad-6tiername-与-tier-整数二选一) | 拓扑比较层级 | **`topologyTierName` 与 `topologyTier` 二选一** |
+| [决策-7](#ad-7组间层级命名与-kubernetes-topologykey) | 字段命名 | **`topologyTierName` / `topologyTier`**（不用 `topologyKey`）；term 嵌套 **`topologyDomain`** |
 
 论证见 [#设计决策](#设计决策)。
 
@@ -218,7 +219,7 @@ flowchart TB
 | 组间互斥 / 共域（同 PodGroup） | `subGroupTopologyAffinity` | 不同 `subGroupPolicy` 拆出的 SubJob 之间 | 分片 **互斥**、角色间 **共域**（见实例 4） |
 | 跨 PodGroup | `topologyAffinity.podGroupAntiAffinity` | 不同 PodGroup（多 instance） | 多副本服务 **故障域** 隔离 |
 
-> **分离层级：** 示例 YAML 多写 `separationTierName`；等价 `separationTier` 整数见 [设计决策-6](#ad-6tiername-与-tier-整数二选一) 与 [HyperNode 层级](#hypernode-层级与-separationtier--separationtiername)。
+> **拓扑比较层级：** 示例 YAML 多写 `topologyTierName`；等价 `topologyTier` 整数见 [设计决策-6](#ad-6tiername-与-tier-整数二选一) 与 [HyperNode 层级](#hypernode-层级与-topologytier--topologytiername)。
 
 ## 如何阅读调度结果图
 
@@ -262,7 +263,7 @@ flowchart TB
 ## 场景实例
 
 > 每个实例包含：**场景与价值** → **配置要点** → **调度结果（HyperNode 树）** → **与其它实例差异**。  
-> **层级双写法（示例集群）：** `supernode` ↔ `spec.tier: 2`，`cabinet` ↔ `spec.tier: 1`。下文 YAML 在 `highestTierName` / `separationTierName` 旁用注释标出等价的 **`highestTierAllowed` / `separationTier` 整数**（二选一，勿同时启用）。
+> **层级双写法（示例集群）：** `supernode` ↔ `spec.tier: 2`，`cabinet` ↔ `spec.tier: 1`。下文 YAML 在 `highestTierName` / `topologyTierName` 旁用注释标出等价的 **`highestTierAllowed` / `topologyTier` 整数**（二选一，勿同时启用）。
 
 ### 实例 1：训练 Job — 组内 Gang
 
@@ -319,7 +320,7 @@ flowchart TB
 metadata:
   labels:
     # 【用户设置】Volcano 不会自动生成；在创建 PodGroup 时由平台/业务方写入。
-    # 【赋值原则】凡应在该 separationTier 上彼此「异域」的 PodGroup，对此键使用相同取值；
+    # 【赋值原则】凡应在同一拓扑层（topologyDomain 所指定的 tier）上彼此「异域」的 PodGroup，对此键使用相同取值；
     #   本例 llama-70b-prod = 同一生产模型服务的多 instance 池（instance-0/1/2 互斥占不同 supernode）。
     #   不同环境/流量池用不同值（如 llama-70b-staging）；与 instance 名、Pod 模板 label 无关。
     topology.volcano.sh/spread-group: llama-70b-prod
@@ -330,8 +331,8 @@ spec:
         - podGroupSelector:
             matchLabels:
               topology.volcano.sh/spread-group: llama-70b-prod
-          separationTierName: supernode
-          # separationTier: 2   # 与 separationTierName: supernode 二选一
+          topologyTierName: supernode
+          # topologyTier: 2   # 与 topologyTierName: supernode 二选一
 ```
 
 **调度结果（HyperNode 树）：** 比较在 **PodGroup 级** `Domain_supernode`；三个 instance 落在 **三个不同** supernode。
@@ -438,14 +439,14 @@ spec:
             matchSubGroupPolicyNames: [prefill]
           antiSubGroupSelector:
             matchSubGroupPolicyNames: [prefill]
-          separationTierName: cabinet
-          # separationTier: 1
+          topologyTierName: cabinet
+          # topologyTier: 1
         - subGroupSelector:
             matchSubGroupPolicyNames: [decode]
           antiSubGroupSelector:
             matchSubGroupPolicyNames: [decode]
-          separationTierName: cabinet
-          # separationTier: 1
+          topologyTierName: cabinet
+          # topologyTier: 1
 ```
 
 ---
@@ -478,22 +479,22 @@ spec:
     subGroupAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
         - matchSubGroupPolicyNames: [prefill, decode]
-          separationTierName: supernode
-          # separationTier: 2
+          topologyTierName: supernode
+          # topologyTier: 2
     subGroupAntiAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
         - subGroupSelector:
             matchSubGroupPolicyNames: [prefill]
           antiSubGroupSelector:
             matchSubGroupPolicyNames: [prefill]
-          separationTierName: cabinet
-          # separationTier: 1
+          topologyTierName: cabinet
+          # topologyTier: 1
         - subGroupSelector:
             matchSubGroupPolicyNames: [decode]
           antiSubGroupSelector:
             matchSubGroupPolicyNames: [decode]
-          separationTierName: cabinet
-          # separationTier: 1
+          topologyTierName: cabinet
+          # topologyTier: 1
 ```
 
 ---
@@ -551,8 +552,8 @@ spec:
         - podGroupSelector:
             matchLabels:
               topology.volcano.sh/spread-group: llama-70b-prod
-          separationTierName: supernode
-          # separationTier: 2
+          topologyTierName: supernode
+          # topologyTier: 2
   # subGroupPolicy + 共超节点 + subGroupAntiAffinity：同实例 4（推荐方式一）
   # 组内/组间 tier 整数注释见实例 4
 ```
@@ -592,8 +593,8 @@ spec:
             matchSubGroupPolicyNames: [prefill]
           antiSubGroupSelector:
             matchSubGroupPolicyNames: [decode]
-          separationTierName: cabinet
-          # separationTier: 1
+          topologyTierName: cabinet
+          # topologyTier: 1
   # 分片互斥、组内 @ cabinet 等同实例 4，省略
 ```
 
@@ -669,19 +670,19 @@ spec:
               matchSubGroupPolicyNames: [prefill]
             antiSubGroupSelector:
               matchSubGroupPolicyNames: [prefill]
-            separationTierName: cabinet
-            # separationTier: 1
+            topologyTierName: cabinet
+            # topologyTier: 1
         - weight: 100
           term:
             subGroupSelector:
               matchSubGroupPolicyNames: [decode]
             antiSubGroupSelector:
               matchSubGroupPolicyNames: [decode]
-            separationTierName: cabinet
-            # separationTier: 1
+            topologyTierName: cabinet
+            # topologyTier: 1
 ```
 
-> **说明：** 软性反亲和 **仅** 通过 `preferredDuringSchedulingIgnoredDuringExecution` + `weight` 表达，**不要** 在 term 上再写 `mode: soft`（与 `required`/`preferred` 重复）。`term` 内只需 `subGroupSelector`、`antiSubGroupSelector`、`separationTierName`（或 `separationTier`）。
+> **说明：** 软性反亲和 **仅** 通过 `preferredDuringSchedulingIgnoredDuringExecution` + `weight` 表达，**不要** 在 term 上再写 `mode: soft`（与 `required`/`preferred` 重复）。`term` 内只需 `subGroupSelector`、`antiSubGroupSelector`、`topologyTierName`（或 `topologyTier`）。
 
 #### 预期行为（业务视角）
 
@@ -717,7 +718,7 @@ flowchart LR
 
 # API 设计
 
-PodGroup 字段、Go 类型与能力边界。配置示例见 [#用户场景与能力对照](#用户场景与能力对照)；tier 填写见 [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)；API 取舍见 **附录**。
+PodGroup 字段、Go 类型与能力边界。配置示例见 [#用户场景与能力对照](#用户场景与能力对照)；tier 填写见 [#hypernode-层级与-topologytier--topologytiername](#hypernode-层级与-topologytier--topologytiername)；API 取舍见 **附录**。
 
 ## PodGroupSpec 新增字段
 
@@ -747,21 +748,23 @@ type PodGroupSpec struct {
 ## 核心类型
 
 ```go
-// TopologySeparationSpec defines the HyperNode tier used as the separation/comparison boundary.
-type TopologySeparationSpec struct {
-    // SeparationTier: compare scheduling domains at HyperNode.spec.tier (integer).
-    // Must match the numeric tier of a HyperNode layer in this cluster. Mutually exclusive with SeparationTierName.
+// TopologyDomainSpec selects the HyperNode tier at which Domain_T is computed for cross-group comparison.
+// Semantics align with choosing a "topology dimension" (cf. PodTopologySpread topologyKey), but values come
+// from HyperNode.spec.tierName / spec.tier — NOT from Node label keys. See design decision-7.
+type TopologyDomainSpec struct {
+    // TopologyTier: compare scheduling domains at HyperNode.spec.tier (integer).
+    // Must match the numeric tier of a HyperNode layer in this cluster. Mutually exclusive with TopologyTierName.
     // +kubebuilder:validation:Minimum=0
     // +optional
-    SeparationTier *int `json:"separationTier,omitempty"`
+    TopologyTier *int `json:"topologyTier,omitempty"`
 
-    // SeparationTierName: compare scheduling domains at HyperNode.spec.tierName (string).
+    // TopologyTierName: compare scheduling domains at HyperNode.spec.tierName (string).
     // The value MUST be identical to tierName configured on HyperNode CRs in the cluster (case-sensitive).
     // Scheduler resolves it via Session HyperNodeTierNameMap (same source as networkTopology.highestTierName).
-    // Example: if cabinet HyperNodes use spec.tierName: cabinet, set separationTierName: cabinet here.
-    // Mutually exclusive with SeparationTier.
+    // Example: if cabinet HyperNodes use spec.tierName: cabinet, set topologyTierName: cabinet here.
+    // Mutually exclusive with TopologyTier.
     // +optional
-    SeparationTierName string `json:"separationTierName,omitempty"`
+    TopologyTierName string `json:"topologyTierName,omitempty"`
     // Note: hard vs soft for topologyAffinity / subGroupTopologyAffinity is NOT expressed here.
     // Use requiredDuringSchedulingIgnoredDuringExecution (hard) vs
     // preferredDuringSchedulingIgnoredDuringExecution (soft), aligned with Kubernetes PodAffinity.
@@ -776,18 +779,27 @@ type NetworkTopologySpec struct {
 }
 ```
 
-> `TopologySeparationSpec` 的层级字段与 HyperNode CR 的对应关系、填写步骤与示例树，见 [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)。
+> `TopologyDomainSpec` 的层级字段与 HyperNode CR 的对应关系、填写步骤、与 Kubernetes `topologyKey` 的对照，见 [#hypernode-层级与-topologytier--topologytiername](#hypernode-层级与-topologytier--topologytiername) 与 [设计决策-7](#ad-7组间层级命名与-kubernetes-topologykey)。
 
 ### 与 `networkTopology` 的 tier / tierName 对齐
 
-组内 `NetworkTopologySpec` 与组间 `TopologySeparationSpec` 使用 **同一套 HyperNode 层级来源**，仅语义不同（组内「不跨越」vs 组间「在该层比 Domain 相同/不同」）：
+组内 `NetworkTopologySpec` 与组间 `TopologyDomainSpec` 使用 **同一套 HyperNode 层级来源**，仅语义不同（组内「不跨越」vs 组间「在该层比 Domain 相同/不同」）：
 
 | 用途 | 字符串（`spec.tierName`） | 整数（`spec.tier`） | 互斥 |
 |------|---------------------------|---------------------|------|
 | **组内** Gang / envelope | `networkTopology.highestTierName` | `networkTopology.highestTierAllowed` | 是 |
-| **组间** affinity / antiAffinity term | `separationTier.separationTierName` | `separationTier.separationTier` | 是 |
+| **组间** affinity / antiAffinity term | `topologyDomain.topologyTierName` | `topologyDomain.topologyTier` | 是 |
 
-调度器在 Session 内维护 **`HyperNodeTierNameMap`**（`tierName → tier`）与 **`HyperNodeTierSet`**（集群出现过的 `spec.tier` 集合）；`network-topology-aware` 与 `group-topology-affinity` **共用** 上述映射解析层级，保证同一 Job 上 `highestTierName: supernode` 与 `separationTierName: supernode`（或 `highestTierAllowed: 2` 与 `separationTier: 2`）指向 **同一物理层**。
+调度器在 Session 内维护 **`HyperNodeTierNameMap`**（`tierName → tier`）与 **`HyperNodeTierSet`**（集群出现过的 `spec.tier` 集合）；`network-topology-aware` 与 `group-topology-affinity` **共用** 上述映射解析层级，保证同一 Job 上 `highestTierName: supernode` 与 `topologyTierName: supernode`（或 `highestTierAllowed: 2` 与 `topologyTier: 2`）指向 **同一物理层**。
+
+### 与 Kubernetes `topologyKey` 的语义对照（速查）
+
+| | Kubernetes（Pod 拓扑散布 / 亲和） | Volcano 组间拓扑 term |
+|---|-----------------------------------|------------------------|
+| **字段** | `topologySpreadConstraints[].topologyKey` 等 | `topologyDomain.topologyTierName`（或 `topologyTier`） |
+| **用户填什么** | Node **标签键**（如 `topology.kubernetes.io/zone`、`kubernetes.io/hostname`） | HyperNode **`spec.tierName`**（如 `supernode`、`cabinet`），**不是** Node label |
+| **域如何划分** | 具有相同 label **key+value** 的 Node 为一域 | 沿 HyperNode 父链取第一个 `tierName`/`tier` 匹配的祖先 `metadata.name` 为 `Domain_T` |
+| **为何不直接叫 `topologyKey`** | — | 与 Job/Pod 模板内已有 **`podAffinity.topologyKey`（Node label key）** 同名异义，易误填 zone/hostname；见 [决策-7](#ad-7组间层级命名与-kubernetes-topologykey) |
 
 **推荐：** 与现有 [Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md) 设计文档一致，运维侧优先 **`tierName`**（跨集群对照表友好）；自动化/模板生成可用 **`tier` 整数**（与 CR 中 `spec.tier` 一一对应，不依赖字符串命名）。
 
@@ -798,13 +810,13 @@ type NetworkTopologySpec struct {
 | `topologyAffinity` / `subGroupTopologyAffinity` | **`requiredDuringSchedulingIgnoredDuringExecution`** = 必须满足（hard）；**`preferredDuringSchedulingIgnoredDuringExecution`** = 尽量满足（soft，`weight` 越大偏好越强） | **否**（与 Kubernetes `PodAffinity` / `PodAntiAffinity` 一致） |
 | `PodGroupSpec.networkTopology`、`subGroupPolicy[].networkTopology` | 字段 **`mode: hard \| soft`**（无 required/preferred 列表） | **是**（仅此两类配置使用 `mode`） |
 
-**为何不在 term 上保留 `mode`：** 若同时在 `preferred` 列表里写 `mode: soft`，或在 `required` 里写 `mode: hard`，与列表语义重复，且可能出现 `required` + `mode: soft` 等矛盾。Webhook 对组间拓扑 term **拒绝或忽略** `separationTier` 内的 `mode` 字段。
+**为何不在 term 上保留 `mode`：** 若同时在 `preferred` 列表里写 `mode: soft`，或在 `required` 里写 `mode: hard`，与列表语义重复，且可能出现 `required` + `mode: soft` 等矛盾。Webhook 对组间拓扑 term **拒绝或忽略** `topologyDomain` 内的 `mode` 字段。
 
 **实现约定：** `ContainsHardCrossSubGroupTopology` / `ContainsHardCrossPodGroupTopology` 仅看是否存在 **非空 `required`** 列表；`preferred` 条目只注册 `HyperNodeOrderFn`。
 
 ### YAML 书写约定
 
-- **组间 term**（`topologyAffinity` / `subGroupTopologyAffinity`）：下文示例为可读性常将 `separationTierName` 或 `separationTier` **与 selector 写在 term 同级**；与 Go 类型等价于嵌套对象 `separationTier: { ... }`，且 **`separationTierName` 与 `separationTier` 互斥**（同 `TopologySeparationSpec`）。
+- **组间 term**（`topologyAffinity` / `subGroupTopologyAffinity`）：下文示例为可读性常将 `topologyTierName` 或 `topologyTier` **与 selector 写在 term 同级**；与 Go 类型等价于嵌套对象 `topologyDomain: { ... }`，且 **`topologyTierName` 与 `topologyTier` 互斥**（同 `TopologyDomainSpec`）。
 - **组内**（`networkTopology`）：`mode: hard | soft` + `highestTierName` **或** `highestTierAllowed`（互斥），**无** `required` / `preferred` 列表。
 
 **组间 term：名称 vs 数字（等价示例，假设 supernode=`tier: 2`、cabinet=`tier: 1`）**
@@ -817,10 +829,10 @@ topologyAffinity:
       - podGroupSelector:
             matchLabels:
               topology.volcano.sh/spread-group: llama-70b-prod
-        separationTierName: supernode   # A
-        # separationTier: 2             # B（与 A 等价，当 supernode 对应 spec.tier==2）
+        topologyTierName: supernode   # A
+        # topologyTier: 2             # B（与 A 等价，当 supernode 对应 spec.tier==2）
 
-# 跨 SubGroup：同样支持 separationTierName 或 separationTier
+# 跨 SubGroup：同样支持 topologyTierName 或 topologyTier
 subGroupTopologyAffinity:
   subGroupAntiAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
@@ -828,7 +840,7 @@ subGroupTopologyAffinity:
           matchSubGroupPolicyNames: [prefill]
         antiSubGroupSelector:
           matchSubGroupPolicyNames: [prefill]
-        separationTierName: cabinet     # 或 separationTier: 1
+        topologyTierName: cabinet     # 或 topologyTier: 1
 ```
 
 ```go
@@ -844,7 +856,7 @@ subGroupTopologyAffinity:
 //   - Peers: other PodGroups whose metadata.labels match podGroupSelector (kube-scheduler labelSelector semantics).
 // Phase 2+ may add: PodGroupAffinity *TopologyAffinitySpec `json:"podGroupAffinity,omitempty"` additively.
 type PodGroupTopologyAffinitySpec struct {
-    // PodGroupAntiAffinity: hard/soft anti-affinity vs other PodGroups at separationTier(/Name).
+    // PodGroupAntiAffinity: hard/soft anti-affinity vs other PodGroups at topologyTier(/Name).
     // +optional
     PodGroupAntiAffinity *TopologyAntiAffinitySpec `json:"podGroupAntiAffinity,omitempty"`
 }
@@ -879,7 +891,7 @@ type TopologyAntiAffinityTerm struct {
     // NamespaceSelector: optional scope for peer PodGroups (same role as in PodAntiAffinityTerm).
     // +optional
     NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
-    SeparationTier    TopologySeparationSpec `json:"separationTier"`
+    TopologyDomain    TopologyDomainSpec `json:"topologyDomain"`
 }
 
 // --- Phase 2+ only (NOT in Phase 1 CRD): cross-PodGroup affinity / colocation ---
@@ -893,7 +905,7 @@ type TopologyAntiAffinityTerm struct {
 // type TopologyAffinityTerm struct {
 //     PodGroupSelector  *metav1.LabelSelector `json:"podGroupSelector"`
 //     NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
-//     SeparationTier    TopologySeparationSpec `json:"separationTier"`
+//     TopologyDomain    TopologyDomainSpec `json:"topologyDomain"`
 // }
 
 // Cross-SubGroup terms (intra-PodGroup only).
@@ -903,15 +915,15 @@ type SubGroupTopologyAntiAffinityTerm struct {
     SubGroupSelector SubGroupSelectorSpec `json:"subGroupSelector"`
     // AntiSubGroupSelector: peer SubJobs to compare against (already placed in this PodGroup).
     AntiSubGroupSelector SubGroupSelectorSpec `json:"antiSubGroupSelector"`
-    SeparationTier       TopologySeparationSpec `json:"separationTier"`
+    TopologyDomain       TopologyDomainSpec `json:"topologyDomain"`
 }
 
 type SubGroupTopologyAffinityTerm struct {
     // MatchSubGroupPolicyNames: policy names (subGroupPolicy[].name). All SubJobs under ANY listed policy
-    // must share Domain_T at SeparationTier (e.g. [prefill, decode] @ supernode covers 4+2 SubJobs).
+    // must share Domain_T at the tier selected in topologyDomain (e.g. [prefill, decode] @ supernode covers 4+2 SubJobs).
     // Must list >= 2 distinct policy names.
     MatchSubGroupPolicyNames []string `json:"matchSubGroupPolicyNames"`
-    SeparationTier           TopologySeparationSpec `json:"separationTier"`
+    TopologyDomain           TopologyDomainSpec `json:"topologyDomain"`
 }
 
 // SubGroupSelectorSpec selects SubJobs by policy name (and optional pod labelSelector).
@@ -943,7 +955,7 @@ type WeightedSubGroupTopologyAffinityTerm struct {
 
 实现上，一条反亲和 term 表达的是：
 
-> 当 **当前待调度** 的 SubJob 属于 `subGroupSelector` 所匹配的 policy 集合时，为其选择的 `Domain_T(separationTier)` 必须与 **本 PodGroup 内已放置**、且属于 `antiSubGroupSelector` 所匹配集合的 **任意 peer SubJob** 的 `Domain_T` **不同**。
+> 当 **当前待调度** 的 SubJob 属于 `subGroupSelector` 所匹配的 policy 集合时，为其选择的 `Domain_T`（在 `topologyDomain` 指定层）必须与 **本 PodGroup 内已放置**、且属于 `antiSubGroupSelector` 所匹配集合的 **任意 peer SubJob** 的 `Domain_T` **不同**。
 
 因此这是 **subject（谁在调度）→ peer（跟谁比）** 的有向关系；两侧集合可以相同，也可以不同。
 
@@ -1004,7 +1016,7 @@ subGroupAntiAffinity:
         matchSubGroupPolicyNames: [prefill]
       antiSubGroupSelector:
         matchSubGroupPolicyNames: [prefill]
-      separationTierName: cabinet
+      topologyTierName: cabinet
 ```
 
 **跨 policy 互斥（实例 6）** — **必须** 区分两侧，不可合并为单列表：
@@ -1014,7 +1026,7 @@ subGroupAntiAffinity:
         matchSubGroupPolicyNames: [prefill]
       antiSubGroupSelector:
         matchSubGroupPolicyNames: [decode]
-      separationTierName: cabinet
+      topologyTierName: cabinet
 ```
 
 **小结：** 双 selector 在 **不引入歧义枚举** 的前提下，同时支持 **policy 内分片互斥** 与 **跨 policy 角色互斥**；与 `subGroupAffinity` 单列表共域形成对称、互补的 API 面。`antiSubGroupSelector` 为 **必选字段**，不提供「省略 peer 侧」或「单 policy 名简写」等等价写法。
@@ -1029,7 +1041,7 @@ subGroupAntiAffinity:
 |------|---------------------------------------------|-------------------------|
 | 声明位置 | Pod `spec`，或每条 `subGroupPolicy` 各写一份 | **`PodGroupSpec.subGroupTopologyAffinity`** 一处声明 |
 | 比较对象 | **Pod** ↔ Pod | **SubJob**（`subGroupPolicy` + `matchLabelKeys`）↔ 已分配 `Domain_T` |
-| 拓扑域 | 多依赖 Node label 等外挂约定 | HyperNode `separationTier` / `separationTierName` |
+| 拓扑域 | 多依赖 Node label 等外挂约定 | HyperNode `topologyTier` / `topologyTierName` |
 | 组内 vs 组间 | 易与组内规则拆在两处、难统一校验 | `subGroupPolicy[].networkTopology`（组内）+ 顶层字段（组间），同一调度链 **AND** |
 
 调度单元是 **SubJob（一组 Pod）**，不是单个 Pod；SubJob 内逐 Pod 打散仍用 Pod 模板上的 spread 等（见 [范围 · SubJob 内逐 Pod spread](#目标外)），**不由** 本字段承担。
@@ -1042,14 +1054,14 @@ subGroupPolicy:
     networkTopology: { mode: hard, highestTierName: cabinet }
     subGroupTopologyAntiAffinity:
       - peerSubGroupPolicyNames: [prefill]   # 分片互斥
-        separationTierName: cabinet
+        topologyTierName: cabinet
       - peerSubGroupPolicyNames: [decode]    # 实例 6 时才需要
-        separationTierName: cabinet
+        topologyTierName: cabinet
   - name: decode
     networkTopology: { mode: hard, highestTierName: cabinet }
     subGroupTopologyAntiAffinity:
       - peerSubGroupPolicyNames: [decode]
-        separationTierName: cabinet
+        topologyTierName: cabinet
 ```
 
 上述写法在 **形式上** 接近 kube-scheduler「每个 Pod 模板在 `spec` 里写 `podAntiAffinity`」；在 Volcano 中 **不采用**，原因如下（故定稿为 PodGroup 顶层 `subGroupTopologyAffinity`）。
@@ -1143,8 +1155,8 @@ PodGroupSpec.topologyAffinity         → 跨 PodGroup 反亲和（仅 podGroupA
 |------|------|
 | `PodGroupSpec.networkTopology` | **Job 级别** 域内聚合（整 Job 不跨 tier） |
 | `subGroupPolicy[].networkTopology` | **组内** Gang：不跨越 `highestTierAllowed`（域内聚合） |
-| `topologyAffinity.podGroupAntiAffinity` | **跨 PodGroup**：在 `separationTier` 上 **异域**；peer 由 `podGroupSelector`（+ 可选 `namespaceSelector`）指定 |
-| `subGroupTopologyAffinity` | **同 PodGroup 跨 SubGroup**：在 `separationTier` 上同域或异域 |
+| `topologyAffinity.podGroupAntiAffinity` | **跨 PodGroup**：在 `topologyDomain` 选定层上 **异域**；peer 由 `podGroupSelector`（+ 可选 `namespaceSelector`）指定 |
+| `subGroupTopologyAffinity` | **同 PodGroup 跨 SubGroup**：在 `topologyDomain` 选定层上同域或异域 |
 
 Go 类型：`SubGroupTopologyAffinitySpec`（容器）与 `SubGroupTopologyAffinityTerm`（单条亲和 term）并存，与 kube-scheduler 所消费的 `PodAffinity` / `PodAffinityTerm` 命名方式一致。
 
@@ -1180,7 +1192,7 @@ flowchart TB
 | 项 | 说明 |
 |----|------|
 | Phase 1 | **仅** `podGroupAntiAffinity`（[设计决策-1](#ad-1跨-podgroup-仅做反亲和)、[设计决策-2](#ad-2phase-1-不声明-podgroupaffinity)） |
-| 作用 | 本 PodGroup 与其它 PodGroup 在 `separationTier(*)` 上 **异域**（`podGroupSelector`，标准 `metav1.LabelSelector`） |
+| 作用 | 本 PodGroup 与其它 PodGroup 在 `topologyTier(*)` 上 **异域**（`podGroupSelector`，标准 `metav1.LabelSelector`） |
 | 调度 | `TopologyOccupancyIndex` + Job 级 `HyperNodeGradientForJobFn`；hard/soft 见 [设计决策-5](#ad-5组间-hardsoft) |
 | 跨 PodGroup 共域 | **不支持** → `networkTopology` / `subGroupAffinity` |
 
@@ -1269,15 +1281,15 @@ subGroupTopologyAffinity:
 |----|------|
 | **谁写入** | **用户/平台** 在创建或更新 PodGroup 时设置 `metadata.labels`；Volcano **不会** 根据 `podGroupAntiAffinity` 自动补写该 label。 |
 | **与 selector 的关系** | `podGroupSelector.matchLabels`（或 `matchExpressions`）必须与目标 PodGroup 上的 label **一致**；通常 **一个键** 即可表达「同一互斥组」（示例键 `topology.volcano.sh/spread-group`，键名可自定）。 |
-| **赋值原则** | 凡需要在某个 `separationTier` 上 **彼此异域** 的 PodGroup，对该键使用 **相同取值**；该取值应表示 **故障域/容量池** 等业务含义（如 `llama-70b-prod` = 同一生产模型多 instance），**不是** PodGroup 名、SubJob 名或 Pod 模板 label 的拷贝。 |
+| **赋值原则** | 凡需要在 **同一拓扑比较层**（`topologyDomain`）上 **彼此异域** 的 PodGroup，对该键使用 **相同取值**；该取值应表示 **故障域/容量池** 等业务含义（如 `llama-70b-prod` = 同一生产模型多 instance），**不是** PodGroup 名、SubJob 名或 Pod 模板 label 的拷贝。 |
 | **与其它 label 分工** | `app` / `model` 等可用于运维筛选；**是否互为 anti-affinity peer** 只由 `podGroupSelector` 选中与否决定。不要把无关 label 写进 selector，以免误伤其它 PodGroup。 |
 | **环境隔离** | 不同环境、租户、流量池使用 **不同取值**（如 `…-staging` vs `…-prod`），避免跨环境互斥。 |
 
-调度实现：peer 集合 = 满足 selector 的其它 PodGroup（排除本 PodGroup UID）；`TopologyOccupancyIndex` 按 `(separationTier, Domain_T)` 记录已占用域，结合 peer 的已分配 HyperNode 做剪枝。
+调度实现：peer 集合 = 满足 selector 的其它 PodGroup（排除本 PodGroup UID）；`TopologyOccupancyIndex` 按 `(topologyTier, Domain_T)` 记录已占用域，结合 peer 的已分配 HyperNode 做剪枝。
 
-## HyperNode 层级与 separationTier / separationTierName
+## HyperNode 层级与 topologyTier / topologyTierName
 
-组间亲和/反亲和与组内 `networkTopology` 一样，基于 **HyperNode CR** 树，**不**使用任意 Node label。用户在 term 的 `TopologySeparationSpec` 中必须指定 **且仅能指定一种** 分离层级：`separationTierName`（对齐 `spec.tierName`）或 `separationTier`（对齐 `spec.tier` 整数），与 `highestTierName` / `highestTierAllowed` 的对偶关系一致。
+组间亲和/反亲和与组内 `networkTopology` 一样，基于 **HyperNode CR** 树，**不**使用任意 Node label。用户在 term 的 `topologyDomain`（`TopologyDomainSpec`）中必须指定 **且仅能指定一种** 拓扑比较层级：`topologyTierName`（对齐 `spec.tierName`）或 `topologyTier`（对齐 `spec.tier` 整数），与 `highestTierName` / `highestTierAllowed` 的对偶关系一致。
 
 ### HyperNode 上定义什么
 
@@ -1285,8 +1297,8 @@ subGroupTopologyAffinity:
 
 | HyperNode 字段 | 含义 | 与 PodGroup 的对应 |
 |----------------|------|-------------------|
-| `spec.tier` | 层级 **序号**（非负整数，集群内统一递增约定，越大越靠近根） | `separationTier: <int>` |
-| `spec.tierName` | 层级 **可读名称**（集群内约定，如 `cabinet`、`supernode`、`rack`） | `separationTierName: "<string>"` |
+| `spec.tier` | 层级 **序号**（非负整数，集群内统一递增约定，越大越靠近根） | `topologyTier: <int>` |
+| `spec.tierName` | 层级 **可读名称**（集群内约定，如 `cabinet`、`supernode`、`rack`） | `topologyTierName: "<string>"` |
 
 示例（集群侧，与 PodGroup 无关）：
 
@@ -1297,7 +1309,7 @@ metadata:
   name: supernode-sn-1
 spec:
   tier: 2
-  tierName: supernode          # ← PodGroup 里 separationTierName 必须写 supernode
+  tierName: supernode          # ← PodGroup 里 topologyTierName 必须写 supernode
   members:
     - type: HyperNode
       selector:
@@ -1314,7 +1326,7 @@ metadata:
   name: cabinet-a
 spec:
   tier: 1
-  tierName: cabinet            # ← separationTierName: cabinet 时，Domain 在机柜层比较
+  tierName: cabinet            # ← topologyTierName: cabinet 时，Domain 在机柜层比较
   members:
     - type: Node
       selector: { ... }
@@ -1322,35 +1334,35 @@ spec:
 
 调度器在 Session 启动时扫描全部 HyperNode，构建：
 
-- **`HyperNodeTierNameMap`**：`tierName → tier`（`network-topology-aware` 解析 `highestTierName`、`group-topology-affinity` 解析 `separationTierName` 共用）；
-- **`HyperNodeTierSet`**：集群内出现过的 `spec.tier` 整数值集合（用于校验 `highestTierAllowed` / `separationTier`）。
+- **`HyperNodeTierNameMap`**：`tierName → tier`（`network-topology-aware` 解析 `highestTierName`、`group-topology-affinity` 解析 `topologyTierName` 共用）；
+- **`HyperNodeTierSet`**：集群内出现过的 `spec.tier` 整数值集合（用于校验 `highestTierAllowed` / `topologyTier`）。
 
-Webhook：未知 `separationTierName` 或不在 `HyperNodeTierSet` 中的 `separationTier` **拒绝**。
+Webhook：未知 `topologyTierName` 或不在 `HyperNodeTierSet` 中的 `topologyTier` **拒绝**。
 
-### 用户如何填写分离层级
+### 用户如何填写拓扑比较层级
 
 1. **先查集群**：`kubectl get hypernodes -o custom-columns=NAME:.metadata.name,TIER:.spec.tier,TIERNAME:.spec.tierName`（维护「tier ↔ tierName」对照表，与组内 `networkTopology` 填法相同）。
-2. **二选一（每个 term 的 `TopologySeparationSpec`）**：
-   - **`separationTierName`**：与目标层 HyperNode 的 `spec.tierName` **完全一致**（区分大小写）；
-   - **`separationTier`**：与目标层 HyperNode 的 `spec.tier` **整数相等**。
-3. **勿混用**：同一 `TopologySeparationSpec` 内 `separationTier` 与 `separationTierName` **互斥**（与 `highestTierAllowed` / `highestTierName` 规则相同）。
+2. **二选一（每个 term 的 `TopologyDomainSpec`）**：
+   - **`topologyTierName`**：与目标层 HyperNode 的 `spec.tierName` **完全一致**（区分大小写）；
+   - **`topologyTier`**：与目标层 HyperNode 的 `spec.tier` **整数相等**。
+3. **勿混用**：同一 `TopologyDomainSpec` 内 `topologyTier` 与 `topologyTierName` **互斥**（与 `highestTierAllowed` / `highestTierName` 规则相同）。
 4. **推荐**：人工运维、多集群对齐 → **tierName**；由 tier 序号驱动的模板/控制器 → **tier 整数**。
-5. **与组内区别**：`highestTier*` 限制 **组内** Pod 不跨层；`separationTier(*)` 定义 **组间** 在该层上 `Domain_T` 相同或不同。
+5. **与组内区别**：`highestTier*` 限制 **组内** Pod 不跨层；`topologyTier(*)` 定义 **组间** 在该层上 `Domain_T` 相同或不同。
 
 | 用户写法 | 调度器解析为 | 组内等价字段 |
 |----------|--------------|--------------|
-| `separationTierName: supernode` | 沿父链取第一个 `spec.tierName == "supernode"` 的祖先 `metadata.name` 为 `Domain_T` | `highestTierName: supernode` |
-| `separationTier: 2` | 沿父链取第一个 `spec.tier == 2` 的祖先为 `Domain_T` | `highestTierAllowed: 2` |
-| `separationTierName: cabinet` | 机柜层域 | `highestTierName: cabinet` |
-| `separationTier: 1` | 机柜层域（当集群约定 cabinet=1） | `highestTierAllowed: 1` |
+| `topologyTierName: supernode` | 沿父链取第一个 `spec.tierName == "supernode"` 的祖先 `metadata.name` 为 `Domain_T` | `highestTierName: supernode` |
+| `topologyTier: 2` | 沿父链取第一个 `spec.tier == 2` 的祖先为 `Domain_T` | `highestTierAllowed: 2` |
+| `topologyTierName: cabinet` | 机柜层域 | `highestTierName: cabinet` |
+| `topologyTier: 1` | 机柜层域（当集群约定 cabinet=1） | `highestTierAllowed: 1` |
 
-无效配置示例：`separationTierName: foo`（无 HyperNode 使用该 tierName）；`separationTier: 99`（`HyperNodeTierSet` 中不存在）。
+无效配置示例：`topologyTierName: foo`（无 HyperNode 使用该 tierName）；`topologyTier: 99`（`HyperNodeTierSet` 中不存在）。
 
 ### 与示例拓扑的对应
 
 **tierName / tier 以本集群 HyperNode CR 为准**（下表两列可任选其一填写）。
 
-| 业务说法 | `separationTierName` | `separationTier`（示例） | API |
+| 业务说法 | `topologyTierName` | `topologyTier`（示例） | API |
 |----------|----------------------|--------------------------|-----|
 | 不同 inference instance 不占同一超节点 | `supernode` | `2` | `topologyAffinity.podGroupAntiAffinity` |
 | 4 个 prefill（或 decode）彼此分机柜 | `cabinet` | `1` | 实例 4：policy 内 anti |
@@ -1361,12 +1373,12 @@ Webhook：未知 `separationTierName` 或不在 `HyperNodeTierSet` 中的 `separ
 
 ## 语义：分离域 Domain_T
 
-对候选 HyperNode `H` 与用户配置的分离层级（`separationTier` 或 `separationTierName`）：
+对候选 HyperNode `H` 与用户配置的拓扑比较层级（`topologyDomain` 中的 `topologyTier` 或 `topologyTierName`）：
 
 ```
 Domain_T(H) = 从 H 沿 HyperNode 父链向上，第一个满足下列之一的祖先 HyperNode 的 metadata.name：
-              · spec.tier == separationTier（整数模式）
-              · spec.tierName == separationTierName（字符串模式，与 HyperNode CR 配置一致）
+              · spec.tier == topologyTier（整数模式）
+              · spec.tierName == topologyTierName（字符串模式，与 HyperNode CR 配置一致）
 ```
 
 | 约束 | Hard 语义 |
@@ -1379,7 +1391,7 @@ Domain_T(H) = 从 H 沿 HyperNode 父链向上，第一个满足下列之一的�
 | 字段 | 语义 | 层级来源 |
 |------|------|----------|
 | `highestTierAllowed` / `highestTierName`（已有） | **组内** Gang：整组 Pod 不跨越该层 | 同上 HyperNode `tier` / `tierName` |
-| `separationTier` / `separationTierName`（本设计） | **组间**：在该层比较 Domain 相同或不同 | 同上，**必须与集群 HyperNode 定义一致** |
+| `topologyTier` / `topologyTierName`（本设计） | **组间**：在该层比较 Domain 相同或不同 | 同上，**必须与集群 HyperNode 定义一致** |
 
 ## Hard 约束优先级
 
@@ -1410,7 +1422,7 @@ spec:
         - podGroupSelector:
             matchLabels:
               topology.volcano.sh/spread-group: llama-70b-prod
-          separationTierName: supernode
+          topologyTierName: supernode
 
   subGroupPolicy:
     - name: prefill
@@ -1432,7 +1444,7 @@ spec:
 
 ### 设计决策-1：跨 PodGroup 仅做反亲和
 
-**结论：** 实现 `topologyAffinity.podGroupAntiAffinity`（**必填** `podGroupSelector` + `separationTier(*)`），配合 `TopologyOccupancyIndex` 与 Job 级 gradient。
+**结论：** 实现 `topologyAffinity.podGroupAntiAffinity`（**必填** `podGroupSelector` + `topologyTier(*)`），配合 `TopologyOccupancyIndex` 与 Job 级 gradient。
 
 **理由（摘要）：**
 
@@ -1487,13 +1499,13 @@ spec:
 
 ### 设计决策-5：组间 hard/soft
 
-**结论：** 组间用 `requiredDuringSchedulingIgnoredDuringExecution` / `preferredDuringSchedulingIgnoredDuringExecution` + `weight`；**禁止** 在 `TopologySeparationSpec` 内写 `mode`。组内仍用 `networkTopology.mode`。
+**结论：** 组间用 `requiredDuringSchedulingIgnoredDuringExecution` / `preferredDuringSchedulingIgnoredDuringExecution` + `weight`；**禁止** 在 `TopologyDomainSpec` 内写 `mode`。组内仍用 `networkTopology.mode`。
 
 ---
 
 ### 设计决策-6：tierName 与 tier 整数二选一
 
-**结论：** 组间 `separationTierName` ↔ `HyperNode.spec.tierName`，`separationTier` ↔ `spec.tier`；与组内 `highestTierName` / `highestTierAllowed` 共用 `HyperNodeTierNameMap`、`HyperNodeTierSet`。
+**结论：** 组间 `topologyTierName` ↔ `HyperNode.spec.tierName`，`topologyTier` ↔ `spec.tier`；与组内 `highestTierName` / `highestTierAllowed` 共用 `HyperNodeTierNameMap`、`HyperNodeTierSet`。
 
 **示例集群约定（实例 YAML 注释亦采用）：** `supernode` ↔ `2`，`cabinet` ↔ `1`（以 `kubectl get hypernodes` 为准）。
 
@@ -1503,7 +1515,35 @@ spec:
 | 分片互斥 @ 机柜 | `cabinet` | `1` |
 | 整机共超节点（组内） | `highestTierName: supernode` | `highestTierAllowed: 2` |
 
-填写步骤、HyperNode CR 示例、Domain_T 解析 → [#hypernode-层级与-separationtier--separationtiername](#hypernode-层级与-separationtier--separationtiername)。实例 YAML 多写 tierName，旁注等价整数。
+填写步骤、HyperNode CR 示例、Domain_T 解析 → [#hypernode-层级与-topologytier--topologytiername](#hypernode-层级与-topologytier--topologytiername)。实例 YAML 多写 tierName，旁注等价整数。
+
+---
+
+### 设计决策-7：组间层级命名与 Kubernetes topologyKey
+
+**背景：** 方案评审中提出：原字段名 **`separationTierName`** 不够直观，难以像 Kubernetes **`topologyKey`** 那样一眼看出「在哪个拓扑维度上比较」。
+
+**结论：**
+
+1. **字符串 / 整数字段** 定名为 **`topologyTierName`**、**`topologyTier`**（二选一，互斥），取值仍分别对齐 `HyperNode.spec.tierName` / `spec.tier`。
+2. **term 上的嵌套对象** 定名为 **`topologyDomain`**（类型 `TopologyDomainSpec`），承载上述二选一字段；**不再** 使用外层也叫 `topologyTier`、内层再写 `topologyTierName` 的重复命名。
+3. **不** 在组间 API 上复用字段名 **`topologyKey`**。
+
+**为何不直接采用 `topologyKey`：**
+
+| 考量 | 说明 |
+|------|------|
+| **与 K8s 字面不一致** | `PodTopologySpread` / `PodAffinity` 的 `topologyKey` 是 **Node 标签键**（如 `topology.kubernetes.io/zone`）；本特性取值是 **HyperNode 层级名**（如 `supernode`），填法与校验规则完全不同。 |
+| **与 Volcano 现有 CR 冲突** | Job / PodGroup 模板中已有标准 **`podAffinity` / `podAntiAffinity` 的 `topologyKey`**；组间 term 再叫 `topologyKey` 会导致「同一 YAML 里两个 topologyKey、含义不同」的运维事故。 |
+| **可读性** | `topologyTierName` 明确表达：**拓扑比较发生在 HyperNode 的哪一层**；与组内 `highestTierName` 共用 `tierName` 词汇，且 `highest*` 表 envelope 上界、`topologyTier*` 表组间比较平面，职责可区分。 |
+
+**与 K8s 的心智模型（回复 reviewer）：**
+
+- K8s：**选定拓扑维度** → 用 Node label **key** 表达 → 字段名 `topologyKey`。
+- Volcano：**选定拓扑维度** → 用 HyperNode **tier 层** 表达 → 字段名 **`topologyTierName`**（或整数 **`topologyTier`**）；调度器在该层计算 `Domain_T`，再在亲和/反亲和 term 中比较相同/不同。
+- 文档 [#与-kubernetes-topologykey-的语义对照速查](#与-kubernetes-topologykey-的语义对照速查) 与实例 YAML 旁注中保留对照表，降低从 Pod 拓扑散布迁移过来的学习成本。
+
+**曾用名（评审稿）：** `separationTierName` / `separationTier`、嵌套对象亦名为 `separationTier` — 仅表示「分离边界」，未突出「拓扑维度」，且外层/内层命名重复；CRD 尚未发布，定稿采用上表命名。
 
 ---
 
@@ -1845,7 +1885,7 @@ tiers:
 | `group-topology-affinity` / 占用索引 | [调度实现 · group-topology-affinity 扩展点](#group-topology-affinity-扩展点) |
 | 实例 2 / 4 / 5 在调度链上的含义 | [用户场景](#用户场景与能力对照)、[概述 · 目标示意](#目标示意volcano-视角) |
 
-**符号：** `Domain_T(H)` = HyperNode H 在分离 tier T 上的祖先域。
+**符号：** `Domain_T(H)` = HyperNode H 在拓扑比较 tier T 上的祖先域。
 
 ---
 
@@ -1921,7 +1961,7 @@ flowchart TB
 
 **通用**
 
-1. 每个组间 term 的 `TopologySeparationSpec`：`separationTier`（int）与 `separationTierName`（string）**互斥**，且 **至少配置其一**（与 `networkTopology` 的 `highestTierAllowed` / `highestTierName` 规则对称）。`separationTierName` 须存在于 `HyperNodeTierNameMap`；`separationTier` 须存在于 `HyperNodeTierSet`（至少一个 HyperNode 的 `spec.tier` 等于该值）。**禁止** 在 `TopologySeparationSpec` 内写 `mode`（hard/soft 由 `required` / `preferred` 决定，见 [#required--preferred-与-mode不重复](#required--preferred-与-mode不重复)）。
+1. 每个组间 term 的 `TopologyDomainSpec`：`topologyTier`（int）与 `topologyTierName`（string）**互斥**，且 **至少配置其一**（与 `networkTopology` 的 `highestTierAllowed` / `highestTierName` 规则对称）。`topologyTierName` 须存在于 `HyperNodeTierNameMap`；`topologyTier` 须存在于 `HyperNodeTierSet`（至少一个 HyperNode 的 `spec.tier` 等于该值）。**禁止** 在 `TopologyDomainSpec` 内写 `mode`（hard/soft 由 `required` / `preferred` 决定，见 [#required--preferred-与-mode不重复](#required--preferred-与-mode不重复)）。
 
 **`topologyAffinity`（跨 PodGroup）**
 
@@ -1943,7 +1983,7 @@ flowchart TB
 
 12. `topologyAffinity`（仅 anti）与 `subGroupTopologyAffinity` 可同时存在；Webhook 分别校验，调度时 **AND**。
 13. `subGroupTopologyAffinity` 与 `subGroupPolicy[].networkTopology` 同时存在时，在文档/Condition 中说明组间 + 组内语义；Webhook 检测明显矛盾的 tier 组合（可选告警）。
-14. 若 `PodGroupSpec.networkTopology`（`mode: hard`）与 `subGroupAffinity` 的 **`required`** term 在 **同一 separation tier**（如均为 `supernode`）表达「共域」，Webhook **警告** 冗余（见 [实例 4](#实例-4分布式-prefill-decode-推理推荐)，方式一与方式二勿重复配置）。
+14. 若 `PodGroupSpec.networkTopology`（`mode: hard`）与 `subGroupAffinity` 的 **`required`** term 在 **同一拓扑层**（如 `topologyTierName: supernode`）表达「共域」，Webhook **警告** 冗余（见 [实例 4](#实例-4分布式-prefill-decode-推理推荐)，方式一与方式二勿重复配置）。
 
 ---
 
@@ -1976,6 +2016,8 @@ const PodGroupTopologyUnsatisfiable PodGroupConditionType = "TopologyUnsatisfiab
 
 # 参考
 
+- 用户使用文档（中文）：[组间拓扑亲和用户使用指南](../user-guide/how_to_use_group_topology_affinity_zh.md)
+- User guide (English)：[How to Use Group Topology Affinity](../user-guide/how_to_use_group_topology_affinity.md)
 - Volcano：[Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)（组内拓扑与 HyperNode，本提案前置依赖）
 - Volcano：[Preempt Action Support Topology](./preempt-action-support-topology.md)（Phase 2 抢占与拓扑一致性参考）
 - Kubernetes / **kube-scheduler**：[Pod affinity and anti-affinity](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity)（组间 `required` / `preferred` 命名与双端 selector 语义对齐参考；本提案作用域为 PodGroup/SubJob，**非** kube-scheduler 实现路径）
