@@ -28,6 +28,7 @@ import (
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
+	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -3384,8 +3385,8 @@ func Test_batchNodeOrderFnForNormalPods(t *testing.T) {
 	}
 }
 
-// TestHyperNodeGradientPreFiltering tests the pre-filtering logic in hyperNodeGradientFn.
-// It verifies that HyperNodes are correctly filtered based on idle and futureIdle resources.
+// TestHyperNodeGradientPreFiltering verifies HyperNode resource pre-filtering in allocate.FilterGradientsByMinResource
+// after topology-only hyperNodeGradientFn.
 func TestHyperNodeGradientPreFiltering(t *testing.T) {
 	const (
 		nodeCount       = 1000
@@ -3648,17 +3649,16 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 			testHN := "hn-1-0"
 			plugin.hyperNodeResourceCache[testHN].idle = tt.idleResource
 			plugin.hyperNodeResourceCache[testHN].futureIdle = tt.futureIdleResource
+			plugin.publishHyperNodeResourceStatus(ssn)
 
-			// Call hyperNodeGradientFn
 			result, err := plugin.hyperNodeGradientFn(
 				ssn,
 				hyperNodesMap[tier2HNName],
 				tt.highestAllowedTier,
 				"",
-				tt.minResource,
 			)
-
 			assert.NoError(t, err)
+			result = allocate.FilterGradientsByMinResource(ssn, result, tt.minResource, "")
 
 			// Check if the test HyperNode is in the result
 			found := false

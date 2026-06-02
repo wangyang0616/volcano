@@ -111,6 +111,8 @@ type Session struct {
 	RealNodesList             map[string][]*api.NodeInfo
 	RealNodesSet              map[string]sets.Set[string]
 	HyperNodesReadyToSchedule bool
+	// HyperNodeResourceStatus maps HyperNode name to aggregate idle/futureIdle (from network-topology-aware).
+	HyperNodeResourceStatus map[string]*api.HyperNodeResourceStatus
 
 	plugins             map[string]Plugin
 	eventHandlers       []*EventHandler
@@ -225,6 +227,7 @@ func openSession(cache cache.Cache) *Session {
 		subJobOrderFns:                map[string]api.CompareFn{},
 		hyperNodeGradientForJobFns:    map[string]api.HyperNodeGradientForJobFn{},
 		hyperNodeGradientForSubJobFns: map[string]api.HyperNodeGradientForSubJobFn{},
+		HyperNodeResourceStatus:       map[string]*api.HyperNodeResourceStatus{},
 	}
 
 	snapshot := cache.Snapshot()

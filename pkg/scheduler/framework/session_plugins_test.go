@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
@@ -135,4 +137,61 @@ func TestFilterOutPreemptMayNotHelpNodes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testHyperNodeInfo(name string, tier int) *api.HyperNodeInfo {
+	return api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+}
+
+func TestIntersectHyperNodeGradients(t *testing.T) {
+	pluginA := [][]*api.HyperNodeInfo{
+		{testHyperNodeInfo("a1", 1), testHyperNodeInfo("a2", 1)},
+		{testHyperNodeInfo("a3", 2)},
+	}
+	pluginB := [][]*api.HyperNodeInfo{
+		{testHyperNodeInfo("a2", 1), testHyperNodeInfo("b1", 1)},
+		{testHyperNodeInfo("a3", 2), testHyperNodeInfo("b2", 2)},
+	}
+
+	result := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{pluginA, pluginB})
+	assert.Len(t, result, 2)
+	assert.Equal(t, []string{"a2"}, hyperNodeNamesAtTier(result, 0))
+	assert.Equal(t, []string{"a3"}, hyperNodeNamesAtTier(result, 1))
+
+	empty := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{
+		{{testHyperNodeInfo("only-a", 1)}},
+		{{testHyperNodeInfo("only-b", 1)}},
+	})
+	assert.Nil(t, empty)
+}
+
+func TestIntersectHyperNodeGradientsSinglePlugin(t *testing.T) {
+	gradients := [][]*api.HyperNodeInfo{{testHyperNodeInfo("x", 1)}}
+	assert.Equal(t, gradients, intersectHyperNodeGradients([][][]*api.HyperNodeInfo{gradients}))
+}
+
+func hyperNodeNamesAtTier(gradients [][]*api.HyperNodeInfo, tierIdx int) []string {
+	if tierIdx >= len(gradients) {
+		return nil
+	}
+	names := make([]string, 0, len(gradients[tierIdx]))
+	for _, h := range gradients[tierIdx] {
+		names = append(names, h.Name)
+	}
+	return names
+}
+
+func TestRebuildGradientsByTierPreservesTierOrder(t *testing.T) {
+	members := []api.MemberConfig{{Name: "child", Type: topologyv1alpha1.MemberTypeHyperNode, Selector: "exact"}}
+	parent := api.NewHyperNodeInfo(api.BuildHyperNode("parent", 2, members))
+	child := api.NewHyperNodeInfo(api.BuildHyperNode("child", 1, nil))
+	parent.Children.Insert("child")
+
+	byName := map[string]*api.HyperNodeInfo{"parent": parent, "child": child}
+	eligible := sets.New("parent", "child")
+
+	result := rebuildGradientsByTier(byName, eligible)
+	assert.Len(t, result, 2)
+	assert.Equal(t, 1, result[0][0].Tier())
+	assert.Equal(t, 2, result[1][0].Tier())
 }

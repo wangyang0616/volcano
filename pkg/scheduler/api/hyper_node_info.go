@@ -95,6 +95,13 @@ type HyperNodeInfo struct {
 	isDeleting bool
 }
 
+// HyperNodeResourceStatus holds aggregate resource view for a HyperNode subtree.
+// Populated by network-topology-aware and read by allocate for capacity pre-filtering.
+type HyperNodeResourceStatus struct {
+	Idle       *Resource
+	FutureIdle *Resource
+}
+
 // HyperNodeInfoOption defines a function type for configuring HyperNodeInfo.
 type HyperNodeInfoOption func(*HyperNodeInfo)
 
