@@ -3642,14 +3642,9 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 				HyperNodesTiers:     []int{1, 2},
 			}
 
-			// Initialize hyperNodeResourceCache
-			plugin.initHyperNodeResourceCache(ssn)
-
-			// Override resource status for the first tier-1 HyperNode
+			// Override aggregate resources for the first tier-1 HyperNode via node status.
 			testHN := "hn-1-0"
-			plugin.hyperNodeResourceCache[testHN].idle = tt.idleResource
-			plugin.hyperNodeResourceCache[testHN].futureIdle = tt.futureIdleResource
-			plugin.publishHyperNodeResourceStatus(ssn)
+			setHyperNodeAggregateResources(nodes, realNodesSet[testHN], tt.idleResource, tt.futureIdleResource)
 
 			result, err := plugin.hyperNodeGradientFn(
 				ssn,
@@ -3690,5 +3685,36 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// setHyperNodeAggregateResources configures per-node idle/futureIdle so their sum matches targets.
+func setHyperNodeAggregateResources(nodes map[string]*api.NodeInfo, nodeNames sets.Set[string], idle, futureIdle *api.Resource) {
+	count := float64(nodeNames.Len())
+	if count == 0 {
+		return
+	}
+
+	perIdleCPU := idle.MilliCPU / count
+	perIdleMem := float64(idle.Memory) / count
+	perFutureCPU := futureIdle.MilliCPU / count
+	perFutureMem := float64(futureIdle.Memory) / count
+
+	for name := range nodeNames {
+		node := nodes[name]
+		node.Idle = &api.Resource{MilliCPU: perIdleCPU, Memory: perIdleMem}
+		node.Releasing = api.EmptyResource()
+		node.Pipelined = api.EmptyResource()
+		if perFutureCPU <= perIdleCPU {
+			node.Pipelined = &api.Resource{
+				MilliCPU: perIdleCPU - perFutureCPU,
+				Memory:   perIdleMem - perFutureMem,
+			}
+		} else {
+			node.Releasing = &api.Resource{
+				MilliCPU: perFutureCPU - perIdleCPU,
+				Memory:   perFutureMem - perIdleMem,
+			}
+		}
 	}
 }

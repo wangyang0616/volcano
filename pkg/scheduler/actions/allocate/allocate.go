@@ -824,8 +824,8 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 	return alloc.session.PredicateForAllocateAction(task, node)
 }
 
-// FilterGradientsByMinResource drops HyperNodes that cannot satisfy minResource using Session
-// aggregate idle/futureIdle. Skipped when allocatedHyperNode is set (partially running Job/SubJob).
+// FilterGradientsByMinResource drops HyperNodes that cannot satisfy minResource by aggregating
+// node idle/futureIdle under each HyperNode. Skipped when allocatedHyperNode is set.
 func FilterGradientsByMinResource(
 	ssn *framework.Session,
 	gradients [][]*api.HyperNodeInfo,
@@ -852,14 +852,22 @@ func FilterGradientsByMinResource(
 }
 
 func hyperNodeSatisfiesMinResource(ssn *framework.Session, hyperNodeName string, minResource *api.Resource) bool {
-	status, found := ssn.HyperNodeResourceStatus[hyperNodeName]
-	if !found {
+	nodes, ok := ssn.RealNodesSet[hyperNodeName]
+	if !ok || nodes.Len() == 0 {
 		return true
 	}
-	if minResource.LessEqual(status.Idle, api.Zero) || minResource.LessEqual(status.FutureIdle, api.Zero) {
-		return true
+
+	idle := api.EmptyResource()
+	futureIdle := api.EmptyResource()
+	for nodeName := range nodes {
+		node, found := ssn.Nodes[nodeName]
+		if !found {
+			continue
+		}
+		idle.Add(node.Idle)
+		futureIdle.Add(node.FutureIdle())
 	}
-	return false
+	return minResource.LessEqual(idle, api.Zero) || minResource.LessEqual(futureIdle, api.Zero)
 }
 
 func (alloc *Action) UnInitialize() {}

@@ -91,8 +91,6 @@ type hyperNodesTier struct {
 type resourceStatus struct {
 	allocatable *api.Resource
 	used        *api.Resource
-	idle        *api.Resource
-	futureIdle  *api.Resource
 }
 
 func (h *hyperNodesTier) init(hyperNodesSetByTier []int) {
@@ -112,14 +110,10 @@ func (nta *networkTopologyAwarePlugin) initHyperNodeResourceCache(ssn *framework
 		nta.hyperNodeResourceCache[hyperNode] = &resourceStatus{
 			allocatable: api.EmptyResource(),
 			used:        api.EmptyResource(),
-			idle:        api.EmptyResource(),
-			futureIdle:  api.EmptyResource(),
 		}
 		for node := range ssn.RealNodesSet[hyperNode] {
 			nta.hyperNodeResourceCache[hyperNode].allocatable.Add(ssn.Nodes[node].Allocatable)
 			nta.hyperNodeResourceCache[hyperNode].used.Add(ssn.Nodes[node].Used)
-			nta.hyperNodeResourceCache[hyperNode].idle.Add(ssn.Nodes[node].Idle)
-			nta.hyperNodeResourceCache[hyperNode].futureIdle.Add(ssn.Nodes[node].FutureIdle())
 		}
 	}
 }
@@ -266,7 +260,6 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	}()
 	nta.hyperNodesTier.init(ssn.HyperNodesTiers)
 	nta.initHyperNodeResourceCache(ssn)
-	nta.publishHyperNodeResourceStatus(ssn)
 
 	ssn.AddHyperNodeOrderFn(nta.Name(), func(subJob *api.SubJobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]float64, error) {
 		return nta.HyperNodeOrderFn(ssn, subJob, hyperNodes)
@@ -605,12 +598,6 @@ func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo
 		return true
 	}
 	return hn.Tier() <= highestAllowedTier
-}
-
-func (nta *networkTopologyAwarePlugin) publishHyperNodeResourceStatus(ssn *framework.Session) {
-	for hyperNode, status := range nta.hyperNodeResourceCache {
-		ssn.UpdateHyperNodeResourceStatus(hyperNode, status.idle, status.futureIdle)
-	}
 }
 
 // getSearchRoot first computes the maximum allowable HyperNode subtree for the Job/SubJob based on `allocatedHyperNode`,

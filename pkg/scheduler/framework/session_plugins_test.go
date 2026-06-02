@@ -195,3 +195,54 @@ func TestRebuildGradientsByTierPreservesTierOrder(t *testing.T) {
 	assert.Equal(t, 1, result[0][0].Tier())
 	assert.Equal(t, 2, result[1][0].Tier())
 }
+
+// buildBenchmarkPluginGradients builds [plugin][tier-layer][hyperNodes] for intersection benchmarks.
+// Each plugin exposes tier-1 HyperNodes hn-1-0..hn-1-(numTier1-1) plus one tier-2 root.
+// pluginOffset skips the first N tier-1 HyperNodes to simulate partial overlap across plugins.
+func buildBenchmarkPluginGradients(numPlugins, numTier1, pluginOffset int) [][][]*api.HyperNodeInfo {
+	tier1 := make([]*api.HyperNodeInfo, 0, numTier1)
+	for index := 0; index < numTier1; index++ {
+		tier1 = append(tier1, testHyperNodeInfo(fmt.Sprintf("hn-1-%d", index), 1))
+	}
+	tier2 := testHyperNodeInfo("hn-2-0", 2)
+
+	pluginGradients := make([][][]*api.HyperNodeInfo, 0, numPlugins)
+	for pluginIndex := 0; pluginIndex < numPlugins; pluginIndex++ {
+		offset := pluginIndex * pluginOffset
+		pluginTier1 := tier1
+		if offset > 0 && offset < len(tier1) {
+			pluginTier1 = tier1[offset:]
+		}
+		pluginGradients = append(pluginGradients, [][]*api.HyperNodeInfo{pluginTier1, {tier2}})
+	}
+	return pluginGradients
+}
+
+func BenchmarkIntersectHyperNodeGradients(b *testing.B) {
+	// Typical production shape: 2 plugins, 100 tier-1 HyperNodes, partial overlap.
+	pluginGradients := buildBenchmarkPluginGradients(2, 100, 10)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
+	}
+}
+
+func BenchmarkIntersectHyperNodeGradients_ManyPlugins(b *testing.B) {
+	pluginGradients := buildBenchmarkPluginGradients(5, 100, 5)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
+	}
+}
+
+func BenchmarkIntersectHyperNodeGradients_LargeCluster(b *testing.B) {
+	// 1000 tier-1 HyperNodes to stress nested loops in phase 2.
+	pluginGradients := buildBenchmarkPluginGradients(2, 1000, 50)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
+	}
+}
