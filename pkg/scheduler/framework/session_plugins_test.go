@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
@@ -134,5 +136,113 @@ func TestFilterOutPreemptMayNotHelpNodes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func testHyperNodeInfo(name string, tier int) *api.HyperNodeInfo {
+	return api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
+}
+
+func TestIntersectHyperNodeGradients(t *testing.T) {
+	pluginA := [][]*api.HyperNodeInfo{
+		{testHyperNodeInfo("a1", 1), testHyperNodeInfo("a2", 1)},
+		{testHyperNodeInfo("a3", 2)},
+	}
+	pluginB := [][]*api.HyperNodeInfo{
+		{testHyperNodeInfo("a2", 1), testHyperNodeInfo("b1", 1)},
+		{testHyperNodeInfo("a3", 2), testHyperNodeInfo("b2", 2)},
+	}
+
+	result := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{pluginA, pluginB})
+	assert.Len(t, result, 2)
+	assert.Equal(t, []string{"a2"}, hyperNodeNamesAtTier(result, 0))
+	assert.Equal(t, []string{"a3"}, hyperNodeNamesAtTier(result, 1))
+
+	empty := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{
+		{{testHyperNodeInfo("only-a", 1)}},
+		{{testHyperNodeInfo("only-b", 1)}},
+	})
+	assert.Nil(t, empty)
+}
+
+func TestIntersectHyperNodeGradientsSinglePlugin(t *testing.T) {
+	gradients := [][]*api.HyperNodeInfo{{testHyperNodeInfo("x", 1)}}
+	assert.Equal(t, gradients, intersectHyperNodeGradients([][][]*api.HyperNodeInfo{gradients}))
+}
+
+func hyperNodeNamesAtTier(gradients [][]*api.HyperNodeInfo, tierIdx int) []string {
+	if tierIdx >= len(gradients) {
+		return nil
+	}
+	names := make([]string, 0, len(gradients[tierIdx]))
+	for _, h := range gradients[tierIdx] {
+		names = append(names, h.Name)
+	}
+	return names
+}
+
+func TestRebuildGradientsByTierPreservesTierOrder(t *testing.T) {
+	members := []api.MemberConfig{{Name: "child", Type: topologyv1alpha1.MemberTypeHyperNode, Selector: "exact"}}
+	parent := api.NewHyperNodeInfo(api.BuildHyperNode("parent", 2, members))
+	child := api.NewHyperNodeInfo(api.BuildHyperNode("child", 1, nil))
+	parent.Children.Insert("child")
+
+	byName := map[string]*api.HyperNodeInfo{"parent": parent, "child": child}
+	eligible := sets.New("parent", "child")
+
+	result := rebuildGradientsByTier(byName, eligible)
+	assert.Len(t, result, 2)
+	assert.Equal(t, 1, result[0][0].Tier())
+	assert.Equal(t, 2, result[1][0].Tier())
+}
+
+// buildBenchmarkPluginGradients builds [plugin][tier-layer][hyperNodes] for intersection benchmarks.
+// Each plugin exposes tier-1 HyperNodes hn-1-0..hn-1-(numTier1-1) plus one tier-2 root.
+// pluginOffset skips the first N tier-1 HyperNodes to simulate partial overlap across plugins.
+func buildBenchmarkPluginGradients(numPlugins, numTier1, pluginOffset int) [][][]*api.HyperNodeInfo {
+	tier1 := make([]*api.HyperNodeInfo, 0, numTier1)
+	for index := 0; index < numTier1; index++ {
+		tier1 = append(tier1, testHyperNodeInfo(fmt.Sprintf("hn-1-%d", index), 1))
+	}
+	tier2 := testHyperNodeInfo("hn-2-0", 2)
+
+	pluginGradients := make([][][]*api.HyperNodeInfo, 0, numPlugins)
+	for pluginIndex := 0; pluginIndex < numPlugins; pluginIndex++ {
+		offset := pluginIndex * pluginOffset
+		pluginTier1 := tier1
+		if offset > 0 && offset < len(tier1) {
+			pluginTier1 = tier1[offset:]
+		}
+		pluginGradients = append(pluginGradients, [][]*api.HyperNodeInfo{pluginTier1, {tier2}})
+	}
+	return pluginGradients
+}
+
+func BenchmarkIntersectHyperNodeGradients(b *testing.B) {
+	// Typical production shape: 2 plugins, 100 tier-1 HyperNodes, partial overlap.
+	pluginGradients := buildBenchmarkPluginGradients(2, 100, 10)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
+	}
+}
+
+func BenchmarkIntersectHyperNodeGradients_ManyPlugins(b *testing.B) {
+	pluginGradients := buildBenchmarkPluginGradients(5, 100, 5)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
+	}
+}
+
+func BenchmarkIntersectHyperNodeGradients_LargeCluster(b *testing.B) {
+	// 1000 tier-1 HyperNodes to stress nested loops in phase 2.
+	pluginGradients := buildBenchmarkPluginGradients(2, 1000, 50)
+
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		intersectHyperNodeGradients(pluginGradients)
 	}
 }

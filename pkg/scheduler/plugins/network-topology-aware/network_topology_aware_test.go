@@ -28,6 +28,7 @@ import (
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
+	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -3384,8 +3385,8 @@ func Test_batchNodeOrderFnForNormalPods(t *testing.T) {
 	}
 }
 
-// TestHyperNodeGradientPreFiltering tests the pre-filtering logic in hyperNodeGradientFn.
-// It verifies that HyperNodes are correctly filtered based on idle and futureIdle resources.
+// TestHyperNodeGradientPreFiltering verifies HyperNode resource pre-filtering in allocate.FilterGradientsByMinResource
+// after topology-only hyperNodeGradientFn.
 func TestHyperNodeGradientPreFiltering(t *testing.T) {
 	const (
 		nodeCount       = 1000
@@ -3641,24 +3642,18 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 				HyperNodesTiers:     []int{1, 2},
 			}
 
-			// Initialize hyperNodeResourceCache
-			plugin.initHyperNodeResourceCache(ssn)
-
-			// Override resource status for the first tier-1 HyperNode
+			// Override aggregate resources for the first tier-1 HyperNode via node status.
 			testHN := "hn-1-0"
-			plugin.hyperNodeResourceCache[testHN].idle = tt.idleResource
-			plugin.hyperNodeResourceCache[testHN].futureIdle = tt.futureIdleResource
+			setHyperNodeAggregateResources(nodes, realNodesSet[testHN], tt.idleResource, tt.futureIdleResource)
 
-			// Call hyperNodeGradientFn
 			result, err := plugin.hyperNodeGradientFn(
 				ssn,
 				hyperNodesMap[tier2HNName],
 				tt.highestAllowedTier,
 				"",
-				tt.minResource,
 			)
-
 			assert.NoError(t, err)
+			result = allocate.FilterGradientsByMinResource(ssn, result, tt.minResource, "")
 
 			// Check if the test HyperNode is in the result
 			found := false
@@ -3690,5 +3685,36 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// setHyperNodeAggregateResources configures per-node idle/futureIdle so their sum matches targets.
+func setHyperNodeAggregateResources(nodes map[string]*api.NodeInfo, nodeNames sets.Set[string], idle, futureIdle *api.Resource) {
+	count := float64(nodeNames.Len())
+	if count == 0 {
+		return
+	}
+
+	perIdleCPU := idle.MilliCPU / count
+	perIdleMem := float64(idle.Memory) / count
+	perFutureCPU := futureIdle.MilliCPU / count
+	perFutureMem := float64(futureIdle.Memory) / count
+
+	for name := range nodeNames {
+		node := nodes[name]
+		node.Idle = &api.Resource{MilliCPU: perIdleCPU, Memory: perIdleMem}
+		node.Releasing = api.EmptyResource()
+		node.Pipelined = api.EmptyResource()
+		if perFutureCPU <= perIdleCPU {
+			node.Pipelined = &api.Resource{
+				MilliCPU: perIdleCPU - perFutureCPU,
+				Memory:   perIdleMem - perFutureMem,
+			}
+		} else {
+			node.Releasing = &api.Resource{
+				MilliCPU: perFutureCPU - perIdleCPU,
+				Memory:   perFutureMem - perIdleMem,
+			}
+		}
 	}
 }
