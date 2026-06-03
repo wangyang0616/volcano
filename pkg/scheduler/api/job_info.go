@@ -1318,6 +1318,11 @@ func (ji *JobInfo) ContainsHardTopology() bool {
 	return false
 }
 
+// RequiresHyperNodeAllocate returns whether the job needs HyperNode-level allocation.
+func (ji *JobInfo) RequiresHyperNodeAllocate() bool {
+	return ji.ContainsHardTopology() || ji.ContainsSubJobPolicy() || ji.ContainsHardPodGroupAntiAffinity()
+}
+
 // ContainsNetworkTopologyInSubJob returns whether the subJobs in the job contain network topology
 func (ji *JobInfo) ContainsNetworkTopologyInSubJob() bool {
 	if ji.PodGroup == nil {

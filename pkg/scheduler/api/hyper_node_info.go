@@ -159,6 +159,11 @@ func (hni *HyperNodeInfo) Tier() int {
 	return hni.tier
 }
 
+// TierName returns the tierName of the hypernode.
+func (hni *HyperNodeInfo) TierName() string {
+	return hni.tierName
+}
+
 func (hni *HyperNodeInfo) DeepCopy() *HyperNodeInfo {
 	if hni == nil {
 		return nil
@@ -755,6 +760,26 @@ func (hnim HyperNodeInfoMap) GetAncestors(name string) []string {
 		}
 	}
 	return ancestors
+}
+
+// GetAncestorHyperNode returns the ancestor HyperNode name at the given tier.
+func (hnim HyperNodeInfoMap) GetAncestorHyperNode(hyperNodeName string, tier int) string {
+	for _, ancestor := range hnim.GetAncestors(hyperNodeName) {
+		if hn, ok := hnim[ancestor]; ok && hn.Tier() == tier {
+			return ancestor
+		}
+	}
+	return ""
+}
+
+// GetAncestorHyperNodeByTierName returns the ancestor HyperNode name at HyperNode.spec.tierName.
+func (hnim HyperNodeInfoMap) GetAncestorHyperNodeByTierName(hyperNodeName, tierName string) string {
+	for _, ancestor := range hnim.GetAncestors(hyperNodeName) {
+		if hn, ok := hnim[ancestor]; ok && hn.TierName() == tierName {
+			return ancestor
+		}
+	}
+	return ""
 }
 
 // getParent returns hyperNode's parent, this is usually used when a new hyperNode is added

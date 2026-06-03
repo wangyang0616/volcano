@@ -208,6 +208,10 @@ type PodGroupSpec struct {
 	// Concurrent use with minTaskMember is not recommended, and SubGroupPolicy is the long-term evolution direction.
 	// +optional
 	SubGroupPolicy []SubGroupPolicySpec `json:"subGroupPolicy,omitempty" protobuf:"bytes,7,rep,name=subGroupPolicy"`
+
+	// TopologyAffinity expresses inter-group topology affinity and anti-affinity on the HyperNode tree.
+	// +optional
+	TopologyAffinity *TopologyAffinitySpec `json:"topologyAffinity,omitempty" protobuf:"bytes,8,opt,name=topologyAffinity"`
 }
 
 type SubGroupPolicySpec struct {
@@ -272,6 +276,40 @@ type NetworkTopologySpec struct {
 	// HighestTierName and HighestTierAllowed cannot be set simultaneously.
 	// +optional
 	HighestTierName string `json:"highestTierName,omitempty" protobuf:"bytes,3,opt,name=highestTierName"`
+}
+
+// TopologyAffinitySpec holds cross-PodGroup topology rules.
+type TopologyAffinitySpec struct {
+	PodGroupAntiAffinity *PodGroupAntiAffinity `json:"podGroupAntiAffinity,omitempty" protobuf:"bytes,1,opt,name=podGroupAntiAffinity"`
+}
+
+// PodGroupAntiAffinity defines required/preferred anti-affinity against other PodGroups.
+type PodGroupAntiAffinity struct {
+	Required  []PodGroupAffinityTerm `json:"required,omitempty" protobuf:"bytes,1,rep,name=required"`
+	Preferred []PodGroupAffinityTerm `json:"preferred,omitempty" protobuf:"bytes,2,rep,name=preferred"`
+}
+
+// PodGroupAffinityTerm selects matching PodGroups and the topology tier for HyperNode comparison.
+type PodGroupAffinityTerm struct {
+	// Weight applies to preferred terms only (1-100).
+	// +optional
+	Weight int32 `json:"weight,omitempty" protobuf:"varint,1,opt,name=weight"`
+
+	// PodGroupSelector matches other PodGroups by metadata.labels.
+	// +required
+	PodGroupSelector *metav1.LabelSelector `json:"podGroupSelector" protobuf:"bytes,2,opt,name=podGroupSelector"`
+
+	// NamespaceSelector optionally limits matching PodGroup namespaces.
+	// +optional
+	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty" protobuf:"bytes,3,opt,name=namespaceSelector"`
+
+	// TopologyTierName compares ancestor HyperNodes at HyperNode.spec.tierName. Mutually exclusive with TopologyTier.
+	// +optional
+	TopologyTierName string `json:"topologyTierName,omitempty" protobuf:"bytes,4,opt,name=topologyTierName"`
+
+	// TopologyTier compares domains at HyperNode.spec.tier. Mutually exclusive with TopologyTierName.
+	// +optional
+	TopologyTier *int32 `json:"topologyTier,omitempty" protobuf:"varint,5,opt,name=topologyTier"`
 }
 
 // PodGroupStatus represents the current state of a pod group.

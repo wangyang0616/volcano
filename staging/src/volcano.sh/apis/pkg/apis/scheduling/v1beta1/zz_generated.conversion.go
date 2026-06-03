@@ -436,6 +436,7 @@ func autoConvert_v1beta1_PodGroupSpec_To_scheduling_PodGroupSpec(in *PodGroupSpe
 	out.MinResources = (*v1.ResourceList)(unsafe.Pointer(in.MinResources))
 	out.NetworkTopology = (*scheduling.NetworkTopologySpec)(unsafe.Pointer(in.NetworkTopology))
 	out.SubGroupPolicy = *(*[]scheduling.SubGroupPolicySpec)(unsafe.Pointer(&in.SubGroupPolicy))
+	out.TopologyAffinity = (*scheduling.TopologyAffinitySpec)(unsafe.Pointer(in.TopologyAffinity))
 	return nil
 }
 
@@ -452,6 +453,7 @@ func autoConvert_scheduling_PodGroupSpec_To_v1beta1_PodGroupSpec(in *scheduling.
 	out.MinResources = (*v1.ResourceList)(unsafe.Pointer(in.MinResources))
 	out.NetworkTopology = (*NetworkTopologySpec)(unsafe.Pointer(in.NetworkTopology))
 	out.SubGroupPolicy = *(*[]SubGroupPolicySpec)(unsafe.Pointer(&in.SubGroupPolicy))
+	out.TopologyAffinity = (*TopologyAffinitySpec)(unsafe.Pointer(in.TopologyAffinity))
 	return nil
 }
 

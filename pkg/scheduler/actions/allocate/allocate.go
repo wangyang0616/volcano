@@ -171,7 +171,7 @@ func (alloc *Action) buildAllocateContext() *allocateContext {
 			continue
 		}
 
-		if !ssn.HyperNodesReadyToSchedule && job.ContainsNetworkTopology() {
+		if !ssn.HyperNodesReadyToSchedule && (job.ContainsNetworkTopology() || job.WithTopologyAffinity()) {
 			klog.V(4).Infof("Job <%s/%s> Queue <%s> skip allocate, reason: hyperNodes are not ready for scheduling",
 				job.Namespace, job.Name, job.Queue)
 			continue
@@ -191,8 +191,8 @@ func (alloc *Action) buildAllocateContext() *allocateContext {
 		actx.jobsByQueue[job.Queue].Push(job)
 		actx.jobWorksheet[job.UID] = worksheet
 
-		// job without any hard network topology policy use actx.tasksNoHardTopology
-		if !job.ContainsHardTopology() {
+		// Jobs that do not need HyperNode-level allocation use actx.tasksNoHardTopology.
+		if !job.RequiresHyperNodeAllocate() {
 			if subJobWorksheet, exist := worksheet.subJobWorksheets[job.DefaultSubJobID()]; exist {
 				actx.tasksNoHardTopology[job.UID] = subJobWorksheet.tasks
 			}
@@ -300,10 +300,10 @@ func (alloc *Action) allocateResources(actx *allocateContext) {
 		updateJobTier(ssn.HyperNodeTierNameMap, job)
 		// Currently, both hard-mode network topology scheduling and subjob level scheduling use allocateForJob.
 		// TODO: In the future, we may need to unify the logic of network topology-aware scheduling and normal scheduling.
-		if job.ContainsHardTopology() || job.ContainsSubJobPolicy() {
+		if job.RequiresHyperNodeAllocate() {
 			jobWorksheet := actx.jobWorksheet[job.UID]
 
-			klog.V(3).InfoS("Try to allocate resource for job contains hard topology or subjob policy", "queue", queue.Name, "job", job.UID,
+			klog.V(3).InfoS("Try to allocate resource for job requires hyperNode allocate", "queue", queue.Name, "job", job.UID,
 				"allocatedHyperNode", job.AllocatedHyperNode, "subJobNum", jobWorksheet.subJobs.Len())
 			stmt := alloc.allocateForJob(job, jobWorksheet, ssn.HyperNodes[framework.ClusterTopHyperNode])
 			if stmt != nil && ssn.JobReady(job) { // do not commit stmt when job is pipelined

@@ -94,6 +94,7 @@ func validatePodGroup(pg *schedulingv1beta1.PodGroup) string {
 
 	errMsg += checkQueueState(pg.Spec.Queue)
 	errMsg += validateNetworkTopology(pg.Spec.NetworkTopology, pg.Spec.SubGroupPolicy)
+	errMsg += validateTopologyAffinity(pg.Spec.TopologyAffinity)
 
 	return errMsg
 }
@@ -129,4 +130,42 @@ func validateNetworkTopology(networkTopology *schedulingv1beta1.NetworkTopologyS
 		}
 	}
 	return strings.Join(errs, " ")
+}
+
+func validateTopologyAffinity(topologyAffinity *schedulingv1beta1.TopologyAffinitySpec) string {
+	if topologyAffinity == nil {
+		return ""
+	}
+
+	var errs []string
+
+	if anti := topologyAffinity.PodGroupAntiAffinity; anti != nil {
+		for index, term := range anti.Required {
+			errs = append(errs, validatePodGroupAffinityTerm(
+				fmt.Sprintf("topologyAffinity.podGroupAntiAffinity.required[%d]", index), term, true)...)
+		}
+		for index, term := range anti.Preferred {
+			errs = append(errs, validatePodGroupAffinityTerm(
+				fmt.Sprintf("topologyAffinity.podGroupAntiAffinity.preferred[%d]", index), term, false)...)
+		}
+	}
+
+	return strings.Join(errs, " ")
+}
+
+func validatePodGroupAffinityTerm(path string, term schedulingv1beta1.PodGroupAffinityTerm, required bool) []string {
+	var errs []string
+	if required && term.Weight != 0 {
+		errs = append(errs, fmt.Sprintf("%s: weight must not be set on required terms.", path))
+	}
+	if term.PodGroupSelector == nil {
+		errs = append(errs, fmt.Sprintf("%s: podGroupSelector is required.", path))
+	}
+	if term.TopologyTier != nil && term.TopologyTierName != "" {
+		errs = append(errs, fmt.Sprintf("%s: must not specify topologyTier and topologyTierName simultaneously.", path))
+	}
+	if term.TopologyTier == nil && term.TopologyTierName == "" {
+		errs = append(errs, fmt.Sprintf("%s: must specify topologyTier or topologyTierName.", path))
+	}
+	return errs
 }

@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	k8sFramework "k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/utils/set"
@@ -270,16 +271,17 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddHyperNodeGradientForJobFn(nta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
-		if hardMode, highestAllowedTier := job.IsHardTopologyMode(); hardMode {
-			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, job.AllocatedHyperNode)
-			if err != nil {
-				klog.ErrorS(err, "build hyperNode gradient fail", "job", job.UID, "hyperNode", hyperNode.Name,
-					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", job.AllocatedHyperNode)
-				return nil
-			}
-			return result
+		highestAllowedTier := maxHyperNodeTier(ssn.HyperNodesSetByTier)
+		if hardMode, tier := job.IsHardTopologyMode(); hardMode {
+			highestAllowedTier = tier
 		}
-		return [][]*api.HyperNodeInfo{{hyperNode}}
+		result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, job.AllocatedHyperNode)
+		if err != nil {
+			klog.ErrorS(err, "build hyperNode gradient fail", "job", job.UID, "hyperNode", hyperNode.Name,
+				"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", job.AllocatedHyperNode)
+			return [][]*api.HyperNodeInfo{}
+		}
+		return result
 	})
 
 	ssn.AddHyperNodeGradientForSubJobFn(nta.Name(), func(subJob *api.SubJobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
@@ -291,7 +293,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "subJob", subJob.UID, "hyperNode", hyperNode.Name,
 					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", subJob.AllocatedHyperNode)
-				return nil
+				return [][]*api.HyperNodeInfo{}
 			}
 			return result
 		}
@@ -714,4 +716,14 @@ func (nta *networkTopologyAwarePlugin) scaleFinalScore(scores map[string]float64
 		scaledScores[name] = float64(k8sFramework.MaxNodeScore) * float64(nta.weight.GlobalWeight) * score
 	}
 	return scaledScores
+}
+
+func maxHyperNodeTier(hyperNodesSetByTier map[int]sets.Set[string]) int {
+	maxTier := 0
+	for tier := range hyperNodesSetByTier {
+		if tier > maxTier {
+			maxTier = tier
+		}
+	}
+	return maxTier
 }

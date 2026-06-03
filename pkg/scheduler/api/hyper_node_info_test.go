@@ -929,3 +929,28 @@ func TestGetMembers(t *testing.T) {
 		})
 	}
 }
+
+func TestGetAncestorHyperNode(t *testing.T) {
+	hn := HyperNodeInfoMap{
+		"root":  newTestHyperNodeWithParent("root", 3, "cluster", ""),
+		"sn-a":  newTestHyperNodeWithParent("sn-a", 2, "supernode", "root"),
+		"cab-a": newTestHyperNodeWithParent("cab-a", 1, "rack", "sn-a"),
+	}
+
+	if got := hn.GetAncestorHyperNode("cab-a", 2); got != "sn-a" {
+		t.Fatalf("expected sn-a, got %s", got)
+	}
+	if got := hn.GetAncestorHyperNodeByTierName("cab-a", "rack"); got != "cab-a" {
+		t.Fatalf("expected cab-a, got %s", got)
+	}
+}
+
+func newTestHyperNodeWithParent(name string, tier int, tierName, parent string) *HyperNodeInfo {
+	return &HyperNodeInfo{
+		Name:     name,
+		tier:     tier,
+		tierName: tierName,
+		Parent:   parent,
+		Children: sets.New[string](),
+	}
+}

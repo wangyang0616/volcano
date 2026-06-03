@@ -1064,10 +1064,17 @@ func (ssn *Session) HyperNodeGradientForJobFn(job *api.JobInfo, hyperNode *api.H
 				continue
 			}
 			foundAny = true
-			pluginGradients = append(pluginGradients, fn(job, hyperNode))
+			gradients := fn(job, hyperNode)
+			if gradients == nil {
+				continue
+			}
+			pluginGradients = append(pluginGradients, gradients)
 		}
 	}
 	if !foundAny {
+		return [][]*api.HyperNodeInfo{{hyperNode}}
+	}
+	if len(pluginGradients) == 0 {
 		return [][]*api.HyperNodeInfo{{hyperNode}}
 	}
 	return intersectHyperNodeGradients(pluginGradients)
@@ -1090,10 +1097,17 @@ func (ssn *Session) HyperNodeGradientForSubJobFn(subJob *api.SubJobInfo, hyperNo
 				continue
 			}
 			foundAny = true
-			pluginGradients = append(pluginGradients, fn(subJob, hyperNode))
+			gradients := fn(subJob, hyperNode)
+			if gradients == nil {
+				continue
+			}
+			pluginGradients = append(pluginGradients, gradients)
 		}
 	}
 	if !foundAny {
+		return [][]*api.HyperNodeInfo{{hyperNode}}
+	}
+	if len(pluginGradients) == 0 {
 		return [][]*api.HyperNodeInfo{{hyperNode}}
 	}
 	return intersectHyperNodeGradients(pluginGradients)
