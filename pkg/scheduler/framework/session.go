@@ -1021,7 +1021,7 @@ func (ssn *Session) InformerFactory() informers.SharedInformerFactory {
 
 // RecordPodGroupEvent records podGroup events
 func (ssn *Session) RecordPodGroupEvent(podGroup *api.PodGroup, eventType, reason, msg string) {
-	if podGroup == nil {
+	if podGroup == nil || ssn.recorder == nil {
 		return
 	}
 

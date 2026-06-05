@@ -130,6 +130,7 @@ func (alloc *Action) Execute(ssn *framework.Session) {
 	// 5. use ssn.NodeOrderFn to judge the best node and assign it to T
 
 	alloc.session = ssn
+	logHyperNodeTiers(ssn)
 	alloc.recorder = NewRecorder()
 	actx := alloc.buildAllocateContext()
 	klog.V(3).Infof("Try to allocate resource to %d Queues", actx.queues.Len())
@@ -352,8 +353,16 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 
 	alloc.recorder.SnapshotSubJobStatus(job, jobWorksheet)
 
-	hyperNodeGradients := ssn.HyperNodeGradientForJobFn(job, hyperNodeToAllocate)
-	hyperNodeGradients = FilterGradientsByMinResource(ssn, hyperNodeGradients, job.GetMinResources(), job.AllocatedHyperNode)
+	hyperNodeGradients, gradientStats := ssn.HyperNodeGradientForJobFn(job, hyperNodeToAllocate)
+	hyperNodeGradients, resourceStats := FilterGradientsByMinResource(
+		ssn, hyperNodeGradients, job.GetMinResources(), job.AllocatedHyperNode,
+	)
+	job.SetHyperNodeFitErrors(gradientStats, resourceStats, job.GetMinResources(),
+		ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
+	if len(hyperNodeGradients) == 0 {
+		klog.V(3).InfoS("No hyperNode gradient for job", "job", job.UID, "fitError", job.JobFitErrors)
+		return nil
+	}
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)   // backup the statement after the job is allocated to a hyperNode
 		jobWorksheetsBackup := make(map[string]*JobWorksheet) // backup the job worksheet after the job is allocated to a hyperNode
@@ -434,7 +443,7 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 		return finalStmt
 	}
 
-	klog.V(5).InfoS("Cannot find any solution for job", "job", job.UID)
+	klog.V(5).InfoS("Cannot find any solution for job", "job", job.UID, "fitError", job.JobFitErrors)
 	return nil
 }
 
@@ -450,8 +459,16 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 	klog.V(3).InfoS("Try to allocate resource for subJob", "job", subJob.Job,
 		"subJob", subJob.UID, "allocatedHyperNode", subJob.AllocatedHyperNode, "taskNum", subJobWorksheet.tasks.Len())
 
-	hyperNodeGradients := ssn.HyperNodeGradientForSubJobFn(subJob, hyperNodeForJob)
-	hyperNodeGradients = FilterGradientsByMinResource(ssn, hyperNodeGradients, subJob.GetMinResources(), subJob.AllocatedHyperNode)
+	hyperNodeGradients, gradientStats := ssn.HyperNodeGradientForSubJobFn(subJob, hyperNodeForJob)
+	hyperNodeGradients, resourceStats := FilterGradientsByMinResource(
+		ssn, hyperNodeGradients, subJob.GetMinResources(), subJob.AllocatedHyperNode,
+	)
+	if len(hyperNodeGradients) == 0 {
+		job.SetHyperNodeFitErrors(gradientStats, resourceStats, subJob.GetMinResources(),
+			ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
+		klog.V(3).InfoS("No hyperNode gradient for subJob", "job", subJob.Job, "subJob", subJob.UID, "fitError", job.JobFitErrors)
+		return nil, 0
+	}
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)         // backup the statement after the subJob is allocated to a hyperNode
 		subJobWorksheetsBackup := make(map[string]*SubJobWorksheet) // backup the subJob worksheet after the subJob is allocated to a hyperNode
@@ -878,6 +895,16 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 	return alloc.session.PredicateForAllocateAction(task, node)
 }
 
+func logHyperNodeTiers(ssn *framework.Session) {
+	if !klog.V(3).Enabled() || len(ssn.HyperNodesSetByTier) == 0 {
+		return
+	}
+	total, listing := api.FormatHyperNodeTierListing(
+		ssn.HyperNodesTiers, ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes,
+	)
+	klog.V(3).Infof("HyperNode tiers in session %v: total=%d; %s", ssn.UID, total, listing)
+}
+
 // FilterGradientsByMinResource drops HyperNodes that cannot satisfy minResource by aggregating
 // node idle/futureIdle under each HyperNode. Skipped when allocatedHyperNode is set.
 func FilterGradientsByMinResource(
@@ -885,24 +912,34 @@ func FilterGradientsByMinResource(
 	gradients [][]*api.HyperNodeInfo,
 	minResource *api.Resource,
 	allocatedHyperNode string,
-) [][]*api.HyperNodeInfo {
-	if allocatedHyperNode != "" || minResource == nil {
-		return gradients
+) ([][]*api.HyperNodeInfo, *api.HyperNodeMinResourceFilterStats) {
+	if allocatedHyperNode != "" || minResource == nil || len(gradients) == 0 {
+		return gradients, nil
 	}
 
+	stats := &api.HyperNodeMinResourceFilterStats{
+		FinalByTier:    make(map[int]int),
+		ExcludedByTier: make(map[int]int),
+	}
 	filtered := make([][]*api.HyperNodeInfo, 0, len(gradients))
 	for _, layer := range gradients {
 		survivors := make([]*api.HyperNodeInfo, 0, len(layer))
 		for _, hn := range layer {
 			if hyperNodeSatisfiesMinResource(ssn, hn.Name, minResource) {
+				stats.FinalByTier[hn.Tier()]++
 				survivors = append(survivors, hn)
+			} else {
+				stats.ExcludedByTier[hn.Tier()]++
 			}
 		}
 		if len(survivors) > 0 {
 			filtered = append(filtered, survivors)
 		}
 	}
-	return filtered
+	if len(filtered) > 0 {
+		return filtered, stats
+	}
+	return nil, stats
 }
 
 func hyperNodeSatisfiesMinResource(ssn *framework.Session, hyperNodeName string, minResource *api.Resource) bool {

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,52 @@ type HyperNodesInfo struct {
 type HyperNodeInfoMap map[string]*HyperNodeInfo
 
 type HyperNodeTierNameMap map[string]int
+
+// NameForTier returns the tier name for a tier number, falling back to tier-N.
+func (m HyperNodeTierNameMap) NameForTier(tier int, hyperNodes HyperNodeInfoMap) string {
+	for name, mappedTier := range m {
+		if mappedTier == tier {
+			return name
+		}
+	}
+	for _, hn := range hyperNodes {
+		if hn.Tier() == tier && hn.TierName() != "" {
+			return hn.TierName()
+		}
+	}
+	return fmt.Sprintf("tier-%d", tier)
+}
+
+// FormatHyperNodeTierListing formats cluster HyperNode tier counts and names for logging.
+// Tiers are listed from coarse to fine (higher tier number first).
+func FormatHyperNodeTierListing(
+	tiers []int,
+	hyperNodesSetByTier map[int]sets.Set[string],
+	tierNameMap HyperNodeTierNameMap,
+	hyperNodes HyperNodeInfoMap,
+) (total int, listing string) {
+	if len(hyperNodesSetByTier) == 0 {
+		return 0, ""
+	}
+
+	sortedTiers := append([]int(nil), tiers...)
+	sort.Sort(sort.Reverse(sort.IntSlice(sortedTiers)))
+
+	parts := make([]string, 0, len(sortedTiers))
+	for _, tier := range sortedTiers {
+		namesSet := hyperNodesSetByTier[tier]
+		if namesSet.Len() == 0 {
+			continue
+		}
+		total += namesSet.Len()
+		names := namesSet.UnsortedList()
+		sort.Strings(names)
+		tierName := tierNameMap.NameForTier(tier, hyperNodes)
+		parts = append(parts, fmt.Sprintf("%s(tier=%d): %d [%s]",
+			tierName, tier, namesSet.Len(), strings.Join(names, ",")))
+	}
+	return total, strings.Join(parts, "; ")
+}
 
 // NewHyperNodesInfo initializes a new HyperNodesInfo instance.
 func NewHyperNodesInfo(lister listerv1.NodeLister) *HyperNodesInfo {
@@ -831,4 +878,59 @@ func (hnim HyperNodeInfoMap) GetLCAHyperNode(hypernode, jobHyperNode string) str
 		}
 	}
 	return ""
+}
+
+// GetSearchRoot returns the HyperNode subtree root for gradient search.
+// It intersects the caller-provided hyperNode with the envelope implied by allocatedHyperNode.
+func GetSearchRoot(
+	hyperNodes HyperNodeInfoMap,
+	hyperNodeAvailable *HyperNodeInfo,
+	highestAllowedTier int,
+	allocatedHyperNode string,
+) (*HyperNodeInfo, error) {
+	if allocatedHyperNode == "" {
+		return hyperNodeAvailable, nil
+	}
+
+	hyperNodeHighestAllowed, err := GetHighestAllowedHyperNode(hyperNodes, highestAllowedTier, allocatedHyperNode)
+	if err != nil {
+		return nil, fmt.Errorf("get highest allowed hyperNode failed: %w", err)
+	}
+
+	lca := hyperNodes.GetLCAHyperNode(hyperNodeAvailable.Name, hyperNodeHighestAllowed)
+	if lca == hyperNodeHighestAllowed {
+		return hyperNodeAvailable, nil
+	}
+	if lca == hyperNodeAvailable.Name {
+		hni, ok := hyperNodes[hyperNodeHighestAllowed]
+		if !ok {
+			return nil, fmt.Errorf("failed to get highest allowed HyperNode info for %s", hyperNodeHighestAllowed)
+		}
+		return hni, nil
+	}
+
+	return nil, fmt.Errorf("there is no intersection between hyperNodeAvailable %s and hyperNodeHighestAllowed %s",
+		hyperNodeAvailable.Name, hyperNodeHighestAllowed)
+}
+
+// GetHighestAllowedHyperNode returns the coarsest ancestor of allocatedHyperNode within highestAllowedTier.
+func GetHighestAllowedHyperNode(hyperNodes HyperNodeInfoMap, highestAllowedTier int, allocatedHyperNode string) (string, error) {
+	var highestAllowedHyperNode string
+
+	for _, ancestor := range hyperNodes.GetAncestors(allocatedHyperNode) {
+		hni, ok := hyperNodes[ancestor]
+		if !ok {
+			return "", fmt.Errorf("allocated hyperNode %s ancestor %s not found", allocatedHyperNode, ancestor)
+		}
+		if hni.Tier() > highestAllowedTier {
+			break
+		}
+		highestAllowedHyperNode = ancestor
+	}
+
+	if highestAllowedHyperNode == "" {
+		return "", fmt.Errorf("allocated hyperNode %s tier is greater than highest allowed tier %d", allocatedHyperNode, highestAllowedTier)
+	}
+
+	return highestAllowedHyperNode, nil
 }

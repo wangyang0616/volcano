@@ -143,6 +143,14 @@ func testHyperNodeInfo(name string, tier int) *api.HyperNodeInfo {
 	return api.NewHyperNodeInfo(api.BuildHyperNode(name, tier, nil))
 }
 
+func gradientByPluginOnly(gradients ...[][]*api.HyperNodeInfo) []api.HyperNodePluginGradient {
+	gradientByPlugin := make([]api.HyperNodePluginGradient, len(gradients))
+	for index, g := range gradients {
+		gradientByPlugin[index] = api.HyperNodePluginGradient{Gradients: g}
+	}
+	return gradientByPlugin
+}
+
 func TestIntersectHyperNodeGradients(t *testing.T) {
 	pluginA := [][]*api.HyperNodeInfo{
 		{testHyperNodeInfo("a1", 1), testHyperNodeInfo("a2", 1)},
@@ -153,30 +161,50 @@ func TestIntersectHyperNodeGradients(t *testing.T) {
 		{testHyperNodeInfo("a3", 2), testHyperNodeInfo("b2", 2)},
 	}
 
-	result := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{pluginA, pluginB})
+	result, stats := intersectHyperNodeGradients([]api.HyperNodePluginGradient{
+		{PluginName: "plugin-a", Gradients: pluginA},
+		{PluginName: "plugin-b", Gradients: pluginB},
+	})
 	assert.Len(t, result, 2)
 	assert.Equal(t, []string{"a2"}, hyperNodeNamesAtTier(result, 0))
 	assert.Equal(t, []string{"a3"}, hyperNodeNamesAtTier(result, 1))
+	assert.Equal(t, map[int]int{1: 2, 2: 1}, stats.PluginEligibleByTier["plugin-a"])
+	assert.Equal(t, map[int]int{1: 2, 2: 2}, stats.PluginEligibleByTier["plugin-b"])
+	assert.Equal(t, map[int]int{1: 1, 2: 1}, stats.IntersectedByTier)
 
-	empty := intersectHyperNodeGradients([][][]*api.HyperNodeInfo{
-		{{testHyperNodeInfo("only-a", 1)}},
-		{{testHyperNodeInfo("only-b", 1)}},
+	empty, stats := intersectHyperNodeGradients([]api.HyperNodePluginGradient{
+		{PluginName: "only-a", Gradients: [][]*api.HyperNodeInfo{{testHyperNodeInfo("only-a", 1)}}},
+		{PluginName: "only-b", Gradients: [][]*api.HyperNodeInfo{{testHyperNodeInfo("only-b", 1)}}},
 	})
 	assert.Nil(t, empty)
+	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["only-a"])
+	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["only-b"])
+	assert.Empty(t, stats.IntersectedByTier)
 }
 
 func TestIntersectHyperNodeGradientsSinglePlugin(t *testing.T) {
 	gradients := [][]*api.HyperNodeInfo{{testHyperNodeInfo("x", 1)}}
-	assert.Equal(t, gradients, intersectHyperNodeGradients([][][]*api.HyperNodeInfo{gradients}))
+	result, stats := intersectHyperNodeGradients(gradientByPluginOnly(gradients))
+	assert.Equal(t, gradients, result)
+	assert.Equal(t, map[int]int{1: 1}, stats.IntersectedByTier)
 
 	empty := [][]*api.HyperNodeInfo{}
-	assert.Equal(t, empty, intersectHyperNodeGradients([][][]*api.HyperNodeInfo{empty}))
+	result, stats = intersectHyperNodeGradients(gradientByPluginOnly(empty))
+	assert.Equal(t, empty, result)
+	assert.Empty(t, stats.IntersectedByTier)
 }
 
 func TestIntersectHyperNodeGradientsWithEmptyPluginResult(t *testing.T) {
 	full := [][]*api.HyperNodeInfo{{testHyperNodeInfo("a", 1)}}
 	empty := [][]*api.HyperNodeInfo{}
-	assert.Nil(t, intersectHyperNodeGradients([][][]*api.HyperNodeInfo{full, empty}))
+	result, stats := intersectHyperNodeGradients([]api.HyperNodePluginGradient{
+		{PluginName: "full", Gradients: full},
+		{PluginName: "empty", Gradients: empty},
+	})
+	assert.Nil(t, result)
+	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["full"])
+	assert.Empty(t, stats.PluginEligibleByTier["empty"])
+	assert.Empty(t, stats.IntersectedByTier)
 }
 
 func hyperNodeNamesAtTier(gradients [][]*api.HyperNodeInfo, tierIdx int) []string {
@@ -205,53 +233,56 @@ func TestRebuildGradientsByTierPreservesTierOrder(t *testing.T) {
 	assert.Equal(t, 2, result[1][0].Tier())
 }
 
-// buildBenchmarkPluginGradients builds [plugin][tier-layer][hyperNodes] for intersection benchmarks.
+// buildBenchmarkPluginGradients builds plugin inputs for intersection benchmarks.
 // Each plugin exposes tier-1 HyperNodes hn-1-0..hn-1-(numTier1-1) plus one tier-2 root.
 // pluginOffset skips the first N tier-1 HyperNodes to simulate partial overlap across plugins.
-func buildBenchmarkPluginGradients(numPlugins, numTier1, pluginOffset int) [][][]*api.HyperNodeInfo {
+func buildBenchmarkGradientByPlugin(numPlugins, numTier1, pluginOffset int) []api.HyperNodePluginGradient {
 	tier1 := make([]*api.HyperNodeInfo, 0, numTier1)
 	for index := 0; index < numTier1; index++ {
 		tier1 = append(tier1, testHyperNodeInfo(fmt.Sprintf("hn-1-%d", index), 1))
 	}
 	tier2 := testHyperNodeInfo("hn-2-0", 2)
 
-	pluginGradients := make([][][]*api.HyperNodeInfo, 0, numPlugins)
+	gradientByPlugin := make([]api.HyperNodePluginGradient, 0, numPlugins)
 	for pluginIndex := 0; pluginIndex < numPlugins; pluginIndex++ {
 		offset := pluginIndex * pluginOffset
 		pluginTier1 := tier1
 		if offset > 0 && offset < len(tier1) {
 			pluginTier1 = tier1[offset:]
 		}
-		pluginGradients = append(pluginGradients, [][]*api.HyperNodeInfo{pluginTier1, {tier2}})
+		gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{
+			PluginName: fmt.Sprintf("plugin-%d", pluginIndex),
+			Gradients:  [][]*api.HyperNodeInfo{pluginTier1, {tier2}},
+		})
 	}
-	return pluginGradients
+	return gradientByPlugin
 }
 
 func BenchmarkIntersectHyperNodeGradients(b *testing.B) {
 	// Typical production shape: 2 plugins, 100 tier-1 HyperNodes, partial overlap.
-	pluginGradients := buildBenchmarkPluginGradients(2, 100, 10)
+	gradientByPlugin := buildBenchmarkGradientByPlugin(2, 100, 10)
 
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		intersectHyperNodeGradients(pluginGradients)
+		intersectHyperNodeGradients(gradientByPlugin)
 	}
 }
 
 func BenchmarkIntersectHyperNodeGradients_ManyPlugins(b *testing.B) {
-	pluginGradients := buildBenchmarkPluginGradients(5, 100, 5)
+	gradientByPlugin := buildBenchmarkGradientByPlugin(5, 100, 5)
 
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		intersectHyperNodeGradients(pluginGradients)
+		intersectHyperNodeGradients(gradientByPlugin)
 	}
 }
 
 func BenchmarkIntersectHyperNodeGradients_LargeCluster(b *testing.B) {
 	// 1000 tier-1 HyperNodes to stress nested loops in phase 2.
-	pluginGradients := buildBenchmarkPluginGradients(2, 1000, 50)
+	gradientByPlugin := buildBenchmarkGradientByPlugin(2, 1000, 50)
 
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		intersectHyperNodeGradients(pluginGradients)
+		intersectHyperNodeGradients(gradientByPlugin)
 	}
 }

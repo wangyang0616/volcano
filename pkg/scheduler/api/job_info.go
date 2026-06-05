@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
@@ -789,20 +790,28 @@ func (ji *JobInfo) FitError() string {
 		reasonMsg += "; " + fmt.Sprintf("%s: %s", Pending.String(), strings.Join(sortReasonsHistogram(reasons), ", "))
 	}
 
-	// record the original reason: such as can not enqueue or failed reasons of first pod failed to predicated
-	if ji.JobFitErrors != "" {
-		reasonMsg += ". Origin reason is: " + ji.JobFitErrors
+	if dimensions := ji.schedulingDimensions(""); dimensions != "" {
+		reasonMsg += ". " + dimensions
+	}
+
+	return reasonMsg
+}
+
+func (ji *JobInfo) schedulingDimensions(taskID TaskID) string {
+	var nodeSummary string
+	if taskID != "" {
+		if fe := ji.NodesFitErrors[taskID]; fe != nil {
+			nodeSummary = fe.Error()
+		}
 	} else {
 		for _, taskInfo := range ji.Tasks {
-			fitError := ji.NodesFitErrors[taskInfo.UID]
-			if fitError != nil {
-				reasonMsg += fmt.Sprintf(". Origin reason is %v: %v", taskInfo.Name, fitError.Error())
+			if fe := ji.NodesFitErrors[taskInfo.UID]; fe != nil {
+				nodeSummary = fmt.Sprintf("%s: %s", taskInfo.Name, fe.Error())
 				break
 			}
 		}
 	}
-
-	return reasonMsg
+	return FormatSchedulingDimensions(ji.JobFitErrors, nodeSummary)
 }
 
 // TaskSchedulingReason get detailed reason and message of the given task
@@ -819,28 +828,36 @@ func (ji *JobInfo) TaskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeN
 		ctx = *taskInfo.LastTransaction
 	}
 
-	msg = ji.JobFitErrors
 	switch status := ctx.Status; status {
 	case Allocated:
 		// Pod is schedulable
-		msg = fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName)
+		msg = AppendSchedulingDimensions(
+			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
+			ji.JobFitErrors, "",
+		)
 		return PodReasonSchedulable, msg, ""
 	case Pipelined:
-		msg = fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once resource is released and minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName)
+		msg = AppendSchedulingDimensions(
+			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once resource is released and minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
+			ji.JobFitErrors, "",
+		)
 		if ctx.EvictionOccurred {
 			nominatedNodeName = ctx.NodeName
 		}
 		return PodReasonUnschedulable, msg, nominatedNodeName
 	case Pending:
+		var nodeSummary string
 		if fe := ji.NodesFitErrors[tid]; fe != nil {
-			// Pod is unschedulable
-			return PodReasonUnschedulable, fe.Error(), ""
+			nodeSummary = fe.Error()
 		}
-		// Pod is not scheduled yet, keep UNSCHEDULABLE as the reason to support cluster autoscaler
-		return PodReasonUnschedulable, msg, ""
+		return PodReasonUnschedulable, ji.schedulingDimensionsForTask(nodeSummary), ""
 	default:
-		return status.String(), msg, ""
+		return status.String(), ji.schedulingDimensionsForTask(""), ""
 	}
+}
+
+func (ji *JobInfo) schedulingDimensionsForTask(nodeSummary string) string {
+	return FormatSchedulingDimensions(ji.JobFitErrors, nodeSummary)
 }
 
 // ReadyTaskNum returns the number of tasks that are ready or that is best-effort.
@@ -1215,10 +1232,27 @@ func (ji *JobInfo) WithNetworkTopology() bool {
 	return ji.PodGroup != nil && ji.PodGroup.Spec.NetworkTopology != nil
 }
 
-// ResetFitErr will set job and node fit err to nil.
+// ResetFitErr clears node-level fit errors between HyperNode dry-run attempts.
+// HyperNode-tier summary in JobFitErrors is preserved.
 func (ji *JobInfo) ResetFitErr() {
-	ji.JobFitErrors = ""
 	ji.NodesFitErrors = make(map[TaskID]*FitErrors)
+}
+
+// SetHyperNodeFitErrors stores HyperNode-tier scheduling diagnostics in JobFitErrors.
+func (ji *JobInfo) SetHyperNodeFitErrors(
+	stats *HyperNodeGradientStats,
+	resourceStats *HyperNodeMinResourceFilterStats,
+	minResource *Resource,
+	hyperNodesSetByTier map[int]sets.Set[string],
+	tierNameMap HyperNodeTierNameMap,
+	hyperNodes HyperNodeInfoMap,
+) {
+	if stats == nil {
+		return
+	}
+	ji.JobFitErrors = FormatHyperNodeFitSummary(
+		stats, resourceStats, minResource, hyperNodesSetByTier, tierNameMap, hyperNodes,
+	)
 }
 
 // ResetSubJobFitErr will set subJob's node fit err to nil.

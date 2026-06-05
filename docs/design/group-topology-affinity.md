@@ -905,6 +905,98 @@ Node-level fit (`PredicateNodes`, task `InitResreq` vs `node.FutureIdle()`) is u
 - **Predicate failure under a valid HyperNode** — dry-run fails for that HyperNode; allocate tries the next HyperNode in the gradient, then the next gradient. Recorded per-task **`NodesFitErrors`** explain Node-level unfit (resource, taint, etc.).
 - **Partial success** — dry-run may pipeline SubJobs (**`SubJobPipelinedFn`**) even when not all tasks bind; winning HyperNode is still chosen from successful dry-runs.
 
+<a id="scheduling-events"></a>
+
+#### Scheduling events and fit messages
+
+When topology-aware allocate fails or leaves tasks Pending, Volcano surfaces **two independent diagnostic dimensions** on PodGroup and Pod events (and on **`PodScheduled`** / PodGroup **`Unschedulable`** conditions where applicable):
+
+1. **HyperNode tier** — K8s-style aggregate statistics from gradient planning (`group-topology-affinity`, `network-topology-aware`, **`filterGradientsByMinResource`**). Stored in **`JobInfo.JobFitErrors`** and built by **`buildHyperNodeFitSummary`** in allocate (`setJobHyperNodeFitSummary`).
+2. **Node tier** — per-task predicate / resource fit errors from dry-run under a candidate HyperNode. Stored in **`JobInfo.NodesFitErrors`**.
+
+Both dimensions are **always joined** in user-visible messages (when each side has data), so operators can tell whether failure happened at HyperNode selection or under a valid HyperNode candidate.
+
+**Data sources (no separate tier index)**
+
+- **Total per tier** — read from Session **`HyperNodesSetByTier[tier].Len()`** (fixed for the session after HyperNode / Node CR snapshot; virtual cluster-top included after **`addClusterTopHyperNode`**).
+- **Per-plugin eligible per tier** — collected while **`HyperNodeGradientForJobFn`** / **`HyperNodeGradientForSubJobFn`** invoke enabled plugins; returned as **`HyperNodeGradientStats`** in `pkg/scheduler/api/unschedule_info.go`.
+- **After minResource filter** — **`FilterGradientsByMinResource`** returns **`HyperNodeMinResourceFilterStats`**; **`JobInfo.SetHyperNodeFitErrors`** writes **`FormatHyperNodeFitSummary`** into **`JobFitErrors`**.
+- **Tier display names** — **`HyperNodeTierNameMap.NameForTier(tier, hyperNodes)`** in `pkg/scheduler/api/hyper_node_info.go`.
+
+**Message composition**
+
+Helper functions in `pkg/scheduler/api/unschedule_info.go`:
+
+```text
+HyperNode: <tier aggregate message>
+Node: <per-task or per-node predicate message>
+```
+
+For PodGroup-level summaries, **`JobInfo.FitError()`** also includes a task-status histogram, then appends the dual dimensions:
+
+```text
+PodGroupNotReady, 3 Pending, 5 Bound, 8 minAvailable; Pending: 3 Unschedulable.
+HyperNode: 2/3 hyperNodes available: supernode 2/2; Node: worker-0: In hyperNode sn-b: 0/3 nodes are unavailable: 2 Insufficient cpu, 1 node(s) pod number exceeded.
+```
+
+**HyperNode tier message format** (from **`FormatHyperNodeFitSummary`** in `pkg/scheduler/api/unschedule_info.go`, via **`JobInfo.SetHyperNodeFitErrors`**):
+
+```text
+<eligible>/<total> hyperNodes available [(minResource: <resource>)] [; <plugin>: <plugin error>]: <tierName> <eligible>/<total> (<exclusions>), ...
+```
+
+Exclusion labels in tier breakdown:
+
+| Source | Label in message |
+| ------ | ---------------- |
+| `group-topology-affinity` (e.g. **`podGroupAntiAffinity`**) | `podGroupAntiAffinity` |
+| `network-topology-aware` | `networkTopology` |
+| **`filterGradientsByMinResource`** | `minResource` |
+
+**HyperNode summary timing:** **`setJobHyperNodeFitSummary`** runs after **`HyperNodeGradientForJobFn`** (or **`HyperNodeGradientForSubJobFn`**) + **`filterGradientsByMinResource`** on **every** allocate attempt — not only when the gradient is empty — so Node-level failures still carry HyperNode context. **`ResetFitErr`** clears **`NodesFitErrors`** between HyperNode dry-runs but **preserves** **`JobFitErrors`**.
+
+**PodGroup Event** (`RecordJobStatusEvent` → **`recordPodGroupEvent`**):
+
+| Field | Value |
+| ----- | ----- |
+| Type | `Warning` |
+| Reason | `Unschedulable` |
+| Message | `{pending}/{total} tasks in gang unschedulable: {JobInfo.FitError()}` |
+
+**Pod Event** (`taskUnschedulable` → **`FailedScheduling`**):
+
+| Field | Value |
+| ----- | ----- |
+| Type | `Warning` |
+| Reason | `FailedScheduling` |
+| **`PodScheduled` Condition.Reason** | `Unschedulable` / `Schedulable` (unchanged for autoscaler compatibility) |
+| Message | From **`TaskSchedulingReason`**: dual dimensions for Pending tasks; **`AppendSchedulingDimensions`** adds **`HyperNode:`** to Allocated / Pipelined “can possibly be assigned …” messages when a summary exists |
+
+**Typical scenarios**
+
+| Failure phase | PodGroup / Pod message highlights |
+| ------------- | --------------------------------- |
+| HyperNode gradient empty (e.g. all candidates conflict on **`podGroupAntiAffinity`**) | **`HyperNode:`** tier breakdown with `podGroupAntiAffinity` exclusions; **`Node:`** often absent |
+| Multiple HyperNode candidates, Node predicate fails | **`HyperNode:`** shows survivors (e.g. `2/3 hyperNodes available`); **`Node:`** shows `In hyperNode <name>: 0/N nodes are unavailable: …` |
+| Gang partially schedulable | Some pods **`Schedulable`** with optional **`HyperNode:`** suffix; failing pods carry full dual dimensions |
+
+**Update deduplication:** Pod **Status** PATCH and **`FailedScheduling`** events are emitted only when **`PodScheduled` Condition** (`Reason` / `Message`) changes (`podConditionHaveUpdate` in `pkg/scheduler/cache/cache.go`). PodGroup **Status** PATCH is skipped when conditions are unchanged (`job_updater.isPodGroupStatusUpdated`). PodGroup **Events** may repeat each cycle if the message is unchanged (known limitation; see TODO in **`RecordJobStatusEvent`**).
+
+**Scheduler logs (`group-topology-affinity`)**
+
+Structured logs use the prefix **`podGroup anti-affinity:`** (grep-friendly):
+
+| Level | Purpose |
+| ----- | ------- |
+| **V(3)** | Core placement decisions: gradient evaluation, matching occupancy, HyperNode reject/accept, preferred penalty hits (`pods`, `hyperNode`, `conflictHyperNode`, `matchingJobs` with `hyperNode=` / `nodes=` ) |
+| **V(4)** | Soft anti-affinity score details: `scoreBefore`, `scoreAfter`, `weightFactor`, final merged scores |
+
+Implementation: `pkg/scheduler/plugins/group-topology-affinity/group_topology_affinity.go`, `pkg/scheduler/api/unschedule_info.go`, `pkg/scheduler/api/job_info.go`, `pkg/scheduler/actions/allocate/allocate.go` (`logHyperNodeTiers`), `pkg/scheduler/cache/cache.go` (`RecordJobStatusEvent`).
+
+**Session diagnostics (V(3)):** at the start of **`allocate` Execute**, one log line lists HyperNode tiers from **`HyperNodesSetByTier`** (tier name, count, HyperNode names). Enable with scheduler `-v=3`.
+
+See also [Scheduling Reason](./scheduling-reason.md) for historical PodGroup / Pod condition behavior.
+
 #### Scope
 
 
@@ -918,9 +1010,11 @@ Node-level fit (`PredicateNodes`, task `InitResreq` vs `node.FutureIdle()`) is u
 | **`allocateForJob`** / `allocateForSubJob` dry-run loop | No — existing behavior (called after pre-filter) |
 | **`allocateResourcesForTasks`** → PrePredicate → Predicate → bind | No |
 | **`predicates`** and other Node order plugins | No |
+| Dual-dimension HyperNode + Node fit messages on PodGroup / Pod events | **Yes** — [Scheduling events and fit messages](#scheduling-events) |
+| V(3)/V(4) structured logs for **`podGroupAntiAffinity`** | **Yes** |
 
 
-Implementation references: `pkg/scheduler/actions/allocate/allocate.go`, `pkg/scheduler/framework/session_plugins.go` (`HyperNodeGradientForJobFn`), [Network Topology Aware Scheduling — allocate action](./Network%20Topology%20Aware%20Scheduling.md#allocate-action).
+Implementation references: `pkg/scheduler/actions/allocate/allocate.go` (`allocateForJob`, `FilterGradientsByMinResource`), `pkg/scheduler/framework/session_plugins.go` (`HyperNodeGradientForJobFn`), `pkg/scheduler/api/job_info.go` (`SetHyperNodeFitErrors`), [Network Topology Aware Scheduling — allocate action](./Network%20Topology%20Aware%20Scheduling.md#allocate-action).
 
 ### Admission webhook
 
@@ -957,11 +1051,18 @@ tiers:
 | Area                               | Path                                                                |
 | ---------------------------------- | ------------------------------------------------------------------- |
 | API types                          | `staging/.../scheduling/v1beta1/types.go`                           |
+| HyperNode tier names               | `pkg/scheduler/api/hyper_node_info.go` (`HyperNodeTierNameMap.NameForTier`) |
 | Occupancy / constraints            | `pkg/scheduler/api/topology_occupancy.go`, `topology_constraint.go` |
-| Plugin                             | `pkg/scheduler/plugins/group-topology-affinity/`                    |
-| Framework aggregation | `pkg/scheduler/framework/session_plugins.go` |
-| HyperNode resource pre-filter | `pkg/scheduler/actions/allocate/allocate.go` (`filterGradientsByMinResource`) |
-| HyperNode resource ledger | `pkg/scheduler/plugins/network-topology-aware/network_topology_aware.go` |
+| Plugin                             | `pkg/scheduler/plugins/group-topology-affinity/group_topology_affinity.go` |
+| HyperNode fit summary types / format | `pkg/scheduler/api/unschedule_info.go` (`HyperNodeGradientStats`, `FormatHyperNodeFitSummary`) |
+| Job HyperNode fit errors             | `pkg/scheduler/api/job_info.go` (`SetHyperNodeFitErrors`, `FitError`) |
+| HyperNode tier listing (log text)    | `pkg/scheduler/api/hyper_node_info.go` (`FormatHyperNodeTierListing`, `NameForTier`) |
+| Fit message dimension join           | `pkg/scheduler/api/unschedule_info.go` (`FormatSchedulingDimensions`) |
+| HyperNode minResource pre-filter     | `pkg/scheduler/actions/allocate/allocate.go` (`FilterGradientsByMinResource`) |
+| HyperNode tier log (V(3))            | `pkg/scheduler/actions/allocate/allocate.go` (`logHyperNodeTiers`) |
+| Gradient intersection / collection   | `pkg/scheduler/framework/session_plugins.go` (`HyperNodeGradientForJobFn`) |
+| PodGroup / Pod events                | `pkg/scheduler/cache/cache.go` (`RecordJobStatusEvent`, `taskUnschedulable`) |
+| HyperNode resource ledger            | `pkg/scheduler/plugins/network-topology-aware/network_topology_aware.go` |
 | Allocate dry-run / bind (existing) | `pkg/scheduler/actions/allocate/allocate.go` |
 | Webhook                            | `pkg/webhooks/.../validate_podgroup.go`                             |
 
@@ -979,7 +1080,7 @@ Not in the current delivery. Items below may be considered later without changin
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | Preempt / backfill      | Keep **`TopologyOccupancyIndex`** consistent; align with [Preempt Action Support Topology](./preempt-action-support-topology.md)        |
 | Enqueue pre-check       | Optional check for global domain exhaustion before allocate                                                                             |
-| Observability           | subGroup annotation with allocated **topology domain name**; optional PodGroup condition **`TopologyUnsatisfiable`**                    |
+| Observability           | subGroup annotation with allocated **topology domain name**; optional PodGroup condition **`TopologyUnsatisfiable`**. Dual-dimension events and V(3)/V(4) anti-affinity logs: [Scheduling events and fit messages](#scheduling-events) |
 | Cross-PodGroup affinity | **`podGroupAffinity`** for co-location across PodGroups (not in scope; within one PodGroup use `networkTopology` or **`subGroupAffinity`**) |
 | Cross-PodGroup subGroup rules | **`subGroupAffinity`** / **`subGroupAntiAffinity`** across PodGroups or namespaces (not in scope; subGroup rules are intra-PodGroup only) |
 | Training workloads      | Batch Job / **`PartitionPolicy`** alignment                                                                                             |

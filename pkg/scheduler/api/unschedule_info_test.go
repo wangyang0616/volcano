@@ -17,6 +17,7 @@ package api
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -144,5 +145,45 @@ func TestFitErrors(t *testing.T) {
 		got := fitErrs.Error()
 		assert.Equal(t, test.want, got)
 		assert.Equal(t, test.filterNodes, fitErrs.GetUnschedulableAndUnresolvableNodes())
+	}
+}
+
+func TestFormatHyperNodeFitSummary(t *testing.T) {
+	hyperNodes := HyperNodeInfoMap{
+		"root": &HyperNodeInfo{Name: "root", tier: 3},
+		"sn-a": &HyperNodeInfo{Name: "sn-a", tier: 2},
+		"sn-b": &HyperNodeInfo{Name: "sn-b", tier: 2},
+	}
+	hyperNodesSetByTier := map[int]sets.Set[string]{
+		3: sets.New("root"),
+		2: sets.New("sn-a", "sn-b"),
+	}
+	tierNameMap := HyperNodeTierNameMap{"cluster": 3, "supernode": 2}
+
+	stats := &HyperNodeGradientStats{
+		PluginEligibleByTier: map[string]map[int]int{
+			"group-topology-affinity": {3: 0, 2: 1},
+			"network-topology-aware":  {3: 1, 2: 2},
+		},
+		IntersectedByTier: map[int]int{2: 1},
+	}
+	resourceStats := &HyperNodeMinResourceFilterStats{
+		FinalByTier:    map[int]int{2: 0},
+		ExcludedByTier: map[int]int{2: 1},
+	}
+	minResource := &Resource{MilliCPU: 20000}
+
+	msg := FormatHyperNodeFitSummary(stats, resourceStats, minResource, hyperNodesSetByTier, tierNameMap, hyperNodes)
+	if !strings.HasPrefix(msg, "0/3 hyperNodes available") {
+		t.Fatalf("expected aggregate prefix, got %q", msg)
+	}
+	if !strings.Contains(msg, "minResource:") {
+		t.Fatalf("expected minResource detail, got %q", msg)
+	}
+	if !strings.Contains(msg, "cluster 0/1 (1 podGroupAntiAffinity") {
+		t.Fatalf("expected cluster tier breakdown, got %q", msg)
+	}
+	if !strings.Contains(msg, "supernode 0/2 (1 podGroupAntiAffinity, 1 minResource") {
+		t.Fatalf("expected supernode tier breakdown, got %q", msg)
 	}
 }

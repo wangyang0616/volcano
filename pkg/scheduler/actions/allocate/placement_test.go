@@ -23,6 +23,7 @@ import (
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
 func TestCaptureRestoreHyperNodePlacement(t *testing.T) {
@@ -68,6 +69,46 @@ func TestUpdateJobAllocatedHyperNodeFromSubJob(t *testing.T) {
 	updateJobAllocatedHyperNodeFromSubJob(ssn, job, subJob, "sn-b")
 	if job.AllocatedHyperNode != "root" {
 		t.Fatalf("job AllocatedHyperNode = %q, want root", job.AllocatedHyperNode)
+	}
+}
+
+func TestFilterGradientsByMinResourceTierStats(t *testing.T) {
+	nodeInfo := api.NewNodeInfo(util.BuildNode(
+		"node-a",
+		api.BuildResourceList("4", "8Gi", []api.ScalarResource{{Name: "pods", Value: "110"}}...),
+		nil,
+	))
+
+	ssn := &framework.Session{
+		Nodes: map[string]*api.NodeInfo{"node-a": nodeInfo},
+		RealNodesSet: map[string]sets.Set[string]{
+			"sn-a": sets.New("node-a"),
+			"sn-b": sets.New("node-a"),
+		},
+		HyperNodes: api.HyperNodeInfoMap{
+			"sn-a": newPlacementTestHyperNode("sn-a", 2, "root"),
+			"sn-b": newPlacementTestHyperNode("sn-b", 2, "root"),
+		},
+		HyperNodeTierNameMap: api.HyperNodeTierNameMap{"supernode": 2},
+	}
+
+	gradients := [][]*api.HyperNodeInfo{
+		{ssn.HyperNodes["sn-a"], ssn.HyperNodes["sn-b"]},
+	}
+	minResource := &api.Resource{MilliCPU: 20000, Memory: 40 * 1024 * 1024 * 1024}
+
+	filtered, stats := FilterGradientsByMinResource(ssn, gradients, minResource, "")
+	if len(filtered) != 0 {
+		t.Fatalf("expected empty filtered gradients, got %#v", filtered)
+	}
+	if stats == nil {
+		t.Fatal("expected resource filter stats")
+	}
+	if stats.ExcludedByTier[2] != 2 {
+		t.Fatalf("expected 2 resource exclusions at supernode tier, got %#v", stats.ExcludedByTier)
+	}
+	if stats.FinalByTier[2] != 0 {
+		t.Fatalf("expected 0 final hyperNodes, got %#v", stats.FinalByTier)
 	}
 }
 

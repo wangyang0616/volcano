@@ -549,28 +549,54 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 // grouping eligible HyperNodes by tier in ascending order. Resource capacity is filtered in allocate
 // via filterGradientsByMinResource after plugin gradients are intersected.
 func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Session, hyperNode *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string) ([][]*api.HyperNodeInfo, error) {
-	enqueued := set.New[string]()
-	var processQueue []*api.HyperNodeInfo
-
-	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, highestAllowedTier, allocatedHyperNode)
+	eligibleByTier, _, err := nta.hyperNodeGradientStats(ssn, hyperNode, highestAllowedTier, allocatedHyperNode)
 	if err != nil {
-		return nil, fmt.Errorf("getSearchRoot failed: %w", err)
+		return nil, err
 	}
 
-	processQueue = append(processQueue, searchRoot)
+	var tiers []int
+	for tier := range eligibleByTier {
+		tiers = append(tiers, tier)
+	}
+	sort.Ints(tiers)
+
+	var result [][]*api.HyperNodeInfo
+	for _, tier := range tiers {
+		result = append(result, eligibleByTier[tier])
+	}
+
+	return result, nil
+}
+
+func (nta *networkTopologyAwarePlugin) hyperNodeGradientStats(
+	ssn *framework.Session,
+	hyperNode *api.HyperNodeInfo,
+	highestAllowedTier int,
+	allocatedHyperNode string,
+) (map[int][]*api.HyperNodeInfo, map[int]int, error) {
+	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, highestAllowedTier, allocatedHyperNode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("getSearchRoot failed: %w", err)
+	}
+
+	totalByTier := make(map[int]int, len(ssn.HyperNodesSetByTier))
+	for tier, names := range ssn.HyperNodesSetByTier {
+		totalByTier[tier] = names.Len()
+	}
+
+	enqueued := set.New[string]()
+	processQueue := []*api.HyperNodeInfo{searchRoot}
 	enqueued.Insert(searchRoot.Name)
 
-	eligibleHyperNodes := make(map[int][]*api.HyperNodeInfo)
+	eligibleByTier := make(map[int][]*api.HyperNodeInfo)
 	for len(processQueue) > 0 {
-		// pop one hyperNode from queue
 		current := processQueue[0]
 		processQueue = processQueue[1:]
 
 		if nta.isEligibleHyperNode(current, highestAllowedTier, allocatedHyperNode) {
-			eligibleHyperNodes[current.Tier()] = append(eligibleHyperNodes[current.Tier()], current)
+			eligibleByTier[current.Tier()] = append(eligibleByTier[current.Tier()], current)
 		}
 
-		// push children hyperNode into queue
 		for child := range current.Children {
 			if enqueued.Has(child) {
 				continue
@@ -580,19 +606,7 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientFn(ssn *framework.Sessio
 		}
 	}
 
-	// organize hyperNode gradients by tiers in ascending order
-	var tiers []int
-	for tier := range eligibleHyperNodes {
-		tiers = append(tiers, tier)
-	}
-	sort.Ints(tiers)
-
-	var result [][]*api.HyperNodeInfo
-	for _, tier := range tiers {
-		result = append(result, eligibleHyperNodes[tier])
-	}
-
-	return result, nil
+	return eligibleByTier, totalByTier, nil
 }
 
 func (nta *networkTopologyAwarePlugin) isEligibleHyperNode(hn *api.HyperNodeInfo, highestAllowedTier int, allocatedHyperNode string) bool {

@@ -3653,7 +3653,7 @@ func TestHyperNodeGradientPreFiltering(t *testing.T) {
 				"",
 			)
 			assert.NoError(t, err)
-			result = allocate.FilterGradientsByMinResource(ssn, result, tt.minResource, "")
+			result, _ = allocate.FilterGradientsByMinResource(ssn, result, tt.minResource, "")
 
 			// Check if the test HyperNode is in the result
 			found := false
