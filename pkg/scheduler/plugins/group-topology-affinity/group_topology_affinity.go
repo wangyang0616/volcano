@@ -287,10 +287,10 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 			return nil, err
 		}
 
-		weightFactor := float64(term.Weight) / 100.0
-		if weightFactor <= 0 {
-			weightFactor = 1.0
+		if term.Weight < 1 || term.Weight > 100 {
+			continue
 		}
+		weightFactor := float64(term.Weight) / 100.0
 		for hyperNode := range hyperNodes {
 			ancestorHyperNode := ssn.HyperNodes.GetAncestorHyperNode(hyperNode, tier)
 			if ancestorHyperNode != "" && matchingHyperNodes.Has(ancestorHyperNode) {

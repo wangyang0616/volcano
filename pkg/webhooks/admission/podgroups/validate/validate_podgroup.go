@@ -158,6 +158,9 @@ func validatePodGroupAffinityTerm(path string, term schedulingv1beta1.PodGroupAf
 	if required && term.Weight != 0 {
 		errs = append(errs, fmt.Sprintf("%s: weight must not be set on required terms.", path))
 	}
+	if !required && (term.Weight < 1 || term.Weight > 100) {
+		errs = append(errs, fmt.Sprintf("%s: weight must be an integer in the range 1-100 for preferred terms.", path))
+	}
 	if term.PodGroupSelector == nil {
 		errs = append(errs, fmt.Sprintf("%s: podGroupSelector is required.", path))
 	}

@@ -293,7 +293,7 @@ func TestHyperNodeOrderFn(t *testing.T) {
 			},
 		},
 		{
-			name:   "zero term weight defaults to full penalty",
+			name:   "invalid term weight is ignored",
 			weight: 1,
 			jobs:   map[api.JobID]*api.JobInfo{"other": otherJobOn("other", "sn-a", "prod")},
 			selfJob: jobWithTopologyAffinity(nil, []scheduling.PodGroupAffinityTerm{
@@ -305,7 +305,7 @@ func TestHyperNodeOrderFn(t *testing.T) {
 			}),
 			candidates: map[string][]*api.NodeInfo{"sn-a": {}, "sn-b": {}},
 			wantScores: map[string]float64{
-				"sn-a": 0,
+				"sn-a": 1.0 * float64(k8sFramework.MaxNodeScore),
 				"sn-b": 1.0 * float64(k8sFramework.MaxNodeScore),
 			},
 		},
@@ -326,6 +326,7 @@ func TestHyperNodeOrderFn(t *testing.T) {
 				Jobs:                 tt.jobs,
 				HyperNodes:           hn,
 				HyperNodeTierNameMap: defaultTierNameMap(),
+				RealNodesSet:         defaultRealNodesSet(),
 			}
 			plugin := New(framework.Arguments{PluginWeight: tt.weight}).(*groupTopologyAffinityPlugin)
 

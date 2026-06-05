@@ -253,3 +253,108 @@ func TestValidatePodGroup(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateTopologyAffinityPreferredWeight(t *testing.T) {
+	selector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"topology.volcano.sh/group": "prod"},
+	}
+	validPreferred := schedulingv1beta1.PodGroupAffinityTerm{
+		PodGroupSelector: selector,
+		TopologyTierName: "supernode",
+		Weight:           50,
+	}
+
+	tests := []struct {
+		name    string
+		spec    *schedulingv1beta1.TopologyAffinitySpec
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "preferred term without weight is rejected",
+			spec: &schedulingv1beta1.TopologyAffinitySpec{
+				PodGroupAntiAffinity: &schedulingv1beta1.PodGroupAntiAffinity{
+					Preferred: []schedulingv1beta1.PodGroupAffinityTerm{
+						{
+							PodGroupSelector: selector,
+							TopologyTierName: "supernode",
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "weight must be an integer in the range 1-100",
+		},
+		{
+			name: "preferred term with zero weight is rejected",
+			spec: &schedulingv1beta1.TopologyAffinitySpec{
+				PodGroupAntiAffinity: &schedulingv1beta1.PodGroupAntiAffinity{
+					Preferred: []schedulingv1beta1.PodGroupAffinityTerm{
+						{
+							PodGroupSelector: selector,
+							TopologyTierName: "supernode",
+							Weight:           0,
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "weight must be an integer in the range 1-100",
+		},
+		{
+			name: "preferred term with weight above 100 is rejected",
+			spec: &schedulingv1beta1.TopologyAffinitySpec{
+				PodGroupAntiAffinity: &schedulingv1beta1.PodGroupAntiAffinity{
+					Preferred: []schedulingv1beta1.PodGroupAffinityTerm{
+						{
+							PodGroupSelector: selector,
+							TopologyTierName: "supernode",
+							Weight:           101,
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "weight must be an integer in the range 1-100",
+		},
+		{
+			name: "preferred term with valid weight is accepted",
+			spec: &schedulingv1beta1.TopologyAffinitySpec{
+				PodGroupAntiAffinity: &schedulingv1beta1.PodGroupAntiAffinity{
+					Preferred: []schedulingv1beta1.PodGroupAffinityTerm{validPreferred},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "required term must not set weight",
+			spec: &schedulingv1beta1.TopologyAffinitySpec{
+				PodGroupAntiAffinity: &schedulingv1beta1.PodGroupAntiAffinity{
+					Required: []schedulingv1beta1.PodGroupAffinityTerm{
+						{
+							PodGroupSelector: selector,
+							TopologyTierName: "supernode",
+							Weight:           50,
+						},
+					},
+				},
+			},
+			wantErr: true,
+			errMsg:  "weight must not be set on required terms",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errMsg := validateTopologyAffinity(tt.spec)
+			if tt.wantErr {
+				assert.NotEmpty(t, errMsg)
+				if tt.errMsg != "" {
+					assert.Contains(t, errMsg, tt.errMsg)
+				}
+				return
+			}
+			assert.Empty(t, errMsg)
+		})
+	}
+}
