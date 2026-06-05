@@ -111,14 +111,155 @@ func matchesNamespaceSelector(namespaceSelector *metav1.LabelSelector, selfNames
 	return selfNamespace == otherNamespace
 }
 
+// getJobAllocatedHyperNode returns job.AllocatedHyperNode when set, otherwise infers it from
+// placed tasks (for example matching PodGroups without network topology).
+func getJobAllocatedHyperNode(
+	job *JobInfo,
+	hyperNodes HyperNodeInfoMap,
+	nodesByHyperNode map[string]sets.Set[string],
+) string {
+	if job == nil || len(nodesByHyperNode) == 0 || len(hyperNodes) == 0 {
+		return ""
+	}
+	if job.AllocatedHyperNode != "" {
+		return job.AllocatedHyperNode
+	}
+
+	hyperNodeSet := sets.New[string]()
+	for name := range hyperNodes {
+		hyperNodeSet.Insert(name)
+	}
+
+	var lca string
+	for _, subJob := range job.SubJobs {
+		subJobHyperNode := subJob.AllocatedHyperNode
+		if subJobHyperNode == "" {
+			subJobHyperNode = getSubJobAllocatedHyperNodeFromTasks(subJob, hyperNodeSet, nodesByHyperNode, hyperNodes)
+		}
+		if subJobHyperNode == "" {
+			continue
+		}
+		lca = hyperNodes.GetLCAHyperNode(lca, subJobHyperNode)
+	}
+	if lca != "" {
+		return lca
+	}
+
+	return getAllocatedHyperNodeFromTasks(collectJobAllocatedTasks(job), hyperNodeSet, nodesByHyperNode, hyperNodes)
+}
+
+func collectJobAllocatedTasks(job *JobInfo) []*TaskInfo {
+	tasks := make([]*TaskInfo, 0)
+	for _, subJob := range job.SubJobs {
+		tasks = append(tasks, collectSubJobAllocatedTasks(subJob)...)
+	}
+	if len(tasks) > 0 {
+		return tasks
+	}
+	for status, taskMap := range job.TaskStatusIndex {
+		if !AllocatedStatus(status) {
+			continue
+		}
+		for _, task := range taskMap {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+func collectSubJobAllocatedTasks(subJob *SubJobInfo) []*TaskInfo {
+	if subJob == nil {
+		return nil
+	}
+	tasks := make([]*TaskInfo, 0, subJob.AllocatedTaskNum())
+	for status, taskMap := range subJob.TaskStatusIndex {
+		if !AllocatedStatus(status) {
+			continue
+		}
+		for _, task := range taskMap {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks
+}
+
+func getSubJobAllocatedHyperNodeFromTasks(
+	subJob *SubJobInfo,
+	hyperNodeSet sets.Set[string],
+	nodesByHyperNode map[string]sets.Set[string],
+	hyperNodes HyperNodeInfoMap,
+) string {
+	return getAllocatedHyperNodeFromTasks(
+		collectSubJobAllocatedTasks(subJob), hyperNodeSet, nodesByHyperNode, hyperNodes,
+	)
+}
+
+func getAllocatedHyperNodeFromTasks(
+	tasks []*TaskInfo,
+	hyperNodeSet sets.Set[string],
+	nodesByHyperNode map[string]sets.Set[string],
+	hyperNodes HyperNodeInfoMap,
+) string {
+	if len(tasks) == 0 {
+		return ""
+	}
+
+	var candidateHyperNodes sets.Set[string]
+	for _, task := range tasks {
+		if task.NodeName == "" {
+			continue
+		}
+
+		search := hyperNodeSet
+		if candidateHyperNodes != nil {
+			search = candidateHyperNodes
+		}
+
+		taskHyperNodes := sets.New[string]()
+		for hyperNode := range search {
+			if nodes, found := nodesByHyperNode[hyperNode]; found && nodes.Has(task.NodeName) {
+				taskHyperNodes.Insert(hyperNode)
+			}
+		}
+		if taskHyperNodes.Len() == 0 {
+			return ""
+		}
+		candidateHyperNodes = taskHyperNodes
+	}
+	return getLowestTierHyperNode(candidateHyperNodes, hyperNodes)
+}
+
+func getLowestTierHyperNode(hyperNodeNames sets.Set[string], hyperNodes HyperNodeInfoMap) string {
+	if hyperNodeNames == nil || hyperNodeNames.Len() == 0 {
+		return ""
+	}
+
+	var lowest *HyperNodeInfo
+	for name := range hyperNodeNames {
+		hyperNode, found := hyperNodes[name]
+		if !found {
+			continue
+		}
+		if lowest == nil || hyperNode.Tier() < lowest.Tier() {
+			lowest = hyperNode
+		}
+	}
+	if lowest == nil {
+		return ""
+	}
+	return lowest.Name
+}
+
 // MatchingPodGroupsAllocatedHyperNodesForTerm returns ancestor HyperNodes at the term tier
 // where matching PodGroups (other than selfJob) are already allocated.
+// nodesByHyperNode is used to infer placement for matching PodGroups without AllocatedHyperNode.
 func MatchingPodGroupsAllocatedHyperNodesForTerm(
 	jobs map[JobID]*JobInfo,
 	hyperNodes HyperNodeInfoMap,
 	tierNameMap HyperNodeTierNameMap,
 	selfJob *JobInfo,
 	term scheduling.PodGroupAffinityTerm,
+	nodesByHyperNode map[string]sets.Set[string],
 ) (sets.Set[string], error) {
 	tier, err := ResolvePodGroupTermTier(term, tierNameMap)
 	if err != nil {
@@ -126,11 +267,15 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 	}
 
 	matchingHyperNodes := sets.New[string]()
-	for _, otherJob := range jobs {
-		if !PodGroupMatchesTerm(term, selfJob, otherJob) || otherJob.AllocatedHyperNode == "" {
+	for _, matchingJob := range jobs {
+		if !PodGroupMatchesTerm(term, selfJob, matchingJob) {
 			continue
 		}
-		ancestorHyperNode := hyperNodes.GetAncestorHyperNode(otherJob.AllocatedHyperNode, tier)
+		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
+		if allocatedHyperNode == "" {
+			continue
+		}
+		ancestorHyperNode := hyperNodes.GetAncestorHyperNode(allocatedHyperNode, tier)
 		if ancestorHyperNode != "" {
 			matchingHyperNodes.Insert(ancestorHyperNode)
 		}

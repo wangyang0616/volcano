@@ -89,7 +89,7 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			wantNil:   true,
 		},
 		{
-			name:           "peer on sn-a leaves sn-b",
+			name:           "matching PodGroup on sn-a leaves sn-b",
 			hn:             buildTwoSupernodeTree(),
 			setByTier:      twoSupernodeSetByTier(),
 			jobs:           map[api.JobID]*api.JobInfo{"other": otherJobOn("other", "sn-a", "prod")},
@@ -99,7 +99,7 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			wantTierOrder:  []int{2},
 		},
 		{
-			name:           "no matching peer label keeps both supernodes",
+			name:           "no matching PodGroup label keeps both supernodes",
 			hn:             buildTwoSupernodeTree(),
 			setByTier:      twoSupernodeSetByTier(),
 			jobs:           map[api.JobID]*api.JobInfo{"other": otherJobOn("other", "sn-a", "staging")},
@@ -159,23 +159,17 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			wantTierOrder:  []int{1, 2},
 		},
 		{
-			name:      "peer without AllocatedHyperNode is ignored",
+			// podgroup-0 has no topologyAffinity; podgroup-1 anti-affinity should still see its placement.
+			name:      "podgroup-1 anti-affinity against podgroup-0 without topologyAffinity",
 			hn:        buildTwoSupernodeTree(),
 			setByTier: twoSupernodeSetByTier(),
 			jobs: map[api.JobID]*api.JobInfo{
-				"other": {
-					UID:       "other",
-					Namespace: "default",
-					PodGroup: &api.PodGroup{
-						PodGroup: scheduling.PodGroup{
-							ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{testGroupLabel: "prod"}},
-						},
-					},
-				},
+				"podgroup-0": otherJobWithTaskOnNode("podgroup-0", "node-a", "prod"),
 			},
 			selfJob:        jobWithTopologyAffinity([]scheduling.PodGroupAffinityTerm{supernodeTerm}, nil),
 			root:           "root",
-			wantHyperNodes: []string{"sn-a", "sn-b"},
+			wantHyperNodes: []string{"sn-b"},
+			wantTierOrder:  []int{2},
 		},
 		{
 			name:           "follow-up placement accepts entire search subtree",
@@ -210,6 +204,7 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 				HyperNodes:           tt.hn,
 				HyperNodesSetByTier:  tt.setByTier,
 				HyperNodeTierNameMap: defaultTierNameMap(),
+				RealNodesSet:         defaultRealNodesSet(),
 			}
 			plugin := New(framework.Arguments{}).(*groupTopologyAffinityPlugin)
 
@@ -561,6 +556,39 @@ func otherJobOn(uid, hyperNode, group string) *api.JobInfo {
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{testGroupLabel: group}},
 			},
 		},
+	}
+}
+
+func otherJobWithTaskOnNode(uid, nodeName, group string) *api.JobInfo {
+	task := &api.TaskInfo{UID: api.TaskID(uid + "-task")}
+	task.Status = api.Allocated
+	task.NodeName = nodeName
+	subJobID := api.SubJobID("default")
+	return &api.JobInfo{
+		UID:       api.JobID(uid),
+		Namespace: "default",
+		PodGroup: &api.PodGroup{
+			PodGroup: scheduling.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{testGroupLabel: group}},
+			},
+		},
+		SubJobs: map[api.SubJobID]*api.SubJobInfo{
+			subJobID: {
+				UID: subJobID,
+				TaskStatusIndex: map[api.TaskStatus]api.TasksMap{
+					api.Allocated: {task.UID: task},
+				},
+			},
+		},
+	}
+}
+
+func defaultRealNodesSet() map[string]sets.Set[string] {
+	return map[string]sets.Set[string]{
+		"sn-a":  sets.New("node-a"),
+		"sn-b":  sets.New("node-b"),
+		"cab-a": sets.New("node-cab-a"),
+		"cab-b": sets.New("node-cab-b"),
 	}
 }
 

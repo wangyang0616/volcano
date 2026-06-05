@@ -157,7 +157,7 @@ func collectMatchingHyperNodesByTerm(
 	matchingHyperNodesByTerm := make([]sets.Set[string], len(terms))
 	for index, term := range terms {
 		matchingHyperNodes, err := api.MatchingPodGroupsAllocatedHyperNodesForTerm(
-			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term,
+			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term, ssn.RealNodesSet,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("term %d: %w", index, err)
@@ -277,7 +277,7 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 
 	for _, term := range terms {
 		matchingHyperNodes, err := api.MatchingPodGroupsAllocatedHyperNodesForTerm(
-			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term,
+			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term, ssn.RealNodesSet,
 		)
 		if err != nil {
 			return nil, err

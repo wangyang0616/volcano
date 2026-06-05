@@ -177,7 +177,7 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			name: "single matching peer at supernode tier",
+			name: "single matching PodGroup at supernode tier",
 			jobs: map[JobID]*JobInfo{
 				"other": {
 					UID: "other", Namespace: "default", AllocatedHyperNode: "sn-a",
@@ -203,7 +203,7 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 			want: sets.New("cab-a"),
 		},
 		{
-			name: "multiple matching peers collapse to set",
+			name: "multiple matching PodGroups collapse to set",
 			jobs: map[JobID]*JobInfo{
 				"j1": {
 					UID: "j1", Namespace: "default", AllocatedHyperNode: "sn-a",
@@ -235,7 +235,7 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 			want: sets.New[string](),
 		},
 		{
-			name: "peer without AllocatedHyperNode is skipped",
+			name: "matching PodGroup without AllocatedHyperNode is skipped without node mapping",
 			jobs: map[JobID]*JobInfo{
 				"other": {
 					UID: "other", Namespace: "default",
@@ -248,6 +248,14 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 			want: sets.New[string](),
 		},
 		{
+			name: "matching PodGroup without AllocatedHyperNode is inferred from allocated tasks",
+			jobs: map[JobID]*JobInfo{
+				"other": otherJobWithTaskOnNode("other", "node-a", "prod"),
+			},
+			term: scheduling.PodGroupAffinityTerm{PodGroupSelector: selector, TopologyTierName: "supernode"},
+			want: sets.New("sn-a"),
+		},
+		{
 			name: "invalid term returns error",
 			jobs: map[JobID]*JobInfo{},
 			term: scheduling.PodGroupAffinityTerm{PodGroupSelector: selector, TopologyTierName: "missing"},
@@ -256,7 +264,12 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := MatchingPodGroupsAllocatedHyperNodesForTerm(tt.jobs, hn, tierNameMap, selfJob, tt.term)
+			nodesByHyperNode := map[string]sets.Set[string]{
+				"sn-a": sets.New("node-a"),
+				"sn-b": sets.New("node-b"),
+				"cab-a": sets.New("node-cab-a"),
+			}
+			got, err := MatchingPodGroupsAllocatedHyperNodesForTerm(tt.jobs, hn, tierNameMap, selfJob, tt.term, nodesByHyperNode)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -336,6 +349,103 @@ func TestJobTopologyAffinityHelpers(t *testing.T) {
 	}
 }
 
+func TestGetJobAllocatedHyperNode(t *testing.T) {
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+	}
+	nodesByHyperNode := map[string]sets.Set[string]{
+		"sn-a": sets.New("node-a"),
+		"sn-b": sets.New("node-b"),
+	}
+
+	tests := []struct {
+		name string
+		job  *JobInfo
+		want string
+	}{
+		{
+			name: "uses AllocatedHyperNode when already recorded",
+			job:  &JobInfo{UID: "job-0", AllocatedHyperNode: "sn-a"},
+			want: "sn-a",
+		},
+		{
+			name: "infers from allocated task without topology config",
+			job:  otherJobWithTaskOnNode("podgroup-0", "node-a", "prod"),
+			want: "sn-a",
+		},
+		{
+			name: "empty when no placement and no tasks",
+			job: &JobInfo{
+				UID: "job-empty",
+				PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"topology.volcano.sh/group": "prod"}},
+				}},
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getJobAllocatedHyperNode(tt.job, hn, nodesByHyperNode)
+			if got != tt.want {
+				t.Fatalf("getJobAllocatedHyperNode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPodGroupAntiAffinityAgainstMatchingJobWithoutTopology(t *testing.T) {
+	// podgroup-0: same label, no topologyAffinity, already placed on node-a (sn-a).
+	// podgroup-1: topologyAffinity podGroupAntiAffinity against matching label.
+	prodSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"topology.volcano.sh/group": "prod"},
+	}
+	term := scheduling.PodGroupAffinityTerm{
+		PodGroupSelector: prodSelector,
+		TopologyTierName: "supernode",
+	}
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+	}
+	hn["root"].Children = sets.New("sn-a", "sn-b")
+	tierNameMap := HyperNodeTierNameMap{"supernode": 2, "cluster": 3}
+
+	podgroup0 := otherJobWithTaskOnNode("podgroup-0", "node-a", "prod")
+	podgroup1 := &JobInfo{
+		UID:       "podgroup-1",
+		Namespace: "default",
+		PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{
+				TopologyAffinity: &scheduling.TopologyAffinitySpec{
+					PodGroupAntiAffinity: &scheduling.PodGroupAntiAffinity{
+						Required: []scheduling.PodGroupAffinityTerm{term},
+					},
+				},
+			},
+		}},
+	}
+	jobs := map[JobID]*JobInfo{
+		"podgroup-0": podgroup0,
+		"podgroup-1": podgroup1,
+	}
+	nodesByHyperNode := map[string]sets.Set[string]{
+		"sn-a": sets.New("node-a"),
+		"sn-b": sets.New("node-b"),
+	}
+
+	got, err := MatchingPodGroupsAllocatedHyperNodesForTerm(jobs, hn, tierNameMap, podgroup1, term, nodesByHyperNode)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got.Equal(sets.New("sn-a")) {
+		t.Fatalf("occupied supernode mismatch: want [sn-a], got %v", got.UnsortedList())
+	}
+}
+
 func newTestHyperNode(name string, tier int, tierName, parent string) *HyperNodeInfo {
 	return &HyperNodeInfo{
 		Name:     name,
@@ -343,5 +453,27 @@ func newTestHyperNode(name string, tier int, tierName, parent string) *HyperNode
 		tierName: tierName,
 		Parent:   parent,
 		Children: sets.New[string](),
+	}
+}
+
+func otherJobWithTaskOnNode(uid, nodeName, group string) *JobInfo {
+	task := &TaskInfo{UID: TaskID(uid + "-task")}
+	task.Status = Allocated
+	task.NodeName = nodeName
+	subJobID := SubJobID("default")
+	return &JobInfo{
+		UID:       JobID(uid),
+		Namespace: "default",
+		PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"topology.volcano.sh/group": group}},
+		}},
+		SubJobs: map[SubJobID]*SubJobInfo{
+			subJobID: {
+				UID: subJobID,
+				TaskStatusIndex: map[TaskStatus]TasksMap{
+					Allocated: {task.UID: task},
+				},
+			},
+		},
 	}
 }

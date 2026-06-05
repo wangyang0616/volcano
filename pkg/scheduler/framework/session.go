@@ -360,15 +360,11 @@ func (ssn *Session) removeInvalidAllocatedHyperNode(job *api.JobInfo, hyperNodes
 // When the scheduler reboot, the allocated hyperNode of job will be lost.
 // We recover this information through the nodes that tasks are running on.
 func (ssn *Session) recoverAllocatedHyperNode(job *api.JobInfo, hyperNodeSet sets.Set[string], hyperNodes api.HyperNodeInfoMap, nodesByHyperNode map[string]sets.Set[string]) {
-	if !job.ContainsNetworkTopology() {
-		return
-	}
-
 	subJobUpdated := false
 
 	// update subJob AllocatedHyperNode based on allocated nodes
 	for _, subJob := range job.SubJobs {
-		if !subJob.WithNetworkTopology() || subJob.AllocatedHyperNode != "" {
+		if subJob.AllocatedHyperNode != "" {
 			continue
 		}
 
