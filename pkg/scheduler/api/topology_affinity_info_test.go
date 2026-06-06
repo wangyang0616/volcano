@@ -371,6 +371,11 @@ func TestGetJobAllocatedHyperNode(t *testing.T) {
 			want: "sn-a",
 		},
 		{
+			name: "uses AllocatedHyperNode when node mapping is unavailable",
+			job:  &JobInfo{UID: "job-1", AllocatedHyperNode: "sn-b"},
+			want: "sn-b",
+		},
+		{
 			name: "infers from allocated task without topology config",
 			job:  otherJobWithTaskOnNode("podgroup-0", "node-a", "prod"),
 			want: "sn-a",
@@ -388,7 +393,11 @@ func TestGetJobAllocatedHyperNode(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := getJobAllocatedHyperNode(tt.job, hn, nodesByHyperNode)
+			nodes := nodesByHyperNode
+			if tt.name == "uses AllocatedHyperNode when node mapping is unavailable" {
+				nodes = nil
+			}
+			got := getJobAllocatedHyperNode(tt.job, hn, nodes)
 			if got != tt.want {
 				t.Fatalf("getJobAllocatedHyperNode() = %q, want %q", got, tt.want)
 			}

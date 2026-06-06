@@ -118,11 +118,14 @@ func getJobAllocatedHyperNode(
 	hyperNodes HyperNodeInfoMap,
 	nodesByHyperNode map[string]sets.Set[string],
 ) string {
-	if job == nil || len(nodesByHyperNode) == 0 || len(hyperNodes) == 0 {
+	if job == nil || len(hyperNodes) == 0 {
 		return ""
 	}
 	if job.AllocatedHyperNode != "" {
 		return job.AllocatedHyperNode
+	}
+	if len(nodesByHyperNode) == 0 {
+		return ""
 	}
 
 	hyperNodeSet := sets.New[string]()
