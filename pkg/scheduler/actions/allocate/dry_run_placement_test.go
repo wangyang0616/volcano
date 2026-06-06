@@ -30,6 +30,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
+	pluginutil "volcano.sh/volcano/pkg/scheduler/plugins/util"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
@@ -83,10 +84,9 @@ func TestAllocateResourcesForTasks_RestoresPlacementOnTotalFailure(t *testing.T)
 	}
 }
 
-// TestAllocateResourcesForTasks_PartialAllocDoesNotRestoreWhenPipelined documents that a
-// partially pipelined subJob keeps placement updates; dry-run rollback is handled at the
-// allocateForSubJob / allocateForJob level instead.
-func TestAllocateResourcesForTasks_PartialAllocDoesNotRestoreWhenPipelined(t *testing.T) {
+// TestAllocateResourcesForTasks_RestoresPlacementWhenPartialAllocNotPipelined verifies that
+// partial allocation which does not satisfy gang pipelined semantics rolls back placement.
+func TestAllocateResourcesForTasks_RestoresPlacementWhenPartialAllocNotPipelined(t *testing.T) {
 	env := newDryRunPlacementEnv(t, dryRunEnvOptions{
 		nodeCPU: map[string]string{
 			"node-a": "8",
@@ -98,6 +98,39 @@ func TestAllocateResourcesForTasks_PartialAllocDoesNotRestoreWhenPipelined(t *te
 		},
 		minMember:    3,
 		subGroupSize: 3,
+	})
+
+	subJob := env.subJob
+	tasks := env.pendingTasks()
+	alloc := env.action()
+
+	stmt := alloc.allocateResourcesForTasks(subJob, tasks, "sn-a")
+	if stmt != nil {
+		t.Fatalf("expected nil statement when subJob is not pipelined, got %d ops", len(stmt.Operations()))
+	}
+	if subJob.AllocatedHyperNode != "" {
+		t.Fatalf("subJob AllocatedHyperNode = %q, want empty after rollback", subJob.AllocatedHyperNode)
+	}
+	if env.job.AllocatedHyperNode != "" {
+		t.Fatalf("job AllocatedHyperNode = %q, want empty after rollback", env.job.AllocatedHyperNode)
+	}
+}
+
+// TestAllocateResourcesForTasks_KeepsPlacementWhenSubJobPipelined verifies placement is kept
+// when a plugin explicitly permits pipelined status after partial allocation.
+func TestAllocateResourcesForTasks_KeepsPlacementWhenSubJobPipelined(t *testing.T) {
+	env := newDryRunPlacementEnv(t, dryRunEnvOptions{
+		nodeCPU: map[string]string{
+			"node-a": "8",
+		},
+		tasks: []dryRunTaskSpec{
+			{name: "p1", cpu: "4", mem: "4G", role: "worker"},
+			{name: "p2", cpu: "4", mem: "4G", role: "worker"},
+			{name: "p3", cpu: "4", mem: "4G", role: "worker"},
+		},
+		minMember:              3,
+		subGroupSize:           3,
+		forceSubJobPipelined:   true,
 	})
 
 	subJob := env.subJob
@@ -331,12 +364,13 @@ type dryRunTaskSpec struct {
 }
 
 type dryRunEnvOptions struct {
-	nodeCPU         map[string]string
-	tasks           []dryRunTaskSpec
-	minMember       int32
-	subGroupSize    int32
-	subJobGradients [][]string
-	hyperNodeScores map[string]float64
+	nodeCPU              map[string]string
+	tasks                []dryRunTaskSpec
+	minMember            int32
+	subGroupSize         int32
+	subJobGradients      [][]string
+	hyperNodeScores      map[string]float64
+	forceSubJobPipelined bool
 }
 
 type dryRunPlacementEnv struct {
@@ -370,18 +404,23 @@ func newDryRunPlacementEnv(t *testing.T, opts dryRunEnvOptions) *dryRunPlacement
 	t.Helper()
 
 	trueVal := true
+	gangPlugin := conf.PluginOption{
+		Name:               gang.PluginName,
+		EnabledSubJobReady: &trueVal,
+	}
+	if !opts.forceSubJobPipelined {
+		gangPlugin.EnabledSubJobPipelined = &trueVal
+	}
+	testPlugin := conf.PluginOption{
+		Name:                     dryRunTestPlugin,
+		EnabledHyperNodeGradient: &trueVal,
+		EnabledHyperNodeOrder:    &trueVal,
+	}
+	if opts.forceSubJobPipelined {
+		testPlugin.EnabledSubJobPipelined = &trueVal
+	}
 	tiers := []conf.Tier{{
-		Plugins: []conf.PluginOption{
-			{
-				Name:               gang.PluginName,
-				EnabledSubJobReady: &trueVal,
-			},
-			{
-				Name:                     dryRunTestPlugin,
-				EnabledHyperNodeGradient: &trueVal,
-				EnabledHyperNodeOrder:    &trueVal,
-			},
-		},
+		Plugins: []conf.PluginOption{gangPlugin, testPlugin},
 	}}
 
 	schedulerCache := cache.NewCustomMockSchedulerCache(
@@ -400,6 +439,12 @@ func newDryRunPlacementEnv(t *testing.T, opts dryRunEnvOptions) *dryRunPlacement
 	ssn.HyperNodesReadyToSchedule = true
 
 	buildDryRunHyperNodeTree(ssn, opts.nodeCPU)
+
+	if opts.forceSubJobPipelined {
+		ssn.AddSubJobPipelinedFn(dryRunTestPlugin, func(obj interface{}) int {
+			return pluginutil.Permit
+		})
+	}
 
 	if len(opts.subJobGradients) > 0 {
 		gradientLayers := make([][]*api.HyperNodeInfo, len(opts.subJobGradients))
