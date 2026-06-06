@@ -460,6 +460,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 			// Clone subJobWorksheet and rest subJob's fit err to make sure it's a clean cache when everytime filter a hyperNode and do not affect each other between hyperNodes.
 			job.ResetSubJobFitErr(subJob.UID)
 			subJobWorksheetCopy := subJobWorksheet.Clone()
+			placementBeforeTry := captureHyperNodePlacement(job, subJob)
 
 			klog.V(3).InfoS("Try to allocate resource for tasks in subJob", "job", subJob.Job,
 				"subJob", subJob.UID, "taskNum", subJobWorksheetCopy.tasks.Len(), "hyperNode", hyperNode.Name)
@@ -470,6 +471,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 				subJobWorksheetsBackup[hyperNode.Name] = subJobWorksheetCopy // backup remains tasks
 				stmt.Discard()                                               // dry run in every hyperNode
 			}
+			restoreHyperNodePlacement(job, subJob, placementBeforeTry)
 		}
 
 		if len(stmtBackup) == 0 {
@@ -493,6 +495,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 		}
 		newAllocatedHyperNode := ssn.HyperNodes.GetLCAHyperNode(subJob.AllocatedHyperNode, bestHyperNode)
 		subJob.AllocatedHyperNode = newAllocatedHyperNode
+		updateJobAllocatedHyperNodeFromSubJob(ssn, job, subJob, newAllocatedHyperNode)
 
 		// inherit the remains worksheet after allocate to the best hyperNode
 		subJobWorksheet.ShallowCopyFrom(subJobWorksheetsBackup[bestHyperNode])
@@ -567,7 +570,8 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 	ph := util.NewPredicateHelper()
 
 	allocatedHyperNode := subJob.AllocatedHyperNode
-	trackHyperNodePlacement := subJob.WithNetworkTopology() || ssn.HyperNodesReadyToSchedule
+	trackHyperNodePlacement := shouldTrackHyperNodePlacement(ssn, subJob)
+	placementAtStart := captureHyperNodePlacement(job, subJob)
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
@@ -652,14 +656,7 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 		if trackHyperNodePlacement {
 			allocatedHyperNode = getNewAllocatedHyperNode(ssn, bestNode.Name, allocatedHyperNode)
 			subJob.AllocatedHyperNode = allocatedHyperNode
-			jobAllocatedHyperNode := allocatedHyperNode
-			if job.AllocatedHyperNode != "" {
-				jobAllocatedHyperNode = ssn.HyperNodes.GetLCAHyperNode(job.AllocatedHyperNode, allocatedHyperNode)
-			}
-			if job.AllocatedHyperNode != jobAllocatedHyperNode {
-				job.AllocatedHyperNode = jobAllocatedHyperNode
-				ssn.MarkJobDirty(job.UID)
-			}
+			updateJobAllocatedHyperNodeFromSubJob(ssn, job, subJob, allocatedHyperNode)
 		}
 
 		if ssn.SubJobReady(job, subJob) {
@@ -679,6 +676,9 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 	}
 
 	stmt.Discard()
+	if trackHyperNodePlacement {
+		restoreHyperNodePlacement(job, subJob, placementAtStart)
+	}
 	return nil
 }
 
@@ -716,6 +716,48 @@ func getNewAllocatedHyperNode(ssn *framework.Session, bestNode string, jobAlloca
 		return ssn.HyperNodes.GetLCAHyperNode(hyperNode, jobAllocatedHyperNode)
 	}
 	return jobAllocatedHyperNode
+}
+
+type hyperNodePlacement struct {
+	jobAllocatedHyperNode    string
+	subJobAllocatedHyperNode string
+}
+
+func captureHyperNodePlacement(job *api.JobInfo, subJob *api.SubJobInfo) hyperNodePlacement {
+	return hyperNodePlacement{
+		jobAllocatedHyperNode:    job.AllocatedHyperNode,
+		subJobAllocatedHyperNode: subJob.AllocatedHyperNode,
+	}
+}
+
+func restoreHyperNodePlacement(job *api.JobInfo, subJob *api.SubJobInfo, placement hyperNodePlacement) {
+	job.AllocatedHyperNode = placement.jobAllocatedHyperNode
+	subJob.AllocatedHyperNode = placement.subJobAllocatedHyperNode
+}
+
+func shouldTrackHyperNodePlacement(ssn *framework.Session, subJob *api.SubJobInfo) bool {
+	return subJob.WithNetworkTopology() || ssn.HyperNodesReadyToSchedule
+}
+
+func updateJobAllocatedHyperNodeFromSubJob(
+	ssn *framework.Session,
+	job *api.JobInfo,
+	subJob *api.SubJobInfo,
+	subJobAllocatedHyperNode string,
+) {
+	if !shouldTrackHyperNodePlacement(ssn, subJob) || subJobAllocatedHyperNode == "" {
+		return
+	}
+
+	jobAllocatedHyperNode := subJobAllocatedHyperNode
+	if job.AllocatedHyperNode != "" {
+		jobAllocatedHyperNode = ssn.HyperNodes.GetLCAHyperNode(job.AllocatedHyperNode, subJobAllocatedHyperNode)
+	}
+	if job.AllocatedHyperNode == jobAllocatedHyperNode {
+		return
+	}
+	job.AllocatedHyperNode = jobAllocatedHyperNode
+	ssn.MarkJobDirty(job.UID)
 }
 
 // prioritizeNodes selects the highest score node.
