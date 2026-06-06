@@ -172,14 +172,48 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			wantTierOrder:  []int{2},
 		},
 		{
-			name:           "follow-up placement accepts entire search subtree",
+			name:           "follow-up still excludes occupied supernode",
 			hn:             buildTwoSupernodeTree(),
 			setByTier:      twoSupernodeSetByTier(),
 			jobs:           map[api.JobID]*api.JobInfo{"other": otherJobOn("other", "sn-a", "prod")},
 			selfJob:        jobWithAllocatedHyperNode("self", "sn-b", supernodeTerm),
 			root:           "root",
-			wantHyperNodes: []string{"root", "sn-a", "sn-b"},
-			wantTierOrder:  []int{2, 3},
+			wantHyperNodes: []string{"sn-b"},
+			wantTierOrder:  []int{2},
+		},
+		{
+			name:      "follow-up after minMember partial placement rejects peer supernode",
+			hn:        buildTwoSupernodeTree(),
+			setByTier: twoSupernodeSetByTier(),
+			jobs: map[api.JobID]*api.JobInfo{
+				"peer-instance": otherJobOn("peer-instance", "sn-a", "prod"),
+			},
+			selfJob: func() *api.JobInfo {
+				job := jobWithAllocatedHyperNode("self-instance", "sn-b", supernodeTerm)
+				task1 := &api.TaskInfo{UID: "task-1"}
+				task1.Status = api.Allocated
+				task1.NodeName = "node-b1"
+				task2 := &api.TaskInfo{UID: "task-2"}
+				task2.Status = api.Allocated
+				task2.NodeName = "node-b2"
+				subJobID := api.SubJobID("self-instance")
+				job.SubJobs = map[api.SubJobID]*api.SubJobInfo{
+					subJobID: {
+						UID:                subJobID,
+						AllocatedHyperNode: "sn-b",
+						TaskStatusIndex: map[api.TaskStatus]api.TasksMap{
+							api.Allocated: {
+								task1.UID: task1,
+								task2.UID: task2,
+							},
+						},
+					},
+				}
+				return job
+			}(),
+			root:           "root",
+			wantHyperNodes: []string{"sn-b"},
+			wantTierOrder:  []int{2},
 		},
 		{
 			name:      "invalid term tierName yields empty gradient",

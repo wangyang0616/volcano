@@ -142,7 +142,7 @@ func (gta *groupTopologyAffinityPlugin) buildPodGroupAntiAffinityGradient(
 	}
 
 	eligibleHyperNodes := gta.bfsAntiAffinityEligibleHyperNodes(
-		ssn, searchRoot, terms, matchingHyperNodesByTerm, highestAllowedTier, allocatedHyperNode,
+		ssn, searchRoot, terms, matchingHyperNodesByTerm, highestAllowedTier,
 	)
 	return groupHyperNodesByTierAsc(eligibleHyperNodes), nil
 }
@@ -181,7 +181,6 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 	terms []scheduling.PodGroupAffinityTerm,
 	matchingHyperNodesByTerm []sets.Set[string],
 	highestAllowedTier int,
-	allocatedHyperNode string,
 ) map[int][]*api.HyperNodeInfo {
 	enqueued := set.New[string]()
 	processQueue := []*api.HyperNodeInfo{searchRoot}
@@ -193,7 +192,7 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 		processQueue = processQueue[1:]
 
 		if gta.isEligibleForPodGroupAntiAffinity(
-			ssn, current, terms, matchingHyperNodesByTerm, highestAllowedTier, allocatedHyperNode,
+			ssn, current, terms, matchingHyperNodesByTerm, highestAllowedTier,
 		) {
 			eligibleHyperNodes[current.Tier()] = append(eligibleHyperNodes[current.Tier()], current)
 		}
@@ -224,20 +223,15 @@ func groupHyperNodesByTierAsc(eligibleHyperNodes map[int][]*api.HyperNodeInfo) [
 	return result
 }
 
-// isEligibleForPodGroupAntiAffinity checks whether hn is a valid first-time placement candidate.
-// After the job has an AllocatedHyperNode, every HyperNode in the search subtree is eligible
-// (follow-up tasks must stay within the chosen envelope).
+// isEligibleForPodGroupAntiAffinity checks whether hn may host the job without violating
+// hard podGroupAntiAffinity at each required term tier.
 func (gta *groupTopologyAffinityPlugin) isEligibleForPodGroupAntiAffinity(
 	ssn *framework.Session,
 	hn *api.HyperNodeInfo,
 	terms []scheduling.PodGroupAffinityTerm,
 	matchingHyperNodesByTerm []sets.Set[string],
 	highestAllowedTier int,
-	allocatedHyperNode string,
 ) bool {
-	if allocatedHyperNode != "" {
-		return true
-	}
 	if hn.Tier() > highestAllowedTier {
 		return false
 	}
