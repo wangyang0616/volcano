@@ -34,13 +34,6 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
-func init() {
-	framework.RegisterPluginBuilder(gang.PluginName, gang.New)
-	framework.RegisterPluginBuilder(dryRunTestPlugin, func(_ framework.Arguments) framework.Plugin {
-		return &dryRunTestPluginImpl{}
-	})
-}
-
 type dryRunTestPluginImpl struct{}
 
 func (p *dryRunTestPluginImpl) Name() string { return dryRunTestPlugin }
@@ -50,6 +43,13 @@ func (p *dryRunTestPluginImpl) OnSessionOpen(_ *framework.Session) {}
 func (p *dryRunTestPluginImpl) OnSessionClose(_ *framework.Session) {}
 
 const dryRunTestPlugin = "dry-run-test"
+
+func registerDryRunTestPlugins() {
+	framework.RegisterPluginBuilder(gang.PluginName, gang.New)
+	framework.RegisterPluginBuilder(dryRunTestPlugin, func(_ framework.Arguments) framework.Plugin {
+		return &dryRunTestPluginImpl{}
+	})
+}
 
 // TestAllocateResourcesForTasks_RestoresPlacementOnTotalFailure verifies placement is
 // rolled back when no task can be allocated and the subJob is neither ready nor pipelined.
@@ -402,6 +402,8 @@ func (e *dryRunPlacementEnv) pendingTasks() *util.PriorityQueue {
 
 func newDryRunPlacementEnv(t *testing.T, opts dryRunEnvOptions) *dryRunPlacementEnv {
 	t.Helper()
+
+	registerDryRunTestPlugins()
 
 	trueVal := true
 	gangPlugin := conf.PluginOption{
