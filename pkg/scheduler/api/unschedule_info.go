@@ -37,6 +37,9 @@ const (
 	HyperNodeFitSummaryPrefix = "HyperNode"
 	// NodeFitSummaryPrefix labels node-level predicate diagnostics.
 	NodeFitSummaryPrefix = "Node"
+
+	// maxSchedulingDimensions is the upper bound of HyperNode + Node fit summaries joined by FormatSchedulingDimensions.
+	maxSchedulingDimensions = 2
 )
 
 // These are reasons for a pod's transition to a condition.
@@ -57,7 +60,7 @@ const (
 
 // FormatSchedulingDimensions joins HyperNode-tier and node-level diagnostics.
 func FormatSchedulingDimensions(hyperNodeSummary, nodeSummary string) string {
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, maxSchedulingDimensions)
 	if hyperNodeSummary != "" {
 		parts = append(parts, fmt.Sprintf("%s: %s", HyperNodeFitSummaryPrefix, hyperNodeSummary))
 	}
@@ -172,6 +175,22 @@ func FormatHyperNodeFitSummary(
 		message += ": " + strings.Join(tierParts, "; ")
 	}
 	return message
+}
+
+// MergeHyperNodeFitSummary layers a subJob-specific summary on the job-level baseline
+// instead of replacing it.
+func MergeHyperNodeFitSummary(baseline, subJobScope, subSummary string) string {
+	if subSummary == "" {
+		return baseline
+	}
+	scoped := subSummary
+	if subJobScope != "" {
+		scoped = fmt.Sprintf("subJob %s: %s", subJobScope, subSummary)
+	}
+	if baseline == "" {
+		return scoped
+	}
+	return baseline + "; " + scoped
 }
 
 func hyperNodeTierExclusions(

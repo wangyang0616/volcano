@@ -444,6 +444,26 @@ func TestSchedulingDimensions(t *testing.T) {
 	}
 }
 
+func TestJobInfoMergeSubJobHyperNodeFitErrors(t *testing.T) {
+	job := &JobInfo{}
+	job.JobFitErrors = "2/2 hyperNodes available: supernode 2/2"
+	stats := &HyperNodeGradientStats{
+		PluginEligibleByTier: map[string]map[int]int{
+			"network-topology-aware": {2: 0},
+		},
+		IntersectedByTier: map[int]int{2: 0},
+	}
+	hyperNodesSetByTier := map[int]sets.Set[string]{2: sets.New("sn-a")}
+	job.MergeSubJobHyperNodeFitErrors(job.JobFitErrors, "sub-1", stats, nil, nil,
+		hyperNodesSetByTier, HyperNodeTierNameMap{"supernode": 2}, nil)
+	if !strings.Contains(job.JobFitErrors, "2/2 hyperNodes available") {
+		t.Fatalf("expected job baseline preserved: %q", job.JobFitErrors)
+	}
+	if !strings.Contains(job.JobFitErrors, "subJob sub-1:") {
+		t.Fatalf("expected subJob scope appended: %q", job.JobFitErrors)
+	}
+}
+
 func TestJobInfoSetHyperNodeFitErrors(t *testing.T) {
 	job := &JobInfo{}
 	stats := &HyperNodeGradientStats{

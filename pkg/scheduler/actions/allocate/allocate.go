@@ -359,7 +359,12 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 	)
 	job.SetHyperNodeFitErrors(gradientStats, resourceStats, job.GetMinResources(),
 		ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
+	// jobHyperNodeBaseline is the job-level HyperNode diagnostic written to JobFitErrors.
+	// SubJob gradient failures append to it via MergeSubJobHyperNodeFitErrors; each HyperNode
+	// dry-run resets JobFitErrors back to this baseline before trying subJobs.
+	jobHyperNodeBaseline := job.JobFitErrors
 	if len(hyperNodeGradients) == 0 {
+		// No candidate HyperNodes: event carries job-level summary only; subJob allocate is skipped.
 		klog.V(3).InfoS("No hyperNode gradient for job", "job", job.UID, "fitError", job.JobFitErrors)
 		return nil
 	}
@@ -373,6 +378,7 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 			var subJobsAllocationScore float64
 
 			// Clone jobWorksheet and rest job's fit err to make sure it's a clean cache when everytime filter a hyperNode and do not affect each other between hyperNodes.
+			job.JobFitErrors = jobHyperNodeBaseline // drop subJob overlay from prior HyperNode attempt
 			job.ResetFitErr()
 			jobWorksheetCopy := jobWorksheet.Clone()
 			klog.V(3).InfoS("Try to allocate resource for job in hyperNode", "job", job.UID, "hyperNode", hyperNode.Name)
@@ -381,7 +387,7 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 				subJob := jobWorksheetCopy.subJobs.Pop().(*api.SubJobInfo)
 				subJobWorksheet := jobWorksheetCopy.subJobWorksheets[subJob.UID]
 
-				stmt, allocationScore := alloc.allocateForSubJob(subJob, subJobWorksheet, hyperNode)
+				stmt, allocationScore := alloc.allocateForSubJob(subJob, subJobWorksheet, hyperNode, jobHyperNodeBaseline)
 
 				if stmt != nil && len(stmt.Operations()) > 0 {
 					stmtList = append(stmtList, stmt)
@@ -447,7 +453,12 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 	return nil
 }
 
-func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *SubJobWorksheet, hyperNodeForJob *api.HyperNodeInfo) (*framework.Statement, float64) {
+func (alloc *Action) allocateForSubJob(
+	subJob *api.SubJobInfo,
+	subJobWorksheet *SubJobWorksheet,
+	hyperNodeForJob *api.HyperNodeInfo,
+	jobHyperNodeBaseline string,
+) (*framework.Statement, float64) {
 	ssn := alloc.session
 	job := ssn.Jobs[subJob.Job]
 
@@ -464,8 +475,8 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 		ssn, hyperNodeGradients, subJob.GetMinResources(), subJob.AllocatedHyperNode,
 	)
 	if len(hyperNodeGradients) == 0 {
-		job.SetHyperNodeFitErrors(gradientStats, resourceStats, subJob.GetMinResources(),
-			ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
+		job.MergeSubJobHyperNodeFitErrors(jobHyperNodeBaseline, subJob.UID, gradientStats, resourceStats,
+			subJob.GetMinResources(), ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
 		klog.V(3).InfoS("No hyperNode gradient for subJob", "job", subJob.Job, "subJob", subJob.UID, "fitError", job.JobFitErrors)
 		return nil, 0
 	}

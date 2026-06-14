@@ -37,12 +37,14 @@ const (
 	DefaultWeight = 1
 	FullScore     = 1.0
 	ZeroScore     = 0.0
+
+	// noAffinityTermIndex marks reject reasons not tied to a specific affinity term.
+	noAffinityTermIndex = -1
 )
 
 type groupTopologyAffinityPlugin struct {
 	pluginArguments framework.Arguments
 	weight          int
-	hyperNodeAffinityCache *hyperNodeAffinityCache
 }
 
 func New(arguments framework.Arguments) framework.Plugin {
@@ -62,8 +64,6 @@ func (gta *groupTopologyAffinityPlugin) Name() string {
 }
 
 func (gta *groupTopologyAffinityPlugin) OnSessionOpen(ssn *framework.Session) {
-	gta.hyperNodeAffinityCache = buildHyperNodeAffinityCache(ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap)
-
 	ssn.AddHyperNodeGradientForJobFn(gta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
 		return gta.hyperNodeGradientForJob(ssn, job, hyperNode)
 	})
@@ -75,27 +75,6 @@ func (gta *groupTopologyAffinityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 		return gta.hyperNodeOrderFn(ssn, job, hyperNodes)
 	})
-
-	ssn.AddEventHandler(&framework.EventHandler{
-		AllocateFunc: func(event *framework.Event) {
-			job, ok := ssn.Jobs[event.Task.Job]
-			if !ok {
-				return
-			}
-			gta.syncHyperNodeAffinityCache(ssn, job)
-		},
-		DeallocateFunc: func(event *framework.Event) {
-			job, ok := ssn.Jobs[event.Task.Job]
-			if !ok {
-				return
-			}
-			gta.syncHyperNodeAffinityCache(ssn, job)
-		},
-	})
-}
-
-func (gta *groupTopologyAffinityPlugin) syncHyperNodeAffinityCache(ssn *framework.Session, job *api.JobInfo) {
-	gta.hyperNodeAffinityCache.syncJob(job, ssn.HyperNodes, ssn.HyperNodeTierNameMap)
 }
 
 func (gta *groupTopologyAffinityPlugin) OnSessionClose(ssn *framework.Session) {}
@@ -118,14 +97,6 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeGradientForJob(
 		return [][]*api.HyperNodeInfo{}
 	}
 	return result
-}
-
-func hyperNodeCountByTier(hyperNodesByTier map[int][]*api.HyperNodeInfo) map[int]int {
-	counts := make(map[int]int, len(hyperNodesByTier))
-	for tier, hyperNodes := range hyperNodesByTier {
-		counts[tier] = len(hyperNodes)
-	}
-	return counts
 }
 
 // buildPodGroupAntiAffinityGradient builds topology-only HyperNode gradients for hard
@@ -188,39 +159,15 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 	matchingHyperNodesByTerm []sets.Set[string],
 	highestAllowedTier int,
 ) map[int][]*api.HyperNodeInfo {
-	eligibleByTier, _ := gta.bfsAntiAffinityHyperNodeStats(
-		ssn, job, searchRoot, terms, matchingHyperNodesByTerm, highestAllowedTier,
-	)
-	return eligibleByTier
-}
-
-// bfsAntiAffinityHyperNodeStats walks the search subtree and counts total and eligible HyperNodes
-// grouped by tier. Tiers are ordered coarse-to-fine in the formatted message (higher tier first).
-//
-// TODO(performance): skip enqueueing descendants when a node is rejected because its tier-T
-// ancestor HyperNode conflicts with a matching PodGroup allocation (descendants share the same
-// tier-T ancestor). Do not prune when rejection is due to tier > highestAllowedTier or when
-// GetAncestorHyperNode returns empty (finer descendants may still qualify). Optionally memoize
-// GetAncestorHyperNode(hn, tier) per BFS pass when there are many terms.
-func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityHyperNodeStats(
-	ssn *framework.Session,
-	job *api.JobInfo,
-	searchRoot *api.HyperNodeInfo,
-	terms []scheduling.PodGroupAffinityTerm,
-	matchingHyperNodesByTerm []sets.Set[string],
-	highestAllowedTier int,
-) (map[int][]*api.HyperNodeInfo, map[int]int) {
 	enqueued := set.New[string]()
 	processQueue := []*api.HyperNodeInfo{searchRoot}
 	enqueued.Insert(searchRoot.Name)
 
 	eligibleByTier := make(map[int][]*api.HyperNodeInfo)
-	totalByTier := make(map[int]int)
 	for len(processQueue) > 0 {
 		current := processQueue[0]
 		processQueue = processQueue[1:]
 
-		totalByTier[current.Tier()]++
 		if gta.isEligibleForPodGroupAntiAffinity(
 			ssn, job, current, terms, matchingHyperNodesByTerm, highestAllowedTier,
 		) {
@@ -235,7 +182,7 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityHyperNodeStats(
 			enqueued.Insert(child)
 		}
 	}
-	return eligibleByTier, totalByTier
+	return eligibleByTier
 }
 
 // groupHyperNodesByTierAsc groups HyperNodes by tier and returns tiers in ascending order.
@@ -264,7 +211,7 @@ func (gta *groupTopologyAffinityPlugin) isEligibleForPodGroupAntiAffinity(
 	highestAllowedTier int,
 ) bool {
 	if hn.Tier() > highestAllowedTier {
-		logPodGroupAntiAffinityRejectHyperNode(job, hn, "tierAboveHighestAllowed", -1, hn.Tier(), "")
+		logPodGroupAntiAffinityRejectHyperNode(job, hn, "tierAboveHighestAllowed", noAffinityTermIndex, hn.Tier(), "")
 		return false
 	}
 
@@ -416,100 +363,6 @@ func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, highestAllowedT
 	}
 
 	return highestAllowedHyperNode, nil
-}
-
-// affinityHyperNodeKey identifies an ancestor HyperNode at a tier used for affinity comparison.
-type affinityHyperNodeKey struct {
-	tier      int
-	hyperNode string
-}
-
-// hyperNodeAffinityCache records which jobs are allocated under each ancestor HyperNode scope.
-type hyperNodeAffinityCache struct {
-	jobsByHyperNode map[affinityHyperNodeKey]sets.Set[api.JobID]
-}
-
-func newHyperNodeAffinityCache() *hyperNodeAffinityCache {
-	return &hyperNodeAffinityCache{
-		jobsByHyperNode: make(map[affinityHyperNodeKey]sets.Set[api.JobID]),
-	}
-}
-
-func (c *hyperNodeAffinityCache) record(jobID api.JobID, tier int, ancestorHyperNode string) {
-	if ancestorHyperNode == "" {
-		return
-	}
-	key := affinityHyperNodeKey{tier: tier, hyperNode: ancestorHyperNode}
-	if c.jobsByHyperNode[key] == nil {
-		c.jobsByHyperNode[key] = sets.New[api.JobID]()
-	}
-	c.jobsByHyperNode[key].Insert(jobID)
-}
-
-func (c *hyperNodeAffinityCache) removeJob(jobID api.JobID) {
-	for key, jobs := range c.jobsByHyperNode {
-		jobs.Delete(jobID)
-		if jobs.Len() == 0 {
-			delete(c.jobsByHyperNode, key)
-		}
-	}
-}
-
-func (c *hyperNodeAffinityCache) hasOtherJob(tier int, ancestorHyperNode string, excludeJob api.JobID) bool {
-	if ancestorHyperNode == "" {
-		return false
-	}
-	key := affinityHyperNodeKey{tier: tier, hyperNode: ancestorHyperNode}
-	for jobID := range c.jobsByHyperNode[key] {
-		if jobID != excludeJob {
-			return true
-		}
-	}
-	return false
-}
-
-func buildHyperNodeAffinityCache(
-	jobs map[api.JobID]*api.JobInfo,
-	hyperNodes api.HyperNodeInfoMap,
-	tierNameMap api.HyperNodeTierNameMap,
-) *hyperNodeAffinityCache {
-	cache := newHyperNodeAffinityCache()
-	for _, job := range jobs {
-		cache.recordJob(job, hyperNodes, tierNameMap)
-	}
-	return cache
-}
-
-func (c *hyperNodeAffinityCache) recordJob(job *api.JobInfo, hyperNodes api.HyperNodeInfoMap, tierNameMap api.HyperNodeTierNameMap) {
-	if job == nil || job.AllocatedHyperNode == "" || job.PodGroup == nil || job.PodGroup.Spec.TopologyAffinity == nil {
-		return
-	}
-	anti := job.PodGroup.Spec.TopologyAffinity.PodGroupAntiAffinity
-	if anti == nil {
-		return
-	}
-	for _, term := range anti.Required {
-		tier, err := api.ResolvePodGroupTermTier(term, tierNameMap)
-		if err != nil {
-			continue
-		}
-		ancestorHyperNode := hyperNodes.GetAncestorHyperNode(job.AllocatedHyperNode, tier)
-		c.record(job.UID, tier, ancestorHyperNode)
-	}
-}
-
-func (c *hyperNodeAffinityCache) syncJob(job *api.JobInfo, hyperNodes api.HyperNodeInfoMap, tierNameMap api.HyperNodeTierNameMap) {
-	if c == nil || job == nil {
-		return
-	}
-	c.removeJob(job.UID)
-	if job.AllocatedHyperNode == "" {
-		return
-	}
-	if job.AllocatedTaskNum() == 0 && job.WaitingTaskNum() == 0 {
-		return
-	}
-	c.recordJob(job, hyperNodes, tierNameMap)
 }
 
 func pendingPodNames(job *api.JobInfo) string {

@@ -148,6 +148,23 @@ func TestFitErrors(t *testing.T) {
 	}
 }
 
+func TestMergeHyperNodeFitSummary(t *testing.T) {
+	baseline := "2/3 hyperNodes available: supernode 2/2"
+	subSummary := "0/1 hyperNodes available: supernode 0/1 (1 networkTopology)"
+	got := MergeHyperNodeFitSummary(baseline, "prefill", subSummary)
+	want := baseline + "; subJob prefill: " + subSummary
+	if got != want {
+		t.Fatalf("MergeHyperNodeFitSummary() = %q, want %q", got, want)
+	}
+
+	if got := MergeHyperNodeFitSummary("", "prefill", subSummary); got != "subJob prefill: "+subSummary {
+		t.Fatalf("empty baseline merge = %q", got)
+	}
+	if got := MergeHyperNodeFitSummary(baseline, "prefill", ""); got != baseline {
+		t.Fatalf("empty subSummary merge = %q", got)
+	}
+}
+
 func TestFormatHyperNodeFitSummary(t *testing.T) {
 	hyperNodes := HyperNodeInfoMap{
 		"root": &HyperNodeInfo{Name: "root", tier: 3},
