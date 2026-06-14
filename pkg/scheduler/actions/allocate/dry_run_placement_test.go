@@ -201,7 +201,7 @@ func TestAllocateForSubJob_DryRunSelectsSiblingNotLCA(t *testing.T) {
 	rootHN := env.ssn.HyperNodes["root"]
 	alloc := env.action()
 
-	stmt, _ := alloc.allocateForSubJob(subJob, worksheet, rootHN)
+	stmt, _ := alloc.allocateForSubJob(subJob, worksheet, rootHN, "")
 	if stmt == nil || len(stmt.Operations()) == 0 {
 		t.Fatal("expected successful subJob allocation statement")
 	}
@@ -300,7 +300,7 @@ func TestAllocateForJobLoop_RecoverSubJobStatusBetweenHyperNodes(t *testing.T) {
 		}
 		wsCopy := worksheet.Clone()
 		subJobWS := wsCopy.subJobWorksheets[subJob.UID]
-		stmt, _ := alloc.allocateForSubJob(subJob, subJobWS, hn)
+		stmt, _ := alloc.allocateForSubJob(subJob, subJobWS, hn, "")
 		if stmt != nil && len(stmt.Operations()) > 0 {
 			stmt.Discard()
 		}

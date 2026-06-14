@@ -1255,6 +1255,27 @@ func (ji *JobInfo) SetHyperNodeFitErrors(
 	)
 }
 
+// MergeSubJobHyperNodeFitErrors appends subJob-tier HyperNode diagnostics to the job baseline.
+func (ji *JobInfo) MergeSubJobHyperNodeFitErrors(
+	baseline string,
+	subJobID SubJobID,
+	stats *HyperNodeGradientStats,
+	resourceStats *HyperNodeMinResourceFilterStats,
+	minResource *Resource,
+	hyperNodesSetByTier map[int]sets.Set[string],
+	tierNameMap HyperNodeTierNameMap,
+	hyperNodes HyperNodeInfoMap,
+) {
+	if stats == nil {
+		ji.JobFitErrors = baseline
+		return
+	}
+	subSummary := FormatHyperNodeFitSummary(
+		stats, resourceStats, minResource, hyperNodesSetByTier, tierNameMap, hyperNodes,
+	)
+	ji.JobFitErrors = MergeHyperNodeFitSummary(baseline, string(subJobID), subSummary)
+}
+
 // ResetSubJobFitErr will set subJob's node fit err to nil.
 func (ji *JobInfo) ResetSubJobFitErr(subJob SubJobID) {
 	maps.DeleteFunc(ji.NodesFitErrors, func(taskID TaskID, _ *FitErrors) bool {

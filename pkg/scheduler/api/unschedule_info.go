@@ -174,6 +174,22 @@ func FormatHyperNodeFitSummary(
 	return message
 }
 
+// MergeHyperNodeFitSummary layers a subJob-specific summary on the job-level baseline
+// instead of replacing it.
+func MergeHyperNodeFitSummary(baseline, subJobScope, subSummary string) string {
+	if subSummary == "" {
+		return baseline
+	}
+	scoped := subSummary
+	if subJobScope != "" {
+		scoped = fmt.Sprintf("subJob %s: %s", subJobScope, subSummary)
+	}
+	if baseline == "" {
+		return scoped
+	}
+	return baseline + "; " + scoped
+}
+
 func hyperNodeTierExclusions(
 	pluginEligibleByTier map[string]map[int]int,
 	resourceStats *HyperNodeMinResourceFilterStats,
