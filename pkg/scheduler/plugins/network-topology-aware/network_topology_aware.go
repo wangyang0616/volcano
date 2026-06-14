@@ -21,6 +21,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -31,6 +32,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/util"
+	"volcano.sh/volcano/pkg/scheduler/util/perflog"
 )
 
 const (
@@ -103,20 +105,26 @@ func (h *hyperNodesTier) init(hyperNodesSetByTier []int) {
 }
 
 func (nta *networkTopologyAwarePlugin) initHyperNodeResourceCache(ssn *framework.Session) {
+	start := time.Now()
 	if nta.hyperNodeResourceCache == nil {
 		nta.hyperNodeResourceCache = make(map[string]*resourceStatus)
 	}
 
+	hyperNodeCount := 0
+	nodeCount := 0
 	for hyperNode := range ssn.HyperNodes {
+		hyperNodeCount++
 		nta.hyperNodeResourceCache[hyperNode] = &resourceStatus{
 			allocatable: api.EmptyResource(),
 			used:        api.EmptyResource(),
 		}
 		for node := range ssn.RealNodesSet[hyperNode] {
+			nodeCount++
 			nta.hyperNodeResourceCache[hyperNode].allocatable.Add(ssn.Nodes[node].Allocatable)
 			nta.hyperNodeResourceCache[hyperNode].used.Add(ssn.Nodes[node].Used)
 		}
 	}
+	perflog.LogNetworkTopologyInitResourceCache(hyperNodeCount, nodeCount, time.Since(start))
 }
 
 /*
@@ -271,6 +279,7 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddHyperNodeGradientForJobFn(nta.Name(), func(job *api.JobInfo, hyperNode *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+		start := time.Now()
 		highestAllowedTier := maxHyperNodeTier(ssn.HyperNodesSetByTier)
 		if hardMode, tier := job.IsHardTopologyMode(); hardMode {
 			highestAllowedTier = tier
@@ -281,6 +290,9 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 				"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", job.AllocatedHyperNode)
 			return [][]*api.HyperNodeInfo{}
 		}
+		perflog.LogNetworkTopologyGradientForOwner(
+			"job", klog.KRef(job.Namespace, job.Name), hyperNode.Name, highestAllowedTier, len(result), time.Since(start),
+		)
 		return result
 	})
 
@@ -289,12 +301,16 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 			return [][]*api.HyperNodeInfo{{hyperNode}} // it is unnecessary to try child hyperNode when there is no actual subJob
 		}
 		if hardMode, highestAllowedTier := subJob.IsHardTopologyMode(); hardMode {
+			start := time.Now()
 			result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, subJob.AllocatedHyperNode)
 			if err != nil {
 				klog.ErrorS(err, "build hyperNode gradient fail", "subJob", subJob.UID, "hyperNode", hyperNode.Name,
 					"highestAllowedTier", highestAllowedTier, "allocatedHyperNode", subJob.AllocatedHyperNode)
 				return [][]*api.HyperNodeInfo{}
 			}
+			perflog.LogNetworkTopologyGradientForOwner(
+				"subJob", string(subJob.UID), hyperNode.Name, highestAllowedTier, len(result), time.Since(start),
+			)
 			return result
 		}
 		return [][]*api.HyperNodeInfo{{hyperNode}}
@@ -333,7 +349,10 @@ func (nta *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 }
 
 func (nta *networkTopologyAwarePlugin) HyperNodeOrderFn(ssn *framework.Session, subJob *api.SubJobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]float64, error) {
+	start := time.Now()
+	binpackStart := time.Now()
 	hyperNodeScores := nta.getSubJobHyperNodeBinPackingScore(subJob, hyperNodes)
+	binpackLatency := time.Since(binpackStart)
 
 	scoreToHyperNodes := map[float64][]string{}
 	var maxScore float64 = -1
@@ -344,17 +363,25 @@ func (nta *networkTopologyAwarePlugin) HyperNodeOrderFn(ssn *framework.Session, 
 		}
 	}
 
+	tiedCandidates := 0
+	var taskNumLatency time.Duration
 	// Calculate score based on the number of tasks scheduled for the job when max score of hyperNode has more than one.
 	if len(scoreToHyperNodes[maxScore]) > 1 {
+		taskNumStart := time.Now()
+		tiedCandidates = len(scoreToHyperNodes[maxScore])
 		candidateHyperNodes := scoreToHyperNodes[maxScore]
 		for _, hyperNode := range candidateHyperNodes {
 			taskNumScore := nta.scoreWithTaskNum(hyperNode, subJob.Tasks, ssn.RealNodesList)
 			hyperNodeScores[hyperNode] += taskNumScore
 		}
+		taskNumLatency = time.Since(taskNumStart)
 	}
 
 	hyperNodeScores = nta.scaleFinalScore(hyperNodeScores)
 	klog.V(4).Infof("networkTopologyAware hyperNode score is: %v", hyperNodeScores)
+	perflog.LogNetworkTopologyHyperNodeOrder(
+		string(subJob.UID), len(hyperNodes), tiedCandidates, binpackLatency, taskNumLatency, time.Since(start),
+	)
 	return hyperNodeScores, nil
 }
 
@@ -414,14 +441,18 @@ func (nta *networkTopologyAwarePlugin) getSubJobHyperNodeBinPackingScore(subJob 
 }
 
 func (nta *networkTopologyAwarePlugin) batchNodeOrderFn(ssn *framework.Session, task *api.TaskInfo, nodes []*api.NodeInfo) (map[string]float64, error) {
+	start := time.Now()
 	var nodeScores map[string]float64
 	var err error
+	var path string
 
 	job := ssn.Jobs[task.Job]
 	subJob := job.SubJobs[job.TaskToSubJob[task.UID]]
 	if subJob.WithNetworkTopology() {
+		path = "networkAware"
 		nodeScores, err = nta.batchNodeOrderFnForNetworkAwarePods(ssn, task, subJob, nodes)
 	} else {
+		path = "normalPod"
 		nodeScores, err = nta.batchNodeOrderFnForNormalPods(ssn, task, nodes)
 	}
 
@@ -430,13 +461,16 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFn(ssn *framework.Session, 
 	}
 	nodeScores = nta.scaleFinalScore(nodeScores)
 	klog.V(4).Infof("networkTopologyAware node score is: %v", nodeScores)
+	perflog.LogNetworkTopologyBatchNodeOrder(string(task.UID), path, len(nodes), time.Since(start))
 	return nodeScores, nil
 }
 
 func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNormalPods(ssn *framework.Session, task *api.TaskInfo, nodes []*api.NodeInfo) (map[string]float64, error) {
+	start := time.Now()
 	nodeScores := make(map[string]float64)
 
 	if !nta.normalPodConfig.hyperNodeBinPackingEnable {
+		perflog.LogNetworkTopologyBatchNodeOrderNormal(string(task.UID), len(nodes), 0, time.Since(start))
 		return nodeScores, nil
 	}
 
@@ -451,6 +485,9 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNormalPods(ssn *framew
 	if totalTierWeight <= 0 {
 		// This should not happen, since there are at least one tier and its weight is one
 		klog.Warningf("the total tier weight of plugin %s should be greater than zero, but got %g", PluginName, totalTierWeight)
+		perflog.LogNetworkTopologyBatchNodeOrderNormal(
+			string(task.UID), len(nodes), nta.hyperNodesTier.maxTier-nta.hyperNodesTier.minTier+1, time.Since(start),
+		)
 		return nodeScores, nil
 	}
 
@@ -469,6 +506,9 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNormalPods(ssn *framew
 		}
 		nodeScores[node.Name] = totalScore / totalTierWeight
 	}
+	perflog.LogNetworkTopologyBatchNodeOrderNormal(
+		string(task.UID), len(nodes), nta.hyperNodesTier.maxTier-nta.hyperNodesTier.minTier+1, time.Since(start),
+	)
 	return nodeScores, nil
 }
 
@@ -514,10 +554,12 @@ func (nta *networkTopologyAwarePlugin) getPodHyperNodeBinPackingScore(task *api.
 }
 
 func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *framework.Session, task *api.TaskInfo, subJob *api.SubJobInfo, nodes []*api.NodeInfo) (map[string]float64, error) {
+	start := time.Now()
 	nodeScores := make(map[string]float64)
 
 	allocatedHyperNode := task.JobAllocatedHyperNode
 	if allocatedHyperNode == "" {
+		perflog.LogNetworkTopologyBatchNodeOrderNetworkAware(string(task.UID), len(nodes), 0, time.Since(start))
 		return nodeScores, nil
 	}
 	// Calculate score based on LCAHyperNode tier.
@@ -532,8 +574,10 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 			scoreToNodes[maxScore] = append(scoreToNodes[maxScore], node.Name)
 		}
 	}
+	tiedCandidates := 0
 	// Calculate score based on the number of tasks scheduled for the subjob when max score of node has more than one.
 	if len(scoreToNodes[maxScore]) > 1 {
+		tiedCandidates = len(scoreToNodes[maxScore])
 		candidateNodes := scoreToNodes[maxScore]
 		for _, node := range candidateNodes {
 			hyperNode := util.FindHyperNodeForNode(node, ssn.RealNodesList, ssn.HyperNodesTiers, ssn.HyperNodesSetByTier)
@@ -542,6 +586,7 @@ func (nta *networkTopologyAwarePlugin) batchNodeOrderFnForNetworkAwarePods(ssn *
 		}
 	}
 
+	perflog.LogNetworkTopologyBatchNodeOrderNetworkAware(string(task.UID), len(nodes), tiedCandidates, time.Since(start))
 	return nodeScores, nil
 }
 
@@ -574,6 +619,7 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientStats(
 	highestAllowedTier int,
 	allocatedHyperNode string,
 ) (map[int][]*api.HyperNodeInfo, map[int]int, error) {
+	start := time.Now()
 	searchRoot, err := getSearchRoot(ssn.HyperNodes, hyperNode, highestAllowedTier, allocatedHyperNode)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getSearchRoot failed: %w", err)
@@ -589,12 +635,14 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientStats(
 	enqueued.Insert(searchRoot.Name)
 
 	eligibleByTier := make(map[int][]*api.HyperNodeInfo)
+	eligibleCount := 0
 	for len(processQueue) > 0 {
 		current := processQueue[0]
 		processQueue = processQueue[1:]
 
 		if nta.isEligibleHyperNode(current, highestAllowedTier, allocatedHyperNode) {
 			eligibleByTier[current.Tier()] = append(eligibleByTier[current.Tier()], current)
+			eligibleCount++
 		}
 
 		for child := range current.Children {
@@ -606,6 +654,16 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientStats(
 		}
 	}
 
+	perflog.LogNetworkTopologyBuildGradient(perflog.NetworkTopologyBuildGradientStats{
+		RootHyperNode:      hyperNode.Name,
+		SearchRoot:         searchRoot.Name,
+		HighestAllowedTier: highestAllowedTier,
+		AllocatedHyperNode: allocatedHyperNode,
+		VisitedHyperNodes:  enqueued.Len(),
+		EligibleHyperNodes: eligibleCount,
+		EligibleTiers:      len(eligibleByTier),
+		Latency:            time.Since(start),
+	})
 	return eligibleByTier, totalByTier, nil
 }
 

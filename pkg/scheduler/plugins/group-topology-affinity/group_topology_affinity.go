@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -29,6 +30,7 @@ import (
 	scheduling "volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/util/perflog"
 )
 
 const (
@@ -81,6 +83,7 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeGradientForJob(
 	job *api.JobInfo,
 	root *api.HyperNodeInfo,
 ) [][]*api.HyperNodeInfo {
+	start := time.Now()
 	terms := job.RequiredPodGroupAntiAffinityTerms()
 	if len(terms) == 0 {
 		return nil
@@ -93,6 +96,9 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeGradientForJob(
 		klog.ErrorS(err, "build podGroup anti-affinity gradient failed", "job", job.UID)
 		return [][]*api.HyperNodeInfo{}
 	}
+	perflog.LogPodGroupAntiAffinityGradientForJob(
+		podGroupAntiAffinityJobContext(job), len(terms), len(result), time.Since(start),
+	)
 	return result
 }
 
@@ -107,10 +113,13 @@ func (gta *groupTopologyAffinityPlugin) buildPodGroupAntiAffinityGradient(
 	highestAllowedTier int,
 	allocatedHyperNode string,
 ) ([][]*api.HyperNodeInfo, error) {
-	matchingHyperNodesByTerm, err := collectMatchingHyperNodesByTerm(ssn, job, terms)
+	start := time.Now()
+	collectStart := time.Now()
+	matchingHyperNodesByTerm, collectStats, err := collectMatchingHyperNodesByTerm(ssn, job, terms)
 	if err != nil {
 		return nil, err
 	}
+	collectLatency := time.Since(collectStart)
 
 	searchRoot, err := getSearchRootForGradient(
 		ssn.HyperNodes, root, highestAllowedTier, allocatedHyperNode,
@@ -121,10 +130,16 @@ func (gta *groupTopologyAffinityPlugin) buildPodGroupAntiAffinityGradient(
 
 	logPodGroupAntiAffinityMatchingOccupancy(ssn, job, terms, matchingHyperNodesByTerm)
 
-	eligibleHyperNodes := gta.bfsAntiAffinityEligibleHyperNodes(
+	bfsStart := time.Now()
+	eligibleHyperNodes, bfsStats := gta.bfsAntiAffinityEligibleHyperNodes(
 		ssn, job, searchRoot, terms, matchingHyperNodesByTerm, highestAllowedTier,
 	)
+	bfsLatency := time.Since(bfsStart)
 	logPodGroupAntiAffinityGradientResult(job, searchRoot, eligibleHyperNodes)
+	perflog.LogPodGroupAntiAffinityBuildGradient(
+		podGroupAntiAffinityJobContext(job),
+		collectStats, collectLatency, bfsStats, bfsLatency, time.Since(start),
+	)
 	return groupHyperNodesByTierAsc(eligibleHyperNodes), nil
 }
 
@@ -134,18 +149,20 @@ func collectMatchingHyperNodesByTerm(
 	ssn *framework.Session,
 	job *api.JobInfo,
 	terms []scheduling.PodGroupAffinityTerm,
-) ([]sets.Set[string], error) {
+) ([]sets.Set[string], perflog.CollectMatchingStats, error) {
 	matchingHyperNodesByTerm := make([]sets.Set[string], len(terms))
+	stats := perflog.CollectMatchingStats{}
 	for index, term := range terms {
 		matchingHyperNodes, err := api.MatchingPodGroupsAllocatedHyperNodesForTerm(
 			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term, ssn.RealNodesSet,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("term %d: %w", index, err)
+			return nil, stats, fmt.Errorf("term %d: %w", index, err)
 		}
 		matchingHyperNodesByTerm[index] = matchingHyperNodes
+		stats.TotalOccupiedHyperNodes += matchingHyperNodes.Len()
 	}
-	return matchingHyperNodesByTerm, nil
+	return matchingHyperNodesByTerm, stats, nil
 }
 
 func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
@@ -155,12 +172,13 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 	terms []scheduling.PodGroupAffinityTerm,
 	matchingHyperNodesByTerm []sets.Set[string],
 	highestAllowedTier int,
-) map[int][]*api.HyperNodeInfo {
+) (map[int][]*api.HyperNodeInfo, perflog.BFSAntiAffinityStats) {
 	enqueued := set.New[string]()
 	processQueue := []*api.HyperNodeInfo{searchRoot}
 	enqueued.Insert(searchRoot.Name)
 
 	eligibleByTier := make(map[int][]*api.HyperNodeInfo)
+	eligibleCount := 0
 	for len(processQueue) > 0 {
 		current := processQueue[0]
 		processQueue = processQueue[1:]
@@ -169,6 +187,7 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 			ssn, job, current, terms, matchingHyperNodesByTerm, highestAllowedTier,
 		) {
 			eligibleByTier[current.Tier()] = append(eligibleByTier[current.Tier()], current)
+			eligibleCount++
 		}
 
 		for child := range current.Children {
@@ -179,7 +198,10 @@ func (gta *groupTopologyAffinityPlugin) bfsAntiAffinityEligibleHyperNodes(
 			enqueued.Insert(child)
 		}
 	}
-	return eligibleByTier
+	return eligibleByTier, perflog.BFSAntiAffinityStats{
+		VisitedHyperNodes:  enqueued.Len(),
+		EligibleHyperNodes: eligibleCount,
+	}
 }
 
 // groupHyperNodesByTierAsc groups HyperNodes by tier and returns tiers in ascending order.
@@ -238,6 +260,7 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 	job *api.JobInfo,
 	hyperNodes map[string][]*api.NodeInfo,
 ) (map[string]float64, error) {
+	start := time.Now()
 	terms := job.PreferredPodGroupAntiAffinityTerms()
 	if len(terms) == 0 {
 		return nil, nil
@@ -254,7 +277,9 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 		scores[hyperNode] = FullScore
 	}
 
+	collectStart := time.Now()
 	matchingHyperNodesByTerm := make([]sets.Set[string], len(terms))
+	totalOccupied := 0
 	for termIndex, term := range terms {
 		matchingHyperNodes, err := api.MatchingPodGroupsAllocatedHyperNodesForTerm(
 			ssn.Jobs, ssn.HyperNodes, ssn.HyperNodeTierNameMap, job, term, ssn.RealNodesSet,
@@ -263,7 +288,9 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 			return nil, err
 		}
 		matchingHyperNodesByTerm[termIndex] = matchingHyperNodes
+		totalOccupied += matchingHyperNodes.Len()
 	}
+	collectLatency := time.Since(collectStart)
 	logPodGroupAntiAffinityMatchingOccupancy(ssn, job, terms, matchingHyperNodesByTerm)
 
 	for termIndex, term := range terms {
@@ -297,6 +324,10 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 		scores[hyperNode] = float64(gta.weight) * score * float64(k8sFramework.MaxNodeScore)
 	}
 	logPodGroupAntiAffinityPreferredFinalScores(job, scores, gta.weight)
+	perflog.LogPodGroupAntiAffinityPreferredOrder(
+		podGroupAntiAffinityJobContext(job),
+		len(terms), len(hyperNodes), totalOccupied, collectLatency, time.Since(start),
+	)
 	return scores, nil
 }
 
@@ -360,6 +391,14 @@ func getHighestAllowedHyperNode(hyperNodes api.HyperNodeInfoMap, highestAllowedT
 	}
 
 	return highestAllowedHyperNode, nil
+}
+
+func podGroupAntiAffinityJobContext(job *api.JobInfo) perflog.PodGroupAntiAffinityJobContext {
+	return perflog.PodGroupAntiAffinityJobContext{
+		Namespace: job.Namespace,
+		Name:      job.Name,
+		Pods:      pendingPodNames(job),
+	}
 }
 
 func pendingPodNames(job *api.JobInfo) string {

@@ -19,12 +19,14 @@ package api
 
 import (
 	"fmt"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
+	"volcano.sh/volcano/pkg/scheduler/util/perflog"
 )
 
 // ContainsHardPodGroupAntiAffinity returns whether the job has hard cross-PodGroup anti-affinity.
@@ -264,24 +266,42 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 	term scheduling.PodGroupAffinityTerm,
 	nodesByHyperNode map[string]sets.Set[string],
 ) (sets.Set[string], error) {
+	start := time.Now()
 	tier, err := ResolvePodGroupTermTier(term, tierNameMap)
 	if err != nil {
 		return nil, err
 	}
 
 	matchingHyperNodes := sets.New[string]()
+	jobsMatched := 0
+	jobsWithPlacement := 0
+	inferredPlacements := 0
 	for _, matchingJob := range jobs {
 		if !PodGroupMatchesTerm(term, selfJob, matchingJob) {
 			continue
 		}
+		jobsMatched++
 		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
 		if allocatedHyperNode == "" {
 			continue
+		}
+		jobsWithPlacement++
+		if matchingJob.AllocatedHyperNode == "" {
+			inferredPlacements++
 		}
 		ancestorHyperNode := hyperNodes.GetAncestorHyperNode(allocatedHyperNode, tier)
 		if ancestorHyperNode != "" {
 			matchingHyperNodes.Insert(ancestorHyperNode)
 		}
 	}
+	perflog.LogPodGroupAntiAffinityScanMatchingJobs(selfJob.Namespace, selfJob.Name, perflog.PodGroupAntiAffinityScanStats{
+		TermTier:           tier,
+		JobsTotal:          len(jobs),
+		JobsMatched:        jobsMatched,
+		JobsWithPlacement:  jobsWithPlacement,
+		InferredPlacements: inferredPlacements,
+		OccupiedHyperNodes: matchingHyperNodes.Len(),
+		Latency:            time.Since(start),
+	})
 	return matchingHyperNodes, nil
 }

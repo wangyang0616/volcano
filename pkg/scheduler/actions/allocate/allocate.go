@@ -32,6 +32,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	"volcano.sh/volcano/pkg/scheduler/util"
+	"volcano.sh/volcano/pkg/scheduler/util/perflog"
 	commonutil "volcano.sh/volcano/pkg/util"
 )
 
@@ -928,12 +929,17 @@ func FilterGradientsByMinResource(
 		return gradients, nil
 	}
 
+	start := time.Now()
+	inputHyperNodes := 0
 	stats := &api.HyperNodeMinResourceFilterStats{
 		FinalByTier:    make(map[int]int),
 		ExcludedByTier: make(map[int]int),
 	}
 	filtered := make([][]*api.HyperNodeInfo, 0, len(gradients))
 	for _, layer := range gradients {
+		for range layer {
+			inputHyperNodes++
+		}
 		survivors := make([]*api.HyperNodeInfo, 0, len(layer))
 		for _, hn := range layer {
 			if hyperNodeSatisfiesMinResource(ssn, hn.Name, minResource) {
@@ -947,6 +953,11 @@ func FilterGradientsByMinResource(
 			filtered = append(filtered, survivors)
 		}
 	}
+	outputHyperNodes := 0
+	for _, count := range stats.FinalByTier {
+		outputHyperNodes += count
+	}
+	perflog.LogHyperNodeGradientFilterByMinResource(inputHyperNodes, outputHyperNodes, time.Since(start))
 	if len(filtered) > 0 {
 		return filtered, stats
 	}

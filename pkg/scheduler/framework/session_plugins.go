@@ -23,6 +23,7 @@ package framework
 import (
 	"context"
 	"sort"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -32,6 +33,7 @@ import (
 	"volcano.sh/volcano/pkg/controllers/job/helpers"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/util"
+	"volcano.sh/volcano/pkg/scheduler/util/perflog"
 )
 
 // AddJobOrderFn add job order function
@@ -1054,6 +1056,7 @@ func (ssn *Session) HyperNodeGradientForJobFn(
 	job *api.JobInfo,
 	hyperNode *api.HyperNodeInfo,
 ) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	start := time.Now()
 	var gradientByPlugin []api.HyperNodePluginGradient
 	foundAny := false
 	for _, tier := range ssn.Tiers {
@@ -1066,7 +1069,9 @@ func (ssn *Session) HyperNodeGradientForJobFn(
 				continue
 			}
 			foundAny = true
+			pluginStart := time.Now()
 			gradients := fn(job, hyperNode)
+			perflog.LogHyperNodeGradientPlugin(job.Namespace, job.Name, plugin.Name, time.Since(pluginStart))
 			if gradients == nil {
 				continue
 			}
@@ -1076,7 +1081,9 @@ func (ssn *Session) HyperNodeGradientForJobFn(
 	if !foundAny || len(gradientByPlugin) == 0 {
 		return [][]*api.HyperNodeInfo{{hyperNode}}, nil
 	}
-	return intersectHyperNodeGradients(gradientByPlugin)
+	gradients, stats := intersectHyperNodeGradients(gradientByPlugin)
+	perflog.LogHyperNodeGradientForJob(job.Namespace, job.Name, len(gradientByPlugin), time.Since(start))
+	return gradients, stats
 }
 
 // HyperNodeGradientForSubJobFn group hyperNodes into several gradients,
@@ -1131,6 +1138,7 @@ func hyperNodeCountByTier(gradients [][]*api.HyperNodeInfo) map[int]int {
 //
 // It also aggregates per-plugin eligible counts and intersected counts for HyperNode fit events.
 func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
+	start := time.Now()
 	stats := &api.HyperNodeGradientStats{
 		PluginEligibleByTier: make(map[string]map[int]int, len(gradientByPlugin)),
 	}
@@ -1143,6 +1151,7 @@ func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient)
 	}
 	if len(gradientByPlugin) == 1 {
 		stats.IntersectedByTier = hyperNodeCountByTier(gradientByPlugin[0].Gradients)
+		perflog.LogHyperNodeGradientIntersect(len(gradientByPlugin), stats.IntersectedByTier, time.Since(start))
 		return gradientByPlugin[0].Gradients, stats
 	}
 
@@ -1156,6 +1165,7 @@ func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient)
 	for index := 1; index < len(pluginGradients); index++ {
 		eligible = eligible.Intersection(hyperNodeNamesInGradients(pluginGradients[index]))
 		if eligible.Len() == 0 {
+			perflog.LogHyperNodeGradientIntersect(len(gradientByPlugin), nil, time.Since(start))
 			return nil, stats
 		}
 	}
@@ -1176,6 +1186,7 @@ func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient)
 	// Phase 3: group survivors by tier and return sorted tier layers.
 	result := rebuildGradientsByTier(hyperNodeByName, eligible)
 	stats.IntersectedByTier = hyperNodeCountByTier(result)
+	perflog.LogHyperNodeGradientIntersect(len(gradientByPlugin), stats.IntersectedByTier, time.Since(start))
 	return result, stats
 }
 
