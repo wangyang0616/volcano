@@ -468,6 +468,72 @@ func TestPodGroupAntiAffinityAgainstMatchingJobWithoutTopology(t *testing.T) {
 	}
 }
 
+func TestSyncJobAllocatedHyperNodeAfterPodRemoval(t *testing.T) {
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+	}
+	nodesByHyperNode := map[string]sets.Set[string]{
+		"sn-a": sets.New("node-a"),
+		"sn-b": sets.New("node-b"),
+		"root": sets.New("node-a", "node-b"),
+	}
+
+	subJobID := SubJobID("default")
+	task1 := &TaskInfo{UID: "task-1"}
+	task1.Status = Allocated
+	task1.NodeName = "node-a"
+	job := &JobInfo{
+		UID:                JobID("job-1"),
+		AllocatedHyperNode: "root",
+		SubJobs: map[SubJobID]*SubJobInfo{
+			subJobID: {
+				UID:                subJobID,
+				AllocatedHyperNode: "root",
+				TaskStatusIndex: map[TaskStatus]TasksMap{
+					Allocated: {task1.UID: task1},
+				},
+			},
+		},
+	}
+
+	SyncJobAllocatedHyperNode(job, hn, nodesByHyperNode)
+
+	if job.SubJobs[subJobID].AllocatedHyperNode != "sn-a" {
+		t.Fatalf("subJob AllocatedHyperNode = %q, want sn-a", job.SubJobs[subJobID].AllocatedHyperNode)
+	}
+	if job.AllocatedHyperNode != "sn-a" {
+		t.Fatalf("job AllocatedHyperNode = %q, want sn-a", job.AllocatedHyperNode)
+	}
+}
+
+func TestSyncJobAllocatedHyperNodeClearsWhenNoAllocatedTasks(t *testing.T) {
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+	}
+	subJobID := SubJobID("default")
+	job := &JobInfo{
+		UID:                JobID("job-1"),
+		AllocatedHyperNode: "root",
+		SubJobs: map[SubJobID]*SubJobInfo{
+			subJobID: {
+				UID:                subJobID,
+				AllocatedHyperNode: "root",
+			},
+		},
+	}
+
+	SyncJobAllocatedHyperNode(job, hn, nil)
+
+	if job.SubJobs[subJobID].AllocatedHyperNode != "" {
+		t.Fatalf("subJob AllocatedHyperNode = %q, want empty", job.SubJobs[subJobID].AllocatedHyperNode)
+	}
+	if job.AllocatedHyperNode != "" {
+		t.Fatalf("job AllocatedHyperNode = %q, want empty", job.AllocatedHyperNode)
+	}
+}
+
 func newTestHyperNode(name string, tier int, tierName, parent string) *HyperNodeInfo {
 	return &HyperNodeInfo{
 		Name:     name,

@@ -112,6 +112,94 @@ func matchesNamespaceSelector(namespaceSelector *metav1.LabelSelector, selfNames
 	return selfNamespace == otherNamespace
 }
 
+// ComputeSubJobAllocatedHyperNode returns the HyperNode that contains all allocated tasks in subJob.
+func ComputeSubJobAllocatedHyperNode(
+	subJob *SubJobInfo,
+	hyperNodes HyperNodeInfoMap,
+	nodesByHyperNode map[string]sets.Set[string],
+) string {
+	if subJob == nil || len(hyperNodes) == 0 || len(nodesByHyperNode) == 0 {
+		return ""
+	}
+	hyperNodeSet := sets.New[string]()
+	for name := range hyperNodes {
+		hyperNodeSet.Insert(name)
+	}
+	return getSubJobAllocatedHyperNodeFromTasks(subJob, hyperNodeSet, nodesByHyperNode, hyperNodes)
+}
+
+// ComputeJobAllocatedHyperNode returns the HyperNode that contains all allocated tasks in job.
+func ComputeJobAllocatedHyperNode(
+	job *JobInfo,
+	hyperNodes HyperNodeInfoMap,
+	nodesByHyperNode map[string]sets.Set[string],
+) string {
+	if job == nil || len(hyperNodes) == 0 || len(nodesByHyperNode) == 0 {
+		return ""
+	}
+	hyperNodeSet := sets.New[string]()
+	for name := range hyperNodes {
+		hyperNodeSet.Insert(name)
+	}
+
+	var lca string
+	for _, subJob := range job.SubJobs {
+		subJobHyperNode := ComputeSubJobAllocatedHyperNode(subJob, hyperNodes, nodesByHyperNode)
+		if subJobHyperNode == "" {
+			continue
+		}
+		lca = hyperNodes.GetLCAHyperNode(lca, subJobHyperNode)
+	}
+	if lca != "" {
+		return lca
+	}
+	return getAllocatedHyperNodeFromTasks(collectJobAllocatedTasks(job), hyperNodeSet, nodesByHyperNode, hyperNodes)
+}
+
+// SyncJobAllocatedHyperNode refreshes job and subJob AllocatedHyperNode from remaining allocated tasks.
+// Call this when task placement changes (for example pod deletion) so placement tracks running pods.
+func SyncJobAllocatedHyperNode(
+	job *JobInfo,
+	hyperNodes HyperNodeInfoMap,
+	nodesByHyperNode map[string]sets.Set[string],
+) {
+	if job == nil {
+		return
+	}
+
+	for _, subJob := range job.SubJobs {
+		if subJob.AllocatedTaskNum() == 0 {
+			subJob.AllocatedHyperNode = ""
+			continue
+		}
+		if len(hyperNodes) == 0 || len(nodesByHyperNode) == 0 {
+			continue
+		}
+		subJob.AllocatedHyperNode = ComputeSubJobAllocatedHyperNode(subJob, hyperNodes, nodesByHyperNode)
+	}
+
+	if !jobHasAllocatedTasks(job) {
+		job.AllocatedHyperNode = ""
+		return
+	}
+	if len(hyperNodes) == 0 || len(nodesByHyperNode) == 0 {
+		return
+	}
+	job.AllocatedHyperNode = ComputeJobAllocatedHyperNode(job, hyperNodes, nodesByHyperNode)
+}
+
+func jobHasAllocatedTasks(job *JobInfo) bool {
+	if job.AllocatedTaskNum() > 0 {
+		return true
+	}
+	for _, subJob := range job.SubJobs {
+		if subJob.AllocatedTaskNum() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // getJobAllocatedHyperNode returns job.AllocatedHyperNode when set, otherwise infers it from
 // placed tasks (for example matching PodGroups without network topology).
 func getJobAllocatedHyperNode(

@@ -336,6 +336,9 @@ func (sc *SchedulerCache) deleteTask(ti *schedulingapi.TaskInfo) error {
 	if len(ti.Job) != 0 {
 		if job, found := sc.Jobs[ti.Job]; found {
 			jobErr = job.DeleteTaskInfo(ti)
+			if jobErr == nil {
+				sc.syncJobAllocatedHyperNode(job)
+			}
 		} else {
 			klog.Warningf("Failed to find Job <%v> for Task <%v/%v> in cache.", ti.Job, ti.Namespace, ti.Name)
 		}
@@ -1404,6 +1407,24 @@ func (sc *SchedulerCache) updateHyperNode(hn *topologyv1alpha1.HyperNode) error 
 // It clears current hyperNode and update ancestors' cache.
 func (sc *SchedulerCache) deleteHyperNode(name string) error {
 	return sc.HyperNodesInfo.DeleteHyperNode(name)
+}
+
+func (sc *SchedulerCache) syncJobAllocatedHyperNode(job *schedulingapi.JobInfo) {
+	if job == nil || sc.HyperNodesInfo == nil {
+		return
+	}
+
+	sc.HyperNodesInfo.Lock()
+	hyperNodes := sc.HyperNodesInfo.HyperNodes()
+	nodesByHyperNode := sc.HyperNodesInfo.RealNodesSet()
+	sc.HyperNodesInfo.Unlock()
+
+	oldJobHyperNode := job.AllocatedHyperNode
+	schedulingapi.SyncJobAllocatedHyperNode(job, hyperNodes, nodesByHyperNode)
+	if job.AllocatedHyperNode != oldJobHyperNode {
+		klog.V(3).InfoS("sync job allocated hyperNode after task change", "job", job.UID,
+			"old", oldJobHyperNode, "new", job.AllocatedHyperNode)
+	}
 }
 
 // AddNodeShard add nodeshard to scheduler cache
