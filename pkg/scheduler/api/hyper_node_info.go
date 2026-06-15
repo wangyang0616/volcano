@@ -817,6 +817,48 @@ func (hnim HyperNodeInfoMap) GetAncestorHyperNode(hyperNodeName string, tier int
 	return ""
 }
 
+// ResolveHyperNodesAtTier maps a placed HyperNode to topology domain name(s) at tier.
+// When placement is coarser than tier, all descendant HyperNodes at tier are returned;
+// when placement is at or finer than tier, the single ancestor at tier (including self) is returned.
+func (hnim HyperNodeInfoMap) ResolveHyperNodesAtTier(hyperNodeName string, tier int) []string {
+	hn, ok := hnim[hyperNodeName]
+	if !ok {
+		return nil
+	}
+	if hn.Tier() > tier {
+		return hnim.hyperNodesAtTierUnder(hyperNodeName, tier)
+	}
+	if ancestor := hnim.GetAncestorHyperNode(hyperNodeName, tier); ancestor != "" {
+		return []string{ancestor}
+	}
+	return nil
+}
+
+// hyperNodesAtTierUnder lists HyperNode names at tier that lie under root in the tree.
+// Called when a job's placement is coarser than the anti-affinity term tier (for example
+// allocated at supernode while the term compares at rack): every descendant domain at tier
+// under root must be treated as occupied.
+//
+// The scan walks all HyperNodes at tier and keeps those whose ancestor chain includes root.
+// Upward lookup via GetAncestors is used instead of BFS from root.Children so this stays
+// correct when only Parent links are populated (tests and early cache states).
+func (hnim HyperNodeInfoMap) hyperNodesAtTierUnder(root string, tier int) []string {
+	names := make([]string, 0)
+	for name, hn := range hnim {
+		if hn.Tier() != tier {
+			continue
+		}
+		for _, ancestor := range hnim.GetAncestors(name) {
+			if ancestor == root {
+				names = append(names, name)
+				break
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // GetAncestorHyperNodeByTierName returns the ancestor HyperNode name at HyperNode.spec.tierName.
 func (hnim HyperNodeInfoMap) GetAncestorHyperNodeByTierName(hyperNodeName, tierName string) string {
 	for _, ancestor := range hnim.GetAncestors(hyperNodeName) {

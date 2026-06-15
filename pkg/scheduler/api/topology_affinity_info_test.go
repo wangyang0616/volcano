@@ -203,6 +203,19 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 			want: sets.New("cab-a"),
 		},
 		{
+			name: "coarser allocated hyperNode expands to descendants at finer term tier",
+			jobs: map[JobID]*JobInfo{
+				"other": {
+					UID: "other", Namespace: "default", AllocatedHyperNode: "sn-a",
+					PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"topology.volcano.sh/group": "prod"}},
+					}},
+				},
+			},
+			term: scheduling.PodGroupAffinityTerm{PodGroupSelector: selector, TopologyTierName: "rack"},
+			want: sets.New("cab-a"),
+		},
+		{
 			name: "multiple matching PodGroups collapse to set",
 			jobs: map[JobID]*JobInfo{
 				"j1": {

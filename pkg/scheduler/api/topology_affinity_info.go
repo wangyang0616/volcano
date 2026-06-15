@@ -276,22 +276,19 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 			continue
 		}
 		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
-		ancestorHyperNode := ""
-		if allocatedHyperNode != "" {
-			ancestorHyperNode = hyperNodes.GetAncestorHyperNode(allocatedHyperNode, tier)
-		}
+		resolvedHyperNodes := hyperNodes.ResolveHyperNodesAtTier(allocatedHyperNode, tier)
 		klog.V(3).InfoS("podGroup anti-affinity: matching job hyperNode",
 			"job", klog.KRef(selfJob.Namespace, selfJob.Name),
 			"matchingJob", klog.KRef(matchingJob.Namespace, matchingJob.Name),
 			"termTier", tier,
 			"allocatedHyperNode", allocatedHyperNode,
-			"ancestorHyperNode", ancestorHyperNode,
+			"resolvedHyperNodes", resolvedHyperNodes,
 		)
 		if allocatedHyperNode == "" {
 			continue
 		}
-		if ancestorHyperNode != "" {
-			matchingHyperNodes.Insert(ancestorHyperNode)
+		for _, hyperNode := range resolvedHyperNodes {
+			matchingHyperNodes.Insert(hyperNode)
 		}
 	}
 	return matchingHyperNodes, nil
