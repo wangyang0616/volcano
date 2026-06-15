@@ -86,6 +86,8 @@ func AppendSchedulingDimensions(base, hyperNodeSummary, nodeSummary string) stri
 type HyperNodeGradientStats struct {
 	PluginEligibleByTier map[string]map[int]int
 	IntersectedByTier    map[int]int
+	// ExcludedByReason maps excluded HyperNode name to plugin exclusion labels (comma-separated).
+	ExcludedByReason map[string]string
 }
 
 // HyperNodePluginGradient carries one plugin's HyperNode gradient result for intersection.
@@ -96,8 +98,9 @@ type HyperNodePluginGradient struct {
 
 // HyperNodeMinResourceFilterStats captures minResource filtering on intersected HyperNodes.
 type HyperNodeMinResourceFilterStats struct {
-	FinalByTier    map[int]int
-	ExcludedByTier map[int]int
+	FinalByTier      map[int]int
+	ExcludedByTier   map[int]int
+	ExcludedByReason map[string]string
 }
 
 var hyperNodeExclusionLabels = map[string]string{
@@ -106,6 +109,55 @@ var hyperNodeExclusionLabels = map[string]string{
 }
 
 const hyperNodeMinResourceExclusionLabel = "minResource"
+
+// HyperNodeNamesInGradients flattens gradient layers into a set of HyperNode names.
+func HyperNodeNamesInGradients(gradients [][]*HyperNodeInfo) sets.Set[string] {
+	names := sets.New[string]()
+	for _, layer := range gradients {
+		for _, hn := range layer {
+			names.Insert(hn.Name)
+		}
+	}
+	return names
+}
+
+// ComputePluginExcludedHyperNodes returns HyperNodes present in any plugin gradient but removed by intersection.
+func ComputePluginExcludedHyperNodes(
+	gradientByPlugin []HyperNodePluginGradient,
+	eligible sets.Set[string],
+) map[string]string {
+	if len(gradientByPlugin) <= 1 {
+		return nil
+	}
+
+	pluginSets := make(map[string]sets.Set[string], len(gradientByPlugin))
+	union := sets.New[string]()
+	for _, pluginGradient := range gradientByPlugin {
+		names := HyperNodeNamesInGradients(pluginGradient.Gradients)
+		pluginSets[pluginGradient.PluginName] = names
+		union = union.Union(names)
+	}
+
+	excluded := make(map[string]string)
+	for name := range union {
+		if eligible.Has(name) {
+			continue
+		}
+		reasons := make([]string, 0, len(gradientByPlugin))
+		for _, pluginGradient := range gradientByPlugin {
+			if !pluginSets[pluginGradient.PluginName].Has(name) {
+				label := hyperNodeExclusionLabels[pluginGradient.PluginName]
+				if label == "" {
+					label = pluginGradient.PluginName
+				}
+				reasons = append(reasons, label)
+			}
+		}
+		sort.Strings(reasons)
+		excluded[name] = strings.Join(reasons, ", ")
+	}
+	return excluded
+}
 
 // FormatHyperNodeFitSummary builds the HyperNode-tier portion of JobFitErrors.
 func FormatHyperNodeFitSummary(

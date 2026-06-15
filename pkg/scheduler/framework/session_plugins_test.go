@@ -28,6 +28,7 @@ import (
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/cache"
+	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
@@ -171,6 +172,11 @@ func TestIntersectHyperNodeGradients(t *testing.T) {
 	assert.Equal(t, map[int]int{1: 2, 2: 1}, stats.PluginEligibleByTier["plugin-a"])
 	assert.Equal(t, map[int]int{1: 2, 2: 2}, stats.PluginEligibleByTier["plugin-b"])
 	assert.Equal(t, map[int]int{1: 1, 2: 1}, stats.IntersectedByTier)
+	assert.Equal(t, map[string]string{
+		"a1": "plugin-b",
+		"b1": "plugin-a",
+		"b2": "plugin-a",
+	}, stats.ExcludedByReason)
 
 	empty, stats := intersectHyperNodeGradients([]api.HyperNodePluginGradient{
 		{PluginName: "only-a", Gradients: [][]*api.HyperNodeInfo{{testHyperNodeInfo("only-a", 1)}}},
@@ -180,6 +186,10 @@ func TestIntersectHyperNodeGradients(t *testing.T) {
 	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["only-a"])
 	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["only-b"])
 	assert.Empty(t, stats.IntersectedByTier)
+	assert.Equal(t, map[string]string{
+		"only-a": "only-b",
+		"only-b": "only-a",
+	}, stats.ExcludedByReason)
 }
 
 func TestIntersectHyperNodeGradientsSinglePlugin(t *testing.T) {
@@ -205,6 +215,43 @@ func TestIntersectHyperNodeGradientsWithEmptyPluginResult(t *testing.T) {
 	assert.Equal(t, map[int]int{1: 1}, stats.PluginEligibleByTier["full"])
 	assert.Empty(t, stats.PluginEligibleByTier["empty"])
 	assert.Empty(t, stats.IntersectedByTier)
+	assert.Equal(t, map[string]string{"a": "empty"}, stats.ExcludedByReason)
+}
+
+func TestHyperNodeGradientForJobFnEmptyGradient(t *testing.T) {
+	enabled := true
+	root := testHyperNodeInfo("root", 3)
+	job := &api.JobInfo{UID: "job-1"}
+
+	ssn := &Session{
+		Tiers: []conf.Tier{
+			{Plugins: []conf.PluginOption{{Name: "test-plugin", EnabledHyperNodeGradient: &enabled}}},
+		},
+		hyperNodeGradientForJobFns: map[string]api.HyperNodeGradientForJobFn{},
+	}
+	ssn.AddHyperNodeGradientForJobFn("test-plugin", func(_ *api.JobInfo, _ *api.HyperNodeInfo) [][]*api.HyperNodeInfo {
+		return [][]*api.HyperNodeInfo{}
+	})
+
+	result, stats := ssn.HyperNodeGradientForJobFn(job, root)
+	assert.Empty(t, result)
+	assert.Empty(t, stats.IntersectedByTier)
+}
+
+func TestHyperNodeGradientForJobFnUnregisteredPlugin(t *testing.T) {
+	enabled := true
+	root := testHyperNodeInfo("root", 3)
+	job := &api.JobInfo{UID: "job-1"}
+
+	ssn := &Session{
+		Tiers: []conf.Tier{
+			{Plugins: []conf.PluginOption{{Name: "missing-plugin", EnabledHyperNodeGradient: &enabled}}},
+		},
+		hyperNodeGradientForJobFns: map[string]api.HyperNodeGradientForJobFn{},
+	}
+	result, stats := ssn.HyperNodeGradientForJobFn(job, root)
+	assert.Equal(t, [][]*api.HyperNodeInfo{{root}}, result)
+	assert.Nil(t, stats)
 }
 
 func hyperNodeNamesAtTier(gradients [][]*api.HyperNodeInfo, tierIdx int) []string {

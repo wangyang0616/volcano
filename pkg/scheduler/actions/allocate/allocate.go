@@ -368,6 +368,13 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 		klog.V(3).InfoS("No hyperNode gradient for job", "job", job.UID, "fitError", job.JobFitErrors)
 		return nil
 	}
+	klog.V(3).InfoS("HyperNode screening for job", "job", job.UID, "fitError", job.JobFitErrors)
+	if gradientStats != nil && len(gradientStats.ExcludedByReason) > 0 {
+		klog.V(3).InfoS("HyperNode excluded by plugin", "job", job.UID, "excluded", gradientStats.ExcludedByReason)
+	}
+	if resourceStats != nil && len(resourceStats.ExcludedByReason) > 0 {
+		klog.V(3).InfoS("HyperNode excluded by minResource", "job", job.UID, "excluded", resourceStats.ExcludedByReason)
+	}
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)   // backup the statement after the job is allocated to a hyperNode
 		jobWorksheetsBackup := make(map[string]*JobWorksheet) // backup the job worksheet after the job is allocated to a hyperNode
@@ -381,7 +388,7 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 			job.JobFitErrors = jobHyperNodeBaseline // drop subJob overlay from prior HyperNode attempt
 			job.ResetFitErr()
 			jobWorksheetCopy := jobWorksheet.Clone()
-			klog.V(3).InfoS("Try to allocate resource for job in hyperNode", "job", job.UID, "hyperNode", hyperNode.Name)
+			klog.V(3).InfoS("Try to allocate resource for job in hyperNode", "job", job.UID, "hyperNode", hyperNode.Name, "tierLayer", gradient)
 
 			for !jobWorksheetCopy.subJobs.Empty() {
 				subJob := jobWorksheetCopy.subJobs.Pop().(*api.SubJobInfo)
@@ -407,12 +414,20 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 
 			mergedStmt := framework.SaveOperations(stmtList...)
 			if len(mergedStmt.Operations()) == 0 {
+				klog.V(3).InfoS("Try to allocate resource for job in hyperNode fail", "job", job.UID,
+					"hyperNode", hyperNode.Name, "tierLayer", gradient, "reason", "no allocatable solution")
 				continue // skip recording this empty solution
 			}
 			if ssn.JobReady(job) || ssn.JobPipelined(job) {
+				klog.V(3).InfoS("Try to allocate resource for job in hyperNode success", "job", job.UID,
+					"hyperNode", hyperNode.Name, "tierLayer", gradient,
+					"jobReady", ssn.JobReady(job), "jobPipelined", ssn.JobPipelined(job))
 				stmtBackup[hyperNode.Name] = mergedStmt                          // backup successful solution
 				jobWorksheetsBackup[hyperNode.Name] = jobWorksheetCopy           // backup remains subJobs
 				subJobsAllocationScores[hyperNode.Name] = subJobsAllocationScore // save the subJobs allocation score of the job
+			} else {
+				klog.V(3).InfoS("Try to allocate resource for job in hyperNode fail", "job", job.UID,
+					"hyperNode", hyperNode.Name, "tierLayer", gradient, "reason", "job not ready or pipelined")
 			}
 
 			// dry run in every hyperNode
@@ -480,6 +495,17 @@ func (alloc *Action) allocateForSubJob(
 		klog.V(3).InfoS("No hyperNode gradient for subJob", "job", subJob.Job, "subJob", subJob.UID, "fitError", job.JobFitErrors)
 		return nil, 0
 	}
+	klog.V(3).InfoS("HyperNode screening for subJob", "job", subJob.Job, "subJob", subJob.UID,
+		"fitError", api.FormatHyperNodeFitSummary(gradientStats, resourceStats, subJob.GetMinResources(),
+			ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes))
+	if gradientStats != nil && len(gradientStats.ExcludedByReason) > 0 {
+		klog.V(3).InfoS("HyperNode excluded by plugin", "job", subJob.Job, "subJob", subJob.UID,
+			"excluded", gradientStats.ExcludedByReason)
+	}
+	if resourceStats != nil && len(resourceStats.ExcludedByReason) > 0 {
+		klog.V(3).InfoS("HyperNode excluded by minResource", "job", subJob.Job, "subJob", subJob.UID,
+			"excluded", resourceStats.ExcludedByReason)
+	}
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)         // backup the statement after the subJob is allocated to a hyperNode
 		subJobWorksheetsBackup := make(map[string]*SubJobWorksheet) // backup the subJob worksheet after the subJob is allocated to a hyperNode
@@ -491,13 +517,21 @@ func (alloc *Action) allocateForSubJob(
 			placementBeforeTry := captureHyperNodePlacement(job, subJob)
 
 			klog.V(3).InfoS("Try to allocate resource for tasks in subJob", "job", subJob.Job,
-				"subJob", subJob.UID, "taskNum", subJobWorksheetCopy.tasks.Len(), "hyperNode", hyperNode.Name)
+				"subJob", subJob.UID, "taskNum", subJobWorksheetCopy.tasks.Len(),
+				"hyperNode", hyperNode.Name, "tierLayer", gradient)
 			stmt := alloc.allocateResourcesForTasks(subJob, subJobWorksheetCopy.tasks, hyperNode.Name)
 
 			if stmt != nil && len(stmt.Operations()) > 0 {
+				klog.V(3).InfoS("Try to allocate resource for tasks in subJob success", "job", subJob.Job,
+					"subJob", subJob.UID, "hyperNode", hyperNode.Name, "tierLayer", gradient,
+					"operations", len(stmt.Operations()))
 				stmtBackup[hyperNode.Name] = framework.SaveOperations(stmt)  // backup successful solution
 				subJobWorksheetsBackup[hyperNode.Name] = subJobWorksheetCopy // backup remains tasks
 				stmt.Discard()                                               // dry run in every hyperNode
+			} else {
+				klog.V(3).InfoS("Try to allocate resource for tasks in subJob fail", "job", subJob.Job,
+					"subJob", subJob.UID, "hyperNode", hyperNode.Name, "tierLayer", gradient,
+					"reason", "no allocatable solution")
 			}
 			restoreHyperNodePlacement(job, subJob, placementBeforeTry)
 		}
@@ -907,7 +941,7 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 }
 
 func logHyperNodeTiers(ssn *framework.Session) {
-	if !klog.V(3).Enabled() || len(ssn.HyperNodesSetByTier) == 0 {
+	if len(ssn.HyperNodesSetByTier) == 0 {
 		return
 	}
 	total, tierCount, listing := api.FormatHyperNodeTierListing(
@@ -929,8 +963,9 @@ func FilterGradientsByMinResource(
 	}
 
 	stats := &api.HyperNodeMinResourceFilterStats{
-		FinalByTier:    make(map[int]int),
-		ExcludedByTier: make(map[int]int),
+		FinalByTier:      make(map[int]int),
+		ExcludedByTier:   make(map[int]int),
+		ExcludedByReason: make(map[string]string),
 	}
 	filtered := make([][]*api.HyperNodeInfo, 0, len(gradients))
 	for _, layer := range gradients {
@@ -941,6 +976,7 @@ func FilterGradientsByMinResource(
 				survivors = append(survivors, hn)
 			} else {
 				stats.ExcludedByTier[hn.Tier()]++
+				stats.ExcludedByReason[hn.Name] = fmt.Sprintf("minResource (%s)", minResource.String())
 			}
 		}
 		if len(survivors) > 0 {

@@ -381,8 +381,10 @@ type SimulateAllocatableFn func(ctx context.Context, state fwk.CycleState, queue
 
 // HyperNodeGradientForJobFn group hyperNodes into several gradients,
 // and discard hyperNodes that unmatched the job topology requirements.
+// Registered plugins always return a non-nil slice; an empty slice means no eligible HyperNodes remain.
 type HyperNodeGradientForJobFn func(job *JobInfo, hyperNode *HyperNodeInfo) [][]*HyperNodeInfo
 
 // HyperNodeGradientForSubJobFn group hyperNodes into several gradients,
 // and discard hyperNodes that unmatched the subJob topology requirements.
+// Registered plugins always return a non-nil slice; an empty slice means no eligible HyperNodes remain.
 type HyperNodeGradientForSubJobFn func(subJob *SubJobInfo, hyperNode *HyperNodeInfo) [][]*HyperNodeInfo

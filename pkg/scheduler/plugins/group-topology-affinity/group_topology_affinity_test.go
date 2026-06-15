@@ -74,19 +74,35 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 		jobs           map[api.JobID]*api.JobInfo
 		selfJob        *api.JobInfo
 		root           string
-		wantNil        bool
 		wantEmpty      bool
 		wantHyperNodes []string
 		wantTierOrder  []int
 	}{
 		{
-			name:      "no required terms returns nil",
-			hn:        buildTwoSupernodeTree(),
-			setByTier: twoSupernodeSetByTier(),
-			jobs:      map[api.JobID]*api.JobInfo{},
-			selfJob:   jobWithTopologyAffinity(nil, nil),
-			root:      "root",
-			wantNil:   true,
+			name:           "no podGroupAntiAffinity passes through full subtree",
+			hn:             buildTwoSupernodeTree(),
+			setByTier:      twoSupernodeSetByTier(),
+			jobs:           map[api.JobID]*api.JobInfo{},
+			selfJob:        jobWithTopologyAffinity(nil, nil),
+			root:           "root",
+			wantHyperNodes: []string{"sn-a", "sn-b", "root"},
+			wantTierOrder:  []int{2, 3},
+		},
+		{
+			name:           "preferred only returns full subtree for hyperNode order",
+			hn:             buildTwoSupernodeTree(),
+			setByTier:      twoSupernodeSetByTier(),
+			jobs:           map[api.JobID]*api.JobInfo{},
+			selfJob: jobWithTopologyAffinity(nil, []scheduling.PodGroupAffinityTerm{
+				{
+					PodGroupSelector: prodSelector,
+					TopologyTierName: "supernode",
+					Weight:           50,
+				},
+			}),
+			root:           "root",
+			wantHyperNodes: []string{"sn-a", "sn-b", "root"},
+			wantTierOrder:  []int{2, 3},
 		},
 		{
 			name:           "matching PodGroup on sn-a leaves sn-b",
@@ -243,12 +259,6 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			plugin := New(framework.Arguments{}).(*groupTopologyAffinityPlugin)
 
 			gradients := plugin.hyperNodeGradientForJob(ssn, tt.selfJob, tt.hn[tt.root])
-			if tt.wantNil {
-				if gradients != nil {
-					t.Fatalf("expected nil gradients, got %#v", gradients)
-				}
-				return
-			}
 			if tt.wantEmpty {
 				if len(gradients) != 0 {
 					t.Fatalf("expected empty gradient, got %#v", gradients)
@@ -272,6 +282,34 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHyperNodeGradientForSubJobPreferredOnly(t *testing.T) {
+	prodSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{testGroupLabel: "prod"},
+	}
+	selfJob := jobWithTopologyAffinity(nil, []scheduling.PodGroupAffinityTerm{
+		{
+			PodGroupSelector: prodSelector,
+			TopologyTierName: "supernode",
+			Weight:           50,
+		},
+	})
+	subJob := &api.SubJobInfo{UID: "subjob-1", Job: selfJob.UID}
+	hn := buildTwoSupernodeTree()
+	ssn := &framework.Session{
+		Jobs:                 map[api.JobID]*api.JobInfo{selfJob.UID: selfJob},
+		HyperNodes:           hn,
+		HyperNodesSetByTier:  twoSupernodeSetByTier(),
+		HyperNodeTierNameMap: defaultTierNameMap(),
+	}
+	plugin := New(framework.Arguments{}).(*groupTopologyAffinityPlugin)
+
+	gradients := plugin.hyperNodeGradientForSubJob(ssn, selfJob, subJob, hn["root"])
+	gotNames := hyperNodeNamesFromGradients(gradients)
+	if !sets.New("sn-a", "sn-b", "root").Equal(sets.New(gotNames...)) {
+		t.Fatalf("eligible hyperNodes mismatch: got %v", gotNames)
 	}
 }
 

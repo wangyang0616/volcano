@@ -1049,13 +1049,12 @@ func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map
 
 // HyperNodeGradientForJobFn group hyperNodes into several gradients,
 // and discard hyperNodes that unmatched the job topology requirements.
-// Gradients from all enabled plugins are intersected (AND), then rebuilt by HyperNode tier.
+// Gradients from all registered plugins are intersected (AND), then rebuilt by HyperNode tier.
 func (ssn *Session) HyperNodeGradientForJobFn(
 	job *api.JobInfo,
 	hyperNode *api.HyperNodeInfo,
 ) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
 	var gradientByPlugin []api.HyperNodePluginGradient
-	foundAny := false
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledHyperNodeGradient) {
@@ -1065,15 +1064,14 @@ func (ssn *Session) HyperNodeGradientForJobFn(
 			if !found {
 				continue
 			}
-			foundAny = true
 			gradients := fn(job, hyperNode)
-			if gradients == nil {
-				continue
-			}
-			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{PluginName: plugin.Name, Gradients: gradients})
+			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{
+				PluginName: plugin.Name,
+				Gradients:  gradients,
+			})
 		}
 	}
-	if !foundAny || len(gradientByPlugin) == 0 {
+	if len(gradientByPlugin) == 0 {
 		return [][]*api.HyperNodeInfo{{hyperNode}}, nil
 	}
 	return intersectHyperNodeGradients(gradientByPlugin)
@@ -1081,13 +1079,12 @@ func (ssn *Session) HyperNodeGradientForJobFn(
 
 // HyperNodeGradientForSubJobFn group hyperNodes into several gradients,
 // and discard hyperNodes that unmatched the subJob topology requirements.
-// Gradients from all enabled plugins are intersected (AND), then rebuilt by HyperNode tier.
+// Gradients from all registered plugins are intersected (AND), then rebuilt by HyperNode tier.
 func (ssn *Session) HyperNodeGradientForSubJobFn(
 	subJob *api.SubJobInfo,
 	hyperNode *api.HyperNodeInfo,
 ) ([][]*api.HyperNodeInfo, *api.HyperNodeGradientStats) {
 	var gradientByPlugin []api.HyperNodePluginGradient
-	foundAny := false
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledHyperNodeGradient) {
@@ -1097,15 +1094,14 @@ func (ssn *Session) HyperNodeGradientForSubJobFn(
 			if !found {
 				continue
 			}
-			foundAny = true
 			gradients := fn(subJob, hyperNode)
-			if gradients == nil {
-				continue
-			}
-			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{PluginName: plugin.Name, Gradients: gradients})
+			gradientByPlugin = append(gradientByPlugin, api.HyperNodePluginGradient{
+				PluginName: plugin.Name,
+				Gradients:  gradients,
+			})
 		}
 	}
-	if !foundAny || len(gradientByPlugin) == 0 {
+	if len(gradientByPlugin) == 0 {
 		return [][]*api.HyperNodeInfo{{hyperNode}}, nil
 	}
 	return intersectHyperNodeGradients(gradientByPlugin)
@@ -1152,13 +1148,15 @@ func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient)
 	}
 
 	// Phase 1: AND HyperNode names from each plugin into `eligible`.
-	eligible := hyperNodeNamesInGradients(pluginGradients[0])
+	eligible := api.HyperNodeNamesInGradients(pluginGradients[0])
 	for index := 1; index < len(pluginGradients); index++ {
-		eligible = eligible.Intersection(hyperNodeNamesInGradients(pluginGradients[index]))
+		eligible = eligible.Intersection(api.HyperNodeNamesInGradients(pluginGradients[index]))
 		if eligible.Len() == 0 {
+			stats.ExcludedByReason = api.ComputePluginExcludedHyperNodes(gradientByPlugin, eligible)
 			return nil, stats
 		}
 	}
+	stats.ExcludedByReason = api.ComputePluginExcludedHyperNodes(gradientByPlugin, eligible)
 
 	// Phase 2: collect HyperNodeInfo for names in `eligible`.
 	// Nested loops walk [plugin][tier-layer][hyperNode]; only eligible names are kept.
@@ -1177,17 +1175,6 @@ func intersectHyperNodeGradients(gradientByPlugin []api.HyperNodePluginGradient)
 	result := rebuildGradientsByTier(hyperNodeByName, eligible)
 	stats.IntersectedByTier = hyperNodeCountByTier(result)
 	return result, stats
-}
-
-// hyperNodeNamesInGradients flattens one plugin result into a set of HyperNode names.
-func hyperNodeNamesInGradients(gradients [][]*api.HyperNodeInfo) sets.Set[string] {
-	names := sets.New[string]()
-	for _, layer := range gradients {
-		for _, hn := range layer {
-			names.Insert(hn.Name)
-		}
-	}
-	return names
 }
 
 // rebuildGradientsByTier groups eligible HyperNodes by tier and returns layers in ascending tier order.
