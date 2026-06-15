@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 )
@@ -275,10 +276,20 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 			continue
 		}
 		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
+		ancestorHyperNode := ""
+		if allocatedHyperNode != "" {
+			ancestorHyperNode = hyperNodes.GetAncestorHyperNode(allocatedHyperNode, tier)
+		}
+		klog.V(3).InfoS("podGroup anti-affinity: matching job hyperNode",
+			"job", klog.KRef(selfJob.Namespace, selfJob.Name),
+			"matchingJob", klog.KRef(matchingJob.Namespace, matchingJob.Name),
+			"termTier", tier,
+			"allocatedHyperNode", allocatedHyperNode,
+			"ancestorHyperNode", ancestorHyperNode,
+		)
 		if allocatedHyperNode == "" {
 			continue
 		}
-		ancestorHyperNode := hyperNodes.GetAncestorHyperNode(allocatedHyperNode, tier)
 		if ancestorHyperNode != "" {
 			matchingHyperNodes.Insert(ancestorHyperNode)
 		}

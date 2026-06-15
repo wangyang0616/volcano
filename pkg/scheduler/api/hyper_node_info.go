@@ -73,16 +73,16 @@ func (m HyperNodeTierNameMap) NameForTier(tier int, hyperNodes HyperNodeInfoMap)
 	return fmt.Sprintf("tier-%d", tier)
 }
 
-// FormatHyperNodeTierListing formats cluster HyperNode tier counts and names for logging.
+// FormatHyperNodeTierListing formats cluster HyperNode tier counts for logging.
 // Tiers are listed from coarse to fine (higher tier number first).
 func FormatHyperNodeTierListing(
 	tiers []int,
 	hyperNodesSetByTier map[int]sets.Set[string],
 	tierNameMap HyperNodeTierNameMap,
 	hyperNodes HyperNodeInfoMap,
-) (total int, listing string) {
+) (total int, tierCount int, listing string) {
 	if len(hyperNodesSetByTier) == 0 {
-		return 0, ""
+		return 0, 0, ""
 	}
 
 	sortedTiers := append([]int(nil), tiers...)
@@ -95,13 +95,11 @@ func FormatHyperNodeTierListing(
 			continue
 		}
 		total += namesSet.Len()
-		names := namesSet.UnsortedList()
-		sort.Strings(names)
+		tierCount++
 		tierName := tierNameMap.NameForTier(tier, hyperNodes)
-		parts = append(parts, fmt.Sprintf("%s(tier=%d): %d [%s]",
-			tierName, tier, namesSet.Len(), strings.Join(names, ",")))
+		parts = append(parts, fmt.Sprintf("%s(tier=%d): %d", tierName, tier, namesSet.Len()))
 	}
-	return total, strings.Join(parts, "; ")
+	return total, tierCount, strings.Join(parts, "; ")
 }
 
 // NewHyperNodesInfo initializes a new HyperNodesInfo instance.

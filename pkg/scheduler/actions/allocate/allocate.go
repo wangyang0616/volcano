@@ -910,10 +910,10 @@ func logHyperNodeTiers(ssn *framework.Session) {
 	if !klog.V(3).Enabled() || len(ssn.HyperNodesSetByTier) == 0 {
 		return
 	}
-	total, listing := api.FormatHyperNodeTierListing(
+	total, tierCount, listing := api.FormatHyperNodeTierListing(
 		ssn.HyperNodesTiers, ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes,
 	)
-	klog.V(3).Infof("HyperNode tiers in session %v: total=%d; %s", ssn.UID, total, listing)
+	klog.V(3).Infof("HyperNode tiers in session %v: tierCount=%d total=%d; %s", ssn.UID, tierCount, total, listing)
 }
 
 // FilterGradientsByMinResource drops HyperNodes that cannot satisfy minResource by aggregating
