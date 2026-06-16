@@ -237,6 +237,12 @@ func (sc *SchedulerCache) addTask(pi *schedulingapi.TaskInfo) error {
 	job := sc.getOrCreateJob(pi)
 	if job != nil {
 		job.AddTaskInfo(pi)
+		// Recompute placement when an already-allocated task is added (for example a scale-up pod
+		// bound to a different HyperNode) so AllocatedHyperNode widens to the common ancestor.
+		// Mirrors the resync done in deleteTask on scale-in.
+		if schedulingapi.AllocatedStatus(pi.Status) {
+			sc.syncJobAllocatedHyperNode(job)
+		}
 	}
 
 	return nil

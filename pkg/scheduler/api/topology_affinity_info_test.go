@@ -299,6 +299,58 @@ func TestMatchingPodGroupsAllocatedHyperNodesForTerm(t *testing.T) {
 	}
 }
 
+func TestRequiresHyperNodeAllocate(t *testing.T) {
+	required := []scheduling.PodGroupAffinityTerm{{TopologyTierName: "supernode"}}
+	preferred := []scheduling.PodGroupAffinityTerm{{TopologyTierName: "rack", Weight: 1}}
+
+	jobWithAntiAffinity := func(anti *scheduling.PodGroupAntiAffinity) *JobInfo {
+		return &JobInfo{
+			PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{Spec: scheduling.PodGroupSpec{
+				TopologyAffinity: &scheduling.TopologyAffinitySpec{PodGroupAntiAffinity: anti},
+			}}},
+		}
+	}
+
+	tests := []struct {
+		name string
+		job  *JobInfo
+		want bool
+	}{
+		{
+			name: "soft (preferred) anti-affinity requires hyperNode path",
+			job:  jobWithAntiAffinity(&scheduling.PodGroupAntiAffinity{Preferred: preferred}),
+			want: true,
+		},
+		{
+			name: "hard (required) anti-affinity requires hyperNode path",
+			job:  jobWithAntiAffinity(&scheduling.PodGroupAntiAffinity{Required: required}),
+			want: true,
+		},
+		{
+			name: "both hard and soft anti-affinity",
+			job:  jobWithAntiAffinity(&scheduling.PodGroupAntiAffinity{Required: required, Preferred: preferred}),
+			want: true,
+		},
+		{
+			name: "plain job without topology or anti-affinity does not require hyperNode path",
+			job:  &JobInfo{PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{Spec: scheduling.PodGroupSpec{}}}},
+			want: false,
+		},
+		{
+			name: "nil podgroup does not require hyperNode path",
+			job:  &JobInfo{},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.job.RequiresHyperNodeAllocate(); got != tt.want {
+				t.Fatalf("RequiresHyperNodeAllocate = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestJobTopologyAffinityHelpers(t *testing.T) {
 	required := []scheduling.PodGroupAffinityTerm{{TopologyTierName: "supernode"}}
 	preferred := []scheduling.PodGroupAffinityTerm{{TopologyTierName: "rack", Weight: 1}}
@@ -505,6 +557,50 @@ func TestSyncJobAllocatedHyperNodeAfterPodRemoval(t *testing.T) {
 	}
 	if job.AllocatedHyperNode != "sn-a" {
 		t.Fatalf("job AllocatedHyperNode = %q, want sn-a", job.AllocatedHyperNode)
+	}
+}
+
+func TestSyncJobAllocatedHyperNodeWidensAfterPodAdded(t *testing.T) {
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+	}
+	nodesByHyperNode := map[string]sets.Set[string]{
+		"sn-a": sets.New("node-a"),
+		"sn-b": sets.New("node-b"),
+		"root": sets.New("node-a", "node-b"),
+	}
+
+	subJobID := SubJobID("default")
+	// task1 is the existing pod on sn-a; task2 is the scale-up pod landing on sn-b.
+	task1 := &TaskInfo{UID: "task-1"}
+	task1.Status = Allocated
+	task1.NodeName = "node-a"
+	task2 := &TaskInfo{UID: "task-2"}
+	task2.Status = Allocated
+	task2.NodeName = "node-b"
+	job := &JobInfo{
+		UID:                JobID("job-1"),
+		AllocatedHyperNode: "sn-a", // stale value from before scale-up
+		SubJobs: map[SubJobID]*SubJobInfo{
+			subJobID: {
+				UID:                subJobID,
+				AllocatedHyperNode: "sn-a",
+				TaskStatusIndex: map[TaskStatus]TasksMap{
+					Allocated: {task1.UID: task1, task2.UID: task2},
+				},
+			},
+		},
+	}
+
+	SyncJobAllocatedHyperNode(job, hn, nodesByHyperNode)
+
+	if job.SubJobs[subJobID].AllocatedHyperNode != "root" {
+		t.Fatalf("subJob AllocatedHyperNode = %q, want root", job.SubJobs[subJobID].AllocatedHyperNode)
+	}
+	if job.AllocatedHyperNode != "root" {
+		t.Fatalf("job AllocatedHyperNode = %q, want root", job.AllocatedHyperNode)
 	}
 }
 
