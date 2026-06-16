@@ -118,29 +118,23 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeGradient(
 	maxTier := maxHyperNodeTier(ssn.HyperNodesSetByTier)
 	hardTerms := job.RequiredPodGroupAntiAffinityTerms()
 	if len(hardTerms) > 0 {
-		klog.V(3).InfoS("podGroup anti-affinity: evaluate gradient",
-			"job", klog.KRef(job.Namespace, job.Name),
-			"rootHyperNode", root.Name,
-			"allocatedHyperNode", allocatedHyperNode,
-		)
+		klog.V(3).Infof("podGroup anti-affinity: evaluate gradient, job=%s, rootHyperNode=%s, allocatedHyperNode=%s",
+			klog.KRef(job.Namespace, job.Name), root.Name, allocatedHyperNode)
 		result, err := gta.buildPodGroupAntiAffinityGradient(
 			ssn, job, root, hardTerms, maxTier, allocatedHyperNode,
 		)
 		if err != nil {
-			klog.ErrorS(err, "build podGroup anti-affinity gradient failed", "job", job.UID)
+			klog.Errorf("build podGroup anti-affinity gradient failed, job=%s, err=%v", job.UID, err)
 			return emptyHyperNodeGradients
 		}
 		return result
 	}
 
-	klog.V(3).InfoS("podGroup anti-affinity: gradient full-subtree",
-		"job", klog.KRef(job.Namespace, job.Name),
-		"rootHyperNode", root.Name,
-		"allocatedHyperNode", allocatedHyperNode,
-	)
+	klog.V(3).Infof("podGroup anti-affinity: gradient full-subtree, job=%s, rootHyperNode=%s, allocatedHyperNode=%s",
+		klog.KRef(job.Namespace, job.Name), root.Name, allocatedHyperNode)
 	result, err := gta.buildFullHyperNodeGradient(ssn, root, maxTier, allocatedHyperNode)
 	if err != nil {
-		klog.ErrorS(err, "build podGroup anti-affinity full gradient failed", "job", job.UID)
+		klog.Errorf("build podGroup anti-affinity full gradient failed, job=%s, err=%v", job.UID, err)
 		return emptyHyperNodeGradients
 	}
 	return result
@@ -223,32 +217,23 @@ func (gta *groupTopologyAffinityPlugin) buildPodGroupAntiAffinityGradient(
 	for index, term := range terms {
 		tier, err := api.ResolvePodGroupTermTier(term, ssn.HyperNodeTierNameMap)
 		if err != nil {
-			klog.V(3).InfoS("podGroup anti-affinity: resolve term tier failed",
-				"job", klog.KRef(job.Namespace, job.Name),
-				"termIndex", index,
-				"err", err,
-			)
+			klog.V(3).Infof("podGroup anti-affinity: resolve term tier failed, job=%s, termIndex=%d, err=%v",
+				klog.KRef(job.Namespace, job.Name), index, err)
 			continue
 		}
 		occupiedHyperNodes := matchingHyperNodesByTerm[index].UnsortedList()
 		sort.Strings(occupiedHyperNodes)
-		klog.V(3).InfoS("podGroup anti-affinity: matching occupancy",
-			"job", klog.KRef(job.Namespace, job.Name),
-			"termIndex", index,
-			"tier", tier,
-			"occupiedHyperNodes", strings.Join(occupiedHyperNodes, ","),
-			"matchingPodGroups", strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "),
-		)
+		klog.V(3).Infof("podGroup anti-affinity: matching occupancy, job=%s, termIndex=%d, tier=%d, occupiedHyperNodes=%s, matchingPodGroups=%s",
+			klog.KRef(job.Namespace, job.Name), index, tier,
+			strings.Join(occupiedHyperNodes, ","),
+			strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "))
 	}
 
 	eligibleHyperNodes := gta.bfsAntiAffinityEligibleHyperNodes(
 		ssn, job, searchRoot, terms, matchingHyperNodesByTerm, highestAllowedTier,
 	)
-	klog.V(3).InfoS("podGroup anti-affinity: gradient result",
-		"job", klog.KRef(job.Namespace, job.Name),
-		"searchRoot", searchRoot.Name,
-		"eligibleHyperNodes", hyperNodeNamesByTier(eligibleHyperNodes),
-	)
+	klog.V(3).Infof("podGroup anti-affinity: gradient result, job=%s, searchRoot=%s, eligibleHyperNodes=%s",
+		klog.KRef(job.Namespace, job.Name), searchRoot.Name, hyperNodeNamesByTier(eligibleHyperNodes))
 	return groupHyperNodesByTierAsc(eligibleHyperNodes), nil
 }
 
@@ -332,53 +317,29 @@ func (gta *groupTopologyAffinityPlugin) isEligibleForPodGroupAntiAffinity(
 	highestAllowedTier int,
 ) bool {
 	if hn.Tier() > highestAllowedTier {
-		klog.V(3).InfoS("podGroup anti-affinity: reject hyperNode",
-			"job", klog.KRef(job.Namespace, job.Name),
-			"hyperNode", hn.Name,
-			"reason", "tierAboveHighestAllowed",
-			"termIndex", noAffinityTermIndex,
-			"tier", hn.Tier(),
-			"conflictHyperNode", "",
-		)
+		klog.V(3).Infof("podGroup anti-affinity: reject hyperNode, job=%s, hyperNode=%s, reason=tierAboveHighestAllowed, termIndex=%d, tier=%d, conflictHyperNode=",
+			klog.KRef(job.Namespace, job.Name), hn.Name, noAffinityTermIndex, hn.Tier())
 		return false
 	}
 
 	for index, term := range terms {
 		tier, err := api.ResolvePodGroupTermTier(term, ssn.HyperNodeTierNameMap)
 		if err != nil {
-			klog.V(3).InfoS("podGroup anti-affinity: reject hyperNode",
-				"job", klog.KRef(job.Namespace, job.Name),
-				"hyperNode", hn.Name,
-				"reason", "resolveTermTierFailed",
-				"termIndex", index,
-				"tier", 0,
-				"conflictHyperNode", "",
-			)
+			klog.V(3).Infof("podGroup anti-affinity: reject hyperNode, job=%s, hyperNode=%s, reason=resolveTermTierFailed, termIndex=%d, tier=0, conflictHyperNode=",
+				klog.KRef(job.Namespace, job.Name), hn.Name, index)
 			return false
 		}
 		// Compare at the term tier: reject if this candidate shares an ancestor HyperNode
 		// with any matching PodGroup that is already placed there.
 		ancestorHyperNode := ssn.HyperNodes.GetAncestorHyperNode(hn.Name, tier)
 		if ancestorHyperNode == "" {
-			klog.V(3).InfoS("podGroup anti-affinity: reject hyperNode",
-				"job", klog.KRef(job.Namespace, job.Name),
-				"hyperNode", hn.Name,
-				"reason", "emptyAncestorHyperNode",
-				"termIndex", index,
-				"tier", tier,
-				"conflictHyperNode", "",
-			)
+			klog.V(3).Infof("podGroup anti-affinity: reject hyperNode, job=%s, hyperNode=%s, reason=emptyAncestorHyperNode, termIndex=%d, tier=%d, conflictHyperNode=",
+				klog.KRef(job.Namespace, job.Name), hn.Name, index, tier)
 			return false
 		}
 		if matchingHyperNodesByTerm[index].Has(ancestorHyperNode) {
-			klog.V(3).InfoS("podGroup anti-affinity: reject hyperNode",
-				"job", klog.KRef(job.Namespace, job.Name),
-				"hyperNode", hn.Name,
-				"reason", "conflictWithMatchingPodGroup",
-				"termIndex", index,
-				"tier", tier,
-				"conflictHyperNode", ancestorHyperNode,
-			)
+			klog.V(3).Infof("podGroup anti-affinity: reject hyperNode, job=%s, hyperNode=%s, reason=conflictWithMatchingPodGroup, termIndex=%d, tier=%d, conflictHyperNode=%s",
+				klog.KRef(job.Namespace, job.Name), hn.Name, index, tier, ancestorHyperNode)
 			return false
 		}
 	}
@@ -400,10 +361,8 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 		hyperNodeCandidates = append(hyperNodeCandidates, hyperNode)
 	}
 	sort.Strings(hyperNodeCandidates)
-	klog.V(3).InfoS("podGroup anti-affinity: evaluate preferred",
-		"job", klog.KRef(job.Namespace, job.Name),
-		"hyperNodeCandidates", strings.Join(hyperNodeCandidates, ","),
-	)
+	klog.V(3).Infof("podGroup anti-affinity: evaluate preferred, job=%s, hyperNodeCandidates=%s",
+		klog.KRef(job.Namespace, job.Name), strings.Join(hyperNodeCandidates, ","))
 
 	scores := make(map[string]float64, len(hyperNodes))
 	for hyperNode := range hyperNodes {
@@ -423,22 +382,16 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 	for index, term := range terms {
 		tier, err := api.ResolvePodGroupTermTier(term, ssn.HyperNodeTierNameMap)
 		if err != nil {
-			klog.V(3).InfoS("podGroup anti-affinity: resolve term tier failed",
-				"job", klog.KRef(job.Namespace, job.Name),
-				"termIndex", index,
-				"err", err,
-			)
+			klog.V(3).Infof("podGroup anti-affinity: resolve term tier failed, job=%s, termIndex=%d, err=%v",
+				klog.KRef(job.Namespace, job.Name), index, err)
 			continue
 		}
 		occupiedHyperNodes := matchingHyperNodesByTerm[index].UnsortedList()
 		sort.Strings(occupiedHyperNodes)
-		klog.V(3).InfoS("podGroup anti-affinity: matching occupancy",
-			"job", klog.KRef(job.Namespace, job.Name),
-			"termIndex", index,
-			"tier", tier,
-			"occupiedHyperNodes", strings.Join(occupiedHyperNodes, ","),
-			"matchingPodGroups", strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "),
-		)
+		klog.V(3).Infof("podGroup anti-affinity: matching occupancy, job=%s, termIndex=%d, tier=%d, occupiedHyperNodes=%s, matchingPodGroups=%s",
+			klog.KRef(job.Namespace, job.Name), index, tier,
+			strings.Join(occupiedHyperNodes, ","),
+			strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "))
 	}
 
 	for termIndex, term := range terms {
@@ -456,27 +409,15 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 			ancestorHyperNode := ssn.HyperNodes.GetAncestorHyperNode(hyperNode, tier)
 			if ancestorHyperNode != "" && matchingHyperNodes.Has(ancestorHyperNode) {
 				scoreBefore := scores[hyperNode]
-				klog.V(3).InfoS("podGroup anti-affinity: preferred penalty",
-					"job", klog.KRef(job.Namespace, job.Name),
-					"hyperNode", hyperNode,
-					"termIndex", termIndex,
-					"tier", tier,
-					"conflictHyperNode", ancestorHyperNode,
-				)
+				klog.V(3).Infof("podGroup anti-affinity: preferred penalty, job=%s, hyperNode=%s, termIndex=%d, tier=%d, conflictHyperNode=%s",
+					klog.KRef(job.Namespace, job.Name), hyperNode, termIndex, tier, ancestorHyperNode)
 				scores[hyperNode] -= weightFactor * FullScore
 				if scores[hyperNode] < ZeroScore {
 					scores[hyperNode] = ZeroScore
 				}
-				klog.V(4).InfoS("podGroup anti-affinity: preferred score detail",
-					"job", klog.KRef(job.Namespace, job.Name),
-					"hyperNode", hyperNode,
-					"termIndex", termIndex,
-					"weight", term.Weight,
-					"weightFactor", weightFactor,
-					"scoreBefore", scoreBefore,
-					"scoreAfter", scores[hyperNode],
-					"penalty", scoreBefore-scores[hyperNode],
-				)
+				klog.V(4).Infof("podGroup anti-affinity: preferred score detail, job=%s, hyperNode=%s, termIndex=%d, weight=%d, weightFactor=%.2f, scoreBefore=%.2f, scoreAfter=%.2f, penalty=%.2f",
+					klog.KRef(job.Namespace, job.Name), hyperNode, termIndex, term.Weight, weightFactor,
+					scoreBefore, scores[hyperNode], scoreBefore-scores[hyperNode])
 			}
 		}
 	}
@@ -495,11 +436,8 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 		for _, hyperNode := range scoredHyperNodes {
 			details = append(details, fmt.Sprintf("%s:%.2f", hyperNode, scores[hyperNode]))
 		}
-		klog.V(4).InfoS("podGroup anti-affinity: preferred final scores",
-			"job", klog.KRef(job.Namespace, job.Name),
-			"pluginWeight", gta.weight,
-			"scores", strings.Join(details, ","),
-		)
+		klog.V(3).Infof("podGroup anti-affinity: preferred final scores, job=%s, pluginWeight=%d, scores=%s",
+			klog.KRef(job.Namespace, job.Name), gta.weight, strings.Join(details, ","))
 	}
 	return scores, nil
 }
