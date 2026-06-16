@@ -133,7 +133,7 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeGradient(
 		return result
 	}
 
-	klog.V(3).InfoS("podGroup anti-affinity: gradient pass-through",
+	klog.V(3).InfoS("podGroup anti-affinity: gradient full-subtree",
 		"job", klog.KRef(job.Namespace, job.Name),
 		"rootHyperNode", root.Name,
 		"allocatedHyperNode", allocatedHyperNode,
@@ -236,8 +236,8 @@ func (gta *groupTopologyAffinityPlugin) buildPodGroupAntiAffinityGradient(
 			"job", klog.KRef(job.Namespace, job.Name),
 			"termIndex", index,
 			"tier", tier,
-			"occupiedHyperNodes", occupiedHyperNodes,
-			"matchingPodGroups", matchingPodGroupPlacementsForTerm(ssn, job, term),
+			"occupiedHyperNodes", strings.Join(occupiedHyperNodes, ","),
+			"matchingPodGroups", strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "),
 		)
 	}
 
@@ -402,7 +402,7 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 	sort.Strings(hyperNodeCandidates)
 	klog.V(3).InfoS("podGroup anti-affinity: evaluate preferred",
 		"job", klog.KRef(job.Namespace, job.Name),
-		"hyperNodeCandidates", hyperNodeCandidates,
+		"hyperNodeCandidates", strings.Join(hyperNodeCandidates, ","),
 	)
 
 	scores := make(map[string]float64, len(hyperNodes))
@@ -436,8 +436,8 @@ func (gta *groupTopologyAffinityPlugin) hyperNodeOrderFn(
 			"job", klog.KRef(job.Namespace, job.Name),
 			"termIndex", index,
 			"tier", tier,
-			"occupiedHyperNodes", occupiedHyperNodes,
-			"matchingPodGroups", matchingPodGroupPlacementsForTerm(ssn, job, term),
+			"occupiedHyperNodes", strings.Join(occupiedHyperNodes, ","),
+			"matchingPodGroups", strings.Join(matchingPodGroupPlacementsForTerm(ssn, job, term), "; "),
 		)
 	}
 
