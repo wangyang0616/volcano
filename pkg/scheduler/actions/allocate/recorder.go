@@ -65,8 +65,8 @@ func (d *Recorder) UpdateDecisionToJob(job *api.JobInfo, hyperNodes api.HyperNod
 
 	jobAllocatedHyperNode := hyperNodes.GetLCAHyperNode(job.AllocatedHyperNode, hyperNodeForJob)
 	if job.AllocatedHyperNode != jobAllocatedHyperNode {
-		klog.V(3).InfoS("update allocated hyperNode for job", "job", job.UID,
-			"old", job.AllocatedHyperNode, "new", jobAllocatedHyperNode)
+		klog.V(3).Infof("update allocated hyperNode for job, job=%s, old=%s, new=%s",
+			job.UID, job.AllocatedHyperNode, jobAllocatedHyperNode)
 		job.AllocatedHyperNode = jobAllocatedHyperNode
 	}
 
@@ -78,8 +78,8 @@ func (d *Recorder) UpdateDecisionToJob(job *api.JobInfo, hyperNodes api.HyperNod
 		}
 		allocatedHyperNode := hyperNodes.GetLCAHyperNode(subJob.AllocatedHyperNode, hyperNode)
 		if subJob.AllocatedHyperNode != allocatedHyperNode {
-			klog.V(3).InfoS("update allocated hyperNode for subJob", "subJob", subJob.UID,
-				"old", subJob.AllocatedHyperNode, "new", allocatedHyperNode)
+			klog.V(3).Infof("update allocated hyperNode for subJob, subJob=%s, old=%s, new=%s",
+				subJob.UID, subJob.AllocatedHyperNode, allocatedHyperNode)
 			subJob.AllocatedHyperNode = allocatedHyperNode
 		}
 	}

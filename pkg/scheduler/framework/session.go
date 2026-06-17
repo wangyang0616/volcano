@@ -259,7 +259,7 @@ func openSession(cache cache.Cache) *Session {
 
 	if klog.V(5).Enabled() {
 		for _, hn := range ssn.HyperNodes {
-			klog.InfoS("hyperNode in session", "name", hn.Name, "tier", hn.Tier(), "parent", hn.Parent, "children", hn.Children)
+			klog.Infof("hyperNode in session, name=%s, tier=%d, parent=%s, children=%v", hn.Name, hn.Tier(), hn.Parent, hn.Children)
 		}
 	}
 
@@ -330,7 +330,7 @@ func (ssn *Session) removeInvalidAllocatedHyperNode(job *api.JobInfo, hyperNodes
 		if remove {
 			job.AllocatedHyperNode = ""
 			ssn.MarkJobDirty(job.UID)
-			klog.V(3).InfoS("remove allocated hyperNode for job", "job", job.UID, "AllocatedHyperNode", job.AllocatedHyperNode, "reason", reason)
+			klog.V(3).Infof("remove allocated hyperNode for job, job=%s, AllocatedHyperNode=%s, reason=%s", job.UID, job.AllocatedHyperNode, reason)
 		}
 	}
 
@@ -350,7 +350,7 @@ func (ssn *Session) removeInvalidAllocatedHyperNode(job *api.JobInfo, hyperNodes
 			if remove {
 				subJob.AllocatedHyperNode = ""
 				ssn.MarkJobDirty(subJob.Job)
-				klog.V(3).InfoS("remove allocated hyperNode for subJob", "subJob", subJob.UID, "AllocatedHyperNode", subJob.AllocatedHyperNode, "reason", reason)
+				klog.V(3).Infof("remove allocated hyperNode for subJob, subJob=%s, AllocatedHyperNode=%s, reason=%s", subJob.UID, subJob.AllocatedHyperNode, reason)
 			}
 		}
 	}
@@ -376,7 +376,7 @@ func (ssn *Session) recoverAllocatedHyperNode(job *api.JobInfo, hyperNodeSet set
 		subJobUpdated = true
 		subJob.AllocatedHyperNode = minimumHyperNode
 		ssn.MarkJobDirty(subJob.Job)
-		klog.V(3).InfoS("update subJob allocated hyperNode", "subJob", subJob.UID, "AllocatedHyperNode", minimumHyperNode)
+		klog.V(3).Infof("update subJob allocated hyperNode, subJob=%s, AllocatedHyperNode=%s", subJob.UID, minimumHyperNode)
 	}
 
 	if job.AllocatedHyperNode == "" || subJobUpdated {
@@ -384,7 +384,7 @@ func (ssn *Session) recoverAllocatedHyperNode(job *api.JobInfo, hyperNodeSet set
 		if jobHyperNode != "" && job.AllocatedHyperNode != jobHyperNode {
 			job.AllocatedHyperNode = jobHyperNode
 			ssn.MarkJobDirty(job.UID)
-			klog.V(3).InfoS("update job allocated hyperNode", "job", job.UID, "AllocatedHyperNode", jobHyperNode)
+			klog.V(3).Infof("update job allocated hyperNode, job=%s, AllocatedHyperNode=%s", job.UID, jobHyperNode)
 		}
 	}
 }

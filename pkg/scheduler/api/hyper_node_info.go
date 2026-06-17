@@ -332,7 +332,7 @@ func (hni *HyperNodesInfo) BuildHyperNodeCache(hn *HyperNodeInfo, processed sets
 	defer ancestorsChain.Delete(hn.Name)
 
 	if hni.hyperNodeIsDeleting(hn.Name) {
-		klog.InfoS("HyperNode is being deleted", "name", hn.Name)
+		klog.Infof("HyperNode is being deleted, name=%s", hn.Name)
 		return nil
 	}
 
@@ -343,7 +343,7 @@ func (hni *HyperNodesInfo) BuildHyperNodeCache(hn *HyperNodeInfo, processed sets
 				hni.realNodesSet[hn.Name] = sets.New[string]()
 			}
 			members := GetMembers(member.Selector, nodes)
-			klog.V(5).InfoS("Get members of hyperNode", "name", hn.Name, "members", members)
+			klog.V(5).Infof("Get members of hyperNode, name=%s, members=%v", hn.Name, members)
 			hni.realNodesSet[hn.Name] = hni.realNodesSet[hn.Name].Union(members)
 
 		case topologyv1alpha1.MemberTypeHyperNode:
@@ -359,7 +359,7 @@ func (hni *HyperNodesInfo) BuildHyperNodeCache(hn *HyperNodeInfo, processed sets
 
 			memberHn, ok := hni.hyperNodes[memberName]
 			if !ok {
-				klog.InfoS("HyperNode not exists in cache, maybe not created or not be watched", "name", memberName, "parent", hn.Name)
+				klog.Infof("HyperNode not exists in cache, maybe not created or not be watched, name=%s, parent=%s", memberName, hn.Name)
 				continue
 			}
 
@@ -374,12 +374,12 @@ func (hni *HyperNodesInfo) BuildHyperNodeCache(hn *HyperNodeInfo, processed sets
 			hni.realNodesSet[hn.Name] = hni.realNodesSet[hn.Name].Union(hni.realNodesSet[memberName])
 
 		default:
-			klog.ErrorS(nil, "Unknown member type", "type", member.Type)
+			klog.Errorf("Unknown member type, type=%v", member.Type)
 		}
 	}
 
 	processed.Insert(hn.Name)
-	klog.V(3).InfoS("Successfully built RealNodesSet with members", "name", hn.Name, "nodeSets", hni.realNodesSet[hn.Name])
+	klog.V(3).Infof("Successfully built RealNodesSet with members, name=%s, nodeSets=%v", hn.Name, hni.realNodesSet[hn.Name])
 	return nil
 }
 
@@ -463,7 +463,7 @@ func (hni *HyperNodesInfo) GetLeafNodes(hyperNodeName string) sets.Set[string] {
 
 func (hni *HyperNodesInfo) findLeafNodesWithCycleCheck(hyperNodeName string, leafNodes sets.Set[string], ancestorsChain sets.Set[string]) {
 	if ancestorsChain.Has(hyperNodeName) {
-		klog.ErrorS(nil, "Cycle detected in HyperNode hierarchy", "hyperNode", hyperNodeName)
+		klog.Errorf("Cycle detected in HyperNode hierarchy, hyperNode=%s", hyperNodeName)
 		return
 	}
 
@@ -524,7 +524,7 @@ func (hni *HyperNodesInfo) addChild(parent, member string) error {
 
 	childHn, ok := hni.hyperNodes[member]
 	if !ok {
-		klog.InfoS("HyperNode not exists in cache, maybe not created or not be watched, will set parent first", "name", member, "parent", parent)
+		klog.Infof("HyperNode not exists in cache, maybe not created or not be watched, will set parent first, name=%s, parent=%s", member, parent)
 		childHn = NewHyperNodeInfo(&topologyv1alpha1.HyperNode{ObjectMeta: metav1.ObjectMeta{
 			Name: member,
 		}})
@@ -556,7 +556,7 @@ func GetMembers(selector topologyv1alpha1.MemberSelector, nodes []*corev1.Node) 
 		pattern := selector.RegexMatch.Pattern
 		reg, err := regexp.Compile(pattern)
 		if err != nil {
-			klog.ErrorS(err, "Failed to compile regular expression", "pattern", pattern)
+			klog.Errorf("Failed to compile regular expression, pattern=%s, err=%v", pattern, err)
 			return sets.Set[string]{}
 		}
 		for _, node := range nodes {
@@ -572,7 +572,7 @@ func GetMembers(selector topologyv1alpha1.MemberSelector, nodes []*corev1.Node) 
 		}
 		labelSelector, err := metav1.LabelSelectorAsSelector(selector.LabelMatch)
 		if err != nil {
-			klog.ErrorS(err, "Failed to convert labelMatch to labelSelector", "LabelMatch", selector.LabelMatch)
+			klog.Errorf("Failed to convert labelMatch to labelSelector, LabelMatch=%v, err=%v", selector.LabelMatch, err)
 			return sets.Set[string]{}
 		}
 		for _, node := range nodes {
@@ -602,7 +602,7 @@ func (hni *HyperNodesInfo) updateAncestors(name string) error {
 	// When last time BuildHyperNodeCache has an err that a hyperNode has multi parents, after the parent is updated
 	// we should find the parent hyperNode to rebuild the correct cache.
 	if hni.builtErrHyperNode == name {
-		klog.InfoS("Rebuilt parent hyperNode", "name", hni.builtErrHyperNode)
+		klog.Infof("Rebuilt parent hyperNode, name=%s", hni.builtErrHyperNode)
 		leafHyperNodes := hni.GetLeafNodes(name)
 		for leaf := range leafHyperNodes {
 			if err := hni.rebuildCache(leaf); err != nil {
@@ -628,7 +628,7 @@ func (hni *HyperNodesInfo) rebuildCache(name string) error {
 	ancestorsChain := sets.New[string]()
 	nodes, err := hni.nodeLister.List(labels.Everything())
 	if err != nil {
-		klog.ErrorS(err, "Failed to list nodes", "hyperNodeName", name)
+		klog.Errorf("Failed to list nodes, hyperNodeName=%s, err=%v", name, err)
 		return err
 	}
 
@@ -693,7 +693,7 @@ func (hni *HyperNodesInfo) resetChildren(name string) {
 func (hni *HyperNodesInfo) deleteHyperNode(name string) {
 	hn, ok := hni.hyperNodes[name]
 	if !ok {
-		klog.ErrorS(nil, "HyperNode not exists in cache", "name", name)
+		klog.Errorf("HyperNode not exists in cache, name=%s", name)
 		return
 	}
 	delete(hni.hyperNodes, name)
@@ -704,7 +704,7 @@ func (hni *HyperNodesInfo) deleteHyperNode(name string) {
 func (hni *HyperNodesInfo) markHyperNodeIsDeleting(name string) {
 	hn, ok := hni.hyperNodes[name]
 	if !ok {
-		klog.ErrorS(nil, "HyperNode not exists in cache", "name", name)
+		klog.Errorf("HyperNode not exists in cache, name=%s", name)
 		return
 	}
 	hn.isDeleting = true
@@ -714,7 +714,7 @@ func (hni *HyperNodesInfo) markHyperNodeIsDeleting(name string) {
 func (hni *HyperNodesInfo) hyperNodeIsDeleting(name string) bool {
 	hn, ok := hni.hyperNodes[name]
 	if !ok {
-		klog.ErrorS(nil, "HyperNode not exists in cache", "name", name)
+		klog.Errorf("HyperNode not exists in cache, name=%s", name)
 		return false
 	}
 	return hn.isDeleting
@@ -755,7 +755,7 @@ func (hni *HyperNodesInfo) nodeMatchSelector(nodeName string, selector topologyv
 	if selector.RegexMatch != nil {
 		reg, err := regexp.Compile(selector.RegexMatch.Pattern)
 		if err != nil {
-			klog.ErrorS(err, "Failed to compile regex pattern", "pattern", selector.RegexMatch.Pattern)
+			klog.Errorf("Failed to compile regex pattern, pattern=%s, err=%v", selector.RegexMatch.Pattern, err)
 			return false
 		}
 		return reg.MatchString(nodeName)
@@ -766,13 +766,13 @@ func (hni *HyperNodesInfo) nodeMatchSelector(nodeName string, selector topologyv
 		}
 		labelSelector, err := metav1.LabelSelectorAsSelector(selector.LabelMatch)
 		if err != nil {
-			klog.ErrorS(err, "Failed to convert labelMatch to labelSelector", "LabelMatch", selector.LabelMatch)
+			klog.Errorf("Failed to convert labelMatch to labelSelector, LabelMatch=%v, err=%v", selector.LabelMatch, err)
 			return false
 		}
 		node, err := hni.nodeLister.Get(nodeName)
 
 		if err != nil {
-			klog.ErrorS(err, "Failed to get node", "nodeName", nodeName)
+			klog.Errorf("Failed to get node, nodeName=%s, err=%v", nodeName, err)
 			return false
 		}
 		nodeLabels := labels.Set(node.Labels)

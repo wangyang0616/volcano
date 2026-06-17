@@ -749,26 +749,26 @@ func (sc *SchedulerCache) triggerUpdateHyperNode(name string) error {
 
 	leafNodes := sc.HyperNodesInfo.GetRegexOrLabelMatchLeafHyperNodes()
 	if len(leafNodes) == 0 {
-		klog.V(3).InfoS("No need to update hyperNode cache when node added or deleted")
+		klog.V(3).Info("No need to update hyperNode cache when node added or deleted")
 		return nil
 	}
 
 	for leafNode := range leafNodes {
 		hn := sc.HyperNodesInfo.HyperNode(leafNode)
 		if hn == nil {
-			klog.ErrorS(nil, "Get empty hyperNode", "hyperNodeName", leafNode)
+			klog.Errorf("Get empty hyperNode, hyperNodeName=%s", leafNode)
 			continue
 		}
 		match, err := sc.HyperNodesInfo.NodeRegexOrLabelMatchLeafHyperNode(name, hn.Name)
 		if err != nil {
-			klog.ErrorS(err, "Failed to get node regex match leaf hyperNode", "nodeName", name, "hyperNodeName", hn.Name)
+			klog.Errorf("Failed to get node regex match leaf hyperNode, nodeName=%s, hyperNodeName=%s, err=%v", name, hn.Name, err)
 			continue
 		}
 		if !match {
 			continue
 		}
 
-		klog.V(3).InfoS("Update leaf hyperNode and its ancestors when node added or deleted", "nodeName", name, "hyperNodeName", hn.Name)
+		klog.V(3).Infof("Update leaf hyperNode and its ancestors when node added or deleted, nodeName=%s, hyperNodeName=%s", name, hn.Name)
 		if err := sc.updateHyperNode(hn); err != nil {
 			return fmt.Errorf("faield to update hyperNode: %v", err)
 		}
@@ -1366,7 +1366,7 @@ func (sc *SchedulerCache) setCSIResourceOnNode(csiNode *sv1.CSINode, node *v1.No
 func (sc *SchedulerCache) AddHyperNode(obj interface{}) {
 	hn, ok := obj.(*topologyv1alpha1.HyperNode)
 	if !ok {
-		klog.ErrorS(nil, "Cannot convert to *topologyv1alpha1.HyperNode", "type", reflect.TypeOf(obj))
+		klog.Errorf("Cannot convert to *topologyv1alpha1.HyperNode, type=%v", reflect.TypeOf(obj))
 		return
 	}
 	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + hn.Name)
@@ -1376,7 +1376,7 @@ func (sc *SchedulerCache) AddHyperNode(obj interface{}) {
 func (sc *SchedulerCache) UpdateHyperNode(oldObj, newObj interface{}) {
 	newHyperNode, ok := newObj.(*topologyv1alpha1.HyperNode)
 	if !ok {
-		klog.ErrorS(nil, "Cannot convert newObj to *topologyv1alpha1.HyperNode: %v", reflect.TypeOf(newObj))
+		klog.Errorf("Cannot convert newObj to *topologyv1alpha1.HyperNode, type=%v", reflect.TypeOf(newObj))
 		return
 	}
 	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + newHyperNode.Name)
@@ -1392,11 +1392,11 @@ func (sc *SchedulerCache) DeleteHyperNode(obj interface{}) {
 		var ok bool
 		hn, ok = t.Obj.(*topologyv1alpha1.HyperNode)
 		if !ok {
-			klog.ErrorS(nil, "Cannot convert to HyperNode", "type", reflect.TypeOf(t.Obj))
+			klog.Errorf("Cannot convert to HyperNode, type=%v", reflect.TypeOf(t.Obj))
 			return
 		}
 	default:
-		klog.ErrorS(nil, "Cannot convert to HyperNode", "type", reflect.TypeOf(t))
+		klog.Errorf("Cannot convert to HyperNode, type=%v", reflect.TypeOf(t))
 		return
 	}
 	sc.hyperNodesQueue.Add(string(hyperNodeEventSourceHyperNode) + "/" + hn.Name)
@@ -1428,8 +1428,8 @@ func (sc *SchedulerCache) syncJobAllocatedHyperNode(job *schedulingapi.JobInfo) 
 	oldJobHyperNode := job.AllocatedHyperNode
 	schedulingapi.SyncJobAllocatedHyperNode(job, hyperNodes, nodesByHyperNode)
 	if job.AllocatedHyperNode != oldJobHyperNode {
-		klog.V(3).InfoS("sync job allocated hyperNode after task change", "job", job.UID,
-			"old", oldJobHyperNode, "new", job.AllocatedHyperNode)
+		klog.V(3).Infof("sync job allocated hyperNode after task change, job=%s, old=%s, new=%s",
+			job.UID, oldJobHyperNode, job.AllocatedHyperNode)
 	}
 }
 

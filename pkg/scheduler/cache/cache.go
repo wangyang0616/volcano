@@ -1274,7 +1274,7 @@ func (sc *SchedulerCache) processSyncHyperNode() {
 			return true
 		}
 
-		klog.ErrorS(err, "Failed to sync hyperNode, retry it.", "name", name)
+		klog.Errorf("Failed to sync hyperNode, retry it. name=%s, err=%v", name, err)
 		sc.hyperNodesQueue.AddRateLimited(name)
 		return true
 	}
@@ -1527,7 +1527,7 @@ func (sc *SchedulerCache) Snapshot() *schedulingapi.ClusterInfo {
 	klog.V(3).InfoS("SnapShot for scheduling", "jobNum", len(snapshot.Jobs), "QueueNum",
 		len(snapshot.Queues), "NodeNum", len(snapshot.Nodes))
 	if klog.V(4).Enabled() {
-		klog.InfoS("HyperNode snapShot for scheduling", "tiers", snapshot.HyperNodesSetByTier, "realNodesSet", snapshot.RealNodesSet, "hyperNodesReadyToSchedule", snapshot.HyperNodesReadyToSchedule)
+		klog.Infof("HyperNode snapShot for scheduling, tiers=%v, realNodesSet=%v, hyperNodesReadyToSchedule=%t", snapshot.HyperNodesSetByTier, snapshot.RealNodesSet, snapshot.HyperNodesReadyToSchedule)
 	}
 	return snapshot
 }

@@ -19,6 +19,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -364,17 +365,15 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 			continue
 		}
 		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
-		resolvedHyperNodes := hyperNodes.ResolveHyperNodesAtTier(allocatedHyperNode, tier)
-		klog.V(3).InfoS("podGroup anti-affinity: matching job hyperNode",
-			"job", klog.KRef(selfJob.Namespace, selfJob.Name),
-			"matchingJob", klog.KRef(matchingJob.Namespace, matchingJob.Name),
-			"termTier", tier,
-			"allocatedHyperNode", allocatedHyperNode,
-			"resolvedHyperNodes", resolvedHyperNodes,
-		)
 		if allocatedHyperNode == "" {
+			// matching job not yet placed, it occupies no domain, skip it.
 			continue
 		}
+		resolvedHyperNodes := hyperNodes.ResolveHyperNodesAtTier(allocatedHyperNode, tier)
+		klog.V(3).Infof("podGroup anti-affinity: matching job hyperNode, job=%s, matchingJob=%s, termTier=%d, allocatedHyperNode=%s, resolvedHyperNodes=%s",
+			klog.KRef(selfJob.Namespace, selfJob.Name),
+			klog.KRef(matchingJob.Namespace, matchingJob.Name),
+			tier, allocatedHyperNode, strings.Join(resolvedHyperNodes, ","))
 		for _, hyperNode := range resolvedHyperNodes {
 			matchingHyperNodes.Insert(hyperNode)
 		}
