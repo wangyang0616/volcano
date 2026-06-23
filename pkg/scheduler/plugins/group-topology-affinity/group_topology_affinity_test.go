@@ -17,6 +17,7 @@ limitations under the License.
 package grouptopologyaffinity
 
 import (
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -244,6 +245,18 @@ func TestHyperNodeGradientForPodGroupAntiAffinity(t *testing.T) {
 			}, nil),
 			root:      "root",
 			wantEmpty: true,
+		},
+		{
+			name:      "matching job spanning two supernodes leaves third supernode",
+			hn:        buildThreeSupernodeTree(),
+			setByTier: threeSupernodeSetByTier(),
+			jobs: map[api.JobID]*api.JobInfo{
+				"podgroup-1": otherJobWithTasksOnNodes("podgroup-1", "prod", "node-a", "node-b"),
+			},
+			selfJob:        jobWithTopologyAffinity([]scheduling.PodGroupAffinityTerm{supernodeTerm}, nil),
+			root:           "root",
+			wantHyperNodes: []string{"sn-c"},
+			wantTierOrder:  []int{2},
 		},
 	}
 
@@ -511,6 +524,24 @@ func TestGroupHyperNodesByTierAsc(t *testing.T) {
 	}
 }
 
+func buildThreeSupernodeTree() api.HyperNodeInfoMap {
+	hn := api.HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+		"sn-c": newTestHyperNode("sn-c", 2, "supernode", "root"),
+	}
+	hn["root"].Children = sets.New("sn-a", "sn-b", "sn-c")
+	return hn
+}
+
+func threeSupernodeSetByTier() map[int]sets.Set[string] {
+	return map[int]sets.Set[string]{
+		2: sets.New("sn-a", "sn-b", "sn-c"),
+		3: sets.New("root"),
+	}
+}
+
 func buildTwoSupernodeTree() api.HyperNodeInfoMap {
 	hn := api.HyperNodeInfoMap{
 		"root": newTestHyperNode("root", 3, "cluster", ""),
@@ -567,9 +598,17 @@ func otherJobOn(uid, hyperNode, group string) *api.JobInfo {
 }
 
 func otherJobWithTaskOnNode(uid, nodeName, group string) *api.JobInfo {
-	task := &api.TaskInfo{UID: api.TaskID(uid + "-task")}
-	task.Status = api.Allocated
-	task.NodeName = nodeName
+	return otherJobWithTasksOnNodes(uid, group, nodeName)
+}
+
+func otherJobWithTasksOnNodes(uid, group string, nodeNames ...string) *api.JobInfo {
+	tasks := make(api.TasksMap, len(nodeNames))
+	for i, nodeName := range nodeNames {
+		task := &api.TaskInfo{UID: api.TaskID(fmt.Sprintf("%s-task-%d", uid, i))}
+		task.Status = api.Allocated
+		task.NodeName = nodeName
+		tasks[task.UID] = task
+	}
 	subJobID := api.SubJobID("default")
 	return &api.JobInfo{
 		UID:       api.JobID(uid),
@@ -583,7 +622,7 @@ func otherJobWithTaskOnNode(uid, nodeName, group string) *api.JobInfo {
 			subJobID: {
 				UID: subJobID,
 				TaskStatusIndex: map[api.TaskStatus]api.TasksMap{
-					api.Allocated: {task.UID: task},
+					api.Allocated: tasks,
 				},
 			},
 		},
@@ -594,6 +633,7 @@ func defaultRealNodesSet() map[string]sets.Set[string] {
 	return map[string]sets.Set[string]{
 		"sn-a":  sets.New("node-a"),
 		"sn-b":  sets.New("node-b"),
+		"sn-c":  sets.New("node-c"),
 		"cab-a": sets.New("node-cab-a"),
 		"cab-b": sets.New("node-cab-b"),
 	}

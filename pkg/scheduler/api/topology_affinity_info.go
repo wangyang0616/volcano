@@ -19,6 +19,7 @@ package api
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -343,6 +344,84 @@ func getLowestTierHyperNode(hyperNodeNames sets.Set[string], hyperNodes HyperNod
 	return lowest.Name
 }
 
+// CollectJobOccupiedHyperNodesAtTier returns HyperNode names at tier where matching
+// job tasks are placed. Each allocated task contributes its ancestor at tier; when a job
+// spans multiple sibling domains (for example hn-A and hn-B), all occupied domains are
+// returned instead of expanding an LCA to every sibling (which would incorrectly block hn-C).
+func CollectJobOccupiedHyperNodesAtTier(
+	job *JobInfo,
+	hyperNodes HyperNodeInfoMap,
+	tier int,
+	nodesByHyperNode map[string]sets.Set[string],
+) sets.Set[string] {
+	occupied := sets.New[string]()
+	if job == nil {
+		return occupied
+	}
+	for _, task := range collectJobAllocatedTasks(job) {
+		if hyperNode := taskOccupiedHyperNodeAtTier(task, hyperNodes, tier, nodesByHyperNode); hyperNode != "" {
+			occupied.Insert(hyperNode)
+		}
+	}
+	if occupied.Len() > 0 {
+		return occupied
+	}
+
+	// Fallback: use job.AllocatedHyperNode when the task path yields nothing.
+	//
+	// Primary path is per-task placement (above). Steady-state Running jobs with a
+	// complete node→HyperNode mapping should always hit that path.
+	//
+	// Fallback is for cases where placement is recorded on the job but tasks cannot
+	// be mapped to HyperNodes at tier, for example:
+	//   - unit tests that set AllocatedHyperNode without populating tasks;
+	//   - scheduler restart or early session: annotation/cache has AllocatedHyperNode
+	//     before allocated tasks are fully synced into JobInfo;
+	//   - HyperNode RealNodesSet not ready or incomplete (nodeName present but no
+	//     matching entry in nodesByHyperNode).
+	//
+	// Limitation: when AllocatedHyperNode is an LCA spanning sibling domains (e.g.
+	// root while pods sit on hn-A and hn-B), ResolveHyperNodesAtTier expands to all
+	// tier siblings and may over-block. That is why the task path is preferred; this
+	// fallback is best-effort for single-domain placement or transient cache gaps.
+	allocatedHyperNode := getJobAllocatedHyperNode(job, hyperNodes, nodesByHyperNode)
+	for _, hyperNode := range hyperNodes.ResolveHyperNodesAtTier(allocatedHyperNode, tier) {
+		occupied.Insert(hyperNode)
+	}
+	return occupied
+}
+
+func taskOccupiedHyperNodeAtTier(
+	task *TaskInfo,
+	hyperNodes HyperNodeInfoMap,
+	tier int,
+	nodesByHyperNode map[string]sets.Set[string],
+) string {
+	if task == nil || task.NodeName == "" || len(nodesByHyperNode) == 0 {
+		return ""
+	}
+
+	finestName := ""
+	finestTier := 0
+	for name, nodes := range nodesByHyperNode {
+		if !nodes.Has(task.NodeName) {
+			continue
+		}
+		hyperNode, ok := hyperNodes[name]
+		if !ok {
+			continue
+		}
+		if finestName == "" || hyperNode.Tier() < finestTier {
+			finestName = name
+			finestTier = hyperNode.Tier()
+		}
+	}
+	if finestName == "" {
+		return ""
+	}
+	return hyperNodes.GetAncestorHyperNode(finestName, tier)
+}
+
 // MatchingPodGroupsAllocatedHyperNodesForTerm returns ancestor HyperNodes at the term tier
 // where matching PodGroups (other than selfJob) are already allocated.
 // nodesByHyperNode is used to infer placement for matching PodGroups without AllocatedHyperNode.
@@ -359,17 +438,19 @@ func MatchingPodGroupsAllocatedHyperNodesForTerm(
 		return nil, err
 	}
 
-	matchingHyperNodes := sets.New[string]()
+		matchingHyperNodes := sets.New[string]()
 	for _, matchingJob := range jobs {
 		if !PodGroupMatchesTerm(term, selfJob, matchingJob) {
 			continue
 		}
-		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
-		if allocatedHyperNode == "" {
+		occupiedHyperNodes := CollectJobOccupiedHyperNodesAtTier(matchingJob, hyperNodes, tier, nodesByHyperNode)
+		if occupiedHyperNodes.Len() == 0 {
 			// matching job not yet placed, it occupies no domain, skip it.
 			continue
 		}
-		resolvedHyperNodes := hyperNodes.ResolveHyperNodesAtTier(allocatedHyperNode, tier)
+		resolvedHyperNodes := occupiedHyperNodes.UnsortedList()
+		sort.Strings(resolvedHyperNodes)
+		allocatedHyperNode := getJobAllocatedHyperNode(matchingJob, hyperNodes, nodesByHyperNode)
 		klog.V(3).Infof("podGroup anti-affinity: matching job hyperNode, job=%s, matchingJob=%s, termTier=%d, allocatedHyperNode=%s, resolvedHyperNodes=%s",
 			klog.KRef(selfJob.Namespace, selfJob.Name),
 			klog.KRef(matchingJob.Namespace, matchingJob.Name),

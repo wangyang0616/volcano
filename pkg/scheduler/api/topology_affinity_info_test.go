@@ -520,6 +520,83 @@ func TestPodGroupAntiAffinityAgainstMatchingJobWithoutTopology(t *testing.T) {
 	}
 }
 
+func TestMatchingPodGroupsOccupiedHyperNodesWhenJobSpansSiblingDomains(t *testing.T) {
+	// Three sibling supernodes under root; podgroup-1 spans sn-a and sn-b.
+	// Anti-affinity at supernode tier must only block sn-a/sn-b, not sn-c.
+	prodSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"topology.volcano.sh/group": "prod"},
+	}
+	term := scheduling.PodGroupAffinityTerm{
+		PodGroupSelector: prodSelector,
+		TopologyTierName: "supernode",
+	}
+	hn := HyperNodeInfoMap{
+		"root": newTestHyperNode("root", 3, "cluster", ""),
+		"sn-a": newTestHyperNode("sn-a", 2, "supernode", "root"),
+		"sn-b": newTestHyperNode("sn-b", 2, "supernode", "root"),
+		"sn-c": newTestHyperNode("sn-c", 2, "supernode", "root"),
+	}
+	tierNameMap := HyperNodeTierNameMap{"supernode": 2, "cluster": 3}
+	nodesByHyperNode := map[string]sets.Set[string]{
+		"sn-a":  sets.New("node-a"),
+		"sn-b":  sets.New("node-b"),
+		"sn-c":  sets.New("node-c"),
+		"root":  sets.New("node-a", "node-b", "node-c"),
+	}
+
+	podgroup1 := &JobInfo{
+		UID:                "podgroup-1",
+		Namespace:          "default",
+		AllocatedHyperNode: "root",
+		PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"topology.volcano.sh/group": "prod"}},
+		}},
+	}
+	taskA := &TaskInfo{UID: "task-a"}
+	taskA.Status = Allocated
+	taskA.NodeName = "node-a"
+	taskB := &TaskInfo{UID: "task-b"}
+	taskB.Status = Allocated
+	taskB.NodeName = "node-b"
+	podgroup1.SubJobs = map[SubJobID]*SubJobInfo{
+		SubJobID("default"): {
+			UID: SubJobID("default"),
+			TaskStatusIndex: map[TaskStatus]TasksMap{
+				Allocated: {
+					taskA.UID: taskA,
+					taskB.UID: taskB,
+				},
+			},
+		},
+	}
+	podgroup2 := &JobInfo{
+		UID:       "podgroup-2",
+		Namespace: "default",
+		PodGroup: &PodGroup{PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{
+				TopologyAffinity: &scheduling.TopologyAffinitySpec{
+					PodGroupAntiAffinity: &scheduling.PodGroupAntiAffinity{
+						Required: []scheduling.PodGroupAffinityTerm{term},
+					},
+				},
+			},
+		}},
+	}
+	jobs := map[JobID]*JobInfo{
+		"podgroup-1": podgroup1,
+		"podgroup-2": podgroup2,
+	}
+
+	got, err := MatchingPodGroupsAllocatedHyperNodesForTerm(jobs, hn, tierNameMap, podgroup2, term, nodesByHyperNode)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := sets.New("sn-a", "sn-b")
+	if !got.Equal(want) {
+		t.Fatalf("occupied supernodes mismatch: want %v, got %v", want.UnsortedList(), got.UnsortedList())
+	}
+}
+
 func TestSyncJobAllocatedHyperNodeAfterPodRemoval(t *testing.T) {
 	hn := HyperNodeInfoMap{
 		"root": newTestHyperNode("root", 3, "cluster", ""),
