@@ -1,0 +1,247 @@
+/*
+Copyright 2026 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package framework
+
+import (
+	v1 "k8s.io/api/core/v1"
+
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	schedapi "volcano.sh/volcano/pkg/scheduler/api"
+
+	"volcano.sh/volcano/pkg/repackengine/api"
+)
+
+// Callback contracts plugins register into a Session.
+type (
+	// PredicateFn reports extra node fit beyond the snapshot's own predicate
+	// (nil = fits). Aggregated with AND.
+	PredicateFn func(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error
+	// MovableFn reports whether a task may be moved. Aggregated with AND — any
+	// plugin may veto a move (gang breach, PDB, frozen scope).
+	MovableFn func(task *schedapi.TaskInfo) bool
+	// DomainFn enumerates the freeable units a domain contributes (node units,
+	// hypernode units, ...). Aggregated by union; the core optimizes their combined
+	// weighted benefit.
+	DomainFn func(snap Snapshot) []api.FreeableUnit
+	// DisruptionScoreFn scores a candidate plan on one dimension (higher = more
+	// disruptive). Weighted + min-max normalized across candidates by the Session.
+	DisruptionScoreFn func(ctx *api.PlanContext, p *api.CandidatePlan) float64
+)
+
+type scoreTerm struct {
+	name   string
+	weight float64
+	fn     DisruptionScoreFn
+}
+
+// SessionConfig is the per-run input the driver supplies to OpenSession.
+type SessionConfig struct {
+	Snapshot      Snapshot
+	Run           *repackv1alpha1.RepackRun
+	Resource      v1.ResourceName
+	Mode          repackv1alpha1.RepackMode
+	CoreName      string      // selected search strategy (repack.core)
+	Hooks         CommitHooks // Execute side effects (nil funcs for DryRun)
+	MinNodesFreed int
+	MaxPodGroups  int
+	MaxResource   int64
+	Free          func(*schedapi.NodeInfo) *schedapi.Resource // nil = FutureIdle
+}
+
+// Session is one repack pass: a snapshot plus the callbacks plugins register,
+// consumed by the core and actions. Mirrors framework.Session in the scheduler.
+type Session struct {
+	cfg     SessionConfig
+	plugins []Plugin // opened plugins, for OnSessionClose
+
+	predicateFns []PredicateFn
+	movableFns   []MovableFn
+	domainFns    []DomainFn
+	scoreTerms   []scoreTerm
+
+	// results filled by the action, read by the driver
+	plan   *api.RepackPlan
+	report Report
+}
+
+// OpenSession builds a Session and runs each named plugin's OnSessionOpen (which
+// registers its callbacks). Unknown plugin names are ignored.
+func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
+	ssn := &Session{cfg: cfg}
+	for _, name := range pluginNames {
+		p, ok := GetPlugin(name)
+		if !ok {
+			continue
+		}
+		p.OnSessionOpen(ssn)
+		ssn.plugins = append(ssn.plugins, p)
+	}
+	return ssn
+}
+
+// CloseSession runs OnSessionClose on the plugins opened by OpenSession.
+func CloseSession(ssn *Session) {
+	for _, p := range ssn.plugins {
+		p.OnSessionClose(ssn)
+	}
+	ssn.plugins = nil
+}
+
+// ---- registration (called by plugins in OnSessionOpen) ----
+
+func (s *Session) AddPredicateFn(fn PredicateFn) {
+	if fn != nil {
+		s.predicateFns = append(s.predicateFns, fn)
+	}
+}
+func (s *Session) AddMovableFn(fn MovableFn) {
+	if fn != nil {
+		s.movableFns = append(s.movableFns, fn)
+	}
+}
+func (s *Session) AddDomainFn(fn DomainFn) {
+	if fn != nil {
+		s.domainFns = append(s.domainFns, fn)
+	}
+}
+func (s *Session) AddDisruptionScoreFn(name string, weight float64, fn DisruptionScoreFn) {
+	if fn != nil {
+		s.scoreTerms = append(s.scoreTerms, scoreTerm{name: name, weight: weight, fn: fn})
+	}
+}
+
+// ---- config accessors ----
+
+func (s *Session) Snapshot() Snapshot                  { return s.cfg.Snapshot }
+func (s *Session) Run() *repackv1alpha1.RepackRun      { return s.cfg.Run }
+func (s *Session) Resource() v1.ResourceName           { return s.cfg.Resource }
+func (s *Session) Mode() repackv1alpha1.RepackMode     { return s.cfg.Mode }
+func (s *Session) CoreName() string                    { return s.cfg.CoreName }
+func (s *Session) Hooks() CommitHooks                  { return s.cfg.Hooks }
+func (s *Session) MinNodesFreed() int                  { return s.cfg.MinNodesFreed }
+func (s *Session) MaxPodGroups() int                   { return s.cfg.MaxPodGroups }
+func (s *Session) MaxResource() int64                  { return s.cfg.MaxResource }
+
+// Free returns the node free-capacity basis (default NodeInfo.FutureIdle).
+func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
+	if s.cfg.Free != nil {
+		return s.cfg.Free
+	}
+	return func(n *schedapi.NodeInfo) *schedapi.Resource { return n.FutureIdle() }
+}
+
+// ---- aggregate consumption (called by the core/actions) ----
+
+// Nodes returns the snapshot's candidate nodes.
+func (s *Session) Nodes() []*schedapi.NodeInfo { return s.cfg.Snapshot.Nodes() }
+
+// Predicate is the AND of the snapshot predicate and all registered PredicateFns.
+func (s *Session) Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
+	if err := s.cfg.Snapshot.Predicate(task, node); err != nil {
+		return err
+	}
+	for _, fn := range s.predicateFns {
+		if err := fn(task, node); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Movable returns an api.Movable that is the AND of all registered MovableFns
+// (no plugins → everything movable).
+func (s *Session) Movable() api.Movable {
+	fns := s.movableFns
+	return func(t *schedapi.TaskInfo) bool {
+		if t == nil {
+			return false
+		}
+		for _, fn := range fns {
+			if !fn(t) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// FreeableUnits is the union of every domain plugin's units. With both node and
+// hypernode domains enabled this carries both levels, and Benefit/LeastDisruptive
+// let the core weigh them jointly (holistic optimum).
+func (s *Session) FreeableUnits() []api.FreeableUnit {
+	var out []api.FreeableUnit
+	for _, fn := range s.domainFns {
+		out = append(out, fn(s.cfg.Snapshot)...)
+	}
+	return out
+}
+
+// PlanContext builds the scoring context from the snapshot and target resource.
+func (s *Session) PlanContext() *api.PlanContext {
+	return &api.PlanContext{GPU: s.cfg.Resource, PodGroup: s.cfg.Snapshot.PodGroupView}
+}
+
+// LeastDisruptive returns the index of the least-disruptive candidate, applying
+// the registered score terms with min-max normalization across the batch (a term
+// where all candidates tie contributes nothing). Ties keep the earliest index, so
+// callers should pass candidates in a meaningful order (e.g. max benefit first).
+// Returns 0 for a single/empty batch.
+func (s *Session) LeastDisruptive(cands []*api.CandidatePlan) int {
+	if len(cands) <= 1 {
+		return 0
+	}
+	ctx := s.PlanContext()
+	totals := make([]float64, len(cands))
+	for _, t := range s.scoreTerms {
+		if t.weight <= 0 {
+			continue
+		}
+		raw := make([]float64, len(cands))
+		mn, mx := 0.0, 0.0
+		for i, p := range cands {
+			raw[i] = t.fn(ctx, p)
+			if i == 0 || raw[i] < mn {
+				mn = raw[i]
+			}
+			if i == 0 || raw[i] > mx {
+				mx = raw[i]
+			}
+		}
+		span := mx - mn
+		for i := range cands {
+			norm := 0.0
+			if span > 0 {
+				norm = (raw[i] - mn) / span
+			}
+			totals[i] += t.weight * norm
+		}
+	}
+	best, bestScore := 0, totals[0]
+	for i, sc := range totals {
+		if sc < bestScore {
+			best, bestScore = i, sc
+		}
+	}
+	return best
+}
+
+// ---- result (set by the action, read by the driver) ----
+
+func (s *Session) SetPlan(p *api.RepackPlan) { s.plan = p }
+func (s *Session) Plan() *api.RepackPlan     { return s.plan }
+func (s *Session) SetReport(r Report)        { s.report = r }
+func (s *Session) Report() Report            { return s.report }
