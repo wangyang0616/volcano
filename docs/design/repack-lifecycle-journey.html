@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Repack 生命周期架构图</title>
+  <style>
+    :root {
+      --k8s: #326ce5;
+      --k8s-light: #eef3fc;
+      --k8s-border: #a8c7f5;
+      --repack: #0ea5e9;
+      --repack-bg: #f0f9ff;
+      --repack-border: #7dd3fc;
+      --policy: #7c3aed;
+      --policy-bg: #f5f3ff;
+      --policy-border: #c4b5fd;
+      --orange: #e8590c;
+      --orange-bg: #fff8f3;
+      --orange-border: #ffc9a8;
+      --purple: #8250df;
+      --purple-bg: #fbefff;
+      --green: #1a7f37;
+      --green-bg: #dafbe1;
+      --dryrun: #64748b;
+      --dryrun-bg: #f8fafc;
+      --gray-bg: #f6f8fa;
+      --gray-border: #d0d7de;
+      --text: #1f2328;
+      --muted: #656d76;
+      --font: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: var(--font); background: #fff; color: var(--text); padding: 28px 16px 40px; }
+    .page { max-width: 1100px; margin: 0 auto; }
+
+    .title-bar { text-align: center; margin-bottom: 18px; }
+    .title-bar h1 { font-size: 22px; font-weight: 600; color: var(--k8s); }
+    .title-bar p { font-size: 13px; color: var(--muted); margin-top: 6px; }
+    .nav { text-align: center; margin-bottom: 16px; font-size: 12px; }
+    .nav a { color: var(--k8s); text-decoration: none; }
+
+    .legend {
+      display: flex; flex-wrap: wrap; gap: 14px 20px; justify-content: center;
+      margin-bottom: 16px; font-size: 11px; color: var(--muted);
+      padding: 8px 12px; border: 1px solid var(--gray-border); border-radius: 4px; background: var(--gray-bg);
+    }
+    .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+
+    .diagram {
+      border: 2px dashed var(--k8s-border);
+      border-radius: 4px;
+      padding: 22px 16px 18px;
+      background: #fafcff;
+      position: relative;
+    }
+    .diagram-label {
+      position: absolute; top: -11px; left: 18px;
+      background: #fafcff; padding: 0 10px;
+      font-size: 13px; font-weight: 600; color: var(--k8s);
+    }
+
+    /* 通用 zone */
+    .zone {
+      border: 1.5px dashed var(--gray-border);
+      border-radius: 4px;
+      padding: 14px 12px 12px;
+      background: #fff;
+      position: relative;
+      margin-bottom: 10px;
+    }
+    .zone-title {
+      position: absolute; top: -10px; left: 12px;
+      background: inherit; padding: 0 8px;
+      font-size: 12px; font-weight: 600; color: var(--muted);
+    }
+    .zone.shared { border-color: var(--k8s-border); background: var(--k8s-light); }
+    .zone.shared .zone-title { color: var(--k8s); background: var(--k8s-light); }
+    .zone.repack { border-color: var(--repack-border); background: var(--repack-bg); }
+    .zone.repack .zone-title { color: var(--repack); background: var(--repack-bg); }
+    .zone.merge { border-color: var(--gray-border); background: var(--gray-bg); margin-bottom: 0; }
+
+    .v-arrow {
+      text-align: center; padding: 4px 0; color: var(--muted); font-size: 10px; line-height: 1;
+    }
+    .v-arrow svg { display: block; margin: 0 auto 2px; }
+
+    /* ── 双入口触发 ── */
+    .dual-entry {
+      display: grid;
+      grid-template-columns: 1fr 48px 1fr;
+      gap: 0;
+      align-items: stretch;
+    }
+    .entry-path {
+      border: 1.5px dashed var(--gray-border);
+      border-radius: 4px;
+      padding: 12px 10px;
+      background: #fff;
+    }
+    .entry-path.manual { border-color: var(--k8s-border); background: var(--k8s-light); }
+    .entry-path.policy { border-color: var(--policy-border); background: var(--policy-bg); }
+
+    .path-tag {
+      font-size: 10px; font-weight: 700; margin-bottom: 8px;
+      padding: 2px 8px; border-radius: 3px; display: inline-block;
+    }
+    .path-tag.a { background: var(--k8s); color: #fff; }
+    .path-tag.b { background: var(--policy); color: #fff; }
+
+    .tile {
+      border: 1px solid var(--gray-border);
+      border-radius: 4px; background: #fff;
+      padding: 8px; text-align: center; margin-bottom: 6px;
+    }
+    .tile .name { font-size: 10px; font-weight: 600; line-height: 1.3; }
+    .tile .sub { font-size: 9px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+
+    /* 组件名标签 — 每个大框顶部 */
+    .comp {
+      display: block;
+      font-family: Consolas, "SF Mono", monospace;
+      font-size: 10px;
+      font-weight: 700;
+      color: #fff;
+      background: var(--text);
+      padding: 3px 8px;
+      border-radius: 3px;
+      margin-bottom: 6px;
+      text-align: center;
+      letter-spacing: 0.01em;
+    }
+    .comp.k8s { background: var(--k8s); }
+    .comp.repack { background: var(--repack); }
+    .comp.ctrl { background: #0f766e; }
+    .comp.sched { background: var(--purple); }
+    .comp.job { background: var(--orange); }
+    .comp.user { background: #57606a; }
+    .comp.policy { background: var(--policy); }
+    .comp.crd { background: #0369a1; }
+    .comp.dryrun { background: var(--dryrun); }
+
+    .trunk-box .comp { margin: -2px -4px 6px -4px; }
+    .branch-step .comp { margin: 0 0 4px 0; font-size: 9px; padding: 2px 6px; }
+
+    .merge-col {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      font-size: 9px; color: var(--muted);
+    }
+
+    .cr-pill {
+      display: inline-block; font-size: 9px; font-family: Consolas, monospace;
+      padding: 2px 8px; border-radius: 10px; margin-top: 4px;
+      border: 1px solid var(--repack-border); background: #fff; color: #0369a1;
+    }
+
+    /* ── 公共 trunk 单行 ── */
+    .trunk-row {
+      display: flex; align-items: center; justify-content: center;
+      flex-wrap: wrap; gap: 8px; padding: 4px 0;
+    }
+    .trunk-box {
+      font-size: 10px; padding: 8px 12px;
+      border: 1px solid var(--repack-border); border-radius: 4px;
+      background: #fff; text-align: center; line-height: 1.4;
+    }
+    .trunk-box strong { display: block; font-size: 10px; color: var(--text); margin-bottom: 2px; }
+
+    /* ── DryRun / Execute 分叉 ── */
+    .fork-head {
+      text-align: center; font-size: 11px; font-weight: 600;
+      color: var(--repack); padding: 6px 0 8px;
+    }
+
+    .fork-grid {
+      display: grid;
+      grid-template-columns: 1fr 40px 1fr;
+      gap: 0;
+      align-items: stretch;
+    }
+
+    .fork-branch {
+      border: 1.5px dashed var(--gray-border);
+      border-radius: 4px;
+      padding: 12px 10px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .fork-branch.dryrun {
+      border-color: #cbd5e1; background: var(--dryrun-bg);
+    }
+    .fork-branch.execute {
+      border-color: var(--repack-border); background: var(--repack-bg);
+    }
+
+    .branch-label {
+      font-size: 11px; font-weight: 700; text-align: center;
+      padding-bottom: 6px; border-bottom: 1px solid rgba(0,0,0,.06);
+    }
+    .fork-branch.dryrun .branch-label { color: var(--dryrun); }
+    .fork-branch.execute .branch-label { color: #0369a1; }
+
+    .branch-step {
+      font-size: 9px; color: var(--muted); line-height: 1.45;
+      padding: 6px 8px; border: 1px solid rgba(0,0,0,.06);
+      border-radius: 3px; background: rgba(255,255,255,.8); text-align: center;
+    }
+    .branch-step strong { color: var(--text); display: block; margin-bottom: 2px; font-size: 10px; }
+
+    .fork-mid {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      font-size: 9px; color: var(--muted); gap: 4px;
+    }
+
+    .no-evict {
+      font-size: 9px; color: #dc2626; font-weight: 600;
+      text-align: center; padding: 4px;
+      border: 1px dashed #fca5a5; border-radius: 3px; background: #fef2f2;
+    }
+
+    /* 汇合 + 收尾 */
+    .converge {
+      display: flex; align-items: center; justify-content: center;
+      gap: 12px; flex-wrap: wrap; padding: 8px 0;
+    }
+    .end-box {
+      flex: 1; min-width: 200px; max-width: 320px;
+      border: 1.5px dashed #86efac; border-radius: 4px;
+      background: var(--green-bg); padding: 10px 12px; text-align: center;
+    }
+    .end-box .name { font-size: 11px; font-weight: 600; color: var(--green); }
+    .end-box .sub { font-size: 9px; color: var(--muted); margin-top: 4px; }
+
+    .note-box {
+      margin-top: 12px;
+      border: 1px solid var(--gray-border); border-radius: 4px;
+      padding: 10px 14px; background: #fff; font-size: 11px; color: var(--muted); line-height: 1.6;
+    }
+    .note-box strong { color: var(--text); }
+
+    footer { text-align: center; margin-top: 16px; font-size: 11px; color: #aaa; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="title-bar">
+      <h1>Repack 生命周期架构图</h1>
+      <p>双入口触发 · 公共规划段 · DryRun / Execute 分叉 · 汇合回收</p>
+    </div>
+    <p class="nav"><a href="volcano-topology.html">← Volcano 顶层架构图</a></p>
+
+    <div class="legend">
+      <span><i style="background:var(--k8s)"></i>kube-apiserver</span>
+      <span><i style="background:var(--repack)"></i>volcano-repack-engine</span>
+      <span><i style="background:#0f766e"></i>repack-controller</span>
+      <span><i style="background:var(--purple)"></i>volcano-scheduler</span>
+      <span><i style="background:var(--orange)"></i>job-controller</span>
+      <span><i style="background:#57606a"></i>用户 / 平台</span>
+    </div>
+
+    <div class="diagram">
+      <span class="diagram-label">Repack 全生命周期 · 架构视图</span>
+
+      <!-- ═══ 1. 双入口触发层 ═══ -->
+      <div class="zone">
+        <span class="zone-title">触发层 · RepackRun 两种创建方式</span>
+        <div class="dual-entry">
+          <!-- 路径 A -->
+          <div class="entry-path manual">
+            <span class="path-tag a">路径 A · 手动一次性</span>
+            <div class="tile">
+              <span class="comp user">用户 / 平台 / CI</span>
+              <div class="name">kubectl · vcctl · 控制台</div>
+              <div class="sub">发起 CREATE 请求</div>
+            </div>
+            <div class="tile" style="border-color:var(--repack-border)">
+              <span class="comp k8s">kube-apiserver</span>
+              <div class="name">持久化 RepackRun</div>
+              <div class="sub">自洽 spec · mode=DryRun 或 Execute</div>
+            </div>
+            <div style="font-size:9px;color:var(--muted);text-align:center;margin-top:4px">
+              P0 · 无 owner · 触发一次整理
+            </div>
+          </div>
+
+          <div class="merge-col">
+            <svg width="20" height="36" viewBox="0 0 20 36"><path d="M10 0v14M2 14h16M2 14l6 8M18 14l-6 8M10 22v14" stroke="#94a3b8" stroke-width="1.5" fill="none"/></svg>
+            汇合
+          </div>
+
+          <!-- 路径 B -->
+          <div class="entry-path policy">
+            <span class="path-tag b">路径 B · 策略驱动</span>
+            <div class="tile">
+              <span class="comp user">平台管理员</span>
+              <div class="name">CREATE RepackPolicy</div>
+              <div class="sub">经 kube-apiserver 写入</div>
+            </div>
+            <div class="tile">
+              <span class="comp ctrl">repack-controller</span>
+              <div class="name">volcano-controller-manager 内嵌</div>
+              <div class="sub">监听 triggers · Admit 补全 spec</div>
+            </div>
+            <div class="tile" style="border-color:var(--repack-border)">
+              <span class="comp ctrl">repack-controller</span>
+              <div class="name">自动 CREATE / 管理 RepackRun</div>
+              <div class="sub">ownerReferences · runRetention 历史上限</div>
+            </div>
+            <div style="font-size:9px;color:var(--muted);text-align:center;margin-top:4px">
+              P1 · onPending 自动 DryRun · approval 后 Execute
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="v-arrow">
+        <svg width="16" height="20" viewBox="0 0 16 20"><path d="M8 0v14M4 10l4 4 4-4" stroke="#94a3b8" stroke-width="1.5" fill="none"/></svg>
+        两条路径均产出 RepackRun 对象
+      </div>
+
+      <!-- ═══ 2. API 准入（公共） ═══ -->
+      <div class="zone shared">
+        <span class="zone-title">API 准入层 · kube-apiserver + RepackRun</span>
+        <div class="trunk-row">
+          <div class="trunk-box">
+            <span class="comp k8s">kube-apiserver</span>
+            <strong>CRD 准入校验</strong>
+            CEL · spec 不可变<br/>
+            Execute 需 scope include
+          </div>
+          <span style="color:#ccc">→</span>
+          <div class="trunk-box" style="border-color:var(--repack-border)">
+            <span class="comp crd">RepackRun</span>
+            <strong>对象就绪</strong>
+            phase = Pending<br/>
+            等待 engine 认领
+          </div>
+        </div>
+      </div>
+
+      <div class="v-arrow">
+        <svg width="16" height="20" viewBox="0 0 16 20"><path d="M8 0v14M4 10l4 4 4-4" stroke="#0ea5e9" stroke-width="1.5" fill="none"/></svg>
+        volcano-repack-engine · watch
+      </div>
+
+      <!-- ═══ 3. Engine 公共规划段 ═══ -->
+      <div class="zone repack">
+        <span class="zone-title">Repack 执行层 · volcano-repack-engine · 公共规划段</span>
+        <div class="trunk-row">
+          <div class="trunk-box">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>EvaluateGate</strong>
+            Execute: K=1 + cooldown<br/>DryRun: 不排队
+          </div>
+          <span style="color:#ccc">→</span>
+          <div class="trunk-box">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>OpenSession</strong>
+            复用 scheduler-conf<br/>热 cache 视图
+          </div>
+          <span style="color:#ccc">→</span>
+          <div class="trunk-box">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>ResolveScope</strong>
+            解析可动<br/>PodGroup / Node
+          </div>
+          <span style="color:#ccc">→</span>
+          <div class="trunk-box">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>drain + Feasible</strong>
+            生成方案 · 收益门控
+          </div>
+        </div>
+        <div style="text-align:center;font-size:10px;color:#0369a1;margin-top:8px;font-weight:600">
+          ↓ 按 spec.mode 分叉（以下路径互斥）↓
+        </div>
+      </div>
+
+      <!-- ═══ 4. DryRun / Execute 分叉 ═══ -->
+      <div class="fork-head">mode 分叉 · 处理过程分歧点</div>
+      <div class="fork-grid">
+        <!-- DryRun 支路 -->
+        <div class="fork-branch dryrun">
+          <div class="branch-label">DryRun 支路 · volcano-repack-engine</div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>Session 沙箱模拟</strong>
+            内存中重排 · 不写集群<br/>不碰 Pod
+          </div>
+          <div class="no-evict">✕ volcano-repack-engine 不调用 Eviction</div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>UpdateStatus · report</strong>
+            recommendedPodGroups / Nodes<br/>fragRateDelta · verdict
+          </div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>UpdateStatus · 终态</strong>
+            phase → Succeeded<br/>completionTime 打戳
+          </div>
+          <div class="tile" style="margin-top:auto;border-color:#cbd5e1">
+            <span class="comp dryrun">— 无下游组件 —</span>
+            <div class="name" style="color:var(--dryrun)">Pod 布局不变</div>
+            <div class="sub">用户读 report 后另建 Execute Run</div>
+          </div>
+        </div>
+
+        <div class="fork-mid">
+          <span style="writing-mode:vertical-rl;font-size:9px;letter-spacing:.1em">spec.mode</span>
+        </div>
+
+        <!-- Execute 支路 -->
+        <div class="fork-branch execute">
+          <div class="branch-label">Execute 支路 · 多组件协作</div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>CommitPlan · Eviction</strong>
+            经 kube-apiserver<br/>policy/v1 Eviction 删 Pod
+          </div>
+          <div class="branch-step">
+            <span class="comp job">volcano-controller-manager</span>
+            <strong>job-controller</strong>
+            gang 缺员检测<br/>重建 Pending Pod
+          </div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>UpdateStatus · result</strong>
+            freedNodes · nominations[]
+          </div>
+          <div class="branch-step">
+            <span class="comp ctrl">repack-controller · Nominator</span>
+            <strong>PATCH Pod</strong>
+            status.nominatedNodeName
+          </div>
+          <div class="branch-step">
+            <span class="comp sched">volcano-scheduler</span>
+            <strong>allocate · bind</strong>
+            Pod → 新 Node Running<br/>gang 重新聚拢
+          </div>
+          <div class="branch-step">
+            <span class="comp repack">volcano-repack-engine</span>
+            <strong>UpdateStatus · 终态</strong>
+            phase → Succeeded
+          </div>
+        </div>
+      </div>
+
+      <div class="v-arrow">
+        <svg width="16" height="20" viewBox="0 0 16 20"><path d="M8 0v14M4 10l4 4 4-4" stroke="#86efac" stroke-width="1.5" fill="none"/></svg>
+        两路均进入终态
+      </div>
+
+      <!-- ═══ 5. 汇合收尾 ═══ -->
+      <div class="zone merge">
+        <span class="zone-title">收尾层 · repack-controller</span>
+        <div class="converge">
+          <div class="end-box">
+            <span class="comp ctrl" style="display:inline-block;margin-bottom:6px">repack-controller · RunGC</span>
+            <div class="name">DELETE RepackRun</div>
+            <div class="sub">终态 + ttlSecondsAfterFinished 到期触发<br/>路径 B 另受 repack-controller · Policy.runRetention 约束（P1）</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="note-box">
+        <strong>架构要点</strong><br/>
+        ① <strong>创建分叉</strong>：路径 A 用户直接下单；路径 B Policy 驱动 controller 代建 Run，engine 只读 Run.spec，两种入口对引擎透明。<br/>
+        ② <strong>处理分叉</strong>：DryRun 与 Execute 在 engine 规划段之后按 <code>spec.mode</code> 分裂——DryRun 止步于 report，Execute 才走 Eviction → 重建 → 调度链。<br/>
+        ③ <strong>典型组合</strong>：路径 A 常为先 DryRun 再 Execute；路径 B 可由 Policy 自动建 DryRun，人工 approval 后再自动 Execute（P1）。
+      </div>
+    </div>
+
+    <footer>docs/design/repack-lifecycle-journey.html · 浏览器直接打开预览</footer>
+  </div>
+</body>
+</html>

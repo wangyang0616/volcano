@@ -1,0 +1,69 @@
+<svg viewBox="0 0 900 566" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif" role="img">
+<title>运行期碎片整理算法选型：方案A 节点腾空法 vs 方案B 集中度法</title>
+<desc>两方案目标一致、底座共享，差别只在搜索范式；A 已实现、KPI直达、稳；B 待编码、可演进可在线、易讲可调。三条选型路线：只A、只B、A基线+B精修。抉择点是"快速稳妥 vs 统一可演进"，非谁腾的节点多。</desc>
+<rect width="900" height="566" fill="#ffffff"/>
+
+<text x="30" y="32" font-size="20" font-weight="700" fill="#1f2328">运行期碎片整理 · 算法选型（A vs B）</text>
+
+<!-- 共识 banner -->
+<rect x="30" y="44" width="840" height="30" rx="6" fill="none" stroke="#d0d7de"/>
+<text x="450" y="63" text-anchor="middle" font-size="12.5" fill="#57606a">目标一致 · 底座共享（可调度性 / 扰动评分 / 收益门控）· 差别只在"搜索范式" —— 2 的幂同构场景下，两者腾出的节点数基本持平</text>
+
+<!-- 方案 A 卡片 -->
+<g>
+  <rect x="30" y="88" width="405" height="262" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="30" y="88" width="405" height="34" rx="10" fill="#6366f1"/>
+  <rect x="30" y="110" width="405" height="12" fill="#6366f1"/>
+  <text x="46" y="111" font-size="14" font-weight="700" fill="#fff">方案 A · 节点腾空法 (drain-anchored)</text>
+  <text x="400" y="111" text-anchor="end" font-size="11.5" font-weight="700" fill="#fff">已实现</text>
+  <text x="46" y="144" font-size="12.5" fill="#57606a">自顶向下 · 选节点 → 整组腾空 → 原子提交（构造式贪心）</text>
+
+  <text x="46" y="174" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> KPI 直达：每次提交 = 一个整空节点</text>
+  <text x="46" y="200" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> 扰动天然有界 · 确定性天然 · 零空转</text>
+  <text x="46" y="226" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> 已落地：代码 + 单测 + Python 交叉验证</text>
+  <text x="46" y="252" font-size="12.5" fill="#1f2328"><tspan fill="#f59e0b" font-weight="700">△</tspan> 粗粒度（整节点 all-or-nothing）</text>
+  <text x="46" y="278" font-size="12.5" fill="#1f2328"><tspan fill="#f59e0b" font-weight="700">△</tspan> 可演进偏硬、不擅在线整理</text>
+  <text x="46" y="318" font-size="12" fill="#57606a">适合：批量周期整理 · 要快/稳/可预测 · P0 见效</text>
+</g>
+
+<!-- 方案 B 卡片 -->
+<g>
+  <rect x="465" y="88" width="405" height="262" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="465" y="88" width="405" height="34" rx="10" fill="#0ea5e9"/>
+  <rect x="465" y="110" width="405" height="12" fill="#0ea5e9"/>
+  <text x="481" y="111" font-size="14" font-weight="700" fill="#fff">方案 B · 集中度法 (势函数局部搜索)</text>
+  <text x="835" y="111" text-anchor="end" font-size="11.5" font-weight="700" fill="#fff">设计完成·待编码</text>
+  <text x="481" y="144" font-size="12.5" fill="#57606a">自底向上 · 逐负载爬「集中度分数 Σused²」（局部搜索）</text>
+
+  <text x="481" y="174" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> 最易讲、可调（单一净分 + 可插拔权重）</text>
+  <text x="481" y="200" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> 可演进最强 · 天然在线 / 增量整理</text>
+  <text x="481" y="226" font-size="12.5" fill="#1f2328"><tspan fill="#22c55e" font-weight="700">✓</tspan> 效果上限略高（可逃部分局部最优）</text>
+  <text x="481" y="252" font-size="12.5" fill="#1f2328"><tspan fill="#f59e0b" font-weight="700">△</tspan> 需防空转闸门 + 调 λ（已知坑已给解法）</text>
+  <text x="481" y="278" font-size="12.5" fill="#1f2328"><tspan fill="#f59e0b" font-weight="700">△</tspan> 待编码、调参需经验</text>
+  <text x="481" y="318" font-size="12" fill="#57606a">适合：持续/在线整理 · 策略常调权重 · 长期演进</text>
+</g>
+
+<!-- 选型路线 -->
+<text x="30" y="382" font-size="15" font-weight="700" fill="#1f2328">选型：三条路线</text>
+<g>
+  <rect x="30" y="394" width="272" height="72" rx="8" fill="none" stroke="#6366f1"/>
+  <text x="44" y="416" font-size="13" font-weight="700" fill="#6366f1">路线一 · 只上 A</text>
+  <text x="44" y="437" font-size="11.5" fill="#57606a">最快最稳、已就绪</text>
+  <text x="44" y="455" font-size="11.5" fill="#57606a">→ P0 快速见效，演进/在线弱</text>
+
+  <rect x="314" y="394" width="272" height="72" rx="8" fill="none" stroke="#0ea5e9"/>
+  <text x="328" y="416" font-size="13" font-weight="700" fill="#0ea5e9">路线二 · 只上 B</text>
+  <text x="328" y="437" font-size="11.5" fill="#57606a">统一、可讲、可调、可在线</text>
+  <text x="328" y="455" font-size="11.5" fill="#57606a">→ 长期省心，需编码+调参</text>
+
+  <rect x="598" y="394" width="272" height="72" rx="8" fill="none" stroke="#d0d7de"/>
+  <text x="612" y="416" font-size="13" font-weight="700" fill="#1f2328">路线三 · A 基线 + B 精修</text>
+  <text x="612" y="437" font-size="11.5" fill="#57606a">最稳健、上限最高</text>
+  <text x="612" y="455" font-size="11.5" fill="#57606a">→ 双实现成本</text>
+</g>
+
+<!-- 抉择点 -->
+<rect x="30" y="482" width="840" height="58" rx="8" fill="none" stroke="#1f2328"/>
+<text x="46" y="506" font-size="13.5" font-weight="700" fill="#1f2328">抉择点 = 「快速稳妥」 vs 「统一可演进」的团队权重 —— 不是"谁腾的节点多"（目标场景二者基本持平）</text>
+<text x="46" y="528" font-size="12" fill="#57606a">倾向：要 P0 快速落地 → 路线一（A 已就绪）；要统一可演进/在线 → 路线二（B 为主，A 退为 fallback）</text>
+</svg>

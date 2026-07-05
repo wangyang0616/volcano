@@ -1,0 +1,157 @@
+<svg viewBox="0 0 1130 792" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
+  <title>图2 drain 内部流程（单趟唯一 plan · 字典序增量代价）</title>
+  <desc>drain 单趟动态贪心：挑字典序增量代价最小的单元→可腾空?→取victims→INV-RESCHED?→预算?→提交并记入已破组→动态重选；遍历完看 freed≥min，输出唯一 RepackPlan。右侧关键能力，底部搭便车例子（B 先腾）。</desc>
+  <style>
+    .t{fill:#111827;} .s{fill:#5b6472;}
+    .m{font-family:ui-monospace,Menlo,monospace;}
+    .proc{fill:#eef2f7;stroke:#8a97a8;}
+    .dec{fill:#fff4e6;stroke:#e8890c;}
+    .com{fill:#e9f7ef;stroke:#2f9e44;}
+    .end{fill:#2f9e44;}
+    .no{fill:#e03131;}
+    .card{fill:#ffffff;stroke:#c4cbd4;}
+    .aw{stroke:#5b6472;fill:none;stroke-width:1.5;}
+    .ab{stroke:#1c7ed6;fill:none;stroke-width:1.5;}
+    .askip{stroke:#e03131;fill:none;stroke-width:1.3;stroke-dasharray:5 3;}
+    text{dominant-baseline:middle;}
+  </style>
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#5b6472"/></marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#1c7ed6"/></marker>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#e03131"/></marker>
+  </defs>
+
+  <text x="565" y="22" text-anchor="middle" font-size="15.5" font-weight="700" class="t">图2 · drain 内部流程（单趟动态贪心 · 字典序增量代价 · 唯一 plan）</text>
+
+  <rect x="150" y="40" width="300" height="40" rx="20" class="proc"/>
+  <text x="300" y="55" text-anchor="middle" font-size="10.5" font-weight="700" class="t">输入</text>
+  <text x="300" y="70" text-anchor="middle" font-size="8.5" class="s">候选单元 · Movable · Free 台账</text>
+
+  <g><rect x="150" y="100" width="300" height="48" rx="8" class="proc"/>
+    <circle cx="168" cy="114" r="8" class="end"/><text x="168" y="115" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">1</text>
+    <text x="300" y="118" text-anchor="middle" font-size="11" font-weight="700" class="t">挑【字典序增量代价最小】的单元</text>
+    <text x="300" y="135" text-anchor="middle" font-size="8.3" class="s">动态重选，非一次性静态排序（见 图3）</text></g>
+
+  <g><path d="M300,148 L300,166" class="aw" marker-end="url(#a)"/>
+    <rect x="170" y="166" width="260" height="50" rx="8" class="dec"/>
+    <circle cx="188" cy="180" r="8" class="end"/><text x="188" y="181" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">2</text>
+    <text x="300" y="184" text-anchor="middle" font-size="10.5" font-weight="700" class="t">单元可腾空？</text>
+    <text x="300" y="201" text-anchor="middle" font-size="8.3" class="s">成员节点全 movable 且未占用/未腾</text></g>
+
+  <g><path d="M300,216 L300,232" class="aw" marker-end="url(#a)"/><text x="312" y="224" font-size="8" class="s">是</text>
+    <rect x="180" y="232" width="240" height="38" rx="8" class="proc"/>
+    <circle cx="198" cy="251" r="8" class="end"/><text x="198" y="252" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">3</text>
+    <text x="308" y="251" text-anchor="middle" font-size="10" class="t">victims = 单元上所有 movable 任务</text></g>
+
+  <g><path d="M300,270 L300,286" class="aw" marker-end="url(#a)"/>
+    <rect x="168" y="286" width="264" height="56" rx="8" class="dec"/>
+    <circle cx="186" cy="302" r="8" class="end"/><text x="186" y="303" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">4</text>
+    <text x="300" y="306" text-anchor="middle" font-size="10.5" font-weight="700" class="t">INV-RESCHED：victims 能全部落下？</text>
+    <text x="300" y="323" text-anchor="middle" font-size="8.2" class="s m">FFD + best-fit + 回溯（克隆余量搜索）</text>
+    <text x="300" y="335" text-anchor="middle" font-size="7.8" class="s">不预留 → 规划时预检、尽力非保证</text></g>
+
+  <g><path d="M300,342 L300,358" class="aw" marker-end="url(#a)"/><text x="312" y="350" font-size="8" class="s">是</text>
+    <rect x="196" y="358" width="208" height="42" rx="8" class="dec"/>
+    <circle cx="214" cy="374" r="8" class="end"/><text x="214" y="375" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">5</text>
+    <text x="304" y="374" text-anchor="middle" font-size="10.5" font-weight="700" class="t">在 maxPerRun 预算内？</text>
+    <text x="300" y="391" text-anchor="middle" font-size="8" class="s">超预算 → 跳过</text></g>
+
+  <g><path d="M300,400 L300,416" class="aw" marker-end="url(#a)"/><text x="312" y="408" font-size="8" class="s">是</text>
+    <rect x="164" y="416" width="272" height="52" rx="8" class="com"/>
+    <circle cx="182" cy="432" r="8" class="end"/><text x="182" y="433" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">6</text>
+    <text x="300" y="436" text-anchor="middle" font-size="11" font-weight="700" class="t">提交：腾空单元</text>
+    <text x="300" y="454" text-anchor="middle" font-size="8.5" class="s">消费 ledger · 标 freed · 记入【已破组集合】</text></g>
+
+  <g><path d="M300,468 L300,484" class="aw" marker-end="url(#a)"/>
+    <rect x="196" y="484" width="208" height="40" rx="8" class="dec"/>
+    <circle cx="214" cy="500" r="8" class="end"/><text x="214" y="501" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">7</text>
+    <text x="300" y="500" text-anchor="middle" font-size="10.5" font-weight="700" class="t">还有候选单元？</text>
+    <text x="300" y="516" text-anchor="middle" font-size="8" class="s">是 → 回 ①（增量代价已更新）</text></g>
+
+  <g><path d="M300,524 L300,540" class="aw" marker-end="url(#a)"/><text x="312" y="532" font-size="8" class="s">否</text>
+    <rect x="184" y="540" width="232" height="42" rx="8" class="dec"/>
+    <circle cx="202" cy="556" r="8" class="end"/><text x="202" y="557" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">8</text>
+    <text x="300" y="556" text-anchor="middle" font-size="10.5" font-weight="700" class="t">freed ≥ MinNodesFreed？</text>
+    <text x="300" y="572" text-anchor="middle" font-size="8" class="s">遍历完才到这——不是腾 1 个就停</text></g>
+
+  <g><path d="M300,582 L300,598" class="aw" marker-end="url(#a)"/><text x="312" y="590" font-size="8" class="s">是</text>
+    <rect x="150" y="598" width="300" height="44" rx="12" class="com"/>
+    <circle cx="168" cy="620" r="8" class="end"/><text x="168" y="621" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">9</text>
+    <text x="308" y="614" text-anchor="middle" font-size="10.5" font-weight="700" class="t">输出唯一 RepackPlan</text>
+    <text x="308" y="631" text-anchor="middle" font-size="8" class="s">本趟的所有 moves + freed nodes（无跨候选择优）</text></g>
+  <path d="M184,562 L120,562 L120,620 L146,620" class="askip"/>
+  <rect x="40" y="604" width="86" height="32" rx="8" class="no"/><text x="83" y="621" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">NoRepack</text>
+  <text x="150" y="554" font-size="8" class="s" fill="#e03131">否</text>
+
+  <path d="M300,504 C470,504 486,300 486,132 L452,124" class="ab" marker-end="url(#ab)"/>
+  <text x="492" y="320" font-size="8.5" class="ab" transform="rotate(90 492 320)" fill="#1c7ed6">循环回 ① · 动态重选</text>
+  <path d="M430,191 C500,191 486,170 486,142" class="askip" marker-end="url(#ar)"/><text x="438" y="184" font-size="8" fill="#e03131">否·跳过</text>
+  <path d="M432,314 C505,314 500,200 490,152" class="askip"/><text x="438" y="306" font-size="8" fill="#e03131">否·原子跳过</text>
+  <path d="M404,379 C468,379 484,250 486,162" class="askip"/><text x="410" y="371" font-size="8" fill="#e03131">否·跳过</text>
+
+  <rect x="622" y="42" width="486" height="150" rx="9" class="card"/>
+  <text x="636" y="60" font-size="12" font-weight="700" class="t">关键① gang — 软感知 + 阶跃（对应 ①④⑥）</text>
+  <text x="636" y="80" font-size="9.3" class="s">· 不硬原子：只搬"腾节点所需"的 pod，不强制整组迁移</text>
+  <text x="636" y="97" font-size="9.3" class="s">· 阶跃代价：未破组=搬走的卡；破组=整组 footprint(定值)</text>
+  <text x="636" y="114" font-size="9.3" class="s">· 破组后边际=0 → 已破组 gang 的 pod 增量记 0</text>
+  <g transform="translate(636,124)">
+    <line x1="0" y1="50" x2="170" y2="50" stroke="#c4cbd4"/>
+    <line x1="0" y1="50" x2="0" y2="8" stroke="#c4cbd4"/>
+    <text x="-2" y="4" font-size="7" class="s" text-anchor="end">代价</text>
+    <text x="172" y="58" font-size="7" class="s" text-anchor="end">搬走 pod 数→</text>
+    <polyline points="0,50 42,32 42,14 170,14" fill="none" stroke="#2f9e44" stroke-width="2"/>
+    <line x1="42" y1="8" x2="42" y2="54" stroke="#e03131" stroke-dasharray="3 2"/>
+    <text x="44" y="58" font-size="7" fill="#e03131">slack</text>
+    <text x="120" y="9" font-size="7" class="s">footprint(平台)</text>
+  </g>
+
+  <rect x="622" y="200" width="486" height="46" rx="8" class="card"/>
+  <text x="636" y="216" font-size="10.5" font-weight="700" class="t">关键② 选单元 = 字典序增量代价（①⑦）</text>
+  <text x="636" y="233" font-size="9.1" class="s">① 增量破组受损卡（已破组记0）→ ② moved卡 → ③ moved pods；每提交后动态重选</text>
+
+  <rect x="622" y="254" width="486" height="46" rx="8" class="card"/>
+  <text x="636" y="270" font-size="10.5" font-weight="700" class="t">关键③ task 排序 / 落点（④）</text>
+  <text x="636" y="287" font-size="9.3" class="s">victims 用 <tspan class="t m">FFD</tspan>(大先)；落点 <tspan class="t m">best-fit</tspan>(高载节点先，不点亮空节点)</text>
+
+  <rect x="622" y="308" width="486" height="46" rx="8" class="card"/>
+  <text x="636" y="324" font-size="10.5" font-weight="700" class="t">关键④ 放不下（④否）</text>
+  <text x="636" y="341" font-size="9.3" class="s">原子跳过：克隆余量搜索，失败则 ledger 不动、绝不半搬 → 下一个</text>
+
+  <rect x="622" y="362" width="486" height="46" rx="8" class="card"/>
+  <text x="636" y="378" font-size="10.5" font-weight="700" class="t">关键⑤ 何时停 / 门槛（⑦⑧）· 单 plan</text>
+  <text x="636" y="395" font-size="9.1" class="s">遍历完才停；<tspan class="t m">MinNodesFreed</tspan> 是门槛非停止；单 core→<tspan class="t" font-weight="600">单趟唯一 plan</tspan>，无跨候选择优</text>
+
+  <rect x="622" y="418" width="486" height="352" rx="9" class="card"/>
+  <text x="636" y="437" font-size="12" font-weight="700" class="t">"搭便车"例子：gang G 跨 A/B（B 更便宜 → 先腾）</text>
+  <text x="636" y="455" font-size="9" class="s">B 只 1 个 pod，字典序增量最小 → 先腾 B、破组(付 1 次 footprint)</text>
+  <text x="636" y="470" font-size="9" class="s">G 破组后，A 上 G.pA 增量=0 → A 增量骤降 → 再腾 A（近免费）</text>
+
+  <text x="700" y="494" text-anchor="middle" font-size="9.5" font-weight="700" class="t">整理前</text>
+  <rect x="640" y="502" width="60" height="94" rx="5" class="card"/><text x="670" y="516" text-anchor="middle" font-size="9" class="t">Node B</text>
+  <rect x="646" y="526" width="48" height="26" rx="3" fill="#e8890c"/><text x="670" y="539" text-anchor="middle" font-size="8" fill="#fff">G.pB</text>
+  <text x="670" y="575" text-anchor="middle" font-size="8" class="s">(空余)</text>
+  <text x="670" y="605" text-anchor="middle" font-size="8" fill="#2f9e44" font-weight="700">① 增量最小·先腾</text>
+
+  <rect x="716" y="502" width="60" height="94" rx="5" class="card"/><text x="746" y="516" text-anchor="middle" font-size="9" class="t">Node A</text>
+  <rect x="722" y="526" width="48" height="26" rx="3" fill="#e8890c"/><text x="746" y="539" text-anchor="middle" font-size="8" fill="#fff">G.pA</text>
+  <rect x="722" y="558" width="48" height="24" rx="3" fill="#1c7ed6" opacity="0.7"/><text x="746" y="570" text-anchor="middle" font-size="7.5" fill="#fff">其它</text>
+  <text x="746" y="605" text-anchor="middle" font-size="8" class="s">② G 破组后·近免费</text>
+
+  <rect x="792" y="502" width="60" height="94" rx="5" class="card"/><text x="822" y="516" text-anchor="middle" font-size="9" class="t">Node C</text>
+  <text x="822" y="549" text-anchor="middle" font-size="8" class="s">接收方</text>
+
+  <path d="M860,549 h30" class="ab" marker-end="url(#ab)"/><text x="875" y="540" text-anchor="middle" font-size="8" class="s">整理</text>
+  <text x="960" y="494" text-anchor="middle" font-size="9.5" font-weight="700" class="t">整理后</text>
+  <rect x="900" y="502" width="60" height="94" rx="5" class="card"/><rect x="904" y="506" width="52" height="86" rx="3" fill="#2f9e44" opacity="0.25"/><text x="930" y="545" text-anchor="middle" font-size="9" class="t">B 空 ✓</text>
+  <rect x="972" y="502" width="60" height="94" rx="5" class="card"/><rect x="976" y="506" width="52" height="86" rx="3" fill="#2f9e44" opacity="0.25"/><text x="1002" y="545" text-anchor="middle" font-size="9" class="t">A 空 ✓</text>
+  <rect x="1044" y="502" width="52" height="94" rx="5" class="card"/><text x="1070" y="549" text-anchor="middle" font-size="8" class="s">C 承接</text>
+
+  <line x1="636" y1="618" x2="1094" y2="618" stroke="#e5e7eb"/>
+  <text x="636" y="638" font-size="10.5" font-weight="700" class="t">效果对比（同样只付 1 次破组）</text>
+  <text x="636" y="657" font-size="9.3" class="s">静态贪心：构造时可能只腾 B（评估 A 时"看着要破组"不划算）→ 腾 1 节点</text>
+  <text x="636" y="676" font-size="9.3" class="s"><tspan class="t" font-weight="600">增量贪心（字典序）</tspan>：B 破组后 A 破组卡增量=0 → 顺带腾 A → 腾 <tspan class="t" font-weight="600">2 节点</tspan></text>
+  <text x="636" y="698" font-size="9" class="s">→ 这正是"破组后搬与不搬无差"的利用：同等 gang 损伤下多腾节点</text>
+  <text x="636" y="722" font-size="8.6" class="s">注：G.pA/G.pB 被驱逐后由各自负载控制器重建，repack 提名引导落到 C</text>
+  <text x="636" y="742" font-size="8.6" class="s">若 A 的 victim 放不下(④否) → 原子跳过 A，B 已腾出的保留</text>
+  <text x="636" y="760" font-size="8.6" class="s">每步"选哪个单元"的字典序增量代价 → 见 图3</text>
+</svg>

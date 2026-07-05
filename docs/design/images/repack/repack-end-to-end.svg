@@ -1,0 +1,167 @@
+<svg viewBox="0 0 1170 662" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
+  <title>Repack 端到端使用与模块交互</title>
+  <desc>用户创建 RepackRun 或 RepackPolicy(P1)，经 volcano-admission 校验落库；repack-engine 事件驱动规划：DryRun 出报告、Execute 驱逐并写 nominations；各负载各自的控制器重建替身 pod，repack-controller 打 nominatedNodeName，volcano-scheduler 把替身与排队作业调度进腾出的空位；用户取回结果，repack-controller 按 TTL 回收。</desc>
+  <style>
+    .t{fill:#111827;} .s{fill:#5b6472;}
+    .m{font-family:ui-monospace,Menlo,monospace;}
+    .mod{fill:#eef2f7;stroke:#8a97a8;}
+    .hub{fill:#fff4e6;stroke:#e8890c;}
+    .eng{fill:#e9f7ef;stroke:#2f9e44;}
+    .usr{fill:#ffffff;stroke:#111827;}
+    .clu{fill:#f2f4f7;stroke:#c4cbd4;}
+    .dash{stroke-dasharray:6 4;}
+    .a{stroke:#1c7ed6;fill:none;stroke-width:1.6;}
+    .ag{stroke:#2f9e44;fill:none;stroke-width:1.8;}
+    .ap{stroke:#8a5cd6;fill:none;stroke-width:1.5;stroke-dasharray:6 4;}
+    text{dominant-baseline:middle;}
+  </style>
+  <defs>
+    <marker id="b" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#1c7ed6"/></marker>
+    <marker id="g" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#2f9e44"/></marker>
+    <marker id="p" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#8a5cd6"/></marker>
+  </defs>
+
+  <text x="585" y="20" text-anchor="middle" font-size="16" font-weight="700" class="t">Repack 端到端使用与模块交互</text>
+
+  <!-- User -->
+  <rect x="20" y="266" width="150" height="104" rx="10" class="usr"/>
+  <text x="95" y="288" text-anchor="middle" font-size="13" font-weight="700" class="t">用户 / 运维</text>
+  <text x="95" y="308" text-anchor="middle" font-size="9" class="s">创建 RepackRun</text>
+  <text x="95" y="322" text-anchor="middle" font-size="9" class="s">或 RepackPolicy(P1)</text>
+  <text x="95" y="342" text-anchor="middle" font-size="9" class="s">设规则:DryRun/Execute</text>
+  <text x="95" y="358" text-anchor="middle" font-size="9" font-weight="700" class="t">读 报告 / 结果 ⑦</text>
+
+  <!-- RepackPolicy -->
+  <rect x="206" y="34" width="196" height="56" rx="8" class="mod dash"/>
+  <text x="304" y="52" text-anchor="middle" font-size="11.5" font-weight="700" class="s">RepackPolicy (CRD · P1)</text>
+  <text x="304" y="70" text-anchor="middle" font-size="8.5" class="s">规则:碎片率 / 排队水位 阈值 + 集群护栏</text>
+
+  <!-- admission -->
+  <rect x="206" y="116" width="196" height="78" rx="8" class="mod"/>
+  <text x="304" y="135" text-anchor="middle" font-size="12.5" font-weight="700" class="t">volcano-admission</text>
+  <text x="304" y="154" text-anchor="middle" font-size="9" class="s">CEL + webhook 校验(mode/scope/goals)</text>
+  <text x="304" y="170" text-anchor="middle" font-size="9" class="s">Policy 护栏继承 → RepackRun (P1)</text>
+  <text x="304" y="185" text-anchor="middle" font-size="8.5" class="s">非法直接拒</text>
+
+  <!-- RepackRun hub -->
+  <rect x="206" y="222" width="196" height="150" rx="8" class="hub"/>
+  <text x="304" y="242" text-anchor="middle" font-size="13" font-weight="700" class="t">RepackRun (CRD)</text>
+  <line x1="222" y1="252" x2="386" y2="252" stroke="#e8890c" opacity="0.4"/>
+  <text x="222" y="270" font-size="9" class="s">spec:</text>
+  <text x="240" y="286" font-size="9" class="s m">mode(DryRun/Execute)·scope·goals</text>
+  <text x="222" y="308" font-size="9" class="s">status:</text>
+  <text x="240" y="324" font-size="9" class="s m">phase · report(DryRun)</text>
+  <text x="240" y="338" font-size="9" class="s m">result · nominations(Execute)</text>
+  <text x="304" y="360" text-anchor="middle" font-size="8.5" class="s">共享状态中枢(大家读/写)</text>
+
+  <!-- repack-engine -->
+  <rect x="446" y="210" width="228" height="188" rx="10" class="eng"/>
+  <text x="560" y="230" text-anchor="middle" font-size="13" font-weight="700" class="t">repack-engine（独立）</text>
+  <text x="460" y="252" font-size="9.5" class="s">· 事件驱动 watch RepackRun</text>
+  <text x="460" y="270" font-size="9.5" class="s">· 复用 schedcache + OpenSession</text>
+  <text x="460" y="288" font-size="9.5" class="s">· 门控 K=1 + 冷静期(自串行)</text>
+  <text x="460" y="306" font-size="9.5" class="s">· 规划 Core=drain</text>
+  <line x1="460" y1="318" x2="660" y2="318" stroke="#2f9e44" opacity="0.35"/>
+  <text x="460" y="336" font-size="9.5" class="t"><tspan fill="#1c7ed6" font-weight="700">DryRun</tspan> → 写 status.report</text>
+  <text x="460" y="356" font-size="9.5" class="t"><tspan fill="#2f9e44" font-weight="700">Execute</tspan> → Evict + result</text>
+  <text x="474" y="374" font-size="9.5" class="t">+ status.nominations[]</text>
+
+  <!-- controller-manager (ONLY repack-controller + policy) -->
+  <rect x="712" y="34" width="256" height="204" rx="10" class="usr"/>
+  <text x="840" y="52" text-anchor="middle" font-size="11.5" font-weight="700" class="t">volcano-controller-manager</text>
+  <rect x="726" y="62" width="228" height="46" rx="7" class="mod dash"/>
+  <text x="840" y="78" text-anchor="middle" font-size="10.5" font-weight="700" class="s">RepackPolicy controller (P1)</text>
+  <text x="840" y="95" text-anchor="middle" font-size="8.3" class="s">碎片/排队阈值 → 自动生成 RepackRun</text>
+  <rect x="726" y="118" width="228" height="104" rx="7" class="mod"/>
+  <text x="840" y="137" text-anchor="middle" font-size="12.5" font-weight="700" class="t">repack-controller</text>
+  <text x="738" y="158" font-size="9" class="s">提名 reconciler:</text>
+  <text x="746" y="174" font-size="8.5" class="s">读 status.nominations →</text>
+  <text x="746" y="188" font-size="8.5" class="s">patch 替身 pod nominatedNodeName</text>
+  <text x="738" y="209" font-size="9" class="s">TTL 回收终态 RepackRun</text>
+
+  <!-- workload controllers (SEPARATE, each workload's own) -->
+  <rect x="980" y="34" width="172" height="204" rx="10" class="usr"/>
+  <text x="1066" y="52" text-anchor="middle" font-size="11.5" font-weight="700" class="t">工作负载控制器</text>
+  <text x="1066" y="67" text-anchor="middle" font-size="8.5" class="s">（各负载各自，不属 CM）</text>
+  <rect x="992" y="80" width="148" height="34" rx="6" class="mod"/>
+  <text x="1066" y="92" text-anchor="middle" font-size="9" class="t">kube-controller-manager</text>
+  <text x="1066" y="105" text-anchor="middle" font-size="8" class="s">Deployment/STS/Job</text>
+  <rect x="992" y="122" width="148" height="30" rx="6" class="mod"/>
+  <text x="1066" y="133" text-anchor="middle" font-size="9" class="t">volcano job-controller</text>
+  <text x="1066" y="145" text-anchor="middle" font-size="8" class="s">vcjob</text>
+  <rect x="992" y="160" width="148" height="30" rx="6" class="mod"/>
+  <text x="1066" y="171" text-anchor="middle" font-size="9" class="t">各 operator</text>
+  <text x="1066" y="183" text-anchor="middle" font-size="8" class="s">RayJob / PyTorchJob …</text>
+  <text x="1066" y="210" text-anchor="middle" font-size="9" font-weight="700" class="t">→ 重建被驱逐 pod</text>
+
+  <!-- scheduler -->
+  <rect x="712" y="252" width="440" height="90" rx="10" class="mod"/>
+  <text x="932" y="272" text-anchor="middle" font-size="12.5" font-weight="700" class="t">volcano-scheduler（现网，不改造）</text>
+  <text x="932" y="294" text-anchor="middle" font-size="9.5" class="s">honor nominatedNodeName — 替身 pod 落到目标节点</text>
+  <text x="932" y="312" text-anchor="middle" font-size="9.5" class="s">排队大作业调度进腾出的连续空位（收益兑现）</text>
+  <text x="932" y="330" text-anchor="middle" font-size="8.5" class="s">调度经同一 schedcache，predicate 与引擎一致</text>
+
+  <!-- cluster band -->
+  <rect x="446" y="472" width="706" height="166" rx="10" class="clu"/>
+  <text x="470" y="492" font-size="12" font-weight="700" class="t">集群节点</text>
+  <text x="560" y="510" text-anchor="middle" font-size="9" class="s">整理前:零散占用</text>
+  <g>
+    <rect x="470" y="518" width="40" height="96" rx="4" class="usr"/><rect x="474" y="560" width="32" height="20" fill="#1c7ed6" opacity="0.8"/><rect x="474" y="586" width="32" height="14" fill="#1c7ed6" opacity="0.5"/>
+    <rect x="520" y="518" width="40" height="96" rx="4" class="usr"/><rect x="524" y="566" width="32" height="16" fill="#1c7ed6" opacity="0.8"/><rect x="524" y="588" width="32" height="12" fill="#1c7ed6" opacity="0.5"/>
+    <rect x="570" y="518" width="40" height="96" rx="4" class="usr"/><rect x="574" y="572" width="32" height="14" fill="#1c7ed6" opacity="0.7"/>
+  </g>
+  <path d="M624,566 h40" class="ag" marker-end="url(#g)"/>
+  <text x="644" y="556" text-anchor="middle" font-size="8.5" class="s">整理</text>
+  <text x="770" y="510" text-anchor="middle" font-size="9" class="s">整理后:腾出整空节点</text>
+  <g>
+    <rect x="686" y="518" width="40" height="96" rx="4" class="usr"/><rect x="690" y="522" width="32" height="88" fill="#2f9e44" opacity="0.85"/>
+    <rect x="736" y="518" width="40" height="96" rx="4" class="eng"/>
+    <rect x="786" y="518" width="40" height="96" rx="4" class="eng"/>
+    <text x="806" y="566" text-anchor="middle" font-size="8" class="s">空</text>
+  </g>
+  <rect x="856" y="518" width="150" height="46" rx="6" class="hub"/>
+  <text x="931" y="535" text-anchor="middle" font-size="9.5" font-weight="700" class="t">排队大作业</text>
+  <text x="931" y="551" text-anchor="middle" font-size="8" class="s">gang: 需整机连续空位</text>
+  <path d="M856,556 C820,556 815,600 786,600 L786,616" class="ag" marker-end="url(#g)"/>
+  <text x="900" y="600" text-anchor="middle" font-size="8" class="s">调度落下</text>
+
+  <!-- ===== numbered flow arrows ===== -->
+  <path d="M170,300 C188,300 190,170 204,158" class="a" marker-end="url(#b)"/>
+  <circle cx="182" cy="228" r="9" fill="#1c7ed6"/><text x="182" y="229" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">1</text>
+  <text x="150" y="205" font-size="8.5" class="s">创建/校验</text>
+  <path d="M120,266 C120,120 150,64 204,60" class="ap" marker-end="url(#p)"/>
+  <text x="96" y="140" font-size="8" class="s">P1</text>
+  <path d="M304,194 L304,220" class="a" marker-end="url(#b)"/>
+  <text x="352" y="208" font-size="8" class="s">落库</text>
+  <path d="M726,86 C560,86 470,140 402,250" class="ap" marker-end="url(#p)"/>
+  <text x="556" y="120" text-anchor="middle" font-size="8" class="s">P1 自动生成 RepackRun</text>
+  <path d="M402,290 L444,300" class="a" marker-end="url(#b)"/>
+  <circle cx="424" cy="284" r="9" fill="#1c7ed6"/><text x="424" y="285" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">2</text>
+  <text x="424" y="270" text-anchor="middle" font-size="8" class="s">watch 事件</text>
+  <path d="M444,340 L404,332" class="a" marker-end="url(#b)"/>
+  <circle cx="424" cy="352" r="9" fill="#1c7ed6"/><text x="424" y="353" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">3</text>
+  <text x="426" y="372" text-anchor="middle" font-size="8" class="s">写 status</text>
+  <path d="M540,398 C540,430 520,450 520,470" class="ag" marker-end="url(#g)"/>
+  <text x="498" y="440" text-anchor="middle" font-size="8" class="ag" font-weight="600">Evict victim (Execute)</text>
+  <path d="M1066,238 C1066,380 1000,445 906,470" class="a" marker-end="url(#b)"/>
+  <circle cx="1030" cy="360" r="9" fill="#1c7ed6"/><text x="1030" y="361" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">4</text>
+  <text x="1032" y="378" text-anchor="middle" font-size="8" class="s">重建替身 pod</text>
+  <path d="M840,222 C840,385 800,450 760,470" class="a" marker-end="url(#b)"/>
+  <circle cx="820" cy="360" r="9" fill="#1c7ed6"/><text x="820" y="361" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">5</text>
+  <text x="820" y="378" text-anchor="middle" font-size="8" class="s">patch nominatedNodeName</text>
+  <path d="M726,150 C560,150 470,205 402,320" class="ap" marker-end="url(#p)"/>
+  <text x="470" y="176" text-anchor="middle" font-size="8" class="s">读 status.nominations</text>
+  <path d="M900,342 C900,410 880,450 850,470" class="ag" marker-end="url(#g)"/>
+  <circle cx="884" cy="410" r="9" fill="#2f9e44"/><text x="884" y="411" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">6</text>
+  <text x="884" y="428" text-anchor="middle" font-size="8" class="s">调度落位</text>
+  <path d="M206,352 C120,352 100,360 172,352" class="a" marker-end="url(#b)"/>
+  <circle cx="192" cy="352" r="9" fill="#1c7ed6"/><text x="192" y="353" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">7</text>
+
+  <!-- legend -->
+  <g font-size="9">
+    <line x1="470" y1="652" x2="492" y2="652" class="a" marker-end="url(#b)"/><text x="498" y="652" class="s">通用 / DryRun</text>
+    <line x1="600" y1="652" x2="622" y2="652" class="ag" marker-end="url(#g)"/><text x="628" y="652" class="s">Execute 专属</text>
+    <line x1="720" y1="652" x2="742" y2="652" class="ap" marker-end="url(#p)"/><text x="748" y="652" class="s">P1(RepackPolicy 自动)</text>
+    <circle cx="880" cy="652" r="8" fill="#1c7ed6"/><text x="880" y="653" text-anchor="middle" font-size="9" font-weight="700" fill="#fff">n</text><text x="894" y="652" class="s">端到端步骤 ①–⑦</text>
+  </g>
+</svg>

@@ -1,0 +1,92 @@
+<svg viewBox="0 0 900 480" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif" role="img">
+<title>Gang 语义受损卡数：没破 minAvailable=可控，一破=整作业受损（阶跃函数）</title>
+<desc>一个 5 pod×8 卡(footprint 40)、minAvailable=3 的 gang：slack=2。搬走 1~2 个盈余 pod 只损 8/16 卡(可控)；动到第 3 个就破 minAvailable，整作业 40 卡全损；再往后边际损失为 0。右图为受损卡数随搬走 pod 数的阶跃曲线。</desc>
+<rect width="900" height="480" fill="#ffffff"/>
+
+<text x="30" y="34" font-size="18" font-weight="700" fill="#1f2328">受损卡数按 Gang 语义计：没破 minAvailable = 可控，一破 = 整作业受损</text>
+<text x="30" y="56" font-size="13" fill="#57606a">示例 gang：5 个 pod ×8 卡 = footprint 40；minAvailable = 3 ⇒ 可搬盈余 slack = Running − minAvailable = 2</text>
+
+<!-- ===== 左：gang 结构 + minAvailable 红线 ===== -->
+<text x="30" y="92" font-size="15" font-weight="700" fill="#1f2328">① 这个 gang 能安全搬几个 pod</text>
+
+<!-- pods stacked: bottom 3 = minAvailable(blue), top 2 = surplus(green) -->
+<!-- each cell 220 wide, 40 high, gap 8 -->
+<!-- y top->bottom: pod5(surplus), pod4(surplus), pod3, pod2, pod1 -->
+<g font-size="12">
+  <rect x="60" y="112" width="230" height="38" rx="5" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="175" y="136" text-anchor="middle" fill="#166534" font-weight="600">盈余 pod ·8卡 — 搬它安全</text>
+  <rect x="60" y="158" width="230" height="38" rx="5" fill="#dcfce7" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="175" y="182" text-anchor="middle" fill="#166534" font-weight="600">盈余 pod ·8卡 — 搬它安全</text>
+
+  <!-- minAvailable red line -->
+  <line x1="48" y1="202" x2="312" y2="202" stroke="#ef4444" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="316" y="206" font-size="11.5" fill="#ef4444" font-weight="700">minAvailable 红线 (=3)</text>
+
+  <rect x="60" y="208" width="230" height="38" rx="5" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="175" y="232" text-anchor="middle" fill="#1e40af" font-weight="600">必须留 ·8卡 — 动它即破红线</text>
+  <rect x="60" y="254" width="230" height="38" rx="5" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="175" y="278" text-anchor="middle" fill="#1e40af" font-weight="600">必须留 ·8卡</text>
+  <rect x="60" y="300" width="230" height="38" rx="5" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="175" y="324" text-anchor="middle" fill="#1e40af" font-weight="600">必须留 ·8卡</text>
+</g>
+
+<text x="60" y="366" font-size="12.5" fill="#166534">绿色 2 个 = 可搬盈余：搬走只损搬走的卡（8 / 16）。</text>
+<text x="60" y="386" font-size="12.5" fill="#b91c1c">一旦碰到蓝色（破 minAvailable）→ gang 失活 → 整 40 卡全损。</text>
+<text x="60" y="406" font-size="12.5" fill="#57606a">已破之后再搬同一 gang 的 pod：边际损失 0（要破就搬透）。</text>
+
+<!-- ===== 右：阶跃曲线 ===== -->
+<text x="500" y="92" font-size="15" font-weight="700" fill="#1f2328">② 受损卡数 = 阶跃函数（不是线性）</text>
+
+<!-- axes -->
+<line x1="540" y1="120" x2="540" y2="400" stroke="#9aa5b1" stroke-width="1.5"/>
+<line x1="540" y1="400" x2="860" y2="400" stroke="#9aa5b1" stroke-width="1.5"/>
+<text x="512" y="128" font-size="11" fill="#57606a" text-anchor="end">受损卡数</text>
+<text x="858" y="420" font-size="11" fill="#57606a" text-anchor="end">搬走 pod 数 →</text>
+
+<!-- safe region (x 0..2) green tint, breach region (x>2) red tint -->
+<rect x="540" y="120" width="120" height="280" fill="#22c55e" opacity="0.06"/>
+<rect x="660" y="120" width="200" height="280" fill="#ef4444" opacity="0.06"/>
+<line x1="660" y1="120" x2="660" y2="400" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="660" y="138" font-size="11" fill="#ef4444" text-anchor="middle" font-weight="700">slack=2 边界</text>
+
+<!-- x ticks: 0..5 at 540,600,660,720,780,840 -->
+<g font-size="11" fill="#57606a" text-anchor="middle">
+  <text x="540" y="416">0</text>
+  <text x="600" y="416">1</text>
+  <text x="660" y="416">2</text>
+  <text x="720" y="416">3</text>
+  <text x="780" y="416">4</text>
+  <text x="840" y="416">5</text>
+</g>
+<!-- y ticks: 8(326),16(272),40(110) -->
+<g font-size="10.5" fill="#57606a" text-anchor="end">
+  <line x1="536" y1="326" x2="540" y2="326" stroke="#9aa5b1"/>
+  <text x="533" y="330">8</text>
+  <line x1="536" y1="272" x2="540" y2="272" stroke="#9aa5b1"/>
+  <text x="533" y="276">16</text>
+  <line x1="536" y1="110" x2="540" y2="110" stroke="#9aa5b1"/>
+  <text x="533" y="114">40</text>
+</g>
+
+<!-- the step curve: (0,0)(1,8)(2,16) linear, jump to (3,40), flat (4,40)(5,40) -->
+<polyline points="540,400 600,326 660,272" fill="none" stroke="#16a34a" stroke-width="3"/>
+<!-- the jump -->
+<polyline points="660,272 720,110" fill="none" stroke="#dc2626" stroke-width="3"/>
+<!-- flat tail -->
+<polyline points="720,110 780,110 840,110" fill="none" stroke="#9aa5b1" stroke-width="3" stroke-dasharray="2 0"/>
+
+<!-- markers -->
+<circle cx="600" cy="326" r="4" fill="#16a34a"/>
+<circle cx="660" cy="272" r="4" fill="#16a34a"/>
+<circle cx="720" cy="110" r="5" fill="#dc2626"/>
+<circle cx="780" cy="110" r="4" fill="#9aa5b1"/>
+<circle cx="840" cy="110" r="4" fill="#9aa5b1"/>
+
+<text x="612" y="300" font-size="11.5" fill="#166534">只损搬走的卡</text>
+<text x="724" y="104" font-size="11.5" fill="#dc2626" font-weight="700">破 minAvailable → 整 40 卡全损</text>
+<text x="746" y="128" font-size="11" fill="#57606a">再搬：边际 +0</text>
+
+<!-- ===== 底部对比条：8卡 vs 1024卡 ===== -->
+<rect x="30" y="430" width="840" height="38" rx="6" fill="#f6f8fa" stroke="#d8dee4"/>
+<text x="48" y="454" font-size="12.5" fill="#1f2328">为什么重要：同样"破一个 gang"，<tspan font-weight="700" fill="#3b82f6">8 卡作业损 8</tspan> vs <tspan font-weight="700" fill="#dc2626">1024 卡作业损 1024</tspan>——damagedGPU 据此自动躲开大作业、优先只动盈余 pod。</text>
+</svg>

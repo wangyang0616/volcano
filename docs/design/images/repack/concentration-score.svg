@@ -1,0 +1,54 @@
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif" role="img">
+<title>集中度分数讲解：同样的负载，越扎堆分数越高、空节点越多</title>
+<desc>整理前 4 个节点用量 6/4/4/2，集中度分数(平方和)=72，空节点 0；整理后并成 8/8/0/0，分数=128，空节点 2。同样总量，扎堆得分翻倍。</desc>
+<rect width="860" height="430" fill="#ffffff"/>
+
+<!-- 左：整理前 -->
+<text x="30" y="30" font-size="15" font-weight="700" fill="#1f2328">整理前：4 个节点都半满</text>
+
+<g>
+  <rect x="40" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="40" y="96" width="44" height="120" rx="4" fill="#6366f1"/>
+  <text x="62" y="234" text-anchor="middle" font-size="12" fill="#57606a">6/8</text>
+  <rect x="104" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="104" y="136" width="44" height="80" rx="4" fill="#6366f1"/>
+  <text x="126" y="234" text-anchor="middle" font-size="12" fill="#57606a">4/8</text>
+  <rect x="168" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="168" y="136" width="44" height="80" rx="4" fill="#6366f1"/>
+  <text x="190" y="234" text-anchor="middle" font-size="12" fill="#57606a">4/8</text>
+  <rect x="232" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="232" y="176" width="44" height="40" rx="4" fill="#6366f1"/>
+  <text x="254" y="234" text-anchor="middle" font-size="12" fill="#57606a">2/8</text>
+</g>
+<text x="40" y="276" font-size="13" fill="#1f2328">集中度分数 = 6²+4²+4²+2² = <tspan font-weight="700">72</tspan></text>
+<text x="40" y="298" font-size="13" fill="#1f2328">空节点：<tspan font-weight="700">0</tspan></text>
+
+<!-- 箭头 -->
+<text x="430" y="150" text-anchor="middle" font-size="30" fill="#57606a">→</text>
+<text x="430" y="176" text-anchor="middle" font-size="12" fill="#57606a">往更满的</text>
+<text x="430" y="192" text-anchor="middle" font-size="12" fill="#57606a">节点并</text>
+
+<!-- 右：整理后 -->
+<text x="500" y="30" font-size="15" font-weight="700" fill="#1f2328">整理后：并成 2 满 + 2 空</text>
+<g>
+  <rect x="510" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="510" y="56" width="44" height="160" rx="4" fill="#6366f1"/>
+  <text x="532" y="234" text-anchor="middle" font-size="12" fill="#57606a">8/8</text>
+  <rect x="574" y="56" width="44" height="160" rx="4" fill="none" stroke="#d8dee4"/>
+  <rect x="574" y="56" width="44" height="160" rx="4" fill="#6366f1"/>
+  <text x="596" y="234" text-anchor="middle" font-size="12" fill="#57606a">8/8</text>
+  <rect x="638" y="56" width="44" height="160" rx="4" fill="none" stroke="#22c55e" stroke-width="2"/>
+  <text x="660" y="142" text-anchor="middle" font-size="12" font-weight="700" fill="#22c55e">空</text>
+  <text x="660" y="234" text-anchor="middle" font-size="12" fill="#57606a">0/8</text>
+  <rect x="702" y="56" width="44" height="160" rx="4" fill="none" stroke="#22c55e" stroke-width="2"/>
+  <text x="724" y="142" text-anchor="middle" font-size="12" font-weight="700" fill="#22c55e">空</text>
+  <text x="724" y="234" text-anchor="middle" font-size="12" fill="#57606a">0/8</text>
+</g>
+<text x="510" y="276" font-size="13" fill="#1f2328">集中度分数 = 8²+8²+0²+0² = <tspan font-weight="700" fill="#22c55e">128 ↑</tspan></text>
+<text x="510" y="298" font-size="13" fill="#1f2328">空节点：<tspan font-weight="700" fill="#22c55e">2</tspan></text>
+
+<!-- 底部一句话 -->
+<rect x="40" y="330" width="780" height="72" rx="8" fill="none" stroke="#d0d7de"/>
+<text x="56" y="358" font-size="14" font-weight="700" fill="#1f2328">同样 16 张卡，没增没减 —— 只是"扎堆"了，分数 72→128，凭空多出 2 个空节点。</text>
+<text x="56" y="384" font-size="13" fill="#57606a">关键：平方让扎堆更值钱 —— (8,0) 得 64，(4,4) 只得 32。所以"把分数做大" = "逼负载往一起凑、腾空节点"。</text>
+</svg>

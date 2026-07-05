@@ -1,0 +1,148 @@
+<svg viewBox="0 0 1020 476" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
+  <title>volcano-repack-engine 架构（Volcano 风格）与扩展点</title>
+  <desc>四列：apiserver 的 RepackRun 与集群对象 → 复用的 schedcache → 引擎 Session（OpenSession→repack action(Core=drain)→CloseSession）→ 右侧 movecost/node/gang 插件注册的扩展点函数；底部收纳四个 Session 回调、三个接缝、三类组件注册表。</desc>
+  <style>
+    .t{fill:#111827;} .s{fill:#667085;}
+    .m{font-family:ui-monospace,Menlo,monospace;}
+    .grn{fill:#2f9e44;} .amb{fill:#e8890c;} .blu{fill:#1c7ed6;}
+    .card{fill:#ffffff;stroke:#c4cbd4;}
+    .cache{fill:#f2f4f7;stroke:#c4cbd4;}
+    .foot{fill:#f8fafc;stroke:#dce1e8;}
+    .dash{stroke-dasharray:5 4;}
+    .aw{stroke:#1c7ed6;fill:none;stroke-width:1.5;}
+    .lbl{fill:#1c7ed6;font-weight:600;}
+    .pill{fill:#eaf6ee;stroke:#2f9e44;}
+    text{dominant-baseline:middle;}
+  </style>
+  <defs><marker id="ah" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#1c7ed6"/></marker></defs>
+
+  <!-- ================= COLUMN 1: apiserver ================= -->
+  <rect x="14" y="30" width="168" height="330" rx="8" class="card"/>
+  <text x="98" y="50" text-anchor="middle" font-size="13" font-weight="700" class="t">kube-apiserver</text>
+
+  <rect x="30" y="66" width="136" height="48" rx="6" class="grn"/>
+  <text x="98" y="84" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">RepackRun (CRD)</text>
+  <text x="98" y="101" text-anchor="middle" font-size="8.5" fill="#e9f7ef">CEL 准入 · 触发源</text>
+
+  <text x="98" y="150" text-anchor="middle" font-size="9.5" class="s">集群状态（引擎只读）</text>
+  <rect x="30" y="164" width="136" height="34" rx="6" class="card"/>
+  <text x="98" y="181" text-anchor="middle" font-size="11" class="t">Node × N</text>
+  <rect x="40" y="228" width="116" height="30" rx="6" class="grn"/>
+  <text x="98" y="243" text-anchor="middle" font-size="10.5" fill="#fff">PodGroup</text>
+  <rect x="54" y="290" width="88" height="28" rx="5" class="blu"/>
+  <text x="98" y="304" text-anchor="middle" font-size="10" fill="#fff">Pod × N</text>
+  <path d="M98,290 L98,260" class="aw" marker-end="url(#ah)"/>
+
+  <!-- big arrow to cache -->
+  <path d="M184,192 l20,-11 v5.5 h13 v11 h-13 v5.5 z" fill="#ced4da"/>
+
+  <!-- ================= COLUMN 2: Cache ================= -->
+  <rect x="208" y="30" width="176" height="330" rx="8" class="cache"/>
+  <text x="296" y="48" text-anchor="middle" font-size="13" font-weight="700" class="t">Cache</text>
+  <text x="296" y="62" text-anchor="middle" font-size="8.5" class="s">复用 volcano-scheduler schedcache</text>
+
+  <rect x="228" y="80" width="136" height="34" rx="6" class="amb"/>
+  <text x="296" y="97" text-anchor="middle" font-size="11.5" font-weight="700" fill="#fff">NodeInfo</text>
+
+  <rect x="228" y="150" width="136" height="32" rx="6" class="amb"/>
+  <text x="296" y="166" text-anchor="middle" font-size="10.5" font-weight="700" fill="#fff">JobInfo (PodGroup)</text>
+  <rect x="244" y="210" width="104" height="26" rx="5" class="blu"/>
+  <text x="296" y="223" text-anchor="middle" font-size="10" fill="#fff">Pod</text>
+  <path d="M296,210 L296,184" class="aw" marker-end="url(#ah)"/>
+
+  <rect x="228" y="278" width="136" height="42" rx="6" class="grn"/>
+  <text x="296" y="293" text-anchor="middle" font-size="10.5" font-weight="700" fill="#fff">RepackRun informer</text>
+  <text x="296" y="308" text-anchor="middle" font-size="8" fill="#e9f7ef">事件 → 引擎 workqueue</text>
+
+  <!-- ================= COLUMN 3: Session ================= -->
+  <rect x="400" y="30" width="300" height="330" rx="10" class="card dash"/>
+  <text x="550" y="48" text-anchor="middle" font-size="12" font-weight="700" class="t">framework.Session（事件驱动 · 单 worker）</text>
+
+  <rect x="440" y="62" width="220" height="34" rx="6" class="amb"/>
+  <text x="550" y="79" text-anchor="middle" font-size="12.5" font-weight="700" fill="#fff">OpenSession</text>
+
+  <rect x="440" y="110" width="220" height="74" rx="7" class="grn"/>
+  <text x="550" y="127" text-anchor="middle" font-size="12.5" font-weight="700" fill="#fff">repack （action, P0）</text>
+  <text x="550" y="145" text-anchor="middle" font-size="9.5" fill="#e9f7ef">Core = drain（单选）</text>
+  <text x="550" y="161" text-anchor="middle" font-size="9.5" class="m" fill="#fff">Domain→Movable→Feasible→Score</text>
+  <text x="550" y="175" text-anchor="middle" font-size="8.5" fill="#e9f7ef">Execute: Commit = Evict + Nominate</text>
+
+  <rect x="440" y="196" width="106" height="24" rx="6" class="grn dash" opacity="0.6"/>
+  <text x="493" y="208" text-anchor="middle" font-size="9.5" fill="#fff">relief (P1)</text>
+  <rect x="554" y="196" width="106" height="24" rx="6" class="grn dash" opacity="0.6"/>
+  <text x="607" y="208" text-anchor="middle" font-size="9.5" fill="#fff">simulate (P1)</text>
+
+  <rect x="440" y="234" width="220" height="46" rx="7" class="card"/>
+  <text x="550" y="250" text-anchor="middle" font-size="9" class="s">写 status.report / result / nominations / phase</text>
+  <text x="550" y="266" text-anchor="middle" font-size="9" class="s">无 Bind · 无预留 · 空间交还排队队列</text>
+
+  <rect x="440" y="294" width="220" height="34" rx="6" class="amb"/>
+  <text x="550" y="311" text-anchor="middle" font-size="12.5" font-weight="700" fill="#fff">CloseSession</text>
+
+  <path d="M550,96 L550,108" class="aw" marker-end="url(#ah)"/>
+  <path d="M550,280 L550,292" class="aw" marker-end="url(#ah)"/>
+
+  <!-- cache <-> session -->
+  <path d="M364,79 L438,79" class="aw" marker-end="url(#ah)"/>
+  <text x="401" y="71" text-anchor="middle" font-size="8" class="lbl">JobInfos/NodeInfos</text>
+  <path d="M438,150 L366,150" class="aw" marker-end="url(#ah)"/>
+  <text x="401" y="142" text-anchor="middle" font-size="8" class="lbl">ssn.Evict (Execute)</text>
+  <path d="M320,299 C360,299 372,120 438,88" class="aw" marker-end="url(#ah)"/>
+  <text x="388" y="330" text-anchor="middle" font-size="8" class="s">事件触发</text>
+
+  <!-- ================= COLUMN 4: Plugins ================= -->
+  <text x="861" y="48" text-anchor="middle" font-size="12.5" font-weight="700" class="t">Plugin（能力，可组合）— 注册扩展点函数</text>
+
+  <!-- movecost -->
+  <rect x="714" y="60" width="294" height="72" rx="7" class="card"/>
+  <text x="726" y="78" font-size="12" font-weight="700" class="t m">movecost</text>
+  <text x="900" y="78" text-anchor="end" font-size="9" class="s m">DisruptionScoreFn ×3</text>
+  <rect x="724" y="94" width="88" height="26" rx="5" class="pill"/><text x="768" y="107" text-anchor="middle" font-size="8.5" class="t m">affectedPG</text>
+  <rect x="818" y="94" width="88" height="26" rx="5" class="pill"/><text x="862" y="107" text-anchor="middle" font-size="8.5" class="t m">movedGPU</text>
+  <rect x="912" y="94" width="88" height="26" rx="5" class="pill"/><text x="956" y="107" text-anchor="middle" font-size="8.5" class="t m">movedPods</text>
+
+  <!-- node -->
+  <rect x="714" y="142" width="294" height="52" rx="7" class="card"/>
+  <text x="726" y="160" font-size="12" font-weight="700" class="t m">node</text>
+  <text x="1000" y="160" text-anchor="end" font-size="9" class="s m">DomainFn</text>
+  <rect x="724" y="170" width="276" height="16" rx="4" class="pill"/><text x="732" y="178" font-size="8.5" class="t m">节点级可释放单元（一节点=一单元, weight 1）</text>
+
+  <!-- gang -->
+  <rect x="714" y="204" width="294" height="64" rx="7" class="card"/>
+  <text x="726" y="222" font-size="12" font-weight="700" class="t m">gang</text>
+  <text x="1000" y="222" text-anchor="end" font-size="9" class="s m">DisruptionScoreFn ×2</text>
+  <rect x="724" y="234" width="135" height="24" rx="5" class="pill"/><text x="791" y="246" text-anchor="middle" font-size="8.5" class="t m">gangBreaches</text>
+  <rect x="865" y="234" width="135" height="24" rx="5" class="pill"/><text x="932" y="246" text-anchor="middle" font-size="8.5" class="t m">damagedGPU</text>
+
+  <!-- future -->
+  <rect x="714" y="278" width="294" height="42" rx="7" class="card dash"/>
+  <text x="726" y="294" font-size="11" font-weight="700" class="s m">未来: hypernode / pdb / priority (P1)</text>
+  <text x="726" y="310" font-size="8.5" class="s m">DomainFn · MovableFn · DisruptionScoreFn</text>
+
+  <!-- plugins -> OpenSession bus -->
+  <path d="M714,96 L706,96" class="aw"/><path d="M714,168 L706,168" class="aw"/><path d="M714,236 L706,236" class="aw"/>
+  <path d="M706,96 L706,236" class="aw"/>
+  <path d="M706,90 L662,80" class="aw" marker-end="url(#ah)"/>
+  <text x="686" y="66" text-anchor="middle" font-size="8" class="s">OnSessionOpen</text>
+
+  <!-- ================= FOOTER ================= -->
+  <rect x="14" y="376" width="324" height="86" rx="8" class="foot"/>
+  <text x="26" y="393" font-size="11" font-weight="700" class="t">4 个 Session 回调扩展点</text>
+  <text x="26" y="410" font-size="8.8" class="s"><tspan class="t m">PredicateFn</tspan> 节点可落 · AND　（Filter）</text>
+  <text x="26" y="424" font-size="8.8" class="s"><tspan class="t m">MovableFn</tspan> 任务可动 · AND</text>
+  <text x="26" y="438" font-size="8.8" class="s"><tspan class="t m">DomainFn</tspan> 可释放单元 · Union</text>
+  <text x="26" y="452" font-size="8.8" class="s"><tspan class="t m">DisruptionScoreFn</tspan> 扰动打分 · 加权归一（Score）</text>
+
+  <rect x="348" y="376" width="300" height="86" rx="8" class="foot"/>
+  <text x="360" y="393" font-size="11" font-weight="700" class="t">3 个基础设施接缝（session 适配）</text>
+  <text x="360" y="411" font-size="8.8" class="s"><tspan class="t m">Snapshot</tspan> 集群视图（ClusterSnapshot）</text>
+  <text x="360" y="426" font-size="8.8" class="s"><tspan class="t m">CommitHooks</tspan> Evict/Nominate（Bind）</text>
+  <text x="360" y="441" font-size="8.8" class="s"><tspan class="t m">GangInfo</tspan> scope 的 gang 源</text>
+  <text x="360" y="455" font-size="8" class="s">PredicateFn 在 P0 由复用的 scheduler predicates 提供</text>
+
+  <rect x="658" y="376" width="350" height="86" rx="8" class="foot"/>
+  <text x="670" y="393" font-size="11" font-weight="700" class="t">3 类可插拔组件（注册表）</text>
+  <text x="670" y="412" font-size="9" class="s"><tspan class="t" font-weight="700">Plugin</tspan> 能力，多个可组合 · RegisterPlugin</text>
+  <text x="670" y="429" font-size="9" class="s"><tspan class="t" font-weight="700">Action</tspan> 有序流水线，repack · RegisterAction</text>
+  <text x="670" y="446" font-size="9" class="s"><tspan class="t" font-weight="700">Core</tspan> 核心搜索，<tspan fill="#2f9e44" font-weight="700">单选</tspan> drain · RegisterCore</text>
+</svg>

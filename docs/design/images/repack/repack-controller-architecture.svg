@@ -1,0 +1,129 @@
+<svg viewBox="0 0 1040 560" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
+  <title>volcano repack-controller 架构与职责</title>
+  <desc>三列：左=apiserver 上的 RepackRun / RepackPolicy(P1) / 替身 Pod；中=repack-controller 的三个 reconciler（RunGC·TTL、提名 reconciler、RepackPolicy 生成 P1）+ pkg/state 纯函数；右=协作与产出（vc-repack-engine 写 nominations、patch pod.nominatedNodeName、scheduler honor、DELETE/CREATE Run）。底部收纳边界、部署、配置。控制器不做准入(CEL)、不做规划/驱逐(引擎)。</desc>
+  <style>
+    .t{fill:#111827;} .s{fill:#667085;}
+    .m{font-family:ui-monospace,Menlo,monospace;}
+    .grn{fill:#2f9e44;} .amb{fill:#e8890c;} .blu{fill:#1c7ed6;}
+    .card{fill:#ffffff;stroke:#c4cbd4;}
+    .cache{fill:#f2f4f7;stroke:#c4cbd4;}
+    .ctrl{fill:#eef4ff;stroke:#1c7ed6;}
+    .foot{fill:#f8fafc;stroke:#dce1e8;}
+    .dash{stroke-dasharray:5 4;}
+    .aw{stroke:#1c7ed6;fill:none;stroke-width:1.5;}
+    .ag{stroke:#2f9e44;fill:none;stroke-width:1.5;}
+    .lbl{fill:#1c7ed6;font-weight:600;}
+    text{dominant-baseline:middle;}
+  </style>
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#1c7ed6"/></marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#2f9e44"/></marker>
+  </defs>
+
+  <text x="16" y="24" font-size="15" font-weight="700" class="t">volcano repack-controller · 架构与职责</text>
+  <text x="330" y="25" font-size="10.5" class="s">（GC/提名/生成 —— 不做准入 CEL、不做规划/驱逐 引擎）</text>
+
+  <!-- ================= COLUMN 1: apiserver ================= -->
+  <rect x="14" y="42" width="206" height="404" rx="8" class="card"/>
+  <text x="117" y="62" text-anchor="middle" font-size="12.5" font-weight="700" class="t">kube-apiserver · 集群对象</text>
+
+  <rect x="30" y="78" width="174" height="52" rx="6" class="grn"/>
+  <text x="117" y="96" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">RepackRun (CRD)</text>
+  <text x="117" y="114" text-anchor="middle" font-size="8.5" fill="#e9f7ef">spec 只读 · status 权威</text>
+  <rect x="46" y="140" width="142" height="30" rx="5" class="cache"/>
+  <text x="117" y="151" text-anchor="middle" font-size="9.5" class="t m">status.nominations[]</text>
+  <text x="117" y="163" text-anchor="middle" font-size="8" class="s">引擎写 · 控制器读</text>
+
+  <rect x="30" y="184" width="174" height="46" rx="6" class="amb"/>
+  <text x="117" y="201" text-anchor="middle" font-size="11.5" font-weight="700" fill="#fff">RepackPolicy (P1)</text>
+  <text x="117" y="218" text-anchor="middle" font-size="8.5" fill="#fdf1e3">trigger · runTemplate</text>
+
+  <rect x="30" y="246" width="174" height="48" rx="6" class="blu"/>
+  <text x="117" y="264" text-anchor="middle" font-size="11.5" font-weight="700" fill="#fff">Pod（替身 / 待绑定）</text>
+  <text x="117" y="281" text-anchor="middle" font-size="8.5" fill="#e7f0ff">驱逐后重建、pending</text>
+
+  <rect x="30" y="312" width="174" height="120" rx="6" class="foot"/>
+  <text x="117" y="330" text-anchor="middle" font-size="10" font-weight="700" class="s">控制器不做的事</text>
+  <text x="42" y="352" font-size="9" class="s">· 准入全在 apiserver CEL</text>
+  <text x="42" y="370" font-size="9" class="s">  （无控制器 admission）</text>
+  <text x="42" y="390" font-size="9" class="s">· 规划 / 驱逐在 vc-repack-engine</text>
+  <text x="42" y="410" font-size="9" class="s">· 不写 spec（CEL 冻结）</text>
+
+  <!-- arrow col1 -> col2 -->
+  <path d="M220,104 L246,104" class="aw" marker-end="url(#ah)"/>
+  <text x="233" y="94" text-anchor="middle" font-size="8" class="lbl">watch</text>
+
+  <!-- ================= COLUMN 2: repack-controller ================= -->
+  <rect x="246" y="42" width="470" height="404" rx="8" class="ctrl"/>
+  <rect x="246" y="42" width="470" height="52" rx="8" class="blu"/>
+  <text x="481" y="62" text-anchor="middle" font-size="13.5" font-weight="700" fill="#fff">volcano repack-controller</text>
+  <text x="481" y="80" text-anchor="middle" font-size="9" fill="#e7f0ff">跑在 volcano-controller-manager（framework shim），或独立 vc-repack-controller</text>
+
+  <rect x="262" y="104" width="438" height="30" rx="6" class="card"/>
+  <text x="481" y="119" text-anchor="middle" font-size="9.5" class="t"><tspan class="m">informer</tspan>: RepackRun · Pod · RepackPolicy(P1)  →  workqueue（<tspan class="m">--workers</tspan>）</text>
+
+  <!-- reconciler 1 -->
+  <rect x="262" y="144" width="438" height="56" rx="6" class="card"/>
+  <text x="278" y="163" font-size="11.5" font-weight="700" class="t">① RunGC / TTL</text>
+  <text x="278" y="182" font-size="9.5" class="s">终态 Run 到 <tspan class="m">ttlSecondsAfterFinished</tspan> → <tspan class="t" font-weight="600">DELETE</tspan>；未到 → <tspan class="m">AddAfter(剩余)</tspan> 重排</text>
+
+  <!-- reconciler 2 -->
+  <rect x="262" y="210" width="438" height="80" rx="6" class="card"/>
+  <text x="278" y="229" font-size="11.5" font-weight="700" class="t">② 提名 reconciler（Nominator）</text>
+  <text x="278" y="249" font-size="9.5" class="s">watch 替身 pending pod → 按 <tspan class="t" font-weight="600">PodName 精确</tspan>（确定性命名）/ <tspan class="t" font-weight="600">gang+role</tspan> 兜底</text>
+  <text x="278" y="266" font-size="9.5" class="s">匹配 <tspan class="m">status.nominations[]</tspan> 一条意图，重申至绑定 / ExpireAt →</text>
+  <text x="278" y="283" font-size="9.5" class="blu" font-weight="600">patch pod.status.nominatedNodeName = node</text>
+
+  <!-- reconciler 3 -->
+  <rect x="262" y="300" width="438" height="56" rx="6" class="card"/>
+  <text x="278" y="319" font-size="11.5" font-weight="700" class="amb">③ RepackPolicy 控制器（P1）</text>
+  <text x="278" y="338" font-size="9.5" class="s">评估 trigger（周期=启动 flag）→ 用 <tspan class="m">runTemplate</tspan> <tspan class="t" font-weight="600">CREATE Run</tspan>（ownerRef→Policy）→ history GC</text>
+
+  <!-- state pkg -->
+  <rect x="262" y="366" width="438" height="66" rx="6" class="foot"/>
+  <text x="278" y="384" font-size="10.5" font-weight="700" class="t m">pkg/state（纯函数）</text>
+  <text x="278" y="403" font-size="9" class="s">DerivePhase(conditions→phase) · TTLExpired · SetCondition · IsTerminal</text>
+  <text x="278" y="420" font-size="9" class="s">条件/原因常量（Queued / Progressing / Complete / Failed / Cancelled；无 Admitted）</text>
+
+  <!-- ================= COLUMN 3: 协作与产出 ================= -->
+  <rect x="742" y="42" width="284" height="404" rx="8" class="card"/>
+  <text x="884" y="62" text-anchor="middle" font-size="12.5" font-weight="700" class="t">协作与产出</text>
+
+  <rect x="758" y="78" width="252" height="58" rx="6" class="card dash" stroke="#2f9e44"/>
+  <text x="884" y="97" text-anchor="middle" font-size="11" font-weight="700" class="grn">vc-repack-engine（独立进程）</text>
+  <text x="884" y="114" text-anchor="middle" font-size="8.5" class="s">读 spec → 规划/驱逐 →</text>
+  <text x="884" y="127" text-anchor="middle" font-size="8.5" class="s">写 <tspan class="m">status.nominations[]</tspan></text>
+
+  <rect x="758" y="176" width="252" height="52" rx="6" class="blu"/>
+  <text x="884" y="194" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff" class="m">pod.status.nominatedNodeName</text>
+  <text x="884" y="212" text-anchor="middle" font-size="8.5" fill="#e7f0ff">被 ② patch（软引导，非预留）</text>
+
+  <rect x="758" y="248" width="252" height="52" rx="6" class="card"/>
+  <text x="884" y="266" text-anchor="middle" font-size="11" font-weight="700" class="t">volcano-scheduler</text>
+  <text x="884" y="284" text-anchor="middle" font-size="8.5" class="s">honor 提名 → 尽量落到目标节点</text>
+
+  <rect x="758" y="312" width="252" height="52" rx="6" class="foot"/>
+  <text x="884" y="330" text-anchor="middle" font-size="10" font-weight="700" class="s">对 RepackRun 的写</text>
+  <text x="884" y="348" text-anchor="middle" font-size="8.7" class="s">① DELETE 终态 Run（TTL） · ③ CREATE 派生 Run（P1）</text>
+
+  <!-- arrows within col3 / cross -->
+  <path d="M884,136 C884,150 884,158 884,176" class="ag" marker-end="url(#ag)"/>
+  <path d="M884,228 L884,248" class="aw" marker-end="url(#ah)"/>
+
+  <!-- engine writes nominations back to RepackRun (col3 -> col1) -->
+  <path d="M758,100 C560,150 300,150 205,150" class="ag dash" marker-end="url(#ag)"/>
+  <text x="470" y="140" text-anchor="middle" font-size="8" class="grn">引擎写 status.nominations</text>
+
+  <!-- controller ② patches pod (col2 -> col3) -->
+  <path d="M700,270 C724,240 730,210 758,202" class="aw" marker-end="url(#ah)"/>
+  <text x="726" y="228" text-anchor="middle" font-size="8" class="lbl">patch</text>
+
+  <!-- ================= FOOTER ================= -->
+  <rect x="14" y="462" width="1012" height="88" rx="8" class="foot"/>
+  <text x="28" y="482" font-size="10.5" font-weight="700" class="t">边界</text>
+  <text x="80" y="482" font-size="9.5" class="s">不做准入（CEL @ apiserver）｜ 不做规划/驱逐（vc-repack-engine）｜ 不写 spec（CEL 冻结）</text>
+  <text x="28" y="506" font-size="10.5" font-weight="700" class="t">部署</text>
+  <text x="80" y="506" font-size="9.5" class="s">默认合入 volcano-controller-manager（framework shim；<tspan class="m">--controllers=*,-repack-controller</tspan> 可禁用）／ 或独立 <tspan class="m">vc-repack-controller</tspan> 二进制</text>
+  <text x="28" y="530" font-size="10.5" font-weight="700" class="t">配置</text>
+  <text x="80" y="530" font-size="9.5" class="s"><tspan class="m">--workers</tspan>（并发）· <tspan class="m">--repack-policy-eval-interval</tspan>（P1 反应式触发评估周期，性质同引擎 <tspan class="m">--repack-execute-cooldown</tspan>）</text>
+</svg>
