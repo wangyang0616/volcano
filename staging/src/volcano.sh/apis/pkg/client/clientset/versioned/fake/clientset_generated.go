@@ -38,6 +38,8 @@ import (
 	fakeflowv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/flow/v1alpha1/fake"
 	nodeinfov1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/nodeinfo/v1alpha1"
 	fakenodeinfov1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/nodeinfo/v1alpha1/fake"
+	repackv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/repack/v1alpha1"
+	fakerepackv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/repack/v1alpha1/fake"
 	schedulingv1beta1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/scheduling/v1beta1"
 	fakeschedulingv1beta1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/scheduling/v1beta1/fake"
 	shardv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/shard/v1alpha1"
@@ -181,6 +183,11 @@ func (c *Clientset) FlowV1alpha1() flowv1alpha1.FlowV1alpha1Interface {
 // NodeinfoV1alpha1 retrieves the NodeinfoV1alpha1Client
 func (c *Clientset) NodeinfoV1alpha1() nodeinfov1alpha1.NodeinfoV1alpha1Interface {
 	return &fakenodeinfov1alpha1.FakeNodeinfoV1alpha1{Fake: &c.Fake}
+}
+
+// RepackV1alpha1 retrieves the RepackV1alpha1Client
+func (c *Clientset) RepackV1alpha1() repackv1alpha1.RepackV1alpha1Interface {
+	return &fakerepackv1alpha1.FakeRepackV1alpha1{Fake: &c.Fake}
 }
 
 // SchedulingV1beta1 retrieves the SchedulingV1beta1Client
