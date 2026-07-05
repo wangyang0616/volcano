@@ -1,0 +1,126 @@
+# volcano-repack-engine — standalone defragmentation engine.
+#
+# It reuses the volcano-scheduler cache + the SAME scheduler-conf (mounted from
+# the volcano-scheduler-configmap), so its RBAC mirrors the scheduler's read-set
+# plus the repack-specific verbs: read/write RepackRuns and evict pods.
+#
+# Apply AFTER the RepackRun CRD (see README) and the volcano-scheduler-configmap.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: volcano-repack-engine
+  namespace: volcano-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: volcano-repack-engine
+rules:
+  # --- repack-specific ---
+  - apiGroups: ["repack.volcano.sh"]
+    resources: ["repackruns"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["repack.volcano.sh"]
+    resources: ["repackruns/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  # --- scheduler-cache read-set (same cluster view as the scheduler) ---
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "services", "replicationcontrollers", "resourcequotas"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "list", "watch", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "csidrivers", "csistoragecapacities", "volumeattachments"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
+    resources: ["queues", "podgroups"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["nodeinfo.volcano.sh"]
+    resources: ["numatopologies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["topology.volcano.sh"]
+    resources: ["hypernodes", "hypernodes/status"]
+    verbs: ["get", "list", "watch"]
+  # --- leader election ---
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: volcano-repack-engine-role
+subjects:
+  - kind: ServiceAccount
+    name: volcano-repack-engine
+    namespace: volcano-system
+roleRef:
+  kind: ClusterRole
+  name: volcano-repack-engine
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: volcano-repack-engine
+  namespace: volcano-system
+  labels:
+    app: volcano-repack-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: volcano-repack-engine
+  template:
+    metadata:
+      labels:
+        app: volcano-repack-engine
+    spec:
+      serviceAccountName: volcano-repack-engine
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: volcano-repack-engine
+          image: volcanosh/vc-repack-engine:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --logtostderr
+            - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
+            - --leader-elect=true
+            - --leader-elect-resource-namespace=volcano-system
+            - --schedule-period=5m
+            # default accelerator when a RepackRun's spec.goals is empty:
+            - --repack-default-resource=nvidia.com/gpu
+            - --repack-core=drain
+            - -v=3
+            - 2>&1
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /volcano.scheduler
+      volumes:
+        - name: scheduler-config
+          configMap:
+            # the SAME ConfigMap the volcano-scheduler uses (plugin tiers /
+            # predicates), so the engine sees the cluster identically.
+            name: volcano-scheduler-configmap

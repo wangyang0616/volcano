@@ -69,7 +69,7 @@ include Makefile.def
 
 .EXPORT_ALL_VARIABLES:
 
-all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-webhook-manager vc-agent vcctl command-lines
+all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-webhook-manager vc-agent vc-repack-engine vcctl command-lines
 
 init:
 	mkdir -p ${BIN_DIR}
@@ -94,6 +94,13 @@ vc-controller-manager: init
 
 vc-webhook-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-webhook-manager ./cmd/webhook-manager
+
+vc-repack-engine: init
+	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-repack-engine ./cmd/volcano-repack-engine
+
+# Standalone RepackRun controller — built from its own module under staging.
+vc-repack-controller: init
+	cd staging/src/volcano.sh/repack-controller && CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o $(abspath ${BIN_DIR})/vc-repack-controller ./cmd/repack-controller
 
 vc-agent: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-agent ./cmd/agent
@@ -136,6 +143,12 @@ vc-webhook-manager-image:
 vc-agent-image:
 	$(call build_component_image,agent)
 
+vc-repack-engine-image:
+	$(call build_component_image,repack-engine)
+
+vc-repack-controller-image:
+	$(call build_component_image,repack-controller)
+
 save-images:
 	@mkdir -p ${IMAGES_DIR}
 	@echo "Saving images with gzip compression..."
@@ -167,6 +180,7 @@ manifests: controller-gen
 	# volcano crd base
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) \
 		paths="./staging/src/volcano.sh/apis/pkg/apis/scheduling/v1beta1; \
+		./staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/batch/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/bus/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1; \

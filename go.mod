@@ -38,7 +38,7 @@ require (
 	k8s.io/apimachinery v0.35.3
 	k8s.io/apiserver v0.35.3
 	k8s.io/client-go v0.35.3
-	k8s.io/code-generator v0.35.3
+	k8s.io/code-generator v0.36.2
 	k8s.io/component-base v0.35.3
 	k8s.io/component-helpers v0.35.3
 	k8s.io/csi-translation-lib v0.35.3
@@ -54,6 +54,7 @@ require (
 	sigs.k8s.io/yaml v1.6.0
 	stathat.com/c/consistent v1.0.0
 	volcano.sh/apis v0.0.0
+	volcano.sh/repack-controller v0.0.0
 )
 
 require (
@@ -251,4 +252,5 @@ replace (
 	// Use local staging directory for APIs development
 	// This allows API changes to be made and reviewed in the same PR as implementation changes
 	volcano.sh/apis => ./staging/src/volcano.sh/apis
+	volcano.sh/repack-controller => ./staging/src/volcano.sh/repack-controller
 )
