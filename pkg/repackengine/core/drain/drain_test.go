@@ -284,3 +284,38 @@ func TestDrain_ExcludedNodeIsReceiverNotTarget(t *testing.T) {
 		t.Fatalf("freed=%v, want 2 (n0,n1; n2 absorbs as preferred receiver)", plan.FreedNodes)
 	}
 }
+
+// drainSessionFragGate mirrors drainSession but sets the per-run frag-improvement
+// gate (spec.goals[0].minFragImprovementPercent).
+func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework.Session {
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Snapshot:                  snap,
+		Resource:                  gpu,
+		Mode:                      repackv1alpha1.RepackModeDryRun,
+		CoreName:                  framework.CoreDrain,
+		MinNodesFreed:             1,
+		MinFragImprovementPercent: minImprovePct,
+		Free:                      freeByCapMinusUsed,
+	}, nil)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+	return ssn
+}
+
+// Freeing n0 of two GPU nodes cuts fragmentation by 1/2 = 50 percentage points.
+// A gate at 50 admits the plan (improvement meets the bar); a gate at 60 rejects
+// it even though a node could be freed (below the run's benefit threshold).
+func TestDrain_FragImprovementGate(t *testing.T) {
+	newSnap := func() *fakeSnap {
+		return &fakeSnap{nodes: []*schedapi.NodeInfo{
+			capNode("n0", 8, gpuTask("a", "g-a", 2)),
+			capNode("n1", 8, gpuTask("b", "g-b", 6)),
+		}}
+	}
+	if plan, ok := (&drainCore{}).Plan(drainSessionFragGate(newSnap(), 50)); !ok || plan == nil {
+		t.Fatalf("gate=50: expected a feasible plan (50pp improvement meets the bar)")
+	}
+	if plan, ok := (&drainCore{}).Plan(drainSessionFragGate(newSnap(), 60)); ok {
+		t.Fatalf("gate=60: expected NoRepack (50pp improvement below the bar), got %+v", plan)
+	}
+}

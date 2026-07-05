@@ -57,8 +57,12 @@ type SessionConfig struct {
 	CoreName      string      // selected search strategy (repack.core)
 	Hooks         CommitHooks // Execute side effects (nil funcs for DryRun)
 	MinNodesFreed int
-	MaxPodGroups  int
-	MaxResource   int64
+	// MinFragImprovementPercent is the run's benefit gate from
+	// spec.goals[0].minFragImprovementPercent (percentage points, 0-100): a plan
+	// whose fragmentation improvement is below it is not worth it. 0 = no gate.
+	MinFragImprovementPercent int
+	MaxPodGroups              int
+	MaxResource               int64
 	Free          func(*schedapi.NodeInfo) *schedapi.Resource // nil = FutureIdle
 }
 
@@ -76,6 +80,7 @@ type Session struct {
 	// results filled by the action, read by the driver
 	plan   *api.RepackPlan
 	report Report
+	commit *CommitResult // Execute-only; nil for DryRun or an empty plan
 }
 
 // OpenSession builds a Session and runs each named plugin's OnSessionOpen (which
@@ -133,6 +138,7 @@ func (s *Session) Mode() repackv1alpha1.RepackMode     { return s.cfg.Mode }
 func (s *Session) CoreName() string                    { return s.cfg.CoreName }
 func (s *Session) Hooks() CommitHooks                  { return s.cfg.Hooks }
 func (s *Session) MinNodesFreed() int                  { return s.cfg.MinNodesFreed }
+func (s *Session) MinFragImprovementPercent() int      { return s.cfg.MinFragImprovementPercent }
 func (s *Session) MaxPodGroups() int                   { return s.cfg.MaxPodGroups }
 func (s *Session) MaxResource() int64                  { return s.cfg.MaxResource }
 
@@ -245,3 +251,5 @@ func (s *Session) SetPlan(p *api.RepackPlan) { s.plan = p }
 func (s *Session) Plan() *api.RepackPlan     { return s.plan }
 func (s *Session) SetReport(r Report)        { s.report = r }
 func (s *Session) Report() Report            { return s.report }
+func (s *Session) SetCommit(r *CommitResult) { s.commit = r }
+func (s *Session) Commit() *CommitResult     { return s.commit }

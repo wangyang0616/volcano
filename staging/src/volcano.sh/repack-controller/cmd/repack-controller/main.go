@@ -52,6 +52,9 @@ var (
 	leNamespace = flag.String("leader-elect-namespace", "volcano-system", "Namespace for the leader-election lease")
 	resync      = flag.Duration("resync-period", 0, "Informer resync period (0 = disabled)")
 	workers     = flag.Int("workers", 1, "Reconcile worker count")
+	// Keep in sync with the engine's --repack-execute-cooldown so GC does not delete
+	// a finished Execute run while it is still the engine's cooldown anchor.
+	execCooldown = flag.Duration("repack-execute-cooldown", 10*time.Minute, "Minimum gap the engine enforces between Execute runs; GC retains a finished Execute run at least this long to preserve the cooldown anchor")
 )
 
 func main() {
@@ -70,7 +73,7 @@ func main() {
 		vcFactory := vcinformers.NewSharedInformerFactory(vc, *resync)
 		kubeFactory := informers.NewSharedInformerFactory(kube, *resync)
 
-		ctrl := repackcontroller.New(vc, vcFactory, repackcontroller.Options{Workers: *workers})
+		ctrl := repackcontroller.New(vc, vcFactory, repackcontroller.Options{Workers: *workers, ExecuteCooldown: *execCooldown})
 		podInformer := kubeFactory.Core().V1().Pods()
 		repackLister := vcFactory.Repack().V1alpha1().RepackRuns().Lister()
 		nom := repackcontroller.NewNominator(kube, vc, podInformer, repackLister)

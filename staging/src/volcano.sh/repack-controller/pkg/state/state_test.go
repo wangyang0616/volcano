@@ -39,11 +39,11 @@ func TestDerivePhase(t *testing.T) {
 		want  repackv1alpha1.RepackPhase
 	}{
 		{"empty -> Pending", nil, repackv1alpha1.RepackPending},
-		{"admitted+queued still Pending",
-			[]metav1.Condition{cond(CondAdmitted, tt), cond(CondQueued, tt)},
+		{"queued still Pending",
+			[]metav1.Condition{cond(CondQueued, tt)},
 			repackv1alpha1.RepackPending},
 		{"progressing -> Running",
-			[]metav1.Condition{cond(CondAdmitted, tt), cond(CondProgressing, tt)},
+			[]metav1.Condition{cond(CondQueued, ff), cond(CondProgressing, tt)},
 			repackv1alpha1.RepackRunning},
 		{"complete -> Succeeded",
 			[]metav1.Condition{cond(CondProgressing, ff), cond(CondComplete, tt)},
@@ -139,13 +139,52 @@ func TestTTLExpired(t *testing.T) {
 	}
 }
 
+// The GC retention floor keeps a finished Execute run alive until its
+// completionTime + cooldown passes, so its completionTime survives as the
+// engine's cooldown anchor even when TTL is shorter than the cooldown.
+func TestCooldownRetained(t *testing.T) {
+	now := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
+	cooldown := 10 * time.Minute
+	mk := func(mode repackv1alpha1.RepackMode, phase repackv1alpha1.RepackPhase, completed *time.Time) *repackv1alpha1.RepackRun {
+		r := &repackv1alpha1.RepackRun{}
+		r.Spec.Mode = mode
+		r.Status.Phase = phase
+		if completed != nil {
+			ct := metav1.NewTime(*completed)
+			r.Status.CompletionTime = &ct
+		}
+		return r
+	}
+	fresh := now.Add(-3 * time.Minute) // still inside the 10m window
+	stale := now.Add(-30 * time.Minute)
+
+	// Execute finished 3m ago: retained, ~7m remaining.
+	if r := mk(repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackSucceeded, &fresh); !CooldownRetained(r, cooldown, now) {
+		t.Error("Execute within the cooldown window must be retained")
+	} else if d := CooldownRemaining(r, cooldown, now); d != 7*time.Minute {
+		t.Errorf("remaining=%v, want 7m", d)
+	}
+	// Execute finished 30m ago: window passed, not retained.
+	if CooldownRetained(mk(repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackSucceeded, &stale), cooldown, now) {
+		t.Error("Execute past the cooldown window must NOT be retained")
+	}
+	// DryRun is never gated, so never retained for cooldown.
+	if CooldownRetained(mk(repackv1alpha1.RepackModeDryRun, repackv1alpha1.RepackSucceeded, &fresh), cooldown, now) {
+		t.Error("DryRun must never be retained for cooldown")
+	}
+	// Zero cooldown disables the floor.
+	if CooldownRetained(mk(repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackSucceeded, &fresh), 0, now) {
+		t.Error("zero cooldown must disable the retention floor")
+	}
+}
+
 func TestSetCondition(t *testing.T) {
 	var conds []metav1.Condition
-	if !SetCondition(&conds, CondAdmitted, metav1.ConditionTrue, ReasonAdmitted, "ok", 1) {
+	if !SetCondition(&conds, CondQueued, metav1.ConditionTrue, ReasonAnotherRunActive, "ok", 1) {
 		t.Error("first set should report changed")
 	}
 	if DerivePhase(conds) != repackv1alpha1.RepackPending {
-		t.Error("admitted-only should still be Pending")
+		t.Error("queued-only should still be Pending")
 	}
 	SetCondition(&conds, CondProgressing, metav1.ConditionTrue, ReasonEvicting, "evicting", 1)
 	if DerivePhase(conds) != repackv1alpha1.RepackRunning {

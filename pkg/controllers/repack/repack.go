@@ -48,8 +48,11 @@ func (c *repackController) Name() string { return "repack-controller" }
 
 // Initialize wires the lifecycle controller and the nomination reconciler onto
 // the shared informer factories (no factory Start here — that happens in Run).
-// Execute serialization/cooldown is the engine's concern, so the controller has
-// no operator flags of its own.
+// Execute serialization/cooldown is the engine's concern; the controller only
+// needs the cooldown as a GC retention floor (so it never deletes a finished
+// Execute run that is still the engine's cooldown anchor). Left unset here, it
+// defaults to state.DefaultExecuteCooldown, which matches the engine's flag
+// default; override the engine flag and this stays safe as long as it is >= it.
 func (c *repackController) Initialize(opt *framework.ControllerOption) error {
 	c.workers = int(opt.WorkerNum)
 

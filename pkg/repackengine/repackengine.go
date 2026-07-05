@@ -43,6 +43,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
@@ -92,6 +93,13 @@ type Engine struct {
 	mu             sync.Mutex
 	tiers          []conf.Tier
 	configurations []conf.Configuration
+	// execActive is the name of the Execute run currently holding the K=1 slot
+	// ("" = none); lastExecFinish is when this engine last finished an Execute.
+	// Both are authoritative (do not depend on informer-cache freshness), so the
+	// gate is correct even before a status write propagates to the lister, and
+	// safe if Workers is ever > 1. Guarded by mu.
+	execActive     string
+	lastExecFinish time.Time
 }
 
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
@@ -224,7 +232,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 		e.updateStatus(work)
 	}
 
-	active, lastFinish := e.executeState(work.Name)
+	active, lastFinish := e.executeGateState(work.Name)
 	gate := state.EvaluateGate(state.GateInputs{
 		Mode:              work.Spec.Mode,
 		ExecuteActive:     active,
@@ -241,6 +249,9 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 			e.queue.AddAfter(name, gate.RequeueAfter)
 		}
 		return nil
+	}
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+		e.markExecuteActive(work.Name) // hold the K=1 slot across this synchronous process
 	}
 	e.process(work)
 	return nil
@@ -268,13 +279,49 @@ func (e *Engine) recoverOrphans() {
 		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, gen)
 		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, gen)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-		e.updateStatus(work)
+		e.updateStatusTerminal(work)
 		klog.InfoS("recovered orphaned Running RepackRun -> Failed", "name", work.Name)
 	}
 }
 
-// executeState scans for the Execute gate: whether another Execute is currently
-// Running, and the most recent terminal Execute completion (cooldown anchor).
+// executeGateState is the authoritative K=1 gate view: it combines this engine's
+// in-memory state (which does not lag the informer cache) with the cache scan
+// (which covers history across restarts / other leaders). active OR-s both; the
+// cooldown anchor takes the latest of the two, so a just-finished Execute's
+// cooldown is enforced even before its status write reaches the lister.
+func (e *Engine) executeGateState(self string) (active bool, lastFinish time.Time) {
+	e.mu.Lock()
+	imActive := e.execActive != "" && e.execActive != self
+	lastFinish = e.lastExecFinish
+	e.mu.Unlock()
+
+	cacheActive, cacheFinish := e.executeState(self)
+	active = imActive || cacheActive
+	if cacheFinish.After(lastFinish) {
+		lastFinish = cacheFinish
+	}
+	return active, lastFinish
+}
+
+// markExecuteActive claims the in-memory K=1 slot for an Execute run.
+func (e *Engine) markExecuteActive(name string) {
+	e.mu.Lock()
+	e.execActive = name
+	e.mu.Unlock()
+}
+
+// markExecuteDone releases the slot and stamps the cooldown anchor.
+func (e *Engine) markExecuteDone(name string) {
+	e.mu.Lock()
+	if e.execActive == name {
+		e.execActive = ""
+	}
+	e.lastExecFinish = e.now()
+	e.mu.Unlock()
+}
+
+// executeState scans the lister for the Execute gate: whether another Execute is
+// currently Running, and the most recent terminal Execute completion.
 func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
 	runs, err := e.lister.List(labels.Everything())
 	if err != nil {
@@ -298,6 +345,11 @@ func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
 
 // process plans and acts on a cleared run (the gate already passed).
 func (e *Engine) process(work *repackv1alpha1.RepackRun) {
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+		// Release the K=1 slot and stamp the cooldown anchor when done, even on
+		// panic/early-return paths.
+		defer e.markExecuteDone(work.Name)
+	}
 	e.mu.Lock()
 	tiers, cfgs := e.tiers, e.configurations
 	e.mu.Unlock()
@@ -307,12 +359,21 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 
 	gen := work.Generation
 	res := e.resolveResource(work)
+	if res == "" {
+		// No target accelerator resolvable: spec.goals is empty AND the engine's
+		// --repack-default-resource is unset. Measuring fragmentation on the empty
+		// resource would count every node as empty and silently report
+		// NoFragmentation, so fail fast with an actionable reason instead.
+		e.fail(work, gen, "NoTargetResource",
+			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
+		return
+	}
 
 	reason := state.ReasonSimulating
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		reason = state.ReasonEvicting
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonAdmitted, "cleared", gen)
+	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", gen)
 	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", gen)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 	e.updateStatus(work)
@@ -326,15 +387,16 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	snap := session.NewSessionSnapshot(sched, res, nodeInScope)
 	maxPG, maxRes := maxPerRun(work, res)
 	esn := engineframework.OpenSession(engineframework.SessionConfig{
-		Snapshot:      snap,
-		Run:           work,
-		Resource:      res,
-		Mode:          work.Spec.Mode,
-		CoreName:      e.cfg.Core,
-		MinNodesFreed: e.cfg.MinNodesFreed,
-		MaxPodGroups:  maxPG,
-		MaxResource:   maxRes,
-		Hooks:         hooksFor(work.Spec.Mode, e.cache.Client()),
+		Snapshot:                  snap,
+		Run:                       work,
+		Resource:                  res,
+		Mode:                      work.Spec.Mode,
+		CoreName:                  e.cfg.Core,
+		MinNodesFreed:             e.cfg.MinNodesFreed,
+		MinFragImprovementPercent: minFragImprovement(work),
+		MaxPodGroups:              maxPG,
+		MaxResource:               maxRes,
+		Hooks:                     hooksFor(work.Spec.Mode, e.cache.Client()),
 	}, e.cfg.Plugins)
 	esn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return inScope(t.Job) })
 	defer engineframework.CloseSession(esn)
@@ -355,21 +417,36 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		ttl = e.cfg.NominationTTL
 	}
 	applyPlan(work, report, plan, res, execute, ttl)
-	var done string
+
+	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
+	// the repack achieved nothing — fail rather than falsely reporting Executed.
+	if execute && worthwhile {
+		if commit := esn.Commit(); commit != nil && len(commit.Evicted) == 0 && len(commit.Failed) > 0 {
+			e.fail(work, gen, state.ReasonExecuteFailed,
+				fmt.Errorf("all %d evictions were rejected; no pods were moved", len(commit.Failed)))
+			return
+		}
+	}
+
+	var done, msg string
 	switch {
 	case !worthwhile && report.FragRateBefore > 0:
-		done = state.ReasonBelowGoalThreshold
+		done, msg = state.ReasonBelowGoalThreshold, "engine finished"
 	case !worthwhile:
-		done = state.ReasonNoFragmentation
+		done, msg = state.ReasonNoFragmentation, "engine finished"
 	case execute:
-		done = state.ReasonExecuted
+		done, msg = state.ReasonExecuted, "engine finished"
+		// Partial success: some evictions were rejected but at least one succeeded.
+		if commit := esn.Commit(); commit != nil && len(commit.Failed) > 0 {
+			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", len(commit.Evicted), len(commit.Failed))
+		}
 	default:
-		done = state.ReasonRepackRecommended
+		done, msg = state.ReasonRepackRecommended, "engine finished"
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, "engine finished", gen)
-	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, "engine finished", gen)
+	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, gen)
+	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, gen)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-	e.updateStatus(work)
+	e.updateStatusTerminal(work)
 }
 
 // hooksFor returns the commit side effects. DryRun: none. Execute: evict each
@@ -404,13 +481,38 @@ func (e *Engine) fail(run *repackv1alpha1.RepackRun, gen int64, reason string, e
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), gen)
 	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), gen)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
-	e.updateStatus(run)
+	e.updateStatusTerminal(run)
 }
 
 func (e *Engine) updateStatus(run *repackv1alpha1.RepackRun) {
 	stampLifecycle(run, time.Now())
 	if _, err := e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), run, metav1.UpdateOptions{}); err != nil {
 		klog.ErrorS(err, "repack-engine: update status", "run", run.Name)
+	}
+}
+
+// updateStatusTerminal writes a terminal status with conflict retry. Intermediate
+// writes are best-effort (a later reconcile re-derives them), but losing the
+// TERMINAL write would strand the run in Running until an orphan recovery — so on
+// conflict re-read the latest object and re-apply the computed status.
+func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
+	stampLifecycle(run, time.Now())
+	desired := run.Status.DeepCopy()
+	name := run.Name
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(context.Background(), name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil // deleted (e.g. TTL GC); nothing to write
+		}
+		if err != nil {
+			return err
+		}
+		desired.DeepCopyInto(&latest.Status)
+		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		klog.ErrorS(err, "repack-engine: write terminal status", "run", name)
 	}
 }
 
@@ -527,6 +629,15 @@ func freedNodesOf(plan *engineapi.RepackPlan) []string {
 	out := append([]string(nil), plan.FreedNodes...)
 	sort.Strings(out)
 	return out
+}
+
+// minFragImprovement reads the run's benefit gate (spec.goals[0].
+// minFragImprovementPercent, percentage points 0-100; 0 = no gate).
+func minFragImprovement(run *repackv1alpha1.RepackRun) int {
+	if len(run.Spec.Goals) > 0 {
+		return int(run.Spec.Goals[0].MinFragImprovementPercent)
+	}
+	return 0
 }
 
 // maxPerRun reads the run's blast-radius caps for the target resource (0 = unset

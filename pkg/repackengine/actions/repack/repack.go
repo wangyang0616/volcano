@@ -54,8 +54,12 @@ func (*repackAction) Execute(ssn *framework.Session) {
 	}
 
 	if ssn.Mode() == repackv1alpha1.RepackModeExecute {
-		if _, err := framework.CommitPlan(plan, ssn.Hooks()); err != nil {
+		res, err := framework.CommitPlan(plan, ssn.Hooks())
+		if err != nil {
 			klog.Errorf("repack: commit failed: %v", err)
 		}
+		// Keep the result (evicted vs failed per-pod) so the driver can distinguish
+		// a real Execute from one where every eviction was rejected (e.g. by PDBs).
+		ssn.SetCommit(&res)
 	}
 }

@@ -33,9 +33,9 @@ import (
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 )
 
-// Condition types (Job-style; §4.6.1).
+// Condition types (Job-style; §4.6.1). Admission is enforced at the apiserver
+// (CEL on the CRD), so there is no controller-side Admitted condition.
 const (
-	CondAdmitted    = "Admitted"
 	CondQueued      = "Queued"
 	CondProgressing = "Progressing"
 	CondComplete    = "Complete"
@@ -45,10 +45,10 @@ const (
 
 // Condition reasons (§4.6.1).
 const (
-	ReasonAdmitted        = "Admitted"
-	ReasonAdmissionFailed = "AdmissionFailed"
+	// ReasonSlotAcquired clears Queued once the K=1/cooldown gate admits the run.
+	ReasonSlotAcquired = "SlotAcquired"
 	// Queued reasons — only Execute is gated; DryRun never queues.
-	ReasonAnotherRunActive  = "AnotherRunActive"  // K=1 occupied
+	ReasonAnotherRunActive   = "AnotherRunActive"  // K=1 occupied
 	ReasonExecuteCoolingDown = "ExecuteCoolingDown" // cooldown not elapsed
 	ReasonWaitingForLeader   = "WaitingForLeader"
 	// Progressing sub-reasons.
@@ -61,6 +61,9 @@ const (
 	ReasonNoFragmentation    = "NoFragmentation"    // clean: nothing to defragment
 	ReasonBelowGoalThreshold = "BelowGoalThreshold" // fragmented but below the benefit gate
 	ReasonCancelledByUser    = "CancelledByUser"
+	// ReasonExecuteFailed is terminal-Failed: a worthwhile plan was found but every
+	// eviction was rejected (e.g. by PDBs), so the repack achieved nothing.
+	ReasonExecuteFailed = "ExecuteFailed"
 )
 
 // DerivePhase projects conditions onto the coarse phase (§4.6.1). Precedence:
@@ -164,4 +167,37 @@ func TTLExpired(run *repackv1alpha1.RepackRun, now time.Time) bool {
 	}
 	deadline := run.Status.CompletionTime.Time.Add(time.Duration(*run.Spec.TTLSecondsAfterFinished) * time.Second)
 	return !now.Before(deadline)
+}
+
+// DefaultExecuteCooldown mirrors the engine's --repack-execute-cooldown default.
+// GC keeps a finished Execute run alive for at least this long (see
+// CooldownRetained) so the engine can still read its status.completionTime as the
+// cooldown anchor — including after a restart, where the engine's in-memory anchor
+// is gone. Keep in sync with the engine flag default.
+const DefaultExecuteCooldown = 10 * time.Minute
+
+// CooldownRetained reports whether a terminal run must be kept to preserve the
+// Execute cooldown anchor: an Execute run whose completionTime + cooldown has not
+// yet passed. Without this, a short TTL (TTL < cooldown) could delete the most
+// recent finished Execute before the window ends, and a restart-recovered engine
+// — which rebuilds the anchor solely from persisted completionTime — would forget
+// the cooldown and admit the next Execute too early. Non-Execute runs, a
+// non-positive cooldown, or a missing completionTime are never retained here.
+func CooldownRetained(run *repackv1alpha1.RepackRun, cooldown time.Duration, now time.Time) bool {
+	if run == nil || cooldown <= 0 || run.Spec.Mode != repackv1alpha1.RepackModeExecute {
+		return false
+	}
+	if !IsTerminal(run.Status.Phase) || run.Status.CompletionTime == nil {
+		return false
+	}
+	return now.Before(run.Status.CompletionTime.Time.Add(cooldown))
+}
+
+// CooldownRemaining is how long until the cooldown-retention floor lifts (0 when
+// not retained), so the controller can requeue precisely at expiry.
+func CooldownRemaining(run *repackv1alpha1.RepackRun, cooldown time.Duration, now time.Time) time.Duration {
+	if !CooldownRetained(run, cooldown, now) {
+		return 0
+	}
+	return run.Status.CompletionTime.Time.Add(cooldown).Sub(now)
 }

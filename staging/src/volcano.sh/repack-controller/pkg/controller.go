@@ -48,6 +48,12 @@ import (
 type Options struct {
 	// Workers is the number of reconcile workers (default 1).
 	Workers int
+	// ExecuteCooldown is the minimum gap the engine enforces after an Execute run
+	// finishes before the next may start. GC keeps a finished Execute run alive at
+	// least this long so its completionTime survives as the engine's cooldown
+	// anchor (defends against TTL < cooldown). <=0 defaults to
+	// state.DefaultExecuteCooldown; keep in sync with the engine's flag.
+	ExecuteCooldown time.Duration
 }
 
 // Controller reconciles RepackRun objects.
@@ -59,6 +65,8 @@ type Controller struct {
 
 	factory vcinformers.SharedInformerFactory
 	opts    Options
+	// executeCooldown is the GC retention floor for finished Execute runs.
+	executeCooldown time.Duration
 	// now is injectable for tests; defaults to time.Now.
 	now func() time.Time
 }
@@ -69,15 +77,19 @@ func New(client vcclientset.Interface, factory vcinformers.SharedInformerFactory
 	if opts.Workers < 1 {
 		opts.Workers = 1
 	}
+	if opts.ExecuteCooldown <= 0 {
+		opts.ExecuteCooldown = state.DefaultExecuteCooldown
+	}
 	informer := factory.Repack().V1alpha1().RepackRuns()
 	c := &Controller{
-		client:  client,
-		lister:  informer.Lister(),
-		synced:  informer.Informer().HasSynced,
-		queue:   workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		factory: factory,
-		opts:    opts,
-		now:     time.Now,
+		client:          client,
+		lister:          informer.Lister(),
+		synced:          informer.Informer().HasSynced,
+		queue:           workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		factory:         factory,
+		opts:            opts,
+		executeCooldown: opts.ExecuteCooldown,
+		now:             time.Now,
 	}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.enqueue,
@@ -152,6 +164,16 @@ func (c *Controller) reconcile(ctx context.Context, name string) error {
 		return nil // engine owns non-terminal runs
 	}
 	now := c.now()
+	// Preserve the cooldown anchor: never delete a finished Execute run while its
+	// completionTime + cooldown window is still open, even if TTL already elapsed.
+	// The engine (which rebuilds the anchor from persisted completionTime after a
+	// restart) would otherwise forget the cooldown and admit the next Execute early.
+	if state.CooldownRetained(run, c.executeCooldown, now) {
+		if d := state.CooldownRemaining(run, c.executeCooldown, now); d > 0 {
+			c.queue.AddAfter(name, d) // revisit right when the window lifts
+		}
+		return nil
+	}
 	if state.TTLExpired(run, now) {
 		klog.InfoS("GC: deleting expired RepackRun", "name", name, "phase", run.Status.Phase)
 		return ignoreNotFound(c.client.RepackV1alpha1().RepackRuns().Delete(ctx, name, metav1.DeleteOptions{}))
