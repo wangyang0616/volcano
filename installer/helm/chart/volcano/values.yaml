@@ -4,6 +4,7 @@ basic:
   agent_scheduler_image_name: "volcanosh/vc-agent-scheduler"
   admission_image_name: "volcanosh/vc-webhook-manager"
   agent_image_name: "volcanosh/vc-agent"
+  repack_engine_image_name: "volcanosh/vc-repack-engine"
   admission_secret_name: "volcano-admission-secret"
   admission_config_file: "config/volcano-admission.conf"
   scheduler_config_file: "config/volcano-scheduler.conf"
@@ -18,6 +19,7 @@ basic:
   agent_scheduler_image_tag_version: ""
   admission_image_tag_version: ""
   agent_image_tag_version: ""
+  repack_engine_image_tag_version: ""
   admission_port: 8443
   image_registry: "docker.io"
 custom:
@@ -33,6 +35,15 @@ custom:
   agent_scheduler_replicas: 1
   agent_scheduler_name: "agent-scheduler"
   scheduler_replicas: 1
+  # Runtime GPU/NPU defragmentation (RepackRun). Research preview — OFF by default.
+  # When enabled, deploys volcano-repack-engine and grants the built-in
+  # repack-controller (inside volcano-controller-manager) its RBAC.
+  repack_enable: false
+  repack_engine_replicas: 1
+  repack_schedule_period: "5m"
+  repack_default_resource: "nvidia.com/gpu" # used when a RepackRun's spec.goals is empty
+  repack_core: "drain"
+  repack_log_level: 3
   scheduler_metrics_enable: true
   scheduler_pprof_enable: false
   scheduler_plugins_dir: ""
