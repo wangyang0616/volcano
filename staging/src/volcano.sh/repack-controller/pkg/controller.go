@@ -1,0 +1,178 @@
+/*
+Copyright 2026 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package controller is the RepackRun lifecycle controller. It is deliberately
+// framework-light: plain client-go informers + workqueue, depending only on the
+// CRD types/generated client (volcano.sh/apis) and the pure decision logic in
+// ./state. It owns admission, phase/conditions projection, active-deadline and
+// TTL GC. Execute serialization (one-at-a-time + cooldown) lives in the engine
+// — the worker that actually evicts — not here. It does NOT open a scheduler
+// Session or move pods; planning/eviction is the volcano-repack-engine's job.
+// The two communicate only through the RepackRun object.
+package repackcontroller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
+
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
+	vcinformers "volcano.sh/apis/pkg/client/informers/externalversions"
+	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
+
+	"volcano.sh/repack-controller/pkg/state"
+)
+
+// Options are operator-level knobs not carried on individual RepackRuns.
+type Options struct {
+	// Workers is the number of reconcile workers (default 1).
+	Workers int
+}
+
+// Controller reconciles RepackRun objects.
+type Controller struct {
+	client vcclientset.Interface
+	lister repacklisters.RepackRunLister
+	synced cache.InformerSynced
+	queue  workqueue.TypedRateLimitingInterface[string]
+
+	factory vcinformers.SharedInformerFactory
+	opts    Options
+	// now is injectable for tests; defaults to time.Now.
+	now func() time.Time
+}
+
+// New builds a Controller wired to the given clientset and shared informer
+// factory. The caller owns starting the factory and the lifecycle context.
+func New(client vcclientset.Interface, factory vcinformers.SharedInformerFactory, opts Options) *Controller {
+	if opts.Workers < 1 {
+		opts.Workers = 1
+	}
+	informer := factory.Repack().V1alpha1().RepackRuns()
+	c := &Controller{
+		client:  client,
+		lister:  informer.Lister(),
+		synced:  informer.Informer().HasSynced,
+		queue:   workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		factory: factory,
+		opts:    opts,
+		now:     time.Now,
+	}
+	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.enqueue,
+		UpdateFunc: func(_, newObj interface{}) { c.enqueue(newObj) },
+		DeleteFunc: c.enqueue,
+	})
+	return c
+}
+
+// enqueue maps an object to its workqueue key (cluster-scoped: the name).
+func (c *Controller) enqueue(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("repackrun key: %w", err))
+		return
+	}
+	c.queue.Add(key)
+}
+
+// Run starts the factory, waits for cache sync, and launches workers until ctx
+// is cancelled.
+func (c *Controller) Run(ctx context.Context) error {
+	defer utilruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	c.factory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), c.synced) {
+		return fmt.Errorf("repackrun controller: cache failed to sync")
+	}
+	klog.InfoS("Starting repackrun controller", "workers", c.opts.Workers)
+
+	for i := 0; i < c.opts.Workers; i++ {
+		go func() {
+			for c.processNext(ctx) {
+			}
+		}()
+	}
+	<-ctx.Done()
+	klog.InfoS("Shutting down repackrun controller")
+	return nil
+}
+
+func (c *Controller) processNext(ctx context.Context) bool {
+	key, shutdown := c.queue.Get()
+	if shutdown {
+		return false
+	}
+	defer c.queue.Done(key)
+
+	if err := c.reconcile(ctx, key); err != nil {
+		utilruntime.HandleError(fmt.Errorf("reconcile repackrun %q: %w", key, err))
+		c.queue.AddRateLimited(key)
+		return true
+	}
+	c.queue.Forget(key)
+	return true
+}
+
+// reconcile handles only RepackRun GC: a finished run is deleted once its TTL
+// elapses (or requeued precisely at expiry). Admission is enforced by CEL at the
+// apiserver; the engine owns all non-terminal lifecycle (phase/conditions); the
+// nomination reconciler (nominate.go) steers replacement pods.
+func (c *Controller) reconcile(ctx context.Context, name string) error {
+	run, err := c.lister.Get(name)
+	if apierrors.IsNotFound(err) {
+		return nil // deleted; nothing to do
+	}
+	if err != nil {
+		return err
+	}
+	if !state.IsTerminal(run.Status.Phase) {
+		return nil // engine owns non-terminal runs
+	}
+	now := c.now()
+	if state.TTLExpired(run, now) {
+		klog.InfoS("GC: deleting expired RepackRun", "name", name, "phase", run.Status.Phase)
+		return ignoreNotFound(c.client.RepackV1alpha1().RepackRuns().Delete(ctx, name, metav1.DeleteOptions{}))
+	}
+	if d := ttlRemaining(run, now); d > 0 {
+		c.queue.AddAfter(name, d)
+	}
+	return nil
+}
+
+func ttlRemaining(run *repackv1alpha1.RepackRun, now time.Time) time.Duration {
+	if run.Spec.TTLSecondsAfterFinished == nil || run.Status.CompletionTime == nil {
+		return 0
+	}
+	deadline := run.Status.CompletionTime.Time.Add(time.Duration(*run.Spec.TTLSecondsAfterFinished) * time.Second)
+	return deadline.Sub(now)
+}
+
+func ignoreNotFound(err error) error {
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
