@@ -12,7 +12,7 @@ spec:
     listKind: RepackRunList
     plural: repackruns
     shortNames:
-    - rpk
+    - rpr
     - repackrun
     singular: repackrun
   scope: Cluster

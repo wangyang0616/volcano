@@ -432,7 +432,7 @@ type RelievedPodGroup struct {
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:path=repackruns,scope=Cluster,shortName=rpk;repackrun
+// +kubebuilder:resource:path=repackruns,scope=Cluster,shortName=rpr;repackrun
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="MODE",type=string,JSONPath=`.spec.mode`
 // +kubebuilder:printcolumn:name="PHASE",type=string,JSONPath=`.status.phase`
