@@ -121,11 +121,25 @@ define build_component_image
 			-f ./installer/dockerfile/$(1)/Dockerfile \
 			--output=type=${BUILDX_OUTPUT_TYPE} \
 			--platform ${DOCKER_PLATFORMS} \
+			$(if $(filter true,$(FORCE_REBUILD)),--pull,) \
 			--build-arg APK_MIRROR=${APK_MIRROR} \
 			--build-arg OPEN_EULER_IMAGE_TAG=${OPEN_EULER_IMAGE_TAG}; \
 	else \
 		echo "Image ${IMAGE_PREFIX}/vc-$(1):$(TAG) already exists, skipping (use FORCE_REBUILD=true to rebuild)"; \
 	fi
+endef
+
+# Package a pre-built linux binary into a minimal alpine image (no golang builder stage).
+define build_e2e_image_from_binary
+	@if [ ! -f ${BIN_DIR}/vc-$(1) ]; then \
+		echo "Missing ${BIN_DIR}/vc-$(1); run 'make vc-$(1)' first"; \
+		exit 1; \
+	fi
+	@echo "Building image ${IMAGE_PREFIX}/vc-$(1):$(TAG) from local binary..."
+	docker build -t "${IMAGE_PREFIX}/vc-$(1):$(TAG)" \
+		-f ./hack/Dockerfile.e2e-binary \
+		--build-arg BINARY=vc-$(1) \
+		.
 endef
 
 vc-controller-manager-image:
@@ -148,6 +162,16 @@ vc-repack-engine-image:
 
 vc-repack-controller-image:
 	$(call build_component_image,repack-controller)
+
+# Images required by repack E2E (scheduler stack + repack-engine only).
+repack-e2e-images: vc-scheduler-image vc-controller-manager-image vc-webhook-manager-image vc-repack-engine-image
+
+# Fast local path: build linux binaries on the host, then wrap them in alpine images.
+repack-e2e-images-from-bin: vc-scheduler vc-controller-manager vc-webhook-manager vc-repack-engine
+	$(call build_e2e_image_from_binary,scheduler)
+	$(call build_e2e_image_from_binary,controller-manager)
+	$(call build_e2e_image_from_binary,webhook-manager)
+	$(call build_e2e_image_from_binary,repack-engine)
 
 save-images:
 	@mkdir -p ${IMAGES_DIR}
@@ -234,8 +258,15 @@ e2e-test-vcctl: vcctl images
 e2e-test-stress: images
 	E2E_TYPE=STRESS ./hack/run-e2e-kind.sh
 
-e2e-test-cronjob: images  
+e2e-test-cronjob: images
 	E2E_TYPE=CRONJOB ./hack/run-e2e-kind.sh
+
+e2e-test-repack: repack-e2e-images
+	E2E_TYPE=REPACK ./hack/run-e2e-kind.sh
+
+# Local dev: skip multi-stage golang docker builds (avoids pulling golang:1.25.x).
+e2e-test-repack-local: repack-e2e-images-from-bin
+	E2E_TYPE=REPACK FORCE_REBUILD=false ./hack/run-e2e-kind.sh
 
 e2e-test-dra: images
 	E2E_TYPE=DRA FEATURE_GATES="DynamicResourceAllocation=true,DRAConsumableCapacity=true" ./hack/run-e2e-kind.sh

@@ -23,6 +23,9 @@ jobs:
     needs: build-images
     uses: ./.github/workflows/e2e_cronjob.yaml
 
+  e2e-repack:
+    uses: ./.github/workflows/e2e_repack.yaml
+
   e2e-dra:
     needs: build-images
     uses: ./.github/workflows/e2e_dra.yml

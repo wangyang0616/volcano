@@ -530,6 +530,12 @@ func EnsureDefaultAndRootQueues(vcClient vcclient.Interface, defaultQueue string
 	return nil
 }
 
+func schedulerShardingEnabled() bool {
+	return options.ServerOpts != nil &&
+		(options.ServerOpts.ShardingMode == util.HardShardingMode ||
+			options.ServerOpts.ShardingMode == util.SoftShardingMode)
+}
+
 func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueue string, nodeSelectors []string, nodeWorkers uint32, ignoredProvisioners []string, resyncPeriod time.Duration, resourceSyncTimeout time.Duration) *SchedulerCache {
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -584,7 +590,7 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 		resourceSyncTimeout: resourceSyncTimeout,
 	}
 
-	if options.ServerOpts.ShardingMode == util.HardShardingMode || options.ServerOpts.ShardingMode == util.SoftShardingMode {
+	if schedulerShardingEnabled() {
 		sc.shardUpdateCoordinator = NewShardUpdateCoordinator()
 	}
 
@@ -830,7 +836,7 @@ func (sc *SchedulerCache) addEventHandler() {
 	sc.hyperNodesInitialEventTracker = schedulercache.NewQueueHandlerTracker(handlerRegistration)
 	handlers["hypernode"] = sc.hyperNodesInitialEventTracker
 
-	if options.ServerOpts.ShardingMode == util.HardShardingMode || options.ServerOpts.ShardingMode == util.SoftShardingMode {
+	if schedulerShardingEnabled() {
 		sc.nodeShardInformer = sc.vcInformerFactory.Shard().V1alpha1().NodeShards()
 		handlerRegistration, _ = sc.nodeShardInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    sc.AddNodeShard,

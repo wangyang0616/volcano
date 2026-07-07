@@ -32,7 +32,11 @@ CLUSTER_NAME=${CLUSTER_NAME:-integration}
 
 export CLUSTER_CONTEXT=("--name" "${CLUSTER_NAME}")
 
-export KIND_OPT=${KIND_OPT:="--config ${VK_ROOT}/hack/e2e-kind-config.yaml"}
+default_kind_config="${VK_ROOT}/hack/e2e-kind-config.yaml"
+if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+  default_kind_config="${VK_ROOT}/hack/e2e-kind-config-repack.yaml"
+fi
+export KIND_OPT=${KIND_OPT:="--config ${default_kind_config}"}
 
 # kwok node config
 export KWOK_NODE_CPU=${KWOK_NODE_CPU:-8}      # 8 cores
@@ -306,6 +310,12 @@ EOF
     shardSyncPeriod: "30s"
     enableNodeEventTrigger: true"
   ;;
+"REPACK")
+  echo "Install volcano chart with crd version $crd_version and repack engine enabled"
+  helm-install-volcano "  controller_log_level: 5
+  repack_enable: true
+  repack_log_level: 5"
+  ;;
 *)
   echo "Install volcano chart with crd version $crd_version"
   helm-install-volcano
@@ -503,6 +513,10 @@ case ${E2E_TYPE} in
 "CRONJOB")
     echo "Running cronjob e2e suite..."
     KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/cronjob/
+    ;;
+"REPACK")
+    echo "Running repack e2e suite..."
+    KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/repack/
     ;;
 "AGENTSCHEDULER"|"AGENTSCHEDULER_NONE"|"AGENTSCHEDULER_SOFT"|"AGENTSCHEDULER_HARD")
     agent_scheduler_sharding_mode="${E2E_TYPE#AGENTSCHEDULER_}"

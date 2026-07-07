@@ -20,7 +20,32 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/rest"
+
+	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
+	commonutil "volcano.sh/volcano/pkg/util"
 )
+
+func TestNewEngineDoesNotPanicWithoutSchedulerServerOpts(t *testing.T) {
+	orig := schedoptions.ServerOpts
+	t.Cleanup(func() { schedoptions.ServerOpts = orig })
+	schedoptions.ServerOpts = nil
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NewEngine panicked without scheduler ServerOpts: %v", r)
+		}
+	}()
+
+	schedOpts := schedoptions.NewServerOption()
+	schedOpts.ShardingMode = commonutil.NoneShardingMode
+	schedOpts.RegisterOptions()
+
+	cfg := &rest.Config{Host: "https://127.0.0.1:6443"}
+	if _, err := NewEngine(cfg, Config{}); err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+}
 
 // Only fully-qualified extended resources (a name with a domain "/") can be
 // defragmented; core compute resources are rejected. This mirrors the CEL rule

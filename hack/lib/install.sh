@@ -33,6 +33,9 @@ function kind-up-cluster {
   if [[ "${E2E_TYPE}" == AGENTSCHEDULER* ]]; then
     kind load docker-image ${IMAGE_PREFIX}/vc-agent-scheduler:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   fi
+  if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+    kind load docker-image ${IMAGE_PREFIX}/vc-repack-engine:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+  fi
   if [[ "${E2E_TYPE}" == "DRA" || "${E2E_TYPE}" == "ALL" ]]; then
     ensure-dra-test-images
   fi
@@ -86,6 +89,13 @@ function check-images {
       exit 1
     fi
   fi
+  if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+    docker image inspect "${IMAGE_PREFIX}/vc-repack-engine:${TAG}" > /dev/null
+    if [[ $? -ne 0 ]]; then
+      echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-repack-engine:${TAG} does not exist"
+      exit 1
+    fi
+  fi
 }
 
 # check if kubectl installed
@@ -103,23 +113,41 @@ function check-prerequisites {
 # check if kind installed
 function check-kind {
   echo "Checking kind"
+  local required_kind_version="0.31.0"
+  local bin_path
+  bin_path=$(go env GOBIN)
+  if [[ -z "${bin_path}" ]]; then
+    bin_path="$(go env GOPATH)/bin"
+  fi
+  export PATH="${bin_path}:${PATH}"
+
   which kind >/dev/null 2>&1
   if [[ $? -ne 0 ]]; then
-    echo "Installing kind ..."
-    GOOS=${OS} go install sigs.k8s.io/kind@v0.31.0
-    local bin_path
-    bin_path=$(go env GOBIN)
-    if [[ -z "${bin_path}" ]]; then
-      bin_path="$(go env GOPATH)/bin"
-    fi
-    export PATH="${bin_path}:${PATH}"
+    echo "Installing kind ${required_kind_version} ..."
+    GOOS=${OS} go install sigs.k8s.io/kind@v${required_kind_version}
     if ! command -v kind >/dev/null 2>&1; then
       echo -e "\033[31mERROR\033[0m: kind installation completed but the binary is still not available on PATH"
       exit 1
     fi
     echo -n "Using kind, version: " && kind version
-  else
-    echo -n "Found kind, version: " && kind version
+    return
+  fi
+
+  local found_version
+  found_version=$(kind version 2>/dev/null | awk '{print $2}' | tr -d 'v')
+  echo -n "Found kind, version: " && kind version
+  if [[ -z "${found_version}" ]]; then
+    echo -e "\033[33mWARNING\033[0m: unable to parse kind version; expected v${required_kind_version}+ for DRA feature gates"
+    return
+  fi
+
+  # e2e-kind-config.yaml enables DRAConsumableCapacity (Kubernetes 1.34+). Older kind
+  # defaults (e.g. v0.29 / k8s 1.33) panic kubelet with "unrecognized feature gate".
+  if [[ "${found_version}" < "${required_kind_version}" ]]; then
+    echo -e "\033[33mWARNING\033[0m: kind v${found_version} is older than v${required_kind_version}; upgrading..."
+    GOOS=${OS} go install sigs.k8s.io/kind@v${required_kind_version}
+    export PATH="${bin_path}:${PATH}"
+    echo -n "Using kind, version: " && kind version
   fi
 }
 

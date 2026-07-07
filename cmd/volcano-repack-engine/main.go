@@ -33,6 +33,7 @@ import (
 
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app"
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app/options"
+	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	commonutil "volcano.sh/volcano/pkg/util"
 	"volcano.sh/volcano/pkg/version"
 
@@ -80,10 +81,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	ensureSchedulerServerOpts()
+
 	klog.StartFlushDaemon(*logFlushFreq)
 	defer klog.Flush()
 
 	if err := app.Run(s); err != nil {
 		klog.Fatalf("%v\n", err)
 	}
+}
+
+// ensureSchedulerServerOpts initializes the scheduler's global options before the
+// engine constructs schedcache.New. The cache shares scheduler globals (e.g.
+// sharding mode) even when used read-only; without this, addEventHandler panics
+// on a nil ServerOpts.
+func ensureSchedulerServerOpts() {
+	if schedoptions.ServerOpts != nil {
+		return
+	}
+	schedOpts := schedoptions.NewServerOption()
+	schedOpts.ShardingMode = commonutil.NoneShardingMode
+	schedOpts.RegisterOptions()
 }

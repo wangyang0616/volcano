@@ -53,6 +53,7 @@ import (
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 	state "volcano.sh/repack-controller/pkg/state"
 
+	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/session"
@@ -61,6 +62,7 @@ import (
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
+	commonutil "volcano.sh/volcano/pkg/util"
 )
 
 // Config holds the engine's runtime parameters.
@@ -102,8 +104,24 @@ type Engine struct {
 	lastExecFinish time.Time
 }
 
+// repackNodeWorkers is the number of scheduler-cache node workers the engine runs
+// to keep sc.Nodes in sync. Must be > 0 or the node queue is never drained.
+const repackNodeWorkers = 4
+
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
 func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
+	// The engine reuses scheduler machinery (cache, plugins, predicates) that reads
+	// the scheduler's global options.ServerOpts — several accesses are unguarded
+	// (e.g. volume-binding, predicate/sharding helpers). The scheduler binary fills
+	// it via RegisterOptions during flag parsing; the repack-engine binary does not,
+	// so ServerOpts would be nil and constructing the cache panics. Initialize a safe
+	// default (sharding disabled) if unset. MUST run before schedcache.New below.
+	if schedoptions.ServerOpts == nil {
+		opt := schedoptions.NewServerOption()
+		opt.ShardingMode = commonutil.NoneShardingMode
+		opt.RegisterOptions()
+	}
+
 	if cfg.Core == "" {
 		cfg.Core = engineframework.CoreDrain
 	}
@@ -119,8 +137,10 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 	e := &Engine{
 		// Reuse the scheduler cache as a read-only cluster view. New is a pure
 		// constructor (no queue bootstrap — that's the scheduler's startup job), so
-		// the engine needs only queues get/list/watch, never create.
-		cache:   schedcache.New(config, nil, "", nil, 0, nil, 0, 0),
+		// the engine needs only queues get/list/watch, never create. nodeWorkers must
+		// be > 0: with 0 workers the node queue is never drained and sc.Nodes stays
+		// empty, so the engine would see a zero-node cluster.
+		cache:   schedcache.New(config, nil, "", nil, repackNodeWorkers, nil, 0, 0),
 		vc:      vc,
 		cfg:     cfg,
 		factory: factory,
@@ -346,9 +366,33 @@ func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
 	return active, lastFinish
 }
 
+// requeueGatedRuns re-enqueues every non-terminal Execute run so any run that was
+// gated on the K=1 slot (reason AnotherRunActive) is re-evaluated now that the
+// slot is free. Called when an Execute releases the slot; the just-finished run is
+// terminal by then and is skipped. DryRun runs are never gated, so they are not
+// re-enqueued here.
+func (e *Engine) requeueGatedRuns() {
+	runs, err := e.lister.List(labels.Everything())
+	if err != nil {
+		klog.ErrorS(err, "repack-engine: list for gated-run requeue")
+		return
+	}
+	for _, r := range runs {
+		if r.Spec.Mode == repackv1alpha1.RepackModeExecute && !state.IsTerminal(r.Status.Phase) {
+			e.queue.Add(r.Name)
+		}
+	}
+}
+
 // process plans and acts on a cleared run (the gate already passed).
 func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+		// Defers run LIFO: markExecuteDone (declared last) releases the K=1 slot
+		// first, then requeueGatedRuns (declared first) re-enqueues Execute runs
+		// that were blocked on it. Without the wake, a run gated with reason
+		// AnotherRunActive — which carries no RequeueAfter — would never be
+		// revisited under the event-driven (resync=0) model and would be starved.
+		defer e.requeueGatedRuns()
 		// Release the K=1 slot and stamp the cooldown anchor when done, even on
 		// panic/early-return paths.
 		defer e.markExecuteDone(work.Name)
@@ -358,7 +402,10 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	e.mu.Unlock()
 
 	sched := schedframework.OpenSession(e.cache, tiers, cfgs)
-	defer schedframework.CloseSession(sched)
+	// Read-only close: the engine plans against the session but must NOT write back
+	// PodGroup/Queue status (gang Unschedulable conditions, JobUpdater, queue
+	// allocated) — that is the scheduler's job and a second writer would race it.
+	defer schedframework.CloseSessionReadOnly(sched)
 
 	gen := work.Generation
 	res := e.resolveResource(work)

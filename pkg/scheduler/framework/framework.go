@@ -69,3 +69,15 @@ func CloseSession(ssn *Session) {
 
 	closeSession(ssn)
 }
+
+// CloseSessionReadOnly releases a session opened purely for read-only planning
+// (e.g. the repack engine) WITHOUT any cluster writes. The normal CloseSession
+// writes PodGroup/Queue status back on close through three paths — plugin
+// OnSessionClose (the gang plugin marks PodGroups Unschedulable),
+// JobUpdater.UpdateAll (PodGroup status) and updateQueueStatus (Queue allocated).
+// Those are the scheduler's responsibility; a second writer would race it and
+// flap the conditions. This variant skips all three and only releases in-memory
+// session state and the cache's per-session snapshot.
+func CloseSessionReadOnly(ssn *Session) {
+	closeSessionCleanup(ssn)
+}
