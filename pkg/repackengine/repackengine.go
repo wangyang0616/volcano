@@ -117,6 +117,9 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 	factory := vcinformers.NewSharedInformerFactory(vc, cfg.ResyncPeriod)
 	informer := factory.Repack().V1alpha1().RepackRuns()
 	e := &Engine{
+		// Reuse the scheduler cache as a read-only cluster view. New is a pure
+		// constructor (no queue bootstrap — that's the scheduler's startup job), so
+		// the engine needs only queues get/list/watch, never create.
 		cache:   schedcache.New(config, nil, "", nil, 0, nil, 0, 0),
 		vc:      vc,
 		cfg:     cfg,
@@ -368,6 +371,17 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
 		return
 	}
+	if !supportedTarget(res) {
+		// Only fully-qualified extended resources (nvidia.com/gpu, huawei.com/Ascend910)
+		// are supported — they live in Resource.ScalarResources. Core compute resources
+		// (cpu, memory, ephemeral-storage, ...) are stored in dedicated fields, so
+		// Scalar() reads 0 for them and the run would be a silent no-op reporting
+		// NoFragmentation. CEL rejects this on spec.goals, but the --repack-default-
+		// resource fallback bypasses CEL, so guard it here too.
+		e.fail(work, gen, "UnsupportedResource",
+			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", res))
+		return
+	}
 
 	reason := state.ReasonSimulating
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
@@ -474,6 +488,15 @@ func (e *Engine) resolveResource(run *repackv1alpha1.RepackRun) v1.ResourceName 
 		return run.Spec.Goals[0].Resource
 	}
 	return v1.ResourceName(e.cfg.DefaultResource)
+}
+
+// supportedTarget reports whether res is a defragmentable accelerator resource.
+// Extended resources are fully qualified with a domain prefix (contain "/"), e.g.
+// nvidia.com/gpu; core resources (cpu, memory, ephemeral-storage, pods,
+// hugepages-*) are not and are unsupported. This mirrors the CEL rule on
+// spec.goals[0].resource and also guards the --repack-default-resource fallback.
+func supportedTarget(res v1.ResourceName) bool {
+	return strings.Contains(string(res), "/")
 }
 
 func (e *Engine) fail(run *repackv1alpha1.RepackRun, gen int64, reason string, err error) {

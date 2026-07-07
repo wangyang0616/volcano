@@ -128,9 +128,17 @@ spec:
                       minimum: 0
                       type: integer
                     resource:
-                      description: Resource is the accelerator to defragment (e.g.
-                        nvidia.com/gpu).
+                      description: |-
+                        Resource is the accelerator to defragment (e.g. nvidia.com/gpu). Only
+                        fully-qualified extended resources (a name containing "/") are supported;
+                        core compute resources such as cpu, memory, ephemeral-storage and pods are
+                        rejected, because repack only consolidates scalar accelerator capacity.
                       type: string
+                      x-kubernetes-validations:
+                      - message: goals.resource must be a fully-qualified accelerator/extended
+                          resource (e.g. nvidia.com/gpu); core resources like cpu,
+                          memory and ephemeral-storage are not supported
+                        rule: self.contains('/')
                   required:
                   - resource
                   type: object

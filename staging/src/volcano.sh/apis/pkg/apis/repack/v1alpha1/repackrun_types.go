@@ -156,8 +156,12 @@ type RepackRelief struct {
 
 // RepackGoal is one resource's fragmentation target.
 type RepackGoal struct {
-	// Resource is the accelerator to defragment (e.g. nvidia.com/gpu).
+	// Resource is the accelerator to defragment (e.g. nvidia.com/gpu). Only
+	// fully-qualified extended resources (a name containing "/") are supported;
+	// core compute resources such as cpu, memory, ephemeral-storage and pods are
+	// rejected, because repack only consolidates scalar accelerator capacity.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self.contains('/')",message="goals.resource must be a fully-qualified accelerator/extended resource (e.g. nvidia.com/gpu); core resources like cpu, memory and ephemeral-storage are not supported"
 	Resource v1.ResourceName `json:"resource"`
 	// MinFragImprovementPercent is the required minimum drop in this resource's
 	// fragmentation, in percentage points (0-100). 0 = any benefit counts.

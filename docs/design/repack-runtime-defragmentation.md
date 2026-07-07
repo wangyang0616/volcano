@@ -274,7 +274,7 @@ flowchart LR
 | `mode` | `DryRun`（模拟出报告）/ `Execute`（真实执行） | 是 | P0 |
 | `scope.podGroups` | 候选被搬迁的作业范围（include/exclude，`selector` 按 PG 标签 + `names` 点名 PG 的 `ns/name`）——**万物皆 PodGroup**（见下方说明） | DryRun 可空，Execute 必填 | P0 |
 | `scope.nodes` | 限定/排除参与整理的节点 | 可选 | P0 |
-| `goals[0].resource` | 整理哪类加速资源（如 `nvidia.com/gpu`），**单资源、恰一条** | 可选（默认自动探测） | P0 |
+| `goals[0].resource` | 整理哪类加速资源（如 `nvidia.com/gpu`），**单资源、至多一条** | 可选（留空=回落引擎 `--repack-default-resource`，皆空即 `NoTargetResource` 失败） | P0 |
 | `goals[0].minFragImprovementPercent` | 碎片率最小改善阈值（百分点 0–100 整数），达不到不整理 | 可选 | P0 |
 | `maxPerRun.podGroups` / `.resources` | 单轮最多动几个作业 / 几张卡 | 可选 | P0 |
 | `ttlSecondsAfterFinished` | 终态后自动清理（对齐 Job，由控制器执行） | 可选 | P0 |
@@ -632,7 +632,7 @@ spec:                                         # 必选；创建后整体不可�
       exclude:
         names:
           - node-a01
-  goals:                                      # 可选：maxItems=1（不填=自动探测唯一加速资源类）
+  goals:                                      # 可选：maxItems=1（不填=回落引擎 --repack-default-resource，皆空即 NoTargetResource 失败）
     - resource: nvidia.com/gpu                # 必选（goals 内）：整理哪类资源
       minFragImprovementPercent: 10           # 可选：碎片率最小改善阈值（百分点 0-100）
   maxPerRun:                                  # 可选：单轮规模封顶（blast radius）

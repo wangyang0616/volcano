@@ -38,7 +38,7 @@ Repack 面向 AI 负载在 **Node 级 + 多层 HyperNode 级** 的运行期碎�
 12. **P1 扩展已预留方案（§4.15）**：多级 HyperNode 拓扑、队列配额感知、最优成本整理（最少作业/卡）、单作业抗反复中断；spec 注释占位、引擎扩展点接入，不改 P0 契约。
 13. **策略可插拔（§4.16）**：repack 全程沿用 Volcano **action+plugin** 范式，关键策略点（碎片度量 `FragmentScoreFn`、收益门控 `RepackBenefitFn`、中断代价 `DisruptionCostFn`、目标画像 `TargetProfileFn`、P1 plan 择优 `RepackPlanScoreFn`）暴露为 **`ssn.AddXxxFn` 扩展函数**，核心库只编排、不写死口径。
 14. **主 KPI 定稿（§4.12.2a）**：`WeightedFragRate` = **空节点整合**，**逐目标资源** `FragRate(R)=(B_R−A_R)/M_R` 经 `FragWeightFn` 合成；§4.13 门控对其求差；`(B_R−A_R)/B_R` 为辅助视角；与「画像可调度」口径互补。
-15. **加速资源整理，单资源/Run（P0/P1，§4.12）**：面向 GPU/NPU 等通用整理，整理哪类资源 = **`spec.goals[0].resource`**（每个 Run **恰一条**，CEL `maxItems:1`；留空=自动探测唯一加速资源类，多于一类则拒绝、要求显式指定）；2 的幂闭式 A 与资源类型无关。**一个 Run 同时整理多类资源（`goals` 多条、跨资源合成）= P2+**——`goals[]` 列表与逐资源度量机制（`perResource`/`WeightedFragRate`/`FragWeightFn`）已预留，P0/P1 退化为单条/单资源，P2 放开。
+15. **加速资源整理，单资源/Run（P0/P1，§4.12）**：面向 GPU/NPU 等通用整理，整理哪类资源 = **`spec.goals[0].resource`**（每个 Run **至多一条**，`omitempty` + CEL `maxItems:1`；**留空则回落引擎 `--repack-default-resource`，两者皆空即 `NoTargetResource` 失败**，解析优先级见 §4.12.2b）；2 的幂闭式 A 与资源类型无关。**一个 Run 同时整理多类资源（`goals` 多条、跨资源合成）= P2+**——`goals[]` 列表与逐资源度量机制（`perResource`/`WeightedFragRate`/`FragWeightFn`）已预留，P0/P1 退化为单条/单资源，P2 放开。
 
 ---
 
@@ -266,7 +266,7 @@ metadata:
 |--------|------|-------|------|
 | **`mode`** | 只出方案(`DryRun`) 还是 真整理(`Execute`) | ✅ | P0 |
 | **`scope`** | **在哪儿整理**：哪些运行中作业可被搬走、限定在哪些节点 | 否（Execute 须指定） | P0 |
-| **`goals`** | **单资源碎片目标（P0/P1 恰一条）**：该类加速资源的碎片改善门槛；省略=自动探测唯一资源用默认（多于一类则须显式指定）。多条=多资源 **P2+** | 否（有默认） | P0 |
+| **`goals`** | **单资源碎片目标（P0/P1 至多一条）**：该类加速资源的碎片改善门槛；`resource` 必须是**扩展资源**（CEL `self.contains('/')`，如 `nvidia.com/gpu`；cpu/memory 等 native 资源被 apiserver 拒）；省略=回落引擎 `--repack-default-resource`，两者皆空即 `NoTargetResource` 失败、误配 native 即 `UnsupportedResource` 失败（§4.12.2b）。多条=多资源 **P2+** | 否（有默认） | P0 |
 | **`maxPerRun`** | **单轮规模封顶**：podGroups + resources(ResourceList，异构) | 否（有默认） | P0 |
 | **`relief`** | **想达成什么**：让哪些排队作业能被调度（`podGroupRefs`）、至少解开几个才值得（`minRelieved`）——relief-driven | — | **P1** |
 | **`disruptionPolicy`** | **怎么/能不能扰动在跑作业**：bundlePolicy/minRunDuration/maxDisruptionScore/**respectPDB（PDB 兼容）** | — | **P1** |
@@ -366,7 +366,7 @@ spec:
     podGroupRefs: [ ml/train-large ]        # 想缓解的 pending PodGroup（namespace/name）
     minRelieved: 1                          # 至少解开几个才算值得（默认 1；pending 跨资源，故与逐资源 goals 分开）
 
-  # ③ 单资源碎片目标（P0/P1：恰一条，CEL maxItems:1；可选，省略=自动探测唯一加速资源用默认）
+  # ③ 单资源碎片目标（P0/P1：至多一条，CEL maxItems:1；可选，省略=回落引擎 --repack-default-resource，见 §4.12.2b）
   goals:
     - resource: nvidia.com/gpu              # 这一个 Run 整理哪类资源（GPU/NPU…）
       minFragRateImprovement: "0.05"        # 该资源碎片率绝对改善≥此值
@@ -1303,7 +1303,26 @@ kubectl get repackrun
 | **`WeightedFragRate`** | 集群 | **P0 主 KPI = 空节点整合口径 `(B−A)/M`（§4.12.2a）**；落到 `summary.fragBeforePercent/fragAfterPercent`、§4.13 门控对它求差。（可插拔 `FragWeightFn` 可改为多层/多画像加权，§4.16）。**注**：此为"整 node × 全局最大"特例；NVLink island / 超节点 per-域 k-配额等其他目标见 §4.15.5 泛化框架（P1） |
 | `SchedulableDomains{d}` | 容量 | 当前 `Feasible(d, H, nil)==true` 的 HyperNode 数（容量视角，relief 的反面） |
 
-> **P0/P1 单资源/Run、整理目标可配置**：`spec.goals` **恰一条**（`goals[0].resource` 指定该 Run 整理的资源类，如 `nvidia.com/gpu`、`huawei.com/Ascend910`；留空=自动探测唯一加速资源，多于一类则拒绝、要求显式指定）。引擎把 GPU/NPU 统一当作 `Resource.ScalarResources[R]`（`resource_info.go`），算法对资源名无感——只需 R 的每节点容量与 `Idle`。`usableDom` 用「整卡可拼副本数 × 单副本卡数」单维近似 + 一次全维 predicate 复核；完整多维背包留 P1。`capDom(n,R)` 取节点 R 的 `Allocatable`。
+> **P0/P1 单资源/Run、整理目标可配置**：`spec.goals` **至多一条**（`omitempty` + CEL `MaxItems=1`，可留空），`goals[0].resource` 指定该 Run 整理的资源类，如 `nvidia.com/gpu`、`huawei.com/Ascend910`。**留空时的目标资源解析见 §4.12.2b（回落到引擎默认资源，而非自动探测）**。引擎把 GPU/NPU 统一当作 `Resource.ScalarResources[R]`（`resource_info.go`），算法对资源名无感——只需 R 的每节点容量与 `Idle`。`usableDom` 用「整卡可拼副本数 × 单副本卡数」单维近似 + 一次全维 predicate 复核；完整多维背包留 P1。`capDom(n,R)` 取节点 R 的 `Allocatable`。
+
+> **§4.12.2b 目标资源解析（`goals` 可选时"整理哪类资源"）**
+>
+> `spec.goals` 为可选（0 或 1 条）。引擎在每次 Run 开跑时用 `resolveResource(run)` 按**固定优先级**确定唯一目标资源 R，之后**所有**判断——碎片率、节点是否满配、集中率、空节点（仅看是否有 pod 申请该类卡）——**一律以 R 为准**：
+>
+> 1. **`spec.goals[0].resource` 非空** → 用它（Run 级显式指定，最高优先级）。
+> 2. **`goals` 为空** → 回落到引擎的 `--repack-default-resource` flag（Helm `custom.repack_default_resource`，默认 `nvidia.com/gpu`）——**运营方在部署时配置的集群级默认**。
+> 3. **两者皆空** → **不做整理**：该 Run 直接判失败，`conditions[Failed].reason = NoTargetResource`，message 提示"填 `spec.goals[0].resource` 或配 `--repack-default-resource`"。
+>
+> **为何不自动探测**（扫节点挑唯一有 `Allocatable` 的加速卡）：混合集群（同时有 GPU 与 NPU）自动挑会**静默选错**，且用户难以察觉。管理员在部署时显式配一个默认值是**可预测、可审计**的——集群装什么卡运营方最清楚。故 P0 采用"显式默认 + 缺失即快速失败"，而非自动探测。（早期草案曾写"留空=自动探测唯一加速资源"，**未实现**，已按本节纠正。）
+>
+> **仅支持异构加速卡，cpu/memory 等 native 资源被拒**：引擎只整理**标量扩展资源**（存放在 `Resource.ScalarResources[R]`，如 GPU/NPU）。cpu/memory/ephemeral-storage/pods/hugepages-* 是 native compute 资源，存放在 `Resource` 的专用字段而非 `ScalarResources`——`Scalar(node,R)` 对它们恒读 0，若放行会让每个节点都算"空"、Run 静默退化成 `NoFragmentation` 假成功。故**两层校验**拦在前面：
+>
+> - **CEL（创建时，apiserver）**：`spec.goals[0].resource` 上加 `x-kubernetes-validations: self.contains('/')`——目标必须是**完全限定的扩展资源**（带域名前缀，含 `/`）。`nvidia.com/gpu`、`huawei.com/Ascend910` 通过；`cpu`、`memory`、`ephemeral-storage`、`pods`、`hugepages-2Mi`（均无 `/`）被 apiserver 直接打回，`kubectl apply` 即报错。
+> - **引擎运行时兜底**：CEL 只管 CR 的 `goals` 字段，**管不到 `--repack-default-resource` flag**。故 `resolveResource` 拿到 R 后再过一遍 `supportedTarget(res)`（同为"含 `/`"判据）：不通过则失败 `conditions[Failed].reason = UnsupportedResource`，堵住"goals 留空 + 默认资源误配成 cpu"的运维侧漏洞。
+>
+> 判据用"含 `/`"而非黑名单：引擎对资源名无感、把任意扩展资源统一当 `ScalarResources[R]` 处理，真正要挡的只有 native compute 资源；`example.com/foo` 这类非加速卡的扩展资源虽非典型用法，但放行也无害。
+>
+> **当前局限**：`goals` 至多一条，一次 Run 只整理**一种**资源；多资源加权整理（`perResource`/`WeightedFragRate`）算法层已预留、驱动层仍单资源，跨资源合成 = P2+。
 >
 > **多资源 = P2+**：下文的逐资源 `FragRate(R)`、`perResource` map、`WeightedFragRate`/`FragWeightFn` 跨资源**合成**机制**均已预留**；P0/P1 单资源时**退化**——`perResource` 只一条，顶层 `fragRate*` **恒等于**该唯一资源的值（合成是恒等映射），门控直接对该资源求差。P2 一个 Run 同时整理多类资源时，这些机制原样生效、不必改 schema。
 
@@ -2986,7 +3005,7 @@ type RepackRunSpec struct {
     Mode                    RepackRunMode `json:"mode"`
     Scope                   *RepackScope  `json:"scope,omitempty"`        // 在哪儿整理（按维度嵌套）
     Relief                  *Relief       `json:"relief,omitempty"`       // 想缓解哪些 pending + 至少解开几个（受益者，自身不动）
-    Goals                   []ResourceGoal `json:"goals,omitempty"`       // P0/P1: 恰一条（CEL maxItems:1，单资源/Run）；省略=自动探测唯一加速资源。多条=多资源 P2+
+    Goals                   []ResourceGoal `json:"goals,omitempty"`       // P0/P1: 至多一条（CEL maxItems:1，单资源/Run）；省略=回落引擎 --repack-default-resource，两者皆空即 NoTargetResource 失败（§4.12.2b）。多条=多资源 P2+
     DisruptionPolicy        *DisruptionPolicy `json:"disruptionPolicy,omitempty"` // 怎么/能不能扰动在跑作业
     MaxPerRun               *MaxPerRun    `json:"maxPerRun,omitempty"`    // 单轮规模封顶（非 K8s 资源 limits）
     TTLSecondsAfterFinished *int64        `json:"ttlSecondsAfterFinished,omitempty"` // 终态后自动 DELETE（不设运行超时字段）
@@ -3175,6 +3194,7 @@ type RepackRunStatus struct {
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v10.7** | 2026-07-07 | **目标资源解析据实纠正（新增 §4.12.2b）+ P0 检视修复对齐**：文档原写「`goals` 留空=自动探测唯一加速资源，多于一类则拒绝」，但实现从未做自动探测——`resolveResource(run)` 实际按固定优先级 `spec.goals[0].resource` → 引擎 `--repack-default-resource`(Helm `custom.repack_default_resource`,默认 `nvidia.com/gpu`) → 两者皆空即**快速失败** `conditions[Failed].reason=NoTargetResource`(P0-4)。新增 **§4.12.2b「目标资源解析」**权威定义此优先级链 + 「为何不自动探测」(混合集群自动挑会静默选错,显式默认可预测可审计) + 单资源局限;同步 §1 摘要 #15、§4.5.2 字段表(`goals`)/YAML 注释、§12 Go 类型注释,把「自动探测」措辞统一改为「回落默认资源 / NoTargetResource 失败」。`goals` 措辞「恰一条」→「至多一条」(`omitempty`,0 或 1)。**② 仅支持异构加速卡、cpu/memory 等 native 资源两层拦截**:cpu/memory 存于 `Resource` 专用字段而非 `ScalarResources`,`Scalar()` 恒读 0,放行会让 Run 静默退化成 `NoFragmentation` 假成功——(a) **CEL** 在 `RepackGoal.resource` 加 `self.contains('/')`(必须扩展资源,`nvidia.com/gpu` 通过、`cpu`/`memory`/`ephemeral-storage`/`pods`/`hugepages-*` 被 apiserver 拒);(b) **引擎运行时** `resolveResource` 后过 `supportedTarget(res)`(同判据),不过则失败 `reason=UnsupportedResource`,堵住 CEL 管不到的 `--repack-default-resource` 误配。判据用「含 `/`」而非黑名单(引擎对资源名无感)。加纯函数单测 `TestSupportedTarget`;§4.12.2b/§4.5.2 补两层校验说明。**修订记录中 v9.x/v10.x 历史条目按惯例保留原「自动探测」字样**(为当时草案事实)。配套 P0 两轮深度检视的代码修复(P0-1 minFragImprovementPercent 接入收益门控／P0-2 K=1 内存态权威门控／P0-3 终态 RetryOnConflict／P0-5 Execute 全驱逐失败判 `ExecuteFailed`／P0-6 删死常量+`ReasonAdmitted`→`ReasonSlotAcquired`) 与 Execute 冷却锚点 GC 保留(`state.CooldownRetained`,防 TTL<cooldown 丢锚点)已落代码 |
 | **v10.6** | 2026-07-04 | **`scope.nodes.exclude` 语义落地：不腾空但可接收（#40 收尾）**——把「node scope 门控腾空目标、而非接收方全集」下沉到 core。①`framework.Snapshot` 接口加 `NodeInScope(n)`（是否可作腾空目标；nil scope=全可）；`SessionSnapshot.Nodes()` **不再按 nodeInScope 过滤**（返回全集=接收方宇宙），`NodeInScope` 单独暴露门控。② `node` 插件生成 FreeableUnit（腾空目标）时按 `snap.NodeInScope(n)` 过滤——**out-of-scope 节点不作目标**。③ drain 的 `prefer` 把 `!NodeInScope(n)` 也判为**首选接收方**（层 2，与 frozen/provenStuck 并列）——用户排除出腾空的节点确定留下,拿它当首选 sink,保住可腾节点。于是 `scope.nodes.exclude` = 「不腾空但可接收(且优先)」,与用户确认语义一致。加 `TestDrain_ExcludedNodeIsReceiverNotTarget`（排除节点不被腾、吸纳 victim、其余两节点腾空）；三处 fakeSnap 补 `NodeInScope`。注:PodGroup 标签匹配(`inScope`)本就完成、5 个 scope 测试覆盖 |
 | **v10.5** | 2026-07-04 | **drain 接收方选择：收益导向的分层偏好（#39 增强）**——腾空某节点时，其 victim 的落点不再是纯 best-fit，而是**先按「是否确定留下」分层、层内再 best-fit**：① **确定留下的占用节点=首选接收方**（有不可迁移 pod／承载 `scope.podGroups.exclude` 的节点=腾不空；动态过程中「试过、证明腾不空」的节点缓存进来——腾空性单调不增，一旦腾不空即永久）——填它们的空隙零代价，不浪费可腾节点的腾空潜力；② **可腾碎片节点=次级接收方**（尽量别填，填了毁其腾空潜力）；③ **加速卡空节点排除出接收方与目标**（往空节点搬=净零 shuffle；「空」按**异构卡占用**判定——只跑 CPU/内存 pod、加速卡占用为 0 的节点也算空，`occupiesAccelerator(n,res)`）——而「满节点腾了净零」这条**自动达成**：满节点的 pod 只在能塞进现有空隙时才被搬（有益），只能靠空节点接收的（净零）因空节点被排除而自动不可行。落地：`api.Domain` 加 `Prefer(fn)` 接收方偏好（只改「先找到哪个可行解」、不改可行性/完整性）；drain 循环传入 `prefer`（`!NodeFreeable ∥ provenStuck → 首选`）+ 排除空节点接收 + 缓存 `provenStuck`。加 `TestDrain_PrefersStayingReceiver`（frozen 节点优先接收、保住可腾节点 → 多腾一个）。注：`scope.nodes.exclude` 节点作首选接收方需 node-scope 下沉到 core（#40）后补 |
 | **v10.4** | 2026-07-04 | **落点身份契约引擎侧落地（#46）**：`framework/apply.go` 新增 `resolveIdentityLabels(pod)`——**只读 pod 自身的标准 label**、按优先级 `repack.volcano.sh/pod-identity`（Tier1 声明式）→ `apps.kubernetes.io/pod-index`（StatefulSet）→ `batch.kubernetes.io/job-completion-index`（Indexed Job），命中即记 `{key: value}`，否则 nil（fungible）；**不查 ownerRef、不硬编码各家 scheme**。`NominationIntent` 加 `IdentityLabels`（构造时解析 `t.Pod`），engine `nominationsOf` 透传至 `status.nominations[].identityLabels`。§5.2.2 相应改为「直接读 pod 标准索引 label」（原「按 ownerRef kind 适配」表述简化）。加 `TestResolveIdentityLabels`（Tier1 优先/pod-index/completion-index/空值/nil）。`identityLabels` 的实际填充自此生效（此前为空占位） |
