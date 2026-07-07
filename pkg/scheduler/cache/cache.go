@@ -100,7 +100,12 @@ func init() {
 	utilruntime.Must(schemeBuilder.AddToScheme(scheme.Scheme))
 }
 
-// New returns a Cache implementation.
+// New returns a Cache implementation. New is a pure constructor: it builds the
+// in-memory cache and wires informers, but performs NO cluster writes. Creating
+// the default/root queues is a cluster-bootstrap concern owned by the scheduler
+// startup (see EnsureDefaultAndRootQueues), so read-only consumers that reuse the
+// cache (e.g. the repack engine) get an identical cluster view without needing
+// queue-create RBAC and without racing the scheduler to create the singletons.
 func New(config *rest.Config, schedulerNames []string, defaultQueue string, nodeSelectors []string, nodeWorkers uint32, ignoredProvisioners []string, resyncPeriod time.Duration, resourceSyncTimeout time.Duration) Cache {
 	return newSchedulerCache(config, schedulerNames, defaultQueue, nodeSelectors, nodeWorkers, ignoredProvisioners, resyncPeriod, resourceSyncTimeout)
 }
@@ -461,8 +466,13 @@ func (sc *SchedulerCache) setBatchBindParallel() {
 	}
 }
 
-// newDefaultAndRootQueue init default queue and root queue
-func newDefaultAndRootQueue(vcClient vcclient.Interface, defaultQueue string) {
+// EnsureDefaultAndRootQueues creates the cluster's root and default queues if
+// absent. This is a cluster-bootstrap concern owned by the scheduler startup and
+// is deliberately kept OUT of New(), so the cache stays a pure, side-effect-free
+// constructor. It returns an error (rather than calling Fatalf, as a constructor
+// once did): the caller — the scheduler's startup — decides how fatal a failure
+// is, while read-only consumers of the cache simply never call it.
+func EnsureDefaultAndRootQueues(vcClient vcclient.Interface, defaultQueue string) error {
 	createIfNotExists := func(name string, reclaimable bool) error {
 		_, err := vcClient.SchedulingV1beta1().Queues().Get(context.TODO(), name, metav1.GetOptions{})
 		if err == nil {
@@ -511,12 +521,13 @@ func newDefaultAndRootQueue(vcClient vcclient.Interface, defaultQueue string) {
 	}
 
 	if err := createIfNotExists("root", false); err != nil {
-		klog.Fatalf("failed to init root queue: %v", err)
+		return fmt.Errorf("init root queue: %w", err)
 	}
 
 	if err := createIfNotExists(defaultQueue, true); err != nil {
-		klog.Fatalf("failed to init default queue: %v", err)
+		return fmt.Errorf("init default queue: %w", err)
 	}
+	return nil
 }
 
 func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueue string, nodeSelectors []string, nodeWorkers uint32, ignoredProvisioners []string, resyncPeriod time.Duration, resourceSyncTimeout time.Duration) *SchedulerCache {
@@ -533,9 +544,10 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 		panic(fmt.Sprintf("failed init eventClient, with err: %v", err))
 	}
 
-	// create default queue and root queue
-	klog.Infof("Creating default queue and root queue")
-	newDefaultAndRootQueue(vcClient, defaultQueue)
+	// NOTE: default/root queue creation is intentionally NOT done here — it is a
+	// cluster-bootstrap side effect that belongs to the scheduler's startup, not
+	// to constructing an in-memory cache. The scheduler calls
+	// EnsureDefaultAndRootQueues explicitly; read-only consumers skip it.
 
 	errTaskRateLimiter := workqueue.NewTypedMaxOfRateLimiter[string](
 		workqueue.NewTypedItemExponentialFailureRateLimiter[string](5*time.Millisecond, 1000*time.Second),

@@ -471,7 +471,9 @@ func TestNewDefaultAndRootQueue(t *testing.T) {
 			for i := 0; i < tt.concurrentNumber; i++ {
 				go func() {
 					defer wg.Done()
-					newDefaultAndRootQueue(tt.vcClient, defaultQueue)
+					if err := EnsureDefaultAndRootQueues(tt.vcClient, defaultQueue); err != nil {
+						t.Errorf("EnsureDefaultAndRootQueues: %v", err)
+					}
 				}()
 			}
 			wg.Wait()
