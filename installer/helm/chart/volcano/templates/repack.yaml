@@ -78,6 +78,15 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["deviceclasses", "resourceslices"]
+    verbs: ["get", "list", "watch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
@@ -145,14 +154,13 @@ spec:
           imagePullPolicy: {{ .Values.basic.image_pull_policy }}
           args:
             - --logtostderr
-            - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
+            - --scheduler-conf=/volcano.scheduler/{{ base .Values.basic.scheduler_config_file }}
             - --leader-elect=true
             - --leader-elect-resource-namespace={{ .Release.Namespace }}
-            - --schedule-period={{ .Values.custom.repack_schedule_period }}
+            - --resync-period={{ .Values.custom.repack_schedule_period }}
             - --repack-default-resource={{ .Values.custom.repack_default_resource }}
-            - --repack-core={{ .Values.custom.repack_core }}
+            - --repack-algorithm={{ .Values.custom.repack_core }}
             - -v={{ .Values.custom.repack_log_level | default 3 }}
-            - 2>&1
           {{- if .Values.custom.repack_resources }}
           resources:
             {{- toYaml .Values.custom.repack_resources | nindent 12 }}

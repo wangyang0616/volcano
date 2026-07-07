@@ -344,7 +344,7 @@ EXTRA
   --kubeconfig ${KUBECONFIG} \
   --values - \
   ${extra_values_flag} \
-  --wait
+  --wait --timeout 10m
 basic:
   image_pull_policy: IfNotPresent
   image_tag_version: ${TAG}
@@ -368,6 +368,13 @@ custom:
       operator: "Exists"
       effect: "NoSchedule"
   scheduler_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  default_tolerations:
     - key: "node-role.kubernetes.io/control-plane"
       operator: "Exists"
       effect: "NoSchedule"
