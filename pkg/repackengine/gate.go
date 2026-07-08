@@ -96,9 +96,14 @@ func (e *Engine) requeueGatedRuns() {
 		klog.ErrorS(err, "repack-engine: list for gated-run requeue")
 		return
 	}
+	woken := 0
 	for _, r := range runs {
 		if r.Spec.Mode == repackv1alpha1.RepackModeExecute && !state.IsTerminal(r.Status.Phase) {
 			e.queue.Add(r.Name)
+			woken++
 		}
+	}
+	if woken > 0 {
+		klog.V(4).InfoS("requeued gated Execute runs after slot release", "count", woken)
 	}
 }

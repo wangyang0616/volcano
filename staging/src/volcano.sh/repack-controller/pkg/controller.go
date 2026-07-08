@@ -119,7 +119,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), c.synced) {
 		return fmt.Errorf("repackrun controller: cache failed to sync")
 	}
-	klog.InfoS("Starting repackrun controller", "workers", c.opts.Workers)
+	klog.V(3).InfoS("Starting repackrun controller", "workers", c.opts.Workers, "executeCooldown", c.executeCooldown)
 
 	for i := 0; i < c.opts.Workers; i++ {
 		go func() {
@@ -128,7 +128,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		}()
 	}
 	<-ctx.Done()
-	klog.InfoS("Shutting down repackrun controller")
+	klog.V(3).InfoS("Shutting down repackrun controller")
 	return nil
 }
 
@@ -170,15 +170,17 @@ func (c *Controller) reconcile(ctx context.Context, name string) error {
 	// restart) would otherwise forget the cooldown and admit the next Execute early.
 	if state.CooldownRetained(run, c.executeCooldown, now) {
 		if d := state.CooldownRemaining(run, c.executeCooldown, now); d > 0 {
+			klog.V(4).InfoS("GC: retaining finished Execute run as cooldown anchor", "name", name, "retainFor", d)
 			c.queue.AddAfter(name, d) // revisit right when the window lifts
 		}
 		return nil
 	}
 	if state.TTLExpired(run, now) {
-		klog.InfoS("GC: deleting expired RepackRun", "name", name, "phase", run.Status.Phase)
+		klog.V(3).InfoS("GC: deleting expired RepackRun", "name", name, "phase", run.Status.Phase)
 		return ignoreNotFound(c.client.RepackV1alpha1().RepackRuns().Delete(ctx, name, metav1.DeleteOptions{}))
 	}
 	if d := ttlRemaining(run, now); d > 0 {
+		klog.V(5).InfoS("GC: run not yet expired, requeueing at TTL", "name", name, "ttlRemaining", d)
 		c.queue.AddAfter(name, d)
 	}
 	return nil

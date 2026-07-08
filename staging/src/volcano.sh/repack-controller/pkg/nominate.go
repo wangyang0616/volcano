@@ -117,7 +117,7 @@ func (n *Nominator) Run(ctx context.Context, workers int) error {
 	if workers < 1 {
 		workers = 1
 	}
-	klog.InfoS("Starting repack nominator", "workers", workers)
+	klog.V(3).InfoS("Starting repack nominator", "workers", workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			for n.processNext(ctx) {
@@ -161,13 +161,14 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 
 	rec, owner := n.matchNomination(pod)
 	if rec == nil {
+		klog.V(5).InfoS("no pending nomination matches this pod", "pod", key)
 		return nil // no pending nomination targets this pod
 	}
 
 	if err := n.patchNominatedNode(ctx, pod, rec.NodeName); err != nil {
 		return err
 	}
-	klog.InfoS("Nominated replacement pod", "pod", key, "node", rec.NodeName, "repackRun", owner)
+	klog.V(3).InfoS("nominated replacement pod", "pod", key, "node", rec.NodeName, "repackRun", owner)
 	// Best-effort: mark the record Bound so it is consumed once. A failure here
 	// only risks a redundant (idempotent) re-nomination, so it is not fatal.
 	if err := n.markBound(ctx, owner, rec); err != nil {

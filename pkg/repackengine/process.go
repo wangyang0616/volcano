@@ -26,6 +26,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	state "volcano.sh/repack-controller/pkg/state"
@@ -123,6 +124,10 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	engineframework.RunActions(e.cfg.Actions, esn)
 
 	report, plan := esn.Report(), esn.Plan()
+	klog.V(3).InfoS("plan computed", "run", work.Name, "mode", work.Spec.Mode, "resource", res,
+		"freedNodes", report.NodesFreed, "movedCards", report.MovedResource,
+		"affectedPodGroups", report.AffectedPodGroups,
+		"fragBeforePct", pct(report.FragRateBefore), "fragAfterPct", pct(report.FragRateAfter))
 	// The Complete reason doubles as the "worth repacking?" verdict (§5.2.2);
 	// there is no summary.verdict. worthwhile = the plan freed nodes; an empty
 	// plan splits by whether fragmentation existed: none (clean) vs below the
@@ -136,6 +141,8 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	applyPlan(work, report, plan, res, execute, ttl)
 	if commit := esn.Commit(); commit != nil {
 		metrics.ObserveEvictions(len(commit.Evicted), len(commit.Failed))
+		klog.V(3).InfoS("evictions issued", "run", work.Name,
+			"evicted", len(commit.Evicted), "rejected", len(commit.Failed))
 	}
 
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
@@ -166,6 +173,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, gen)
 	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, gen)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
+	klog.V(3).InfoS("RepackRun finished", "run", work.Name, "mode", work.Spec.Mode, "outcome", done)
 	e.updateStatusTerminal(work)
 }
 

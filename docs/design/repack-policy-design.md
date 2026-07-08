@@ -2373,7 +2373,11 @@ A≈O(N²)，B（朴素）≈O(N³)，B/A 每翻倍再 ×2。
 - **Prometheus 指标**（`/metrics`,`pkg/repackengine/metrics`）:`volcano_repack_runs_total{mode,outcome}`、`_evictions_total{result}`、`_cycle_duration_seconds{mode}`、`_gate_rejections_total{reason}`。
 - **Kubernetes 事件**:每个 Run 到终态时在其对象上打事件(Normal/Warning + reason),便于 `kubectl describe` 定位。
 - **健康探针**:`/healthz`(liveness);Deployment 配 livenessProbe,K8s 可重启卡死实例。
-- **结构化日志**:klog,关键日志带 `run` 名;panic 带完整栈。
+- **结构化日志（分级约定，面向人工运维/定位）**:klog,统一走结构化 `InfoS`(带 `run`/`mode`/`outcome` 等键值),panic 带完整栈。**级别约定**——
+  - **Error/Warning**:始终打印,真实失败与配置错误(load conf 失败、写状态失败、panic、未知 core/action)。
+  - **V(3) 运维叙事(默认开,`--v=3`)**:每个 Run 的"故事"——引擎启停、被 gate 推迟(带 reason)、plan 算出(freedNodes/movedCards/frag 前后%)、发出驱逐(evicted/rejected)、Run 终态(outcome)、孤儿恢复、GC 删除、提名写入。看默认日志即可跟踪一个 Run 全过程。
+  - **V(4) 排障细节**:reconcile 进入、抢到 execute 槽、重试次数、gated 唤醒数、cooldown 保留。
+  - **V(5) 深度调试**:gate 内部态、无匹配/跳过决策、逐项细节。
 
 #### 4.18.4 优雅退出
 

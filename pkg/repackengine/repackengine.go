@@ -31,6 +31,15 @@ limitations under the License.
 //   - process.go:      one cleared run's plan/act path and its eviction hooks.
 //   - status.go:       rendering the search outcome into RepackRun.status.
 //   - translate.go:    reading spec knobs (goals/maxPerRun) into engine params.
+//
+// Logging convention (klog verbosity; logs are for human operators/triage):
+//   - Error/Warning: always shown — real failures and misconfiguration.
+//   - V(3): operator narrative, on by default. The story of each run: engine
+//     started/stopped, per-run gate deferral, plan computed, evictions issued,
+//     run finished (outcome), orphan recovery, GC delete, nomination written.
+//   - V(4): troubleshooting detail — reconcile entry, slot acquired, retry count,
+//     requeue counts, cooldown retention.
+//   - V(5): deep debug — gate-state internals, no-match/skip decisions, per-item.
 package repackengine
 
 import (
@@ -197,14 +206,16 @@ func (e *Engine) Run(ctx context.Context) {
 		return
 	}
 	e.recoverOrphans() // fail runs left Running by a crashed predecessor
-	klog.InfoS("repack-engine started (event-driven)", "core", e.cfg.Core, "plugins", e.cfg.Plugins)
+	klog.V(3).InfoS("repack-engine started (event-driven)",
+		"core", e.cfg.Core, "plugins", e.cfg.Plugins,
+		"defaultResource", e.cfg.DefaultResource, "cooldown", e.cfg.Cooldown, "resyncPeriod", e.cfg.ResyncPeriod)
 	// Single worker: Execute runs serialize naturally (one reconcile at a time).
 	go func() {
 		for e.processNext(ctx) {
 		}
 	}()
 	<-ctx.Done()
-	klog.InfoS("repack-engine shutting down")
+	klog.V(3).InfoS("repack-engine shutting down")
 }
 
 func (e *Engine) loadConf() error {
@@ -257,6 +268,7 @@ func (e *Engine) processNext(ctx context.Context) bool {
 	if err := e.reconcileSafely(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("repack-engine reconcile %q: %w", key, err))
 		if e.queue.NumRequeues(key) < maxReconcileRetries {
+			klog.V(4).InfoS("requeueing RepackRun after error", "run", key, "retries", e.queue.NumRequeues(key)+1)
 			e.queue.AddRateLimited(key)
 			return true
 		}
@@ -308,6 +320,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 	if !candidate(run) {
 		return nil // already picked up / terminal
 	}
+	klog.V(4).InfoS("reconciling RepackRun", "run", name, "mode", run.Spec.Mode)
 	work := run.DeepCopy()
 
 	// Acknowledge as Pending so `kubectl get repackrun` shows a phase before the
@@ -327,6 +340,8 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 	})
 	if !gate.Admit {
 		metrics.ObserveGateRejection(gate.Reason)
+		klog.V(3).InfoS("RepackRun deferred by execute gate",
+			"run", name, "reason", gate.Reason, "requeueAfter", gate.RequeueAfter)
 		state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
 			gate.Reason, "waiting for an execute slot", work.Generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
@@ -338,6 +353,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 	}
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		e.markExecuteActive(work.Name) // hold the K=1 slot across this synchronous process
+		klog.V(4).InfoS("acquired execute slot", "run", work.Name)
 	}
 	e.process(work)
 	return nil
@@ -366,6 +382,6 @@ func (e *Engine) recoverOrphans() {
 		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, gen)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 		e.updateStatusTerminal(work)
-		klog.InfoS("recovered orphaned Running RepackRun -> Failed", "name", work.Name)
+		klog.V(3).InfoS("recovered orphaned Running RepackRun -> Failed", "run", work.Name)
 	}
 }
