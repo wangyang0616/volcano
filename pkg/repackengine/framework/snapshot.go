@@ -21,7 +21,7 @@ limitations under the License.
 // search strategy) and their registries, plus the commit (evict/nominate) and
 // report plumbing. It depends only on pkg/repackengine/api (pure model) and
 // pkg/scheduler/api (NodeInfo/TaskInfo) — never on the scheduler framework; the
-// live-Session coupling lives in pkg/repackengine/session.
+// live-Session coupling lives in pkg/repackengine/adapter.
 package framework
 
 import (
@@ -35,7 +35,7 @@ import (
 // Snapshot is the read-only cluster view a repack pass plans against. Abstracting
 // it (instead of the scheduler cache/Session) lets the standalone engine build a
 // view from informers; a live scheduler Session is one implementation (see
-// pkg/repackengine/session), tests use a fake. Implementations must be safe for
+// pkg/repackengine/adapter), tests use a fake. Implementations must be safe for
 // concurrent reads during one pass.
 type Snapshot interface {
 	// Nodes returns ALL candidate nodes — the receiver universe. scope.nodes

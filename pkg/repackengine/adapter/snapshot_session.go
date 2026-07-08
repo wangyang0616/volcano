@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package session is the ONLY scheduler-framework-coupled layer of the repack
+// Package adapter is the ONLY scheduler-framework-coupled layer of the repack
 // engine. It adapts a live volcano-scheduler Session into the framework's
 // abstractions: a Snapshot (cluster view), the EngineFit/ValidatePlan oracle, and
 // the gang-info source for scope resolution. Keeping every scheduler/framework
 // import here lets api/ and framework/ stay pure and unit-testable.
-package session
+package adapter
 
 import (
 	v1 "k8s.io/api/core/v1"

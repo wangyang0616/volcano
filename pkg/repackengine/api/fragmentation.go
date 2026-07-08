@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package repack implements the fragmentation index for the repack
-// (defragmentation) engine. See docs/design/repack-policy-design.md §4.12.
+// Package api implements the fragmentation index and pure model/contracts for
+// the repack (defragmentation) engine. See docs/design/repack-policy-design.md §4.12.
 //
 // Per accelerator resource R (e.g. nvidia.com/gpu, huawei.com/Ascend910):
 //
