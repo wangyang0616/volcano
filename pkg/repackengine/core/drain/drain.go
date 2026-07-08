@@ -49,6 +49,15 @@ type drainCore struct{}
 
 func (*drainCore) Name() string { return framework.CoreDrain }
 
+// Receiver-preference tiers for the drain (higher = filled first). A node that
+// will definitely stay occupied is the best receiver — filling its slack never
+// wastes a drainable node's empty-ability; a still-drainable node is filled only
+// when necessary, so its own empty-ability is preserved.
+const (
+	preferDrainable = 1
+	preferStaying   = 2
+)
+
 // Plan runs the incremental, gang-aware drain over the session's freeable units.
 func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	res := ssn.Resource()
@@ -120,9 +129,9 @@ func drainGreedy(
 	snap := ssn.Snapshot()
 	prefer := func(n *schedapi.NodeInfo) int {
 		if !api.NodeFreeable(n, movable, res) || provenStuck[n.Name] || !snap.NodeInScope(n) {
-			return 2
+			return preferStaying
 		}
-		return 1
+		return preferDrainable
 	}
 
 	type cand struct {

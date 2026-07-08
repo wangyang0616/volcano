@@ -28,6 +28,14 @@ import (
 // Name is the config name for this plugin.
 const Name = "base"
 
+// Default P0 weights for the base disruption dimensions (disruptionPolicy overrides
+// them in P1). Breaking a whole gang matters most, then relocated cards, then pods.
+const (
+	weightAffectedPodGroups = 1.0
+	weightMovedResource     = 0.3
+	weightMovedPods         = 0.1
+)
+
 func init() {
 	framework.RegisterPlugin(Name, func() framework.Plugin { return &basePlugin{} })
 }
@@ -37,13 +45,13 @@ type basePlugin struct{}
 func (*basePlugin) Name() string { return Name }
 
 func (*basePlugin) OnSessionOpen(ssn *framework.Session) {
-	ssn.AddDisruptionScoreFn("affectedPodGroups", 1.0, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+	ssn.AddDisruptionScoreFn("affectedPodGroups", weightAffectedPodGroups, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 		return float64(p.Aggregate(ctx).AffectedPGs)
 	})
-	ssn.AddDisruptionScoreFn("movedGPU", 0.3, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+	ssn.AddDisruptionScoreFn("movedGPU", weightMovedResource, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 		return float64(p.Aggregate(ctx).MovedGPU)
 	})
-	ssn.AddDisruptionScoreFn("movedPods", 0.1, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+	ssn.AddDisruptionScoreFn("movedPods", weightMovedPods, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 		return float64(p.Aggregate(ctx).MovedPods)
 	})
 }

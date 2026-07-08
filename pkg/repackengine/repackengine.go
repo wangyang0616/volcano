@@ -120,9 +120,14 @@ type Engine struct {
 	lastExecFinish time.Time
 }
 
-// repackNodeWorkers is the number of scheduler-cache node workers the engine runs
-// to keep sc.Nodes in sync. Must be > 0 or the node queue is never drained.
-const repackNodeWorkers = 4
+const (
+	// repackNodeWorkers is the number of scheduler-cache node workers the engine
+	// runs to keep sc.Nodes in sync. Must be > 0 or the node queue is never drained.
+	repackNodeWorkers = 4
+	// defaultNominationTTL is how long an Execute nomination is re-asserted onto the
+	// replacement pod before expiring, when the run does not override it.
+	defaultNominationTTL = 10 * time.Minute
+)
 
 // newEventRecorder builds a recorder that emits Kubernetes events on RepackRun
 // objects. It uses a scheme carrying both core (event) and repack types so the
@@ -162,7 +167,7 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 		cfg.Plugins = []string{"base", "node", "gang"}
 	}
 	if cfg.NominationTTL <= 0 {
-		cfg.NominationTTL = 10 * time.Minute
+		cfg.NominationTTL = defaultNominationTTL
 	}
 	vc := vcclientset.NewForConfigOrDie(config)
 	factory := vcinformers.NewSharedInformerFactory(vc, cfg.ResyncPeriod)
@@ -239,16 +244,16 @@ func (e *Engine) loadConf() error {
 // enqueue adds a candidate RepackRun (Admitted + Pending) to the workqueue.
 func (e *Engine) enqueue(obj interface{}) {
 	run, ok := obj.(*repackv1alpha1.RepackRun)
-	if !ok || !candidate(run) {
+	if !ok || !isCandidate(run) {
 		return
 	}
 	e.queue.Add(run.Name)
 }
 
-// candidate reports whether a run is ready for the engine: not yet processed
+// isCandidate reports whether a run is ready for the engine: not yet processed
 // (phase empty or Pending) and not terminal/Running. Admission is enforced by
 // CEL at the apiserver, so any RepackRun that exists is already valid.
-func candidate(run *repackv1alpha1.RepackRun) bool {
+func isCandidate(run *repackv1alpha1.RepackRun) bool {
 	p := run.Status.Phase
 	return p == "" || p == repackv1alpha1.RepackPending
 }
@@ -317,7 +322,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if !candidate(run) {
+	if !isCandidate(run) {
 		return nil // already picked up / terminal
 	}
 	klog.V(4).InfoS("reconciling RepackRun", "run", name, "mode", run.Spec.Mode)

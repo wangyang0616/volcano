@@ -30,6 +30,18 @@ import (
 const (
 	defaultQPS   = 50.0
 	defaultBurst = 100
+
+	// Aligned with the other Volcano components: healthz :11251 (same as
+	// volcano-scheduler / volcano-controller-manager), metrics :8081 (same as
+	// volcano-controller-manager). Each runs in its own pod, so there is no port
+	// collision — this is purely for a consistent, memorable convention.
+	defaultHealthzAddress = ":11251"
+	defaultMetricsAddress = ":8081"
+	// defaultExecuteCooldown / defaultNominationTTL are the P0 time defaults; keep
+	// defaultExecuteCooldown in sync with the controller's GC cooldown floor.
+	defaultExecuteCooldown = 10 * time.Minute
+	defaultNominationTTL   = 10 * time.Minute
+	defaultResyncPeriod    = 10 * time.Minute
 )
 
 // ServerOption holds the volcano-repack-engine configuration.
@@ -78,19 +90,19 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.KubeClientOptions.Burst, "kube-api-burst", defaultBurst, "Burst to use while talking with kubernetes apiserver")
 
 	fs.StringVar(&s.SchedulerConf, "scheduler-conf", "", "Absolute path of the shared scheduler configuration file (same as volcano-scheduler)")
-	fs.DurationVar(&s.SchedulePeriod, "resync-period", 10*time.Minute, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
-	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", 10*time.Minute, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
+	fs.DurationVar(&s.SchedulePeriod, "resync-period", defaultResyncPeriod, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
+	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", defaultExecuteCooldown, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
 
 	fs.StringVar(&s.Algorithm, "repack-algorithm", "", "Planner: drain (default) or concentration")
 	fs.StringSliceVar(&s.Actions, "repack-actions", nil, "Ordered action pipeline (default: repack)")
 	fs.IntVar(&s.MinNodesFreed, "repack-min-nodes-freed", 0, "Benefit gate: minimum whole nodes a plan must free (0 = engine default 1)")
 	fs.StringVar(&s.DefaultResource, "repack-default-resource", "", "Target resource when a RepackRun's spec.goals is empty (e.g. nvidia.com/gpu)")
-	fs.DurationVar(&s.NominationTTL, "repack-nomination-ttl", 10*time.Minute, "How long an Execute nomination is re-asserted onto the replacement pod before expiring")
+	fs.DurationVar(&s.NominationTTL, "repack-nomination-ttl", defaultNominationTTL, "How long an Execute nomination is re-asserted onto the replacement pod before expiring")
 
 	fs.BoolVar(&s.EnableHealthz, "enable-healthz", false, "Enable the /healthz liveness endpoint (false by default)")
-	fs.StringVar(&s.HealthzBindAddress, "healthz-address", ":11261", "The address to listen on for the /healthz health-check server")
+	fs.StringVar(&s.HealthzBindAddress, "healthz-address", defaultHealthzAddress, "The address to listen on for the /healthz health-check server")
 	fs.BoolVar(&s.EnableMetrics, "enable-metrics", false, "Enable the Prometheus /metrics endpoint (false by default)")
-	fs.StringVar(&s.ListenAddress, "listen-address", ":8081", "The address to listen on for the Prometheus /metrics server")
+	fs.StringVar(&s.ListenAddress, "listen-address", defaultMetricsAddress, "The address to listen on for the Prometheus /metrics server")
 
 	fs.BoolVar(&s.PrintVersion, "version", false, "Show version and quit")
 	//lint:ignore SA1019 kept for compatibility with the other components' flags

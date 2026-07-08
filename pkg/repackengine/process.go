@@ -104,7 +104,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 
 	snap := adapter.NewSessionSnapshot(sched, res, nodeInScope)
 	maxPG, maxRes := maxPerRun(work, res)
-	esn := engineframework.OpenSession(engineframework.SessionConfig{
+	engineSsn := engineframework.OpenSession(engineframework.SessionConfig{
 		Snapshot:                  snap,
 		Run:                       work,
 		Resource:                  res,
@@ -116,14 +116,14 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		MaxResource:               maxRes,
 		Hooks:                     hooksFor(work.Spec.Mode, e.cache.Client()),
 	}, e.cfg.Plugins)
-	esn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return inScope(t.Job) })
-	defer engineframework.CloseSession(esn)
+	engineSsn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return inScope(t.Job) })
+	defer engineframework.CloseSession(engineSsn)
 
 	// The repack action runs the core and (Execute) evicts via Hooks; open-loop —
 	// a failed eviction is recorded, not fatal.
-	engineframework.RunActions(e.cfg.Actions, esn)
+	engineframework.RunActions(e.cfg.Actions, engineSsn)
 
-	report, plan := esn.Report(), esn.Plan()
+	report, plan := engineSsn.Report(), engineSsn.Plan()
 	klog.V(3).InfoS("plan computed", "run", work.Name, "mode", work.Spec.Mode, "resource", res,
 		"freedNodes", report.NodesFreed, "movedCards", report.MovedResource,
 		"affectedPodGroups", report.AffectedPodGroups,
@@ -139,7 +139,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		ttl = e.cfg.NominationTTL
 	}
 	applyPlan(work, report, plan, res, execute, ttl)
-	commit := esn.Commit()
+	commit := engineSsn.Commit()
 	evicted, rejected := 0, 0
 	if commit != nil {
 		evicted, rejected = len(commit.Evicted), len(commit.Failed)

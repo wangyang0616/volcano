@@ -161,19 +161,19 @@ spec:
             - --repack-default-resource={{ .Values.custom.repack_default_resource }}
             - --repack-algorithm={{ .Values.custom.repack_core }}
             - --enable-healthz=true
-            - --healthz-address=:11261
+            - --healthz-address=:11251
             - --enable-metrics=true
             - --listen-address=:8081
             - -v={{ .Values.custom.repack_log_level | default 3 }}
           ports:
-            - containerPort: 11261
+            - containerPort: 11251
               name: healthz
             - containerPort: 8081
               name: metrics
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 11261
+              port: 11251
             initialDelaySeconds: 15
             periodSeconds: 20
           {{- if .Values.custom.repack_resources }}

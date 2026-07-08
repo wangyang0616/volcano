@@ -28,6 +28,14 @@ import (
 // Name is the config name for this plugin.
 const Name = "gang"
 
+// Default P0 weights for the gang-semantics disruption dimensions: pushing a gang
+// below minAvailable (a breach) is weighted above merely churning a breached gang's
+// cards (disruptionPolicy overrides these in P1).
+const (
+	weightGangBreaches = 0.8
+	weightDamagedGPU   = 0.6
+)
+
 func init() {
 	framework.RegisterPlugin(Name, func() framework.Plugin { return &gangPlugin{} })
 }
@@ -37,8 +45,8 @@ type gangPlugin struct{}
 func (*gangPlugin) Name() string { return Name }
 
 func (*gangPlugin) OnSessionOpen(ssn *framework.Session) {
-	ssn.AddDisruptionScoreFn("gangBreaches", 0.8, scoreGangBreaches)
-	ssn.AddDisruptionScoreFn("damagedGPU", 0.6, scoreDamagedGPU)
+	ssn.AddDisruptionScoreFn("gangBreaches", weightGangBreaches, scoreGangBreaches)
+	ssn.AddDisruptionScoreFn("damagedGPU", weightDamagedGPU, scoreDamagedGPU)
 }
 
 func (*gangPlugin) OnSessionClose(*framework.Session) {}
