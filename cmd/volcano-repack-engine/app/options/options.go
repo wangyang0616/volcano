@@ -53,6 +53,13 @@ type ServerOption struct {
 	LeaderElection      componentbaseconfig.LeaderElectionConfiguration
 	LockObjectNamespace string
 
+	// EnableHealthz serves /healthz (liveness) on HealthzBindAddress; EnableMetrics
+	// serves Prometheus /metrics on ListenAddress.
+	EnableHealthz      bool
+	HealthzBindAddress string
+	EnableMetrics      bool
+	ListenAddress      string
+
 	PrintVersion bool
 }
 
@@ -71,7 +78,7 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.KubeClientOptions.Burst, "kube-api-burst", defaultBurst, "Burst to use while talking with kubernetes apiserver")
 
 	fs.StringVar(&s.SchedulerConf, "scheduler-conf", "", "Absolute path of the shared scheduler configuration file (same as volcano-scheduler)")
-	fs.DurationVar(&s.SchedulePeriod, "resync-period", 0, "Informer resync safety-net period (0 = pure event-driven)")
+	fs.DurationVar(&s.SchedulePeriod, "resync-period", 10*time.Minute, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
 	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", 10*time.Minute, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
 
 	fs.StringVar(&s.Algorithm, "repack-algorithm", "", "Planner: drain (default) or concentration")
@@ -79,6 +86,11 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.MinNodesFreed, "repack-min-nodes-freed", 0, "Benefit gate: minimum whole nodes a plan must free (0 = engine default 1)")
 	fs.StringVar(&s.DefaultResource, "repack-default-resource", "", "Target resource when a RepackRun's spec.goals is empty (e.g. nvidia.com/gpu)")
 	fs.DurationVar(&s.NominationTTL, "repack-nomination-ttl", 10*time.Minute, "How long an Execute nomination is re-asserted onto the replacement pod before expiring")
+
+	fs.BoolVar(&s.EnableHealthz, "enable-healthz", false, "Enable the /healthz liveness endpoint (false by default)")
+	fs.StringVar(&s.HealthzBindAddress, "healthz-address", ":11261", "The address to listen on for the /healthz health-check server")
+	fs.BoolVar(&s.EnableMetrics, "enable-metrics", false, "Enable the Prometheus /metrics endpoint (false by default)")
+	fs.StringVar(&s.ListenAddress, "listen-address", ":8081", "The address to listen on for the Prometheus /metrics server")
 
 	fs.BoolVar(&s.PrintVersion, "version", false, "Show version and quit")
 	//lint:ignore SA1019 kept for compatibility with the other components' flags

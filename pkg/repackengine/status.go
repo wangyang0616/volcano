@@ -33,6 +33,7 @@ import (
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	"volcano.sh/volcano/pkg/repackengine/metrics"
 )
 
 func (e *Engine) fail(run *repackv1alpha1.RepackRun, gen int64, reason string, err error) {
@@ -56,6 +57,15 @@ func (e *Engine) updateStatus(run *repackv1alpha1.RepackRun) {
 // conflict re-read the latest object and re-apply the computed status.
 func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
 	stampLifecycle(run, time.Now())
+	outcome := terminalOutcome(run)
+	metrics.ObserveRun(string(run.Spec.Mode), outcome)
+	if e.recorder != nil {
+		etype := v1.EventTypeNormal
+		if run.Status.Phase == repackv1alpha1.RepackFailed {
+			etype = v1.EventTypeWarning
+		}
+		e.recorder.Event(run, etype, outcome, "repack run reached a terminal state")
+	}
 	desired := run.Status.DeepCopy()
 	name := run.Name
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -73,6 +83,18 @@ func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
 	if err != nil {
 		klog.ErrorS(err, "repack-engine: write terminal status", "run", name)
 	}
+}
+
+// terminalOutcome is the reason of the True Complete/Failed/Cancelled condition
+// (the run's terminal verdict) for the runs_total metric; "Unknown" if none.
+func terminalOutcome(run *repackv1alpha1.RepackRun) string {
+	for _, c := range run.Status.Conditions {
+		if c.Status == metav1.ConditionTrue &&
+			(c.Type == state.CondComplete || c.Type == state.CondFailed || c.Type == state.CondCancelled) {
+			return c.Reason
+		}
+	}
+	return "Unknown"
 }
 
 // stampLifecycle records StartTime on first Running and CompletionTime on first

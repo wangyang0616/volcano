@@ -37,15 +37,22 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
@@ -57,6 +64,7 @@ import (
 
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	"volcano.sh/volcano/pkg/repackengine/metrics"
 	"volcano.sh/volcano/pkg/scheduler"
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/conf"
@@ -87,8 +95,9 @@ type Engine struct {
 	factory vcinformers.SharedInformerFactory
 	lister  repacklisters.RepackRunLister
 	synced  cache.InformerSynced
-	queue   workqueue.TypedRateLimitingInterface[string]
-	now     func() time.Time
+	queue    workqueue.TypedRateLimitingInterface[string]
+	recorder record.EventRecorder
+	now      func() time.Time
 
 	mu             sync.Mutex
 	tiers          []conf.Tier
@@ -105,6 +114,23 @@ type Engine struct {
 // repackNodeWorkers is the number of scheduler-cache node workers the engine runs
 // to keep sc.Nodes in sync. Must be > 0 or the node queue is never drained.
 const repackNodeWorkers = 4
+
+// newEventRecorder builds a recorder that emits Kubernetes events on RepackRun
+// objects. It uses a scheme carrying both core (event) and repack types so the
+// event references resolve. Nil-safe callers guard on e.recorder.
+func newEventRecorder(config *rest.Config) record.EventRecorder {
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		klog.ErrorS(err, "repack-engine: event recorder disabled (client build failed)")
+		return nil
+	}
+	s := runtime.NewScheme()
+	utilruntime.Must(kubescheme.AddToScheme(s))
+	utilruntime.Must(repackv1alpha1.AddToScheme(s))
+	b := record.NewBroadcaster()
+	b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+	return b.NewRecorder(s, v1.EventSource{Component: "volcano-repack-engine"})
+}
 
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
 func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
@@ -133,6 +159,7 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 	factory := vcinformers.NewSharedInformerFactory(vc, cfg.ResyncPeriod)
 	informer := factory.Repack().V1alpha1().RepackRuns()
 	e := &Engine{
+		recorder: newEventRecorder(config),
 		// Reuse the scheduler cache as a read-only cluster view. New is a pure
 		// constructor (no queue bootstrap — that's the scheduler's startup job), so
 		// the engine needs only queues get/list/watch, never create. nodeWorkers must
@@ -215,19 +242,56 @@ func candidate(run *repackv1alpha1.RepackRun) bool {
 	return p == "" || p == repackv1alpha1.RepackPending
 }
 
+// maxReconcileRetries caps how many times a failing RepackRun is retried before
+// it is treated as a poison pill: the engine gives up and marks it Failed rather
+// than retrying forever (which would also keep re-panicking on a bad object).
+const maxReconcileRetries = 5
+
 func (e *Engine) processNext(ctx context.Context) bool {
 	key, shutdown := e.queue.Get()
 	if shutdown {
 		return false
 	}
 	defer e.queue.Done(key)
-	if err := e.reconcile(ctx, key); err != nil {
+
+	if err := e.reconcileSafely(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("repack-engine reconcile %q: %w", key, err))
-		e.queue.AddRateLimited(key)
+		if e.queue.NumRequeues(key) < maxReconcileRetries {
+			e.queue.AddRateLimited(key)
+			return true
+		}
+		// Poison pill: stop retrying and fail the run so it does not loop forever
+		// (and its Execute slot, if any, was already released by process's defer).
+		e.queue.Forget(key)
+		e.failByName(key, "ReconcileGaveUp", fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
 		return true
 	}
 	e.queue.Forget(key)
 	return true
+}
+
+// reconcileSafely runs reconcile with panic recovery so a single bad RepackRun
+// (e.g. a plugin/snapshot panic) cannot crash the engine's worker goroutine. The
+// panic is converted to an error; process's own defers (slot release, session
+// close) still run during unwinding before it reaches here.
+func (e *Engine) reconcileSafely(ctx context.Context, name string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in reconcile: %v", r)
+			klog.ErrorS(err, "repack-engine: recovered panic", "run", name, "stack", string(debug.Stack()))
+		}
+	}()
+	return e.reconcile(ctx, name)
+}
+
+// failByName marks a run Failed by name (poison-pill path); best-effort.
+func (e *Engine) failByName(name, reason string, cause error) {
+	run, err := e.lister.Get(name)
+	if err != nil {
+		return // gone or lister error; nothing to write
+	}
+	work := run.DeepCopy()
+	e.fail(work, work.Generation, reason, cause)
 }
 
 // reconcile processes one RepackRun: re-check it's still a candidate, apply the
@@ -262,6 +326,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 		Now:               e.now(),
 	})
 	if !gate.Admit {
+		metrics.ObserveGateRejection(gate.Reason)
 		state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
 			gate.Reason, "waiting for an execute slot", work.Generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)

@@ -19,9 +19,19 @@ package framework
 import "sort"
 
 // Plugin is a repack capability/scenario (gang awareness, node domain, hypernode
-// domain, PDB, ...). On OnSessionOpen it registers callbacks into the Session
-// (AddMovableFn / AddDomainFn / AddDisruptionScoreFn / AddPredicateFn); actions
-// and the core then consume the aggregated result. Mirrors a scheduler plugin.
+// domain, PDB, ...). On OnSessionOpen it registers callbacks into the Session on
+// one of the five extension dimensions; actions and the core consume the
+// aggregated result. Mirrors a scheduler plugin. The dimensions are:
+//
+//   - AddMovableFn         — may a task move? (veto: gang breach, PDB, minRunDuration, scope)
+//   - AddPredicateFn       — may a task land on a node? (extra fit: DRA, topology)
+//   - AddDomainFn          — what is a freeable unit? (node, hypernode/topology level)
+//   - AddDisruptionScoreFn — soft cost of a plan on one dimension (ranking only)
+//   - AddConstraintFn      — hard admissibility gate on a finished plan (veto: maxDisruptionScore)
+//
+// The search objective (consolidation vs relief-driven) and move-unit bundling
+// (disruptionPolicy.bundlePolicy) are NOT plugin dimensions — they are Core
+// concerns: the selected Core reads the run's goal and shapes its own units.
 type Plugin interface {
 	Name() string
 	OnSessionOpen(ssn *Session)

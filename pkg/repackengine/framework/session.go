@@ -39,7 +39,15 @@ type (
 	DomainFn func(snap Snapshot) []api.FreeableUnit
 	// DisruptionScoreFn scores a candidate plan on one dimension (higher = more
 	// disruptive). Weighted + min-max normalized across candidates by the Session.
+	// This is SOFT ranking (used by LeastDisruptive to pick among feasible plans).
 	DisruptionScoreFn func(ctx *api.PlanContext, p *api.CandidatePlan) float64
+	// PlanConstraintFn is a HARD admissibility gate on a finished plan: return
+	// false to reject it outright. Aggregated with AND — any constraint may veto.
+	// Distinct from DisruptionScoreFn (soft ranking): a failed constraint discards
+	// the plan. The P0 benefit gates (MinNodesFreed, MinFragImprovementPercent) are
+	// registered as built-in constraints; P1 features like disruptionPolicy's
+	// maxDisruptionScore add their own via AddConstraintFn.
+	PlanConstraintFn func(ctx *api.PlanContext, plan *api.RepackPlan) bool
 )
 
 type scoreTerm struct {
@@ -72,10 +80,11 @@ type Session struct {
 	cfg     SessionConfig
 	plugins []Plugin // opened plugins, for OnSessionClose
 
-	predicateFns []PredicateFn
-	movableFns   []MovableFn
-	domainFns    []DomainFn
-	scoreTerms   []scoreTerm
+	predicateFns  []PredicateFn
+	movableFns    []MovableFn
+	domainFns     []DomainFn
+	scoreTerms    []scoreTerm
+	constraintFns []PlanConstraintFn
 
 	// results filled by the action, read by the driver
 	plan   *api.RepackPlan
@@ -87,6 +96,7 @@ type Session struct {
 // registers its callbacks). Unknown plugin names are ignored.
 func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
 	ssn := &Session{cfg: cfg}
+	ssn.registerBuiltinConstraints()
 	for _, name := range pluginNames {
 		p, ok := GetPlugin(name)
 		if !ok {
@@ -96,6 +106,33 @@ func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
 		ssn.plugins = append(ssn.plugins, p)
 	}
 	return ssn
+}
+
+// registerBuiltinConstraints turns the run's P0 benefit gates into first-class
+// plan constraints, so the core just asks PlanAdmissible instead of hardcoding
+// them. P1 plan-level policies (e.g. disruptionPolicy.maxDisruptionScore) join
+// the same seam via AddConstraintFn.
+func (s *Session) registerBuiltinConstraints() {
+	// MinNodesFreed: a plan must free at least this many nodes (default 1).
+	minFreed := s.cfg.MinNodesFreed
+	if minFreed < 1 {
+		minFreed = 1
+	}
+	s.AddConstraintFn(func(_ *api.PlanContext, plan *api.RepackPlan) bool {
+		return plan != nil && plan.Benefit() >= float64(minFreed)
+	})
+	// MinFragImprovementPercent: fragmentation must drop by at least this many
+	// percentage points. FragRateDelta is negative (fragmentation fell), so the
+	// improvement is round(-delta*100). 0 = no gate.
+	if minImprove := s.cfg.MinFragImprovementPercent; minImprove > 0 {
+		s.AddConstraintFn(func(_ *api.PlanContext, plan *api.RepackPlan) bool {
+			if plan == nil {
+				return false
+			}
+			improvePct := int(-plan.FragRateDelta()*100 + 0.5)
+			return improvePct >= minImprove
+		})
+	}
 }
 
 // CloseSession runs OnSessionClose on the plugins opened by OpenSession.
@@ -127,6 +164,26 @@ func (s *Session) AddDisruptionScoreFn(name string, weight float64, fn Disruptio
 	if fn != nil {
 		s.scoreTerms = append(s.scoreTerms, scoreTerm{name: name, weight: weight, fn: fn})
 	}
+}
+func (s *Session) AddConstraintFn(fn PlanConstraintFn) {
+	if fn != nil {
+		s.constraintFns = append(s.constraintFns, fn)
+	}
+}
+
+// PlanAdmissible reports whether a finished plan passes every hard constraint
+// (built-in benefit gates + any plugin-registered PlanConstraintFns), AND-
+// aggregated: a single false rejects the plan. Soft ranking among admissible
+// plans is LeastDisruptive; this is the hard veto the core applies before
+// committing a plan.
+func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
+	ctx := s.PlanContext()
+	for _, fn := range s.constraintFns {
+		if !fn(ctx, plan) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- config accessors ----

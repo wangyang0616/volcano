@@ -59,10 +59,6 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	if len(units) == 0 || len(nodes) == 0 {
 		return nil, false
 	}
-	minFreed := ssn.MinNodesFreed()
-	if minFreed < 1 {
-		minFreed = 1
-	}
 	byName := make(map[string]*schedapi.NodeInfo, len(nodes))
 	for _, n := range nodes {
 		if n != nil {
@@ -75,17 +71,11 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 		return nil, false
 	}
 	plan.Before = api.MeasureResource(nodes, res)
-	if plan.Benefit() < float64(minFreed) {
-		return nil, false // below the node-count benefit gate (NoRepackNeeded)
-	}
-	// Per-run benefit gate: the run's spec.goals[0].minFragImprovementPercent —
-	// improvement (before-after) in percentage points must clear it. FragRateDelta
-	// is negative (fragmentation dropped), so improvement% = round(-delta*100).
-	if minImprove := ssn.MinFragImprovementPercent(); minImprove > 0 {
-		improvePct := int(-plan.FragRateDelta()*100 + 0.5)
-		if improvePct < minImprove {
-			return nil, false // fragmentation improvement below the run's threshold
-		}
+	// Hard admissibility gate: the built-in benefit constraints (MinNodesFreed,
+	// MinFragImprovementPercent) plus any plugin-registered plan constraints (e.g.
+	// disruptionPolicy.maxDisruptionScore in P1). A rejected plan = NoRepackNeeded.
+	if !ssn.PlanAdmissible(plan) {
+		return nil, false
 	}
 	plan.Cost = api.CostOf(plan.Moves, res)
 	return plan, true

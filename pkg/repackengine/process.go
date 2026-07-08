@@ -33,12 +33,15 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/adapter"
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	"volcano.sh/volcano/pkg/repackengine/metrics"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
 // process plans and acts on a cleared run (the gate already passed).
 func (e *Engine) process(work *repackv1alpha1.RepackRun) {
+	start := time.Now()
+	defer func() { metrics.ObserveCycle(string(work.Spec.Mode), time.Since(start).Seconds()) }()
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		// Defers run LIFO: markExecuteDone (declared last) releases the K=1 slot
 		// first, then requeueGatedRuns (declared first) re-enqueues Execute runs
@@ -131,6 +134,9 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		ttl = e.cfg.NominationTTL
 	}
 	applyPlan(work, report, plan, res, execute, ttl)
+	if commit := esn.Commit(); commit != nil {
+		metrics.ObserveEvictions(len(commit.Evicted), len(commit.Failed))
+	}
 
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
 	// the repack achieved nothing — fail rather than falsely reporting Executed.

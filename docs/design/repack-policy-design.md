@@ -1816,23 +1816,32 @@ disruptionPolicy:
 
 #### 4.16.2 关键策略点 → 扩展函数 → 默认实现
 
-| 策略点 | 新增扩展函数（拟） | 默认插件实现 | 阶段 |
-|--------|-------------------|--------------|------|
-| **碎片度量 / 整理效果评估** | **`AddFragmentScoreFn`**：`(snapshot, scope, profiles) → FragMetrics` | 空节点口径 `(B−A)/M` + `/B`（§4.12.2a） | **P0** |
-| **WeightedFragRate 合成** | **`AddFragWeightFn`**：多层/多画像 → 单一 KPI | node 整合率为主轴加权（§4.12.2a 末） | **P0** |
-| **收益门控 / 是否值得整理** | **`AddRepackBenefitFn`**：`(before, after FragMetrics, planCost) → (score, worth bool)` | §4.13 阈值（解开 pending / 碎片改善） | **P0** |
-| **目标画像来源** | **`AddTargetProfileFn`**：`(snapshot, scope) → []Profile` | `PendingAndDefault`（§4.12.1） | **P0** |
-| **中断代价 / victim 排序** | **`AddDisruptionCostFn`**：`(podGroup) → score`（victim 升序） | §4.13.3 代价分；**资格门控复用既有 `UnifiedEvictableFn`**（PDB/protected/优先级/per-job 预算） | **P0** |
-| **整理域 / 拓扑顺序** | 复用 **`HyperNodeGradientForSubJobFn`**；P1 增 `AddRepackDomainOrderFn` | 自底向上 tier 梯度（§4.14.4） | P0 / P1 |
-| **最优 plan 选择** | **`AddRepackPlanScoreFn`**：`(plan) → cost`，取 argmin | §4.15.3 `MinAffectedJobs/GPUs/Weighted` | P1 |
-| **集中度收益（精修）** | **`AddConsolidationGainFn`**：`(move) → gain`（越大越该搬） | `ConcentrationGain`=ΔΣused²（§4.14.6） | P1 |
-| **单步净分（精修）** | **`AddMoveScoreFn`**：`net = Σwᵍ·gainFn − λ·Σwᶜ·costFn` | 默认线性组合，权重/λ 走 config（§4.16.5） | P1 |
+> **落地口径（权威）**：早期本节曾拟了一组细粒度的策略点扩展函数（`FragmentScoreFn`/`RepackBenefitFn`/`DisruptionCostFn`/`TargetProfileFn`/`RepackPlanScoreFn`…）。**实际落地收敛为下面这套更粗、正交的维度**——插件只在**五个"搜索输入面"**维度上注册回调，"目标/算法/单元形状"归 **Core**,"流水线"归 **Action**。本表为准。
 
-> 命名仅为示意；落地时按 Volcano 习惯定 `api.XxxFn` 类型 + `session_plugins.go` 的 `Add/调用` 对。**「整理效果评估」即 `FragmentScoreFn` + `RepackBenefitFn` 两个扩展点**——正是你要的「像 JobOrderFn 一样可扩展的策略插件」。
+**① 插件维度（`ssn.AddXxxFn`，搜索的输入面，AND/union/加权聚合）**
+
+| 维度 | 注册函数 | 语义 | 现有/预留实现 |
+|------|----------|------|----------------|
+| **可动性** | `AddMovableFn(task)→bool` | 某 task 能不能被搬（否决） | scope 冻结（P0，驱动内联）；PDB / `minRunDuration`（P1） |
+| **落点适配** | `AddPredicateFn(task,node)→err` | 某 task 能不能落到某节点（额外 fit，复用 scheduler predicate） | DRA / 拓扑（随 scheduler 插件） |
+| **可腾空单元** | `AddDomainFn(snap)→[]FreeableUnit` | 什么算一个可腾空单元 | `node`（P0，单节点）；hypernode/多级拓扑（P1，更大单元） |
+| **扰动软打分** | `AddDisruptionScoreFn(name,w,fn)` | 给候选计划的某个扰动维度打分（**只用于排序**，min-max 归一加权） | `base`(affectedPodGroups/movedCards/movedPods) + `gang`(gangBreaches/damagedGPU)（P0）；自定义权重（P1） |
+| **计划硬约束闸** | `AddConstraintFn(plan)→bool` | 给**成品计划**的硬否决（AND，任一 false 即丢弃） | 内置收益门控 `MinNodesFreed`/`MinFragImprovementPercent`（P0）；`disruptionPolicy.maxDisruptionScore`（P1） |
+
+**② 策略注册表（不是插件维度）**
+
+| 维度 | 机制 | 现有/预留 |
+|------|------|-----------|
+| **搜索目标 + 算法 + 单元形状** | `Core.Plan(ssn)`（`RegisterCore`） | `drain`=腾空节点(P0)；`concentration`=Σused² 爬山(P1)；relief-driven「让 pending gang 可调度」为**另一 Core + SessionConfig 目标**(P1)；`bundlePolicy`(整组/部分) 为 Core 的单元构造参数(P1) |
+| **流水线步骤** | `Action.Execute(ssn)`（`RegisterAction`，有序） | `repack`(P0)；`relief`/`simulate`(P1，追加注册即可) |
+
+> **为什么这么分**：`AddDisruptionScoreFn` 是"软排序"(在可行计划里挑最不扰动的)，`AddConstraintFn` 是"硬否决"(阈值不过直接丢计划)——两者互补,原设计缺后者、把 `MinNodesFreed`/`MinFragImprovementPercent` 硬编码在 Core 里，现已收编成内置 constraint，P1 的 `maxDisruptionScore` 走同一 seam。**目标方向(relief vs consolidation)与单元打包(bundlePolicy)不是插件维度**——它们决定"搜索为了什么、单元怎么切"，是 Core 的职责(选/配 Core + 读 Run 的 goal)，不是喂给搜索的输入。
 >
-> **P1 目标泛化即这些扩展点的新实现**（§4.15.5 三轴框架）：NVLink 节点内整理 = `FragmentScoreFn=NVLinkBlockScore` + NVLink 感知 `Fit`（§4.15.6）；超节点每域腾 k 空 node = `TargetProfileFn`(per-HyperNode) + `RepackBenefitFn=PerDomainQuota{k}` + 域枚举器（§4.15.7）。主干（编排 + A/B 算法）不变。
+> **P1 目标泛化即这套维度的新实现**（§4.15.5 三轴框架）：多级拓扑 = 新 `AddDomainFn`(hypernode 单元)；NVLink 域内整理 = 新 `Core` + NVLink 感知 `AddPredicateFn`；每域腾 k 空 node = relief 风格 `Core`(读域配额目标)。主干(五维插件面 + Core/Action 注册表)不变。
 
 #### 4.16.3 编排骨架（核心库只编排，策略全可插拔）
+
+> **注（与落地的关系）**：下面这段伪代码是**早期概念草图**，其 `TargetProfileFn`/`FragmentScoreFn`/`RepackBenefitFn`/`AddDisruptionCostFn` 等已按 §4.16.2「落地口径」收敛为五维插件面。**实际编排**为:`Action`(P0 `repack`) 调选定 `Core`(P0 `drain`) 的 `Plan(ssn)` → 增量破组感知贪心出计划 → `ssn.PlanAdmissible(plan)` 过硬约束闸(内置收益门控 + 插件 constraint) → `LeastDisruptive` 用软打分择优。碎片度量在 `api.MeasureResource`，不再是一个插件 Fn。下图仅存档设计意图。
 
 ```text
 RepackEngine.Run(ssn, scope):                      // pkg/scheduler/repack
@@ -2324,6 +2333,58 @@ A≈O(N²)，B（朴素）≈O(N³)，B/A 每翻倍再 ×2。
 **结论**：**一线可运维、可定位性 A 显著更好**——动作单元（节点）即运维动作单元（cordon/drain），每个 move 自带"为腾哪个节点"的理由，零配置、故障半径有界、契合维护窗口。B 的运维优势是**平台级**的（统一打分易讲、按集群调权重不改代码、在线增量），更利于平台团队，但抽象分数+大配置面+弥散 churn 对一线 SRE 是负担。
 
 > **商用倾向**：**P0 大规模商用、重运维 → 选 A**（路线一）；**B 留作 P1 演进引擎**，待平台侧可观测/权重治理/回放调试工具成熟后，再评估切换或"A 可见提交 + B 内部精修"的混合（路线三）。
+
+---
+
+### 4.18 可靠性、并发与可维护性设计
+
+> repack-engine 是一个**单活（leader-elected）+ 单 worker + 事件驱动**的迷你控制器,和 volcano-scheduler 共享 cache/插件、和 repack-controller 共写同一个 RepackRun。本节把这套的**失败模型、并发不变量、崩溃恢复、可观测性、优雅退出、测试策略**成文,作为后续维护的契约。
+
+#### 4.18.1 并发模型与不变量（务必维护）
+
+| 不变量 | 保证机制 | 破坏后果 |
+|--------|----------|----------|
+| **全局至多一个活跃引擎** | leader election（Lease，`RunOrDie`；失去租约 `klog.Fatalf` 退出让位） | 多写、双执行 |
+| **一次至多处理一个 Run** | 单 worker（一个 goroutine `for processNext`）,`process()` 同步阻塞 | 并发 session、cache 竞争 |
+| **Execute 全局 K=1 串行** | `executeGateState` = 内存态(`execActive`/`lastExecFinish`,mutex 保护) OR-合并 cache 扫描;**权威、不依赖 informer 新鲜度**,故 Workers 若>1 也安全 | 两个 Execute 同时驱逐 |
+| **DryRun 不占 Execute 槽** | gate 对非 Execute 直接 `Admit`;但单 worker 下仍与 Execute **串行**(不并发,§4.5) | — |
+| **引擎不写 PodGroup/Queue 状态** | `CloseSessionReadOnly`(跳过 gang OnSessionClose / JobUpdater / updateQueueStatus) | 与 scheduler 抢写、条件抖动 |
+| **引擎与 controller 不互相 clobber 生命周期字段** | `stampLifecycle` 对 `StartTime`/`CompletionTime` **nil-guard**,谁先到谁写 | TTL/cooldown 锚点错乱 |
+| **目标资源必为异构卡** | CEL(`goals[0].resource` 含 `/`) + 运行时 `supportedTarget` 兜底 | 静默 NoFragmentation 假成功 |
+
+> **并发升级路径**：当前单 worker。若未来要让 DryRun 与 Execute **真并发**,需把 worker 数调>1——gate 已按并发安全设计,但要先验证并发多个 `schedframework.OpenSession` 读同一 cache 的安全性(只读规划,大概率安全,未验证)。
+
+#### 4.18.2 失败模型与崩溃恢复
+
+| 失败场景 | 处理 |
+|----------|------|
+| **单个 Run 处理 panic**（插件/快照 bug） | `reconcileSafely` 每 work-item `recover`,转成 error,打栈;`process` 的 defer(放 K=1 槽/关 session)在 unwind 时照常执行——**一个坏 Run 不拖垮引擎** |
+| **Run 永久失败**（毒丸） | workqueue 重试 `maxReconcileRetries`(5) 次后放弃,标 `Failed`(reason `ReconcileGaveUp`),不无限重试 |
+| **引擎崩溃在 Execute 中途**（已发部分驱逐、未写终态） | 重启后 `recoverOrphans` 把残留 `Running` 的 Run 标 `Failed`(reason `Interrupted`)——**保守、不重跑**(半途驱逐不能盲目重复);已发出的驱逐由提名 reconciler 继续引导替身落点 |
+| **终态写丢失**（冲突/重启） | `updateStatusTerminal` 用 `RetryOnConflict` 重读重写;彻底失败也有 `recoverOrphans` 兜底 |
+| **被 K=1 挡住的 Execute 饿死** | Execute 释放槽时 `requeueGatedRuns` 重新入队所有未终态 Execute(事件驱动唤醒,不靠轮询) |
+| **cooldown 锚点被 TTL GC 提前删** | controller 的 `CooldownRetained`:终态 Execute 在 `completionTime+cooldown` 前不删 |
+| **watch 掉线漏事件** | `--resync-period`(默认 10m)安全网 relist;`requeueGatedRuns` 覆盖 gate 唤醒 |
+| **全局 `ServerOpts` 未初始化** | `NewEngine` 起始自初始化(sharding 关闭)+ cmd `ensureSchedulerServerOpts` 双保险 |
+
+#### 4.18.3 可观测性
+
+- **Conditions（权威状态面）**:`Queued`/`Progressing`/`Complete`/`Failed`/`Cancelled` + reason;`phase` 为派生投影。
+- **Prometheus 指标**（`/metrics`,`pkg/repackengine/metrics`）:`volcano_repack_runs_total{mode,outcome}`、`_evictions_total{result}`、`_cycle_duration_seconds{mode}`、`_gate_rejections_total{reason}`。
+- **Kubernetes 事件**:每个 Run 到终态时在其对象上打事件(Normal/Warning + reason),便于 `kubectl describe` 定位。
+- **健康探针**:`/healthz`(liveness);Deployment 配 livenessProbe,K8s 可重启卡死实例。
+- **结构化日志**:klog,关键日志带 `run` 名;panic 带完整栈。
+
+#### 4.18.4 优雅退出
+
+`signals.SetupSignalContext()` → ctx;`Run` 里 `defer queue.ShutDown()`,worker 在队列关闭后退出。**注意(已知不足)**:`reconcile` 目前忽略 ctx、`process` 用 `context.Background()` 做 API 调用,长驱逐不会被退出信号取消——退出时靠 worker 循环自然收尾。P1 可把 ctx 透传进 process 以支持中途取消。
+
+#### 4.18.5 测试策略
+
+- **纯函数单测**:gate(`EvaluateGate`)、状态机(`DerivePhase`/`IsTerminal`/`CooldownRetained`)、约束闸(`PlanAdmissible`)、资源判据(`supportedTarget`)、饥饿唤醒(`requeueGatedRuns`)、drain 门控。
+- **构造/启动冒烟**:`NewEngine` 不 panic(含 nil `ServerOpts`)、默认值。
+- **e2e**:DryRun 跑到终态 + CEL 拒 cpu(`test/e2e/repack`)。
+- **待补**:崩溃恢复(recoverOrphans)、毒丸放弃、并发 gate 的驱动级测试(需 mock lister/queue/clientset,成本较高,列 P1)。
 
 ---
 
@@ -3194,6 +3255,8 @@ type RepackRunStatus struct {
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v10.9** | 2026-07-08 | **可靠性/并发/可维护性设计成文 + 代码硬化落地（新增 §4.18）**：补齐此前缺失的可靠性章节——并发不变量表(单活/单worker/K=1/只读close/nil-guard)、失败模型与崩溃恢复表、可观测性(conditions/指标/事件/探针)、优雅退出、测试策略。**代码硬化**:①`reconcileSafely` 每 work-item panic `recover`(一个坏 Run 不拖垮引擎);②毒丸——`maxReconcileRetries=5` 后放弃并标 Failed(`ReconcileGaveUp`);③健康探针 `/healthz`(cmd `--enable-healthz` + helm livenessProbe);④Prometheus 指标(`pkg/repackengine/metrics`:runs/evictions/cycle/gate_rejections + `/metrics` 端点 + helm);⑤`--resync-period` 默认 0→10m(watch 掉线自愈安全网);⑥K8s 事件(RepackRun 终态打 Normal/Warning 事件,专用 scheme 注册 repack 类型)。指标/事件 emit 点集中在 `updateStatusTerminal`/`process`/`reconcile`。helm repack.yaml 加 healthz/metrics 端口 + livenessProbe + args |
+| **v10.8** | 2026-07-08 | **扩展点对齐落地 + 补计划硬约束闸维度（§4.16.2 重写）**：文档 §4.16.2 原列的一组细粒度策略点扩展函数(`FragmentScoreFn`/`RepackBenefitFn`/`DisruptionCostFn`/`TargetProfileFn`/`RepackPlanScoreFn`…)与实际落地的插件维度对不上。据实重写为**五维插件面**(`AddMovableFn`/`AddPredicateFn`/`AddDomainFn`/`AddDisruptionScoreFn`/**新增 `AddConstraintFn`**) + **Core/Action 注册表**两层,并给出「预留特性 → seam」对应表。**代码侧新增 `PlanConstraintFn` 硬约束闸维度**(`framework/session.go`:类型 + `constraintFns` + `AddConstraintFn` + `PlanAdmissible` + `registerBuiltinConstraints`):把原本硬编码在 `drain.Plan` 里的收益门控 `MinNodesFreed`/`MinFragImprovementPercent` 收编成**内置 constraint**(行为不变),P1 的 `disruptionPolicy.maxDisruptionScore` 走同一 seam;`drain.Plan` 两处内联 gate 改为一句 `ssn.PlanAdmissible(plan)`。明确**目标方向(relief vs consolidation)与 `bundlePolicy` 不是插件维度、是 Core 职责**。加 `TestPlanAdmissible_BuiltinMinNodesFreed`/`_PluginConstraintVetoes`;`framework/plugin.go` 包注释列全五维 + Core/Action 边界;§4.16.3 伪代码加"早期草图"注、指向实际编排(Action→Core.Plan→PlanAdmissible→LeastDisruptive)。**目录整理**同批:775 行 `repackengine.go` 拆为 engine/gate/process/status/translate 五文件(纯挪动);`session/`→`adapter/`(消除与 `framework.Session` 撞名);`api` 包注释更正 |
 | **v10.7** | 2026-07-07 | **目标资源解析据实纠正（新增 §4.12.2b）+ P0 检视修复对齐**：文档原写「`goals` 留空=自动探测唯一加速资源，多于一类则拒绝」，但实现从未做自动探测——`resolveResource(run)` 实际按固定优先级 `spec.goals[0].resource` → 引擎 `--repack-default-resource`(Helm `custom.repack_default_resource`,默认 `nvidia.com/gpu`) → 两者皆空即**快速失败** `conditions[Failed].reason=NoTargetResource`(P0-4)。新增 **§4.12.2b「目标资源解析」**权威定义此优先级链 + 「为何不自动探测」(混合集群自动挑会静默选错,显式默认可预测可审计) + 单资源局限;同步 §1 摘要 #15、§4.5.2 字段表(`goals`)/YAML 注释、§12 Go 类型注释,把「自动探测」措辞统一改为「回落默认资源 / NoTargetResource 失败」。`goals` 措辞「恰一条」→「至多一条」(`omitempty`,0 或 1)。**② 仅支持异构加速卡、cpu/memory 等 native 资源两层拦截**:cpu/memory 存于 `Resource` 专用字段而非 `ScalarResources`,`Scalar()` 恒读 0,放行会让 Run 静默退化成 `NoFragmentation` 假成功——(a) **CEL** 在 `RepackGoal.resource` 加 `self.contains('/')`(必须扩展资源,`nvidia.com/gpu` 通过、`cpu`/`memory`/`ephemeral-storage`/`pods`/`hugepages-*` 被 apiserver 拒);(b) **引擎运行时** `resolveResource` 后过 `supportedTarget(res)`(同判据),不过则失败 `reason=UnsupportedResource`,堵住 CEL 管不到的 `--repack-default-resource` 误配。判据用「含 `/`」而非黑名单(引擎对资源名无感)。加纯函数单测 `TestSupportedTarget`;§4.12.2b/§4.5.2 补两层校验说明。**修订记录中 v9.x/v10.x 历史条目按惯例保留原「自动探测」字样**(为当时草案事实)。配套 P0 两轮深度检视的代码修复(P0-1 minFragImprovementPercent 接入收益门控／P0-2 K=1 内存态权威门控／P0-3 终态 RetryOnConflict／P0-5 Execute 全驱逐失败判 `ExecuteFailed`／P0-6 删死常量+`ReasonAdmitted`→`ReasonSlotAcquired`) 与 Execute 冷却锚点 GC 保留(`state.CooldownRetained`,防 TTL<cooldown 丢锚点)已落代码 |
 | **v10.6** | 2026-07-04 | **`scope.nodes.exclude` 语义落地：不腾空但可接收（#40 收尾）**——把「node scope 门控腾空目标、而非接收方全集」下沉到 core。①`framework.Snapshot` 接口加 `NodeInScope(n)`（是否可作腾空目标；nil scope=全可）；`SessionSnapshot.Nodes()` **不再按 nodeInScope 过滤**（返回全集=接收方宇宙），`NodeInScope` 单独暴露门控。② `node` 插件生成 FreeableUnit（腾空目标）时按 `snap.NodeInScope(n)` 过滤——**out-of-scope 节点不作目标**。③ drain 的 `prefer` 把 `!NodeInScope(n)` 也判为**首选接收方**（层 2，与 frozen/provenStuck 并列）——用户排除出腾空的节点确定留下,拿它当首选 sink,保住可腾节点。于是 `scope.nodes.exclude` = 「不腾空但可接收(且优先)」,与用户确认语义一致。加 `TestDrain_ExcludedNodeIsReceiverNotTarget`（排除节点不被腾、吸纳 victim、其余两节点腾空）；三处 fakeSnap 补 `NodeInScope`。注:PodGroup 标签匹配(`inScope`)本就完成、5 个 scope 测试覆盖 |
 | **v10.5** | 2026-07-04 | **drain 接收方选择：收益导向的分层偏好（#39 增强）**——腾空某节点时，其 victim 的落点不再是纯 best-fit，而是**先按「是否确定留下」分层、层内再 best-fit**：① **确定留下的占用节点=首选接收方**（有不可迁移 pod／承载 `scope.podGroups.exclude` 的节点=腾不空；动态过程中「试过、证明腾不空」的节点缓存进来——腾空性单调不增，一旦腾不空即永久）——填它们的空隙零代价，不浪费可腾节点的腾空潜力；② **可腾碎片节点=次级接收方**（尽量别填，填了毁其腾空潜力）；③ **加速卡空节点排除出接收方与目标**（往空节点搬=净零 shuffle；「空」按**异构卡占用**判定——只跑 CPU/内存 pod、加速卡占用为 0 的节点也算空，`occupiesAccelerator(n,res)`）——而「满节点腾了净零」这条**自动达成**：满节点的 pod 只在能塞进现有空隙时才被搬（有益），只能靠空节点接收的（净零）因空节点被排除而自动不可行。落地：`api.Domain` 加 `Prefer(fn)` 接收方偏好（只改「先找到哪个可行解」、不改可行性/完整性）；drain 循环传入 `prefer`（`!NodeFreeable ∥ provenStuck → 首选`）+ 排除空节点接收 + 缓存 `provenStuck`。加 `TestDrain_PrefersStayingReceiver`（frozen 节点优先接收、保住可腾节点 → 多腾一个）。注：`scope.nodes.exclude` 节点作首选接收方需 node-scope 下沉到 core（#40）后补 |

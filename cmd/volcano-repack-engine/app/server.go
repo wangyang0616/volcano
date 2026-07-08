@@ -19,6 +19,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,10 +33,13 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
+	"volcano.sh/apis/pkg/apis/helpers"
+
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app/options"
 	"volcano.sh/volcano/pkg/kube"
 	"volcano.sh/volcano/pkg/repackengine"
 	"volcano.sh/volcano/pkg/signals"
+	commonutil "volcano.sh/volcano/pkg/util"
 )
 
 const componentName = "volcano-repack-engine"
@@ -45,6 +49,29 @@ func Run(opt *options.ServerOption) error {
 	config, err := kube.BuildConfig(opt.KubeClientOptions)
 	if err != nil {
 		return err
+	}
+
+	// Liveness: /healthz so Kubernetes can restart a wedged engine. Started before
+	// leader election so standby replicas are also live.
+	if opt.EnableHealthz {
+		if err := helpers.StartHealthz(opt.HealthzBindAddress, componentName, nil, nil, nil); err != nil {
+			return err
+		}
+	}
+	// Observability: Prometheus /metrics.
+	if opt.EnableMetrics {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", commonutil.PromHandler())
+			server := &http.Server{
+				Addr:              opt.ListenAddress,
+				Handler:           mux,
+				ReadHeaderTimeout: helpers.DefaultReadHeaderTimeout,
+				ReadTimeout:       helpers.DefaultReadTimeout,
+				WriteTimeout:      helpers.DefaultWriteTimeout,
+			}
+			klog.Fatalf("repack-engine metrics server failed: %s", server.ListenAndServe())
+		}()
 	}
 
 	engine, err := repackengine.NewEngine(config, repackengine.Config{
