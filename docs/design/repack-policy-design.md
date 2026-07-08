@@ -2385,10 +2385,12 @@ A≈O(N²)，B（朴素）≈O(N³)，B/A 每翻倍再 ×2。
 
 #### 4.18.5 测试策略
 
-- **纯函数单测**:gate(`EvaluateGate`)、状态机(`DerivePhase`/`IsTerminal`/`CooldownRetained`)、约束闸(`PlanAdmissible`)、资源判据(`supportedTarget`)、饥饿唤醒(`requeueGatedRuns`)、drain 门控。
-- **构造/启动冒烟**:`NewEngine` 不 panic(含 nil `ServerOpts`)、默认值。
+- **基础功能单测**:碎片度量(`MeasureResource`/`OptimalNodes`,含暴力最优交叉校验)、可行性求解(`Feasible`,含暴力交叉校验)、drain 核心(10+ 场景)、scope 解析、状态机(`DerivePhase`/`IsTerminal`/`EvaluateGate`/`CooldownRetained`/`TTLExpired`)、约束闸(`PlanAdmissible`)、状态渲染(`movesOf`/`summaryOf`/`nominationsOf`/`applyPlan`/`pct`/`terminalOutcome`)、spec 翻译(`resolveResource`/`maxPerRun`/`minFragImprovement`)、提名匹配(`matchNomination`/`needsNomination`/`labelsMatch` 覆盖 victimPodName/identityLabels/fungible/过期/已绑定/跨 ns 各分支)、扰动评分。
+- **边界场景**:nil/空 plan、多 pod 分散跨节点的 gang、`pct` 越界钳制、系统 DaemonSet pod 不阻塞腾空、frozen 节点、预算封顶、非同构容量、无目标资源快速失败。
+- **可靠性/并发**:K=1 gate 内存态并发压测(`TestExecuteGateState_ConcurrentAccess`,配 `-race`)、饥饿唤醒(`requeueGatedRuns`)、构造/启动不 panic(含 nil `ServerOpts`)。
+- **性能(核心算法基准)**:`BenchmarkOptimalNodes`(碎片打包界)、`BenchmarkFeasible`(INV-RESCHED 回溯求解)、`BenchmarkDrain`(端到端,25/100/250 节点规模)。
 - **e2e**:DryRun 跑到终态 + CEL 拒 cpu(`test/e2e/repack`)。
-- **待补**:崩溃恢复(recoverOrphans)、毒丸放弃、并发 gate 的驱动级测试(需 mock lister/queue/clientset,成本较高,列 P1)。
+- **待补(P1)**:崩溃恢复(recoverOrphans)、毒丸放弃、controller GC reconcile 的驱动级测试(需 fake clientset)。
 
 ---
 

@@ -312,8 +312,11 @@ EOF
   ;;
 "REPACK")
   echo "Install volcano chart with crd version $crd_version and repack engine enabled"
+  # The e2e advertises a fake extended resource volcano.sh/e2e-npu on nodes, so the
+  # engine's default target resource is set to it (covers empty-goals runs too).
   helm-install-volcano "  controller_log_level: 5
   repack_enable: true
+  repack_default_resource: volcano.sh/e2e-npu
   repack_log_level: 5"
   ;;
 *)

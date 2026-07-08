@@ -18,79 +18,143 @@ package repack
 
 import (
 	"context"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
 
-// These are smoke tests: they check the RepackRun CRD admits/rejects specs
-// correctly and that a DryRun run is driven to a terminal phase. They require the
-// repack CRDs installed, and the DryRun case additionally requires the
-// volcano-repack-engine running (helm custom.repack_enable=true).
-var _ = Describe("Repack E2E", func() {
-	deleteRun := func(name string) {
-		_ = e2eutil.VcClient.RepackV1alpha1().RepackRuns().Delete(
-			context.TODO(), name, metav1.DeleteOptions{})
-	}
+// These tests require the repack CRDs and the volcano-repack-engine running
+// (helm custom.repack_enable=true, run via E2E_TYPE=REPACK).
 
+var _ = Describe("Repack DryRun & admission", func() {
+	var ctx *e2eutil.TestContext
+	var nodes []string
+
+	BeforeEach(func() {
+		ctx = e2eutil.InitTestContext(e2eutil.Options{})
+		nodes = npuFixture(ctx, 3) // advertise fake NPUs on 3 worker nodes
+	})
+	AfterEach(func() {
+		for _, n := range nodes {
+			clearNPU(ctx, n)
+		}
+		e2eutil.CleanupTestContext(ctx)
+	})
+
+	// B1/B2/B3: fragmented cluster -> DryRun recommends consolidation, reports a
+	// plan with moves + freed nodes + reduced fragmentation, and evicts nothing.
+	It("recommends consolidation on a fragmented cluster (no eviction)", func() {
+		occupy(ctx, "frag-a", nodes[0], 4) // node0: 4/8
+		occupy(ctx, "frag-b", nodes[1], 2) // node1: 2/8 (node2 empty)
+		before := runningPodCount(ctx)
+
+		run, err := newRun("dryrun-recommend", repackv1alpha1.RepackModeDryRun).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("RepackRecommended"))
+		Expect(got.Status.Plan).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1))
+		Expect(got.Status.Plan.Summary.FragAfterPercent).To(BeNumerically("<", got.Status.Plan.Summary.FragBeforePercent))
+		Expect(len(got.Status.Plan.Moves)).To(BeNumerically(">=", 1))
+		// DryRun must not evict or nominate.
+		Expect(got.Status.Nominations).To(BeEmpty())
+		Expect(runningPodCount(ctx)).To(Equal(before), "DryRun must not evict pods")
+		// Moves carry per-pod from/to and cards.
+		mv := got.Status.Plan.Moves[0]
+		Expect(mv.PodGroupName).NotTo(BeEmpty())
+		Expect(len(mv.Pods)).To(BeNumerically(">=", 1))
+		Expect(mv.Pods[0].ToNode).NotTo(BeEmpty())
+	})
+
+	// B4: an already-optimal (single occupied node) cluster has no fragmentation.
+	It("reports NoFragmentation on a clean cluster", func() {
+		occupy(ctx, "clean", nodes[0], 4) // only one node occupied -> optimal
+
+		run, err := newRun("dryrun-clean", repackv1alpha1.RepackModeDryRun).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("NoFragmentation"))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(0))
+		Expect(got.Status.Plan.Moves).To(BeEmpty())
+	})
+
+	// B5: fragmented but nothing in scope is movable -> BelowGoalThreshold (the
+	// "fragmented but no worthwhile plan" case), with before==after > 0.
+	It("reports BelowGoalThreshold when fragmented but nothing is movable", func() {
+		occupy(ctx, "stuck-a", nodes[0], 4)
+		occupy(ctx, "stuck-b", nodes[1], 2)
+
+		// scope includes only a non-existent PodGroup -> no gang is movable.
+		scope := &repackv1alpha1.RepackScope{
+			PodGroups: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{Names: []string{ctx.Namespace + "/does-not-exist"}},
+			},
+		}
+		run, err := newRun("dryrun-stuck", repackv1alpha1.RepackModeDryRun).goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("BelowGoalThreshold"))
+		Expect(got.Status.Plan.Summary.FragBeforePercent).To(BeNumerically(">", 0))
+		Expect(got.Status.Plan.Summary.FragAfterPercent).To(Equal(got.Status.Plan.Summary.FragBeforePercent))
+		Expect(got.Status.Plan.Moves).To(BeEmpty())
+	})
+
+	// D10/D11: empty goals falls back to the engine's --repack-default-resource
+	// (set to volcano.sh/e2e-npu for the e2e), so it still defragments.
+	It("uses the engine default resource when goals is empty", func() {
+		occupy(ctx, "def-a", nodes[0], 4)
+		occupy(ctx, "def-b", nodes[1], 2)
+
+		run, err := newRun("dryrun-default", repackv1alpha1.RepackModeDryRun).create(ctx) // no goal()
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1))
+	})
+
+	// D12: CEL rejects a core resource target at apply time (no engine needed).
 	It("rejects a RepackRun whose goal targets a core resource (cpu)", func() {
-		// CEL on spec.goals[0].resource requires a fully-qualified extended
-		// resource; core resources like cpu/memory must be rejected by the
-		// apiserver. This needs only the CRD (no engine).
 		run := &repackv1alpha1.RepackRun{
-			ObjectMeta: metav1.ObjectMeta{GenerateName: "e2e-repack-badresource-"},
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "bad-resource-"},
 			Spec: repackv1alpha1.RepackRunSpec{
 				Mode:  repackv1alpha1.RepackModeDryRun,
 				Goals: []repackv1alpha1.RepackGoal{{Resource: "cpu"}},
 			},
 		}
-		created, err := e2eutil.VcClient.RepackV1alpha1().RepackRuns().Create(
-			context.TODO(), run, metav1.CreateOptions{})
+		created, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Create(context.TODO(), run, metav1.CreateOptions{})
 		if err == nil {
-			deleteRun(created.Name)
+			deleteRun(ctx, created.Name)
 		}
-		Expect(err).To(HaveOccurred(), "cpu goal should be rejected by CEL validation")
+		Expect(err).To(HaveOccurred(), "cpu goal must be rejected by CEL")
 	})
 
-	It("drives a DryRun RepackRun to a terminal phase", func() {
-		run := &repackv1alpha1.RepackRun{
-			ObjectMeta: metav1.ObjectMeta{GenerateName: "e2e-repack-dryrun-"},
-			Spec: repackv1alpha1.RepackRunSpec{
-				Mode:  repackv1alpha1.RepackModeDryRun,
-				Goals: []repackv1alpha1.RepackGoal{{Resource: "nvidia.com/gpu"}},
-			},
-		}
-		created, err := e2eutil.VcClient.RepackV1alpha1().RepackRuns().Create(
-			context.TODO(), run, metav1.CreateOptions{})
+	// G22: spec is immutable once created (CEL self==oldSelf).
+	It("rejects a spec mutation on an existing RepackRun", func() {
+		run, err := newRun("immutable", repackv1alpha1.RepackModeDryRun).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
-		defer deleteRun(created.Name)
+		defer deleteRun(ctx, run.Name)
+		waitTerminal(ctx, run.Name)
 
-		// The engine picks it up and writes a terminal status. With no matching
-		// accelerator nodes it settles as Succeeded (NoFragmentation).
-		var last repackv1alpha1.RepackPhase
-		err = wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, e2eutil.TwoMinute, false,
-			func(ctx context.Context) (bool, error) {
-				got, err := e2eutil.VcClient.RepackV1alpha1().RepackRuns().Get(ctx, created.Name, metav1.GetOptions{})
-				if err != nil {
-					return false, err
-				}
-				last = got.Status.Phase
-				switch last {
-				case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled:
-					return true, nil
-				default:
-					return false, nil
-				}
-			})
-		Expect(err).NotTo(HaveOccurred(), "DryRun should reach a terminal phase (last=%s); is the repack engine running?", last)
-		Expect(last).To(Equal(repackv1alpha1.RepackSucceeded))
+		latest := getRun(ctx, run.Name)
+		latest.Spec.Mode = repackv1alpha1.RepackModeExecute // mutate spec
+		_, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().Update(context.TODO(), latest, metav1.UpdateOptions{})
+		Expect(err).To(HaveOccurred(), "spec is immutable; the mutation must be rejected")
 	})
 })
