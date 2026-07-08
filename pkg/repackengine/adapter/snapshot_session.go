@@ -16,8 +16,8 @@ limitations under the License.
 
 // Package adapter is the ONLY scheduler-framework-coupled layer of the repack
 // engine. It adapts a live volcano-scheduler Session into the framework's
-// abstractions: a Snapshot (cluster view), the EngineFit/ValidatePlan oracle, and
-// the gang-info source for scope resolution. Keeping every scheduler/framework
+// abstractions: a Snapshot (cluster view) and the gang-info source for scope
+// resolution. Keeping every scheduler/framework
 // import here lets api/ and framework/ stay pure and unit-testable.
 package adapter
 
@@ -36,17 +36,17 @@ import (
 // in-scheduler-cache implementation. It applies the resolved scope.nodes filter
 // so the core only ever sees in-scope nodes.
 type SessionSnapshot struct {
-	ssn         *schedframework.Session
-	resource    v1.ResourceName
-	nodeInScope func(*schedapi.NodeInfo) bool // nil = all nodes in scope
+	ssn      *schedframework.Session
+	resource v1.ResourceName
+	scope    *framework.ScopeMatcher // nil = all nodes in scope
 }
 
 var _ framework.Snapshot = (*SessionSnapshot)(nil)
 
-// NewSessionSnapshot wraps a Session for the given target resource. nodeInScope
-// gates drain targets (nil = all in scope); it does NOT filter the receiver set.
-func NewSessionSnapshot(ssn *schedframework.Session, resource v1.ResourceName, nodeInScope func(*schedapi.NodeInfo) bool) *SessionSnapshot {
-	return &SessionSnapshot{ssn: ssn, resource: resource, nodeInScope: nodeInScope}
+// NewSessionSnapshot wraps a Session for the given target resource. scope gates
+// drain targets (nil = all in scope); it does NOT filter the receiver set.
+func NewSessionSnapshot(ssn *schedframework.Session, resource v1.ResourceName, scope *framework.ScopeMatcher) *SessionSnapshot {
+	return &SessionSnapshot{ssn: ssn, resource: resource, scope: scope}
 }
 
 // Nodes returns ALL session nodes (the receiver universe). scope.nodes gates
@@ -63,12 +63,18 @@ func (s *SessionSnapshot) Nodes() []*schedapi.NodeInfo {
 
 // NodeInScope reports whether a node may be a drain target (nil scope = all).
 func (s *SessionSnapshot) NodeInScope(n *schedapi.NodeInfo) bool {
-	return s.nodeInScope == nil || s.nodeInScope(n)
+	return s.scope == nil || s.scope.NodeInScope(n)
 }
 
-// Predicate delegates to the session's per-node predicate stack.
+// Predicate skips the scheduler's full PredicateFn stack for P0 drain feasibility.
+// Resource fit is enforced by the drain ledger (Allocatable−Used); calling
+// ssn.PredicateFn here false-negates feasible reshuffles because the bundled
+// predicates plugin re-checks capacity via stale cache Idle/FutureIdle and runs
+// PreFilter-dependent filters (DRA, inter-pod affinity) without the matching
+// PreFilter state. Engine plugins may add constraint checks via AddPredicateFn
+// in P1; until then nil means "constraints not modeled at this layer".
 func (s *SessionSnapshot) Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
-	return s.ssn.PredicateFn(task, node)
+	return nil
 }
 
 // PodGroupView reads MinAvailable/Running/Priority/Footprint off the JobInfo.

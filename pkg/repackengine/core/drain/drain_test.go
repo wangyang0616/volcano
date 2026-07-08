@@ -350,3 +350,57 @@ func TestDrain_FragImprovementGate(t *testing.T) {
 		t.Fatalf("gate=60: expected NoRepack (50pp improvement below the bar), got %+v", plan)
 	}
 }
+
+const e2eNPU = v1.ResourceName("volcano.sh/e2e-npu")
+
+// TestDrain_E2EMilliNPULayout mirrors the e2e two-halves-into-one scenario at the
+// scheduler's milli scale (8→8000, 4→4000, 2→2000). Ledger math must work even
+// when Scalar() returns thousands, not single-digit card counts.
+func TestDrain_E2EMilliNPULayout(t *testing.T) {
+	npuRes := func(n float64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{e2eNPU: n}}
+	}
+	npuTask := func(name, gang string, cards float64) *schedapi.TaskInfo {
+		return &schedapi.TaskInfo{Name: name, Job: schedapi.JobID(gang), InitResreq: npuRes(cards)}
+	}
+	capNPUNode := func(name string, cap, used float64, tasks ...*schedapi.TaskInfo) *schedapi.NodeInfo {
+		m := map[schedapi.TaskID]*schedapi.TaskInfo{}
+		for i, t := range tasks {
+			t.NodeName = name
+			m[schedapi.TaskID(fmt.Sprintf("%s-%d", name, i))] = t
+		}
+		return &schedapi.NodeInfo{
+			Name: name, Tasks: m,
+			Allocatable: npuRes(cap),
+			Used:        npuRes(used),
+		}
+	}
+	freeNPU := func(n *schedapi.NodeInfo) *schedapi.Resource {
+		return npuRes(n.Allocatable.ScalarResources[e2eNPU] - n.Used.ScalarResources[e2eNPU])
+	}
+
+	a := npuTask("a", "g-a", 4000)
+	b := npuTask("b", "g-b", 2000)
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNPUNode("n0", 8000, 4000, a),
+		capNPUNode("n1", 8000, 2000, b),
+		capNPUNode("n2", 8000, 0),
+	}}
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Snapshot: snap, Resource: e2eNPU, CoreName: framework.CoreDrain,
+		MinNodesFreed: 1, Free: freeNPU,
+	}, nil)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+
+	plan, ok := (&drainCore{}).Plan(ssn)
+	if !ok || plan == nil {
+		t.Fatal("expected consolidation plan for milli-scale e2e layout")
+	}
+	if len(plan.FreedNodes) != 1 {
+		t.Fatalf("freed=%v, want one node", plan.FreedNodes)
+	}
+	if mv := realMoves(plan); len(mv) != 1 || mv[0].To == mv[0].From {
+		t.Fatalf("moves=%+v, want one real relocation", mv)
+	}
+}

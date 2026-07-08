@@ -120,13 +120,15 @@ func npuFixture(ctx *e2eutil.TestContext, nodes int) []string {
 // task is pinned there (deterministic fragmented layout for DryRun); otherwise the
 // scheduler places it (used for Execute, so the replacement can move). Waits Ready.
 func occupy(ctx *e2eutil.TestContext, name, node string, cards int) *batchv1alpha1.Job {
+	npuQty := resource.MustParse(fmt.Sprintf("%d", cards))
+	npuList := v1.ResourceList{npuResource: npuQty}
 	spec := &e2eutil.JobSpec{
 		Name:      name,
 		Namespace: ctx.Namespace,
 		NodeName:  node,
 		Tasks: []e2eutil.TaskSpec{{
 			Name: "w", Min: 1, Rep: 1, Img: e2eutil.DefaultNginxImage,
-			Req: v1.ResourceList{npuResource: resource.MustParse(fmt.Sprintf("%d", cards))},
+			Req: npuList, Limit: npuList,
 		}},
 	}
 	job := e2eutil.CreateJob(ctx, spec)

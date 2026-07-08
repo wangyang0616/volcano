@@ -69,7 +69,7 @@ func RunActions(names []string, ssn *Session) {
 	for _, name := range names {
 		a, ok := GetAction(name)
 		if !ok {
-			klog.Warningf("repack: unknown action %q (registered: %v), skipping", name, ActionNames())
+			klog.ErrorS(nil, "repack: unknown action in config, skipping", "action", name, "registered", ActionNames())
 			continue
 		}
 		a.Execute(ssn)

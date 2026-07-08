@@ -36,12 +36,23 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// Fit reports whether task may run on node, judging everything *except* the
-// running resource ledger the solver tracks itself: node selectors, affinity /
-// anti-affinity, taints / tolerations, topology and device constraints. The
-// engine adapter implements it with ssn.PredicateFn; tests supply a fake.
-// A nil Fit means "resource fit only".
-type Fit func(task *api.TaskInfo, node *api.NodeInfo) bool
+// ReceiverPolicy tells the feasibility search how to treat candidate receiver
+// nodes. Bundling the three decisions into one named type (rather than passing
+// three loose funcs around) keeps the drain call site readable: a reader can jump
+// to the policy implementation and see exactly how receivers are judged.
+type ReceiverPolicy interface {
+	// Free is a node's working free capacity, used to seed the search. NewDomain
+	// clones it, so the caller's NodeInfo is never mutated. Typically FutureIdle.
+	Free(node *api.NodeInfo) *api.Resource
+	// Fit reports whether a task may (re)schedule onto a node for reasons beyond
+	// raw capacity — node selectors, affinity/anti-affinity, taints/tolerations,
+	// topology and device constraints. The solver tracks resource fit itself.
+	Fit(task *api.TaskInfo, node *api.NodeInfo) bool
+	// Prefer biases receiver selection: among the nodes that fit, higher preference
+	// is filled first (best-fit orders within one tier). It only changes which
+	// feasible assignment is found first, never feasibility. 0 = neutral.
+	Prefer(node *api.NodeInfo) int
+}
 
 // Move is a decided (re)placement of one task produced by the solver.
 type Move struct {
@@ -64,35 +75,24 @@ type freeNode struct {
 // released by victims evicted in the surrounding Statement.
 type Domain struct {
 	nodes  []*freeNode
-	fit    Fit
-	prefer func(*api.NodeInfo) int // higher = preferred receiver; nil = neutral
+	policy ReceiverPolicy
 }
 
-// NewDomain builds a search domain. free returns the working free capacity for
-// a node; it is cloned so the caller's NodeInfo is never mutated.
-func NewDomain(nodes []*api.NodeInfo, free func(*api.NodeInfo) *api.Resource, fit Fit) *Domain {
-	d := &Domain{fit: fit}
+// NewDomain builds a search domain from the surviving nodes and a ReceiverPolicy.
+// Each node's capacity is seeded from policy.Free and cloned, so the caller's
+// NodeInfo is never mutated.
+func NewDomain(nodes []*api.NodeInfo, policy ReceiverPolicy) *Domain {
+	d := &Domain{policy: policy}
 	for _, n := range nodes {
 		if n == nil {
 			continue
 		}
-		cap := free(n)
-		if cap == nil {
-			cap = api.EmptyResource()
+		free := policy.Free(n)
+		if free == nil {
+			free = api.EmptyResource()
 		}
-		d.nodes = append(d.nodes, &freeNode{info: n, free: cap.Clone()})
+		d.nodes = append(d.nodes, &freeNode{info: n, free: free.Clone()})
 	}
-	return d
-}
-
-// Prefer biases receiver selection: among the nodes that fit a task, those with a
-// higher preference are filled first (e.g. nodes that will definitely stay
-// occupied — so filling them never wastes a drainable node's empty-ability).
-// Best-fit (tightest capacity) still orders within one preference tier. Preference
-// changes only which feasible assignment is found first, never feasibility. nil
-// (the default) is neutral. Returns d for chaining.
-func (d *Domain) Prefer(fn func(*api.NodeInfo) int) *Domain {
-	d.prefer = fn
 	return d
 }
 
@@ -149,27 +149,25 @@ func (d *Domain) assign(order []*api.TaskInfo, i int, moves *[]*Move) bool {
 	}
 
 	// Collect feasible nodes for this task, tightest-fit first.
-	cand := make([]*freeNode, 0, len(d.nodes))
+	candidates := make([]*freeNode, 0, len(d.nodes))
 	for _, n := range d.nodes {
 		if !req.LessEqual(n.free, api.Zero) {
 			continue // not enough room on this node
 		}
-		if d.fit != nil && !d.fit(task, n.info) {
+		if !d.policy.Fit(task, n.info) {
 			continue // predicate (affinity/taint/topology/...) rejects it
 		}
-		cand = append(cand, n)
+		candidates = append(candidates, n)
 	}
-	sort.SliceStable(cand, func(a, b int) bool {
-		if d.prefer != nil {
-			pa, pb := d.prefer(cand[a].info), d.prefer(cand[b].info)
-			if pa != pb {
-				return pa > pb // higher-preference receiver first
-			}
+	sort.SliceStable(candidates, func(a, b int) bool {
+		pa, pb := d.policy.Prefer(candidates[a].info), d.policy.Prefer(candidates[b].info)
+		if pa != pb {
+			return pa > pb // higher-preference receiver first
 		}
-		return magnitude(cand[a].free) < magnitude(cand[b].free) // then least free = most loaded
+		return magnitude(candidates[a].free) < magnitude(candidates[b].free) // then least free = most loaded
 	})
 
-	for _, n := range cand {
+	for _, n := range candidates {
 		n.free.Sub(req) // guarded by LessEqual above, so never goes negative
 		*moves = append(*moves, &Move{Task: task, From: task.NodeName, To: n.info.Name})
 

@@ -135,7 +135,7 @@ const (
 func newEventRecorder(config *rest.Config) record.EventRecorder {
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		klog.ErrorS(err, "repack-engine: event recorder disabled (client build failed)")
+		klog.ErrorS(err, "repack: event recorder disabled (client build failed)")
 		return nil
 	}
 	s := runtime.NewScheme()
@@ -172,6 +172,10 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 	vc := vcclientset.NewForConfigOrDie(config)
 	factory := vcinformers.NewSharedInformerFactory(vc, cfg.ResyncPeriod)
 	informer := factory.Repack().V1alpha1().RepackRuns()
+	schedulerNames := schedoptions.ServerOpts.SchedulerNames
+	if len(schedulerNames) == 0 {
+		schedulerNames = []string{"volcano"}
+	}
 	e := &Engine{
 		recorder: newEventRecorder(config),
 		// Reuse the scheduler cache as a read-only cluster view. New is a pure
@@ -179,7 +183,11 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 		// the engine needs only queues get/list/watch, never create. nodeWorkers must
 		// be > 0: with 0 workers the node queue is never drained and sc.Nodes stays
 		// empty, so the engine would see a zero-node cluster.
-		cache:   schedcache.New(config, nil, "", nil, repackNodeWorkers, nil, 0, 0),
+		// schedulerNames must match the pods the engine plans to move (volcano Jobs
+		// use schedulerName=volcano); an empty list skips Job/PodGroup indexing.
+		cache: schedcache.New(config, schedulerNames, schedoptions.ServerOpts.DefaultQueue,
+			schedoptions.ServerOpts.NodeSelector, repackNodeWorkers,
+			schedoptions.ServerOpts.IgnoredCSIProvisioners, 0, 0),
 		vc:      vc,
 		cfg:     cfg,
 		factory: factory,
@@ -202,12 +210,12 @@ func (e *Engine) Run(ctx context.Context) {
 	defer e.queue.ShutDown()
 
 	if err := e.loadConf(); err != nil {
-		klog.ErrorS(err, "repack-engine: load scheduler conf")
+		klog.ErrorS(err, "repack: load scheduler conf")
 	}
 	e.factory.Start(ctx.Done())
 	e.cache.Run(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), e.synced) {
-		klog.Error("repack-engine: RepackRun cache failed to sync")
+		klog.Error("repack: RepackRun cache failed to sync")
 		return
 	}
 	e.recoverOrphans() // fail runs left Running by a crashed predecessor
@@ -295,7 +303,7 @@ func (e *Engine) reconcileSafely(ctx context.Context, name string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in reconcile: %v", r)
-			klog.ErrorS(err, "repack-engine: recovered panic", "run", name, "stack", string(debug.Stack()))
+			klog.ErrorS(err, "repack: recovered panic", "run", name, "stack", string(debug.Stack()))
 		}
 	}()
 	return e.reconcile(ctx, name)
@@ -372,7 +380,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 func (e *Engine) recoverOrphans() {
 	runs, err := e.lister.List(labels.Everything())
 	if err != nil {
-		klog.ErrorS(err, "repack-engine: list for orphan recovery")
+		klog.ErrorS(err, "repack: list for orphan recovery")
 		return
 	}
 	for _, r := range runs {
@@ -380,11 +388,11 @@ func (e *Engine) recoverOrphans() {
 			continue
 		}
 		work := r.DeepCopy()
-		gen := work.Generation
+		generation := work.Generation
 		const reason = "Interrupted"
 		msg := "engine restarted while this run was in progress"
-		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, gen)
-		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, gen)
+		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, generation)
+		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 		e.updateStatusTerminal(work)
 		klog.V(3).InfoS("recovered orphaned Running RepackRun -> Failed", "run", work.Name)

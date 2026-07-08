@@ -36,7 +36,7 @@ type (
 	// DomainFn enumerates the freeable units a domain contributes (node units,
 	// hypernode units, ...). Aggregated by union; the core optimizes their combined
 	// weighted benefit.
-	DomainFn func(snap Snapshot) []api.FreeableUnit
+	DomainFn func(snapshot Snapshot) []api.FreeableUnit
 	// DisruptionScoreFn scores a candidate plan on one dimension (higher = more
 	// disruptive). Weighted + min-max normalized across candidates by the Session.
 	// This is SOFT ranking (used by LeastDisruptive to pick among feasible plans).
@@ -225,6 +225,30 @@ func (s *Session) Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) er
 	return nil
 }
 
+// PredicateForReschedule is Predicate on a task treated as an unbound reschedule
+// candidate: pod.spec.nodeName and the task's bound node are cleared so
+// INV-RESCHED feasibility is not blocked by the pod's current assignment.
+func (s *Session) PredicateForReschedule(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
+	return s.Predicate(taskForReschedule(task), node)
+}
+
+func taskForReschedule(task *schedapi.TaskInfo) *schedapi.TaskInfo {
+	if task == nil {
+		return nil
+	}
+	if task.NodeName == "" && (task.Pod == nil || task.Pod.Spec.NodeName == "") {
+		return task
+	}
+	t := *task
+	if task.Pod != nil {
+		pod := task.Pod.DeepCopy()
+		pod.Spec.NodeName = ""
+		t.Pod = pod
+	}
+	t.NodeName = ""
+	return &t
+}
+
 // Movable returns an api.Movable that is the AND of all registered MovableFns
 // (no plugins → everything movable).
 func (s *Session) Movable() api.Movable {
@@ -255,7 +279,7 @@ func (s *Session) FreeableUnits() []api.FreeableUnit {
 
 // PlanContext builds the scoring context from the snapshot and target resource.
 func (s *Session) PlanContext() *api.PlanContext {
-	return &api.PlanContext{GPU: s.cfg.Resource, PodGroup: s.cfg.Snapshot.PodGroupView}
+	return &api.PlanContext{GPU: s.cfg.Resource, Views: s.cfg.Snapshot}
 }
 
 // CurrentFragRate is the target resource's fragmentation rate over the snapshot's

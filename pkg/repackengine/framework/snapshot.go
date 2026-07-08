@@ -25,8 +25,6 @@ limitations under the License.
 package framework
 
 import (
-	"sort"
-
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -51,39 +49,4 @@ type Snapshot interface {
 	// Predicate reports node fit for affinity/taint/topology/device constraints
 	// (nil = fits). Resource fit is handled by the core's own ledger.
 	Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error
-}
-
-// MovableInScope builds an api.Movable from scope predicates: a task is movable
-// iff its PodGroup is in scope (scope.podGroups include − exclude) and — P1 — not
-// blocked by PDB. inScope nil = all PodGroups; pdbBlocks nil = ignore PDB.
-func MovableInScope(inScope func(schedapi.JobID) bool, pdbBlocks func(*schedapi.TaskInfo) bool) api.Movable {
-	return func(t *schedapi.TaskInfo) bool {
-		if t == nil {
-			return false
-		}
-		if inScope != nil && !inScope(t.Job) {
-			return false
-		}
-		if pdbBlocks != nil && pdbBlocks(t) { // P1 seam
-			return false
-		}
-		return true
-	}
-}
-
-// NodesInScope filters nodes by nodeInScope (scope.nodes include − exclude; nil =
-// all) and returns them in stable name order for deterministic planning.
-func NodesInScope(nodes []*schedapi.NodeInfo, nodeInScope func(*schedapi.NodeInfo) bool) []*schedapi.NodeInfo {
-	out := make([]*schedapi.NodeInfo, 0, len(nodes))
-	for _, n := range nodes {
-		if n == nil {
-			continue
-		}
-		if nodeInScope != nil && !nodeInScope(n) {
-			continue
-		}
-		out = append(out, n)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }

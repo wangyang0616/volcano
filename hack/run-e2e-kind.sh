@@ -314,9 +314,13 @@ EOF
   echo "Install volcano chart with crd version $crd_version and repack engine enabled"
   # The e2e advertises a fake extended resource volcano.sh/e2e-npu on nodes, so the
   # engine's default target resource is set to it (covers empty-goals runs too).
+  # A short execute-cooldown keeps the Execute e2e cases independent: a gated run is
+  # only delayed (not failed), so the 10m default would push later Execute cases past
+  # their wait timeout. 30s is long enough to still observe the cooldown gate case.
   helm-install-volcano "  controller_log_level: 5
   repack_enable: true
   repack_default_resource: volcano.sh/e2e-npu
+  repack_execute_cooldown: 30s
   repack_log_level: 5"
   ;;
 *)

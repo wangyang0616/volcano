@@ -453,14 +453,6 @@ spec:
             - message: RepackRun.spec is immutable; create a new RepackRun to change
                 it
               rule: self == oldSelf
-            - message: Execute requires spec.scope with a non-empty include on podGroups
-                or nodes
-              rule: self.mode != 'Execute' || (has(self.scope) && ((has(self.scope.podGroups)
-                && has(self.scope.podGroups.include) && (has(self.scope.podGroups.include.selector)
-                || (has(self.scope.podGroups.include.names) && size(self.scope.podGroups.include.names)
-                > 0))) || (has(self.scope.nodes) && has(self.scope.nodes.include)
-                && (has(self.scope.nodes.include.selector) || (has(self.scope.nodes.include.names)
-                && size(self.scope.nodes.include.names) > 0)))))
           status:
             description: |-
               RepackRunStatus reports lifecycle and business output. conditions are

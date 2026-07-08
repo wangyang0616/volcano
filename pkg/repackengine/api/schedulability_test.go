@@ -38,6 +38,35 @@ func gpuTask(idx int, from string, g int64) *api.TaskInfo {
 	return t
 }
 
+// gpuPolicy is a test ReceiverPolicy: node capacity from a per-node GPU map, an
+// optional Fit allow-map (taskName -> nodeName -> allowed; nil = fit everything),
+// and neutral receiver preference.
+type gpuPolicy struct {
+	caps  map[string]int64
+	allow map[string]map[string]bool
+}
+
+func (p gpuPolicy) Free(n *api.NodeInfo) *api.Resource { return gpuRes(p.caps[n.Name]) }
+func (p gpuPolicy) Fit(t *api.TaskInfo, n *api.NodeInfo) bool {
+	if p.allow == nil {
+		return true
+	}
+	byNode, ok := p.allow[t.Name]
+	if !ok {
+		return true
+	}
+	return byNode[n.Name]
+}
+func (p gpuPolicy) Prefer(*api.NodeInfo) int { return 0 }
+
+// fixedPolicy is a test ReceiverPolicy giving every node the same capacity, no Fit
+// constraint and neutral preference.
+type fixedPolicy struct{ capacity *api.Resource }
+
+func (p fixedPolicy) Free(*api.NodeInfo) *api.Resource       { return p.capacity }
+func (p fixedPolicy) Fit(*api.TaskInfo, *api.NodeInfo) bool  { return true }
+func (p fixedPolicy) Prefer(*api.NodeInfo) int               { return 0 }
+
 // buildDomain builds a GPU-only domain from per-node capacities, with an
 // optional Fit allow-map keyed taskName -> nodeName -> allowed.
 func buildDomain(caps map[string]int64, allow map[string]map[string]bool) ([]*api.NodeInfo, *Domain) {
@@ -49,18 +78,7 @@ func buildDomain(caps map[string]int64, allow map[string]map[string]bool) ([]*ap
 			nodes = append(nodes, &api.NodeInfo{Name: name})
 		}
 	}
-	free := func(n *api.NodeInfo) *api.Resource { return gpuRes(caps[n.Name]) }
-	var fit Fit
-	if allow != nil {
-		fit = func(t *api.TaskInfo, n *api.NodeInfo) bool {
-			byNode, ok := allow[t.Name]
-			if !ok {
-				return true
-			}
-			return byNode[n.Name]
-		}
-	}
-	return nodes, NewDomain(nodes, free, fit)
+	return nodes, NewDomain(nodes, gpuPolicy{caps: caps, allow: allow})
 }
 
 // brute-force: does a complete assignment of reqs onto caps exist?
@@ -177,10 +195,8 @@ func TestFeasible_RequiresBacktracking(t *testing.T) {
 func TestFeasible_MultiDimensional(t *testing.T) {
 	// cpu+mem+gpu; node has 16 cpu / 64Gi / 8 gpu free.
 	node := &api.NodeInfo{Name: "n0"}
-	free := func(*api.NodeInfo) *api.Resource {
-		return &api.Resource{MilliCPU: 16000, Memory: 64 << 30, ScalarResources: map[v1.ResourceName]float64{gpu: 8}}
-	}
-	d := NewDomain([]*api.NodeInfo{node}, free, nil)
+	capacity := &api.Resource{MilliCPU: 16000, Memory: 64 << 30, ScalarResources: map[v1.ResourceName]float64{gpu: 8}}
+	d := NewDomain([]*api.NodeInfo{node}, fixedPolicy{capacity: capacity})
 	mk := func(name string, cpu, memGi, g int64) *api.TaskInfo {
 		return &api.TaskInfo{Name: name, InitResreq: &api.Resource{
 			MilliCPU: float64(cpu * 1000), Memory: float64(memGi << 30),
@@ -193,7 +209,7 @@ func TestFeasible_MultiDimensional(t *testing.T) {
 		t.Fatal("expected feasible: two pods exactly filling one node")
 	}
 	// Bump gpu past capacity -> infeasible despite cpu/mem fitting.
-	d2 := NewDomain([]*api.NodeInfo{node}, free, nil)
+	d2 := NewDomain([]*api.NodeInfo{node}, fixedPolicy{capacity: capacity})
 	place2 := []*api.TaskInfo{mk("a", 8, 32, 4), mk("b", 8, 32, 8)}
 	if _, ok := d2.Feasible(place2); ok {
 		t.Fatal("expected infeasible: gpu 4+8 > 8")

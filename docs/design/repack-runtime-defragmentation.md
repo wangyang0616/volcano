@@ -256,7 +256,7 @@ flowchart LR
     alloc -->|消费空位| SCHED
 ```
 
-- **apiserver（CEL 准入）**：`RepackRun` 的基本校验全部在创建期由 CRD 上的 CEL/marker 完成（mode 枚举、`goals≤1`、spec 不可变、Execute 必须带非空 scope）；非法对象根本不落库。**没有控制器准入步骤。**
+- **apiserver（CEL 准入）**：`RepackRun` 的基本校验全部在创建期由 CRD 上的 CEL/marker 完成（mode 枚举、`goals≤1`、spec 不可变）；scope 两种 mode 均可省略（=全集群，迁移规模由引擎计划兜底）；非法对象根本不落库。**没有控制器准入步骤。**
 - **控制器**（在 controller-manager 内，轻量 client-go）：只做 **TTL/历史回收** 和 **提名注入**（提名 reconciler：watch 替身 Pod → patch `nominatedNodeName`）；P1 的 `RepackPolicy` 也演进在这里。**不写非终态 status。**
 - **`volcano-repack-engine`**（独立 Deployment）：**事件驱动** watch `RepackRun`，**复用调度器框架**打开 Session;跑门控(Execute 全局 K=1 + 冷静期，谁干活谁串行)与整理算法;两种 mode 都写 `status.plan`（同一结构），Execute 额外驱逐 victim + 写 `status.nominations` + `phase/conditions`。**不 bind Pod、不打污点、不保留节点。**
 - **`volcano-scheduler`**（现网，不改造）：照常调度；通过原生 `nominatedNodeName` honor 路径，把重建的 Pod 与排队作业落到腾出的空间。

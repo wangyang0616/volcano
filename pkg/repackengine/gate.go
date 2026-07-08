@@ -93,7 +93,7 @@ func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
 func (e *Engine) requeueGatedRuns() {
 	runs, err := e.lister.List(labels.Everything())
 	if err != nil {
-		klog.ErrorS(err, "repack-engine: list for gated-run requeue")
+		klog.ErrorS(err, "repack: list for gated-run requeue")
 		return
 	}
 	woken := 0

@@ -37,11 +37,11 @@ type nodePlugin struct{}
 func (*nodePlugin) Name() string { return Name }
 
 func (*nodePlugin) OnSessionOpen(ssn *framework.Session) {
-	ssn.AddDomainFn(func(snap framework.Snapshot) []api.FreeableUnit {
-		ns := snap.Nodes()
-		out := make([]api.FreeableUnit, 0, len(ns))
-		for _, n := range ns {
-			if n == nil || !snap.NodeInScope(n) {
+	ssn.AddDomainFn(func(snapshot framework.Snapshot) []api.FreeableUnit {
+		nodes := snapshot.Nodes()
+		out := make([]api.FreeableUnit, 0, len(nodes))
+		for _, n := range nodes {
+			if n == nil || !snapshot.NodeInScope(n) {
 				continue // scope.nodes gates drain targets; out-of-scope = receiver only
 			}
 			out = append(out, api.FreeableUnit{Level: "node", Nodes: []string{n.Name}, Weight: 1})

@@ -54,36 +54,36 @@ func (*gangPlugin) OnSessionClose(*framework.Session) {}
 // scoreGangBreaches: number of gangs pushed below minAvailable (moved pods exceed
 // the gang's slack = Running − MinAvailable), risking gang eviction mid-repack.
 func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-	var n int64
-	for pg, agg := range p.Aggregate(ctx).ByPG {
-		v := ctx.View(pg)
-		slack := int64(v.Running) - int64(v.MinAvailable)
+	var breachedGangs int64
+	for podGroupID, moved := range p.Aggregate(ctx).ByPG {
+		view := ctx.View(podGroupID)
+		slack := int64(view.Running) - int64(view.MinAvailable)
 		if slack < 0 {
 			slack = 0
 		}
-		if agg.MovedPods > slack {
-			n++
+		if moved.MovedPods > slack {
+			breachedGangs++
 		}
 	}
-	return float64(n)
+	return float64(breachedGangs)
 }
 
 // scoreDamagedGPU: gang-semantics "damaged cards". Within slack → only the moved
 // cards count; breaching minAvailable → the whole gang Footprint counts (and
 // further pods of an already-breached gang add nothing).
 func scoreDamagedGPU(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-	var sum int64
-	for pg, agg := range p.Aggregate(ctx).ByPG {
-		v := ctx.View(pg)
-		slack := int64(v.Running) - int64(v.MinAvailable)
+	var damagedCards int64
+	for podGroupID, moved := range p.Aggregate(ctx).ByPG {
+		view := ctx.View(podGroupID)
+		slack := int64(view.Running) - int64(view.MinAvailable)
 		if slack < 0 {
 			slack = 0
 		}
-		if agg.MovedPods > slack {
-			sum += v.Footprint
+		if moved.MovedPods > slack {
+			damagedCards += view.Footprint
 		} else {
-			sum += agg.MovedGPU
+			damagedCards += moved.MovedGPU
 		}
 	}
-	return float64(sum)
+	return float64(damagedCards)
 }

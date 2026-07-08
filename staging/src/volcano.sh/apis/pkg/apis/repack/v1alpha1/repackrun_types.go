@@ -64,10 +64,10 @@ const (
 // honors engine defaults in P0.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
-// admission step): mode is an enum, goals is capped at one entry, the spec is
-// immutable, and the rule below requires Execute to name a non-empty scope on at
-// least one axis (a blanket whole-cluster Execute is rejected).
-// +kubebuilder:validation:XValidation:rule="self.mode != 'Execute' || (has(self.scope) && ((has(self.scope.podGroups) && has(self.scope.podGroups.include) && (has(self.scope.podGroups.include.selector) || (has(self.scope.podGroups.include.names) && size(self.scope.podGroups.include.names) > 0))) || (has(self.scope.nodes) && has(self.scope.nodes.include) && (has(self.scope.nodes.include.selector) || (has(self.scope.nodes.include.names) && size(self.scope.nodes.include.names) > 0)))))",message="Execute requires spec.scope with a non-empty include on podGroups or nodes"
+// admission step): mode is an enum, goals is capped at one entry, and the spec is
+// immutable. Scope is optional in both modes: an omitted scope means whole-cluster
+// (all PodGroups, all nodes); how much a run actually relocates is bounded by the
+// engine's internal plan (maxPerRun, cooldown, K=1, PDB), not by requiring a scope.
 type RepackRunSpec struct {
 	// Mode selects DryRun (simulate + report) or Execute (act).
 	// +kubebuilder:validation:Required

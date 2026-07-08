@@ -170,7 +170,11 @@ repack-e2e-images: vc-scheduler-image vc-controller-manager-image vc-webhook-man
 repack-e2e-images-from-bin: vc-scheduler vc-controller-manager vc-webhook-manager vc-repack-engine
 	$(call build_e2e_image_from_binary,scheduler)
 	$(call build_e2e_image_from_binary,controller-manager)
-	$(call build_e2e_image_from_binary,webhook-manager)
+	@echo "Building image ${IMAGE_PREFIX}/vc-webhook-manager:$(TAG) from local binary..."
+	docker build -t "${IMAGE_PREFIX}/vc-webhook-manager:$(TAG)" \
+		-f ./hack/Dockerfile.e2e-webhook-binary \
+		--platform linux/${GOARCH} \
+		.
 	$(call build_e2e_image_from_binary,repack-engine)
 
 save-images:

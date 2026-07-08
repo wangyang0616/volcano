@@ -36,10 +36,10 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/metrics"
 )
 
-func (e *Engine) fail(run *repackv1alpha1.RepackRun, gen int64, reason string, err error) {
-	klog.ErrorS(err, "repack-engine: run failed", "run", run.Name, "reason", reason)
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), gen)
-	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), gen)
+func (e *Engine) fail(run *repackv1alpha1.RepackRun, generation int64, reason string, err error) {
+	klog.ErrorS(err, "repack: run failed", "run", run.Name, "reason", reason)
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), generation)
+	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 	e.updateStatusTerminal(run)
 }
@@ -47,7 +47,7 @@ func (e *Engine) fail(run *repackv1alpha1.RepackRun, gen int64, reason string, e
 func (e *Engine) updateStatus(run *repackv1alpha1.RepackRun) {
 	stampLifecycle(run, time.Now())
 	if _, err := e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), run, metav1.UpdateOptions{}); err != nil {
-		klog.ErrorS(err, "repack-engine: update status", "run", run.Name)
+		klog.ErrorS(err, "repack: update status", "run", run.Name)
 	}
 }
 
@@ -81,7 +81,7 @@ func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
 		return err
 	})
 	if err != nil {
-		klog.ErrorS(err, "repack-engine: write terminal status", "run", name)
+		klog.ErrorS(err, "repack: write terminal status", "run", name)
 	}
 }
 
@@ -247,10 +247,10 @@ func nominationsOf(plan *engineapi.RepackPlan, ttl time.Duration) []repackv1alph
 	intents := engineframework.NominationIntents(plan)
 	out := make([]repackv1alpha1.PodNomination, 0, len(intents))
 	for _, in := range intents {
-		_, pgName := splitJobID(string(in.Gang))
+		_, podGroupName := splitJobID(string(in.Gang))
 		out = append(out, repackv1alpha1.PodNomination{
 			Namespace:      in.Namespace,
-			PodGroupName:   pgName,
+			PodGroupName:   podGroupName,
 			VictimPodName:  in.PodName,
 			IdentityLabels: in.IdentityLabels,
 			NodeName:       in.Node,

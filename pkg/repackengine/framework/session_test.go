@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -72,6 +75,26 @@ func TestSession_PredicateAND(t *testing.T) {
 	}
 	if ssn.Predicate(task("a", "g", 1), node("blocked", nil)) == nil {
 		t.Error("registered predicate should reject blocked")
+	}
+}
+
+// PredicateForReschedule clears a bound pod's nodeName before predicate checks.
+func TestSession_PredicateForRescheduleClearsBinding(t *testing.T) {
+	snap := &fakeSnap{pred: func(t *schedapi.TaskInfo, n *schedapi.NodeInfo) error {
+		if t.Pod != nil && t.Pod.Spec.NodeName != "" && t.Pod.Spec.NodeName != n.Name {
+			return fmt.Errorf("bound to %s", t.Pod.Spec.NodeName)
+		}
+		return nil
+	}}
+	ssn := newSession(snap)
+	bound := task("a", "g", 1)
+	bound.Pod = &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "a"}, Spec: v1.PodSpec{NodeName: "n0"}}
+	bound.NodeName = "n0"
+	if err := ssn.Predicate(bound, node("n1", nil)); err == nil {
+		t.Fatal("Predicate should reject a different node when pod is bound")
+	}
+	if err := ssn.PredicateForReschedule(bound, node("n1", nil)); err != nil {
+		t.Fatalf("PredicateForReschedule should ignore current binding: %v", err)
 	}
 }
 

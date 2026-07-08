@@ -31,20 +31,27 @@ type PodGroupView struct {
 	Footprint    int64 // gang's total accelerator cards (whole-gang blast radius)
 }
 
+// PodGroupViewer supplies per-PodGroup facts (MinAvailable/Running/Priority/
+// Footprint) to the scoring strategies. framework.Snapshot satisfies it, so the
+// engine Session just hands its snapshot in — no lookup closure to thread through.
+type PodGroupViewer interface {
+	PodGroupView(id api.JobID) PodGroupView
+}
+
 // PlanContext carries lookups shared by every scoring strategy in a comparison.
 // It is built by the engine Session and passed to the disruption score functions
 // that plugins register.
 type PlanContext struct {
-	GPU      v1.ResourceName              // accelerator resource being defragmented
-	PodGroup func(api.JobID) PodGroupView // per-PodGroup facts; nil-safe via zero value
+	GPU     v1.ResourceName // accelerator resource being defragmented
+	Views   PodGroupViewer  // per-PodGroup facts; nil-safe via View()
 }
 
 // View returns the PodGroup facts, zero-valued when unknown.
 func (c *PlanContext) View(id api.JobID) PodGroupView {
-	if c == nil || c.PodGroup == nil {
+	if c == nil || c.Views == nil {
 		return PodGroupView{}
 	}
-	return c.PodGroup(id)
+	return c.Views.PodGroupView(id)
 }
 
 // Resource returns the target accelerator, defaulting to nvidia.com/gpu.

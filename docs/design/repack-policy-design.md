@@ -93,7 +93,7 @@ Repack **不等于** gang 抢占：优化目标是 **降低碎片、解开 pendi
 
 > **⚠️ 相对本文旧稿的关键变更（已定稿）**：
 >
-> 1. **准入 = CEL（apiserver），无控制器 Admit**：`RepackRun` 的校验（mode 枚举、`goals≤1`、spec 不可变、Execute 须带非空 scope）全部由 CRD 上的 CEL/marker 在创建期完成。**没有控制器 Admit 步骤、没有 Admit 继承补全、没有 `Admitted` 条件**。后文凡「Controller Admit / 从 Policy 继承补全 / `conditions[Admitted]`」均已废弃。
+> 1. **准入 = CEL（apiserver），无控制器 Admit**：`RepackRun` 的校验（mode 枚举、`goals≤1`、spec 不可变）全部由 CRD 上的 CEL/marker 在创建期完成。scope 两种 mode 均可省略（=全集群），迁移规模由引擎计划兜底。**没有控制器 Admit 步骤、没有 Admit 继承补全、没有 `Admitted` 条件**。后文凡「Controller Admit / 从 Policy 继承补全 / `conditions[Admitted]`」均已废弃。
 > 2. **`RepackPolicy` = 纯模板生成（CronJob→Job 式），只做 P1**：Policy 内嵌一份 `RepackRun` 模板（`runTemplate.spec` = `RepackRunSpec` 本体），按 `trigger` 生成 Run。**不承担集群级默认/硬护栏**（那是治理，另议）。字段为 `trigger`(`cronSchedule`/`onPendingBlocked`/`onFragmentation`) · `runTemplate` · `suspend` · 扁平 `successfulRunsHistoryLimit`/`failedRunsHistoryLimit`。**已删除 `triggers`/`approval`/`concurrencyPolicy`/`runRetention` 及「继承补全/护栏下发」。**
 > 3. **万物皆 PodGroup 的 scope**：`scope.podGroups.include/exclude`（`selector` 匹配 PG 标签 ∪ `names`）；非 vcjob 负载靠 **pg-controller 把 pod 模板标签继承到 PodGroup**（配套增强）使 selector 生效。**已删除 `excluded*` 独立字段与「Policy 级硬红线实时下发」。**
 > 4. **删除 `activeDeadlineSeconds`**：不再设运行超时字段；「卡在 Running」由引擎启动时的**崩溃孤儿回收**（Running 孤儿标 Failed + 交 TTL）兜底。
@@ -212,7 +212,7 @@ sequenceDiagram
 
 ### 4.5 RepackRun — 用户向 spec（P0 主体）
 
-> **P0 自洽**：无 Policy 时，Run.spec **手写全量**——`mode`/`scope`（含 exclude）/`relief`/`goals`/`disruptionPolicy`/`maxPerRun`/`ttlSecondsAfterFinished` 全部直接写在 Run 上（`relief`/`disruptionPolicy` 为 P1）。**准入=CEL（apiserver）**：只做校验（mode 枚举、`goals≤1`、spec 不可变、Execute 须带非空 scope），**无控制器 Admit、无从 Policy 继承补全**；P0 Run 无 ownerReferences。
+> **P0 自洽**：无 Policy 时，Run.spec **手写全量**——`mode`/`scope`（含 exclude）/`relief`/`goals`/`disruptionPolicy`/`maxPerRun`/`ttlSecondsAfterFinished` 全部直接写在 Run 上（`relief`/`disruptionPolicy` 为 P1）。**准入=CEL（apiserver）**：只做校验（mode 枚举、`goals≤1`、spec 不可变），**无控制器 Admit、无从 Policy 继承补全**；scope 可选（省略=全集群，迁移规模由引擎计划兜底），P0 Run 无 ownerReferences。
 
 #### 4.5.1 Run 归属 Policy：`ownerReferences`（**P1**）
 
@@ -525,7 +525,8 @@ x-kubernetes-validations:
 CRD CEL / marker（创建期校验）：
 On CREATE RepackRun:
   require mode ∈ {DryRun,Execute}                    // enum marker
-  require mode=Execute ⇒ scope（podGroups 或 nodes）带非空 include  // spec XValidation
+  // scope 可选（DryRun/Execute 均可省略=全集群）；迁移规模由引擎计划
+  // (maxPerRun/cooldown/K=1/PDB) 兜底，不再强制 Execute 带 scope include
   require size(goals) <= 1                            // maxItems
 On UPDATE:
   reject（spec 冻结，CEL self==oldSelf）
@@ -3261,6 +3262,7 @@ type RepackRunStatus struct {
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v10.12** | 2026-07-08 | **移除「Execute 必须带非空 scope」CEL 约束**：原规则要求 `mode=Execute` 时 `scope.podGroups.include` 或 `scope.nodes.include` 至少一条非空(禁止全集群 Execute)。经评审,该约束与"空=全部"的统一语义相冲突、并造成 DryRun→Execute 转换摩擦(spec 不可变,需新建 CR 时被迫补 scope);而迁移规模本就由引擎计划兜底(`maxPerRun`/cooldown/K=1/PDB)。**决定直接去掉**:两种 mode 下 scope 均可省略=全集群。改动:①删 `RepackRunSpec` 的 XValidation marker;②从 4 份生成 CRD yaml(config + helm 的 repackruns/repackpolicies)剔除该 CEL,并清理 RepackPolicy 模板下遗留的空 `x-kubernetes-validations`;③同步 `state.go`/applyconfiguration/design 文档(§CEL 块 + 两处散文)注释。仅 `self==oldSelf` 不可变规则保留。**待用户本地 `make manifests` 复核生成一致** |
 | **v10.11** | 2026-07-08 | **命名风格对齐 + 消除魔鬼数字**：① **魔鬼数字→具名常量**:扰动评分权重(`weightAffectedPodGroups/MovedResource/MovedPods=1.0/0.3/0.1`、`weightGangBreaches/DamagedGPU=0.8/0.6`)、drain 接收方偏好层(`preferDrainable=1`/`preferStaying=2`)、`defaultNominationTTL=10m`、cmd 侧 `defaultHealthzAddress/MetricsAddress/ExecuteCooldown/NominationTTL/ResyncPeriod`。② **命名对齐 Volcano/云原生风格**:引擎会话 `esn`→`engineSsn`(与 Volcano `ssn` 对齐,和调度器会话 `sched` 区分);布尔谓词 `candidate()`→`isCandidate()`(Go `is/has` 惯例)。`ssn`/短 receiver 等本就符合 Volcano 约定,保留;`supportedTarget` 保留(与既有单测一致)。评分权重加注释说明 P0 默认值语义(P1 由 disruptionPolicy 覆盖) |
 | **v10.10** | 2026-07-08 | **全量代码检视（3+轮）修复**：① **关键 bug——`NodeFreeable` 全任务判定**：调度器 cache 把节点上**每个** pod(含系统 DaemonSet:kube-proxy/CNI)都加进 `NodeInfo.Tasks`,而它们无 PodGroup→不可迁移;原 `NodeFreeable` 要求"所有 task 可迁移"→**任何真实加速卡节点都不可腾空→生产环境 repack 恒空操作**。改为**只看申请目标卡的 task**(`NodeFreeable`/`VictimsOf` 加 `res` 参数,`Scalar(t.InitResreq,res)>0` 才计入);"腾空"=腾出加速卡而非清空节点,系统 pod 留在原地。加回归测试 `TestDrain_SystemPodDoesNotBlockFreeing`。② **`BelowGoalThreshold` 不可达**:nil plan 时 `RenderReport` 的 `FragRateBefore=0`,使"有碎片但无收益计划"被误判 `NoFragmentation`。加 `Session.CurrentFragRate()`,action 在无 plan 时补测当前碎片率→可区分。③ **死代码**:`adapter/schedulability_engine.go`(`ValidatePlan`/`EngineFit`)未被引用、与实际 drain 路径分叉→标注为 P1 保留(并记录其 `PrePredicateFn` 是 P0 drain 未覆盖的可行性缺口);`Report` 删 4 个无消费死字段(`RecommendedPodGroups`/`RecommendedNodes`/`Benefit`/`MovedPods`)+ `sort` import。④ 小整理:`process` 里 `esn.Commit()` 由 3 次取值合并为 1 次。检视亦确认可接受项:drain 候选 plan 重建/nominate 匹配的 O(N²)(P0 规模小、评分/匹配模型固有)、event broadcaster 不 Shutdown(随进程退出)、ctx 未透传 process(单 worker 同步、优雅退出靠循环收尾) |
 | **v10.9** | 2026-07-08 | **可靠性/并发/可维护性设计成文 + 代码硬化落地（新增 §4.18）**：补齐此前缺失的可靠性章节——并发不变量表(单活/单worker/K=1/只读close/nil-guard)、失败模型与崩溃恢复表、可观测性(conditions/指标/事件/探针)、优雅退出、测试策略。**代码硬化**:①`reconcileSafely` 每 work-item panic `recover`(一个坏 Run 不拖垮引擎);②毒丸——`maxReconcileRetries=5` 后放弃并标 Failed(`ReconcileGaveUp`);③健康探针 `/healthz`(cmd `--enable-healthz` + helm livenessProbe);④Prometheus 指标(`pkg/repackengine/metrics`:runs/evictions/cycle/gate_rejections + `/metrics` 端点 + helm);⑤`--resync-period` 默认 0→10m(watch 掉线自愈安全网);⑥K8s 事件(RepackRun 终态打 Normal/Warning 事件,专用 scheme 注册 repack 类型)。指标/事件 emit 点集中在 `updateStatusTerminal`/`process`/`reconcile`。helm repack.yaml 加 healthz/metrics 端口 + livenessProbe + args |

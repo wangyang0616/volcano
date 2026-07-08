@@ -42,7 +42,7 @@ func (*repackAction) Execute(ssn *framework.Session) {
 	}
 	core, ok := framework.GetCore(name)
 	if !ok {
-		klog.Errorf("repack: unknown core %q (registered: %v)", name, framework.CoreNames())
+		klog.ErrorS(nil, "repack: unknown core in config", "core", name, "registered", framework.CoreNames())
 		return
 	}
 
@@ -64,7 +64,7 @@ func (*repackAction) Execute(ssn *framework.Session) {
 	if ssn.Mode() == repackv1alpha1.RepackModeExecute {
 		res, err := framework.CommitPlan(plan, ssn.Hooks())
 		if err != nil {
-			klog.Errorf("repack: commit failed: %v", err)
+			klog.ErrorS(err, "repack: commit failed")
 		}
 		// Keep the result (evicted vs failed per-pod) so the driver can distinguish
 		// a real Execute from one where every eviction was rejected (e.g. by PDBs).

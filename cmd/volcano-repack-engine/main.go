@@ -101,5 +101,7 @@ func ensureSchedulerServerOpts() {
 	}
 	schedOpts := schedoptions.NewServerOption()
 	schedOpts.ShardingMode = commonutil.NoneShardingMode
+	schedOpts.SchedulerNames = []string{"volcano"}
+	schedOpts.DefaultQueue = "default"
 	schedOpts.RegisterOptions()
 }

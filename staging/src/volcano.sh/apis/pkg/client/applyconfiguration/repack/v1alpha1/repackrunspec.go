@@ -31,9 +31,10 @@ import (
 // honors engine defaults in P0.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
-// admission step): mode is an enum, goals is capped at one entry, the spec is
-// immutable, and the rule below requires Execute to name a non-empty scope on at
-// least one axis (a blanket whole-cluster Execute is rejected).
+// admission step): mode is an enum, goals is capped at one entry, and the spec is
+// immutable. Scope is optional in both modes: an omitted scope means whole-cluster
+// (all PodGroups, all nodes); how much a run actually relocates is bounded by the
+// engine's internal plan (maxPerRun, cooldown, K=1, PDB), not by requiring a scope.
 type RepackRunSpecApplyConfiguration struct {
 	// Mode selects DryRun (simulate + report) or Execute (act).
 	Mode *repackv1alpha1.RepackMode `json:"mode,omitempty"`

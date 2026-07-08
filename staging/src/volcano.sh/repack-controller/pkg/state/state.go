@@ -110,8 +110,10 @@ func SetCondition(conds *[]metav1.Condition, condType string, status metav1.Cond
 }
 
 // Admission is enforced at the apiserver via CEL/markers on the CRD (mode enum,
-// goals MaxItems, spec immutability, and the "Execute requires a non-empty scope"
-// rule), so there is no controller-side admission function here.
+// goals MaxItems, spec immutability), so there is no controller-side admission
+// function here. Scope is optional in both modes; an omitted scope means
+// whole-cluster and the engine's plan (maxPerRun/cooldown/K=1/PDB) bounds the blast
+// radius, so there is no "Execute requires a scope" rule.
 
 // GateInputs are the facts needed to decide whether a Pending run may claim a
 // worker slot now. They come from the controller's view of the world.

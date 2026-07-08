@@ -158,6 +158,7 @@ spec:
             - --leader-elect=true
             - --leader-elect-resource-namespace={{ .Release.Namespace }}
             - --resync-period={{ .Values.custom.repack_schedule_period }}
+            - --repack-execute-cooldown={{ .Values.custom.repack_execute_cooldown | default "10m" }}
             - --repack-default-resource={{ .Values.custom.repack_default_resource }}
             - --repack-algorithm={{ .Values.custom.repack_core }}
             - --enable-healthz=true

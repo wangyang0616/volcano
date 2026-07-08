@@ -26,14 +26,16 @@ import (
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// GangInfo returns a gang's "namespace/name" and labels for scope matching.
+// GangScopeLookup returns the information needed to match a gang against a
+// RepackScope: its PodGroup name in "namespace/name" form (for name selectors)
+// and its labels (for label selectors).
 // "Everything is a PodGroup": the labels are the PodGroup's own labels — for
 // non-vcjob workloads the pg-controller inherits pod template labels onto the
 // auto-created PodGroup (§5.2.1), so a PG label selector addresses every
 // workload type uniformly (no need to read pods).
-// ok=false means the JobID is unknown to the snapshot (treated as out of scope).
-// The live-Session implementation is session.SessionGangInfo; tests use a func.
-type GangInfo func(schedapi.JobID) (namespacedName string, lbls labels.Labels, ok bool)
+// found=false means the JobID is unknown to the snapshot (treated as out of scope).
+// The live-Session implementation is adapter.SessionGangScopeLookup; tests use a func.
+type GangScopeLookup func(schedapi.JobID) (podGroupName string, gangLabels labels.Labels, found bool)
 
 type compiledTerm struct {
 	includeAll bool
@@ -45,24 +47,24 @@ type compiledTerm struct {
 
 // matches applies "included AND NOT excluded", include/exclude each (selector ∪
 // names); empty include = all, empty exclude = none.
-func (c *compiledTerm) matches(name string, lbls labels.Labels) bool {
+func (c *compiledTerm) matches(name string, labelSet labels.Labels) bool {
 	included := c.includeAll ||
 		(c.incNames != nil && c.incNames[name]) ||
-		(c.incSel != nil && c.incSel.Matches(lbls))
+		(c.incSel != nil && c.incSel.Matches(labelSet))
 	if !included {
 		return false
 	}
 	excluded := (c.excNames != nil && c.excNames[name]) ||
-		(c.excSel != nil && c.excSel.Matches(lbls))
+		(c.excSel != nil && c.excSel.Matches(labelSet))
 	return !excluded
 }
 
-func compileSelector(sel *repackv1alpha1.RepackSelector) (ls labels.Selector, names map[string]bool, empty bool, err error) {
+func compileSelector(sel *repackv1alpha1.RepackSelector) (selector labels.Selector, names map[string]bool, empty bool, err error) {
 	if sel == nil || (sel.Selector == nil && len(sel.Names) == 0) {
 		return nil, nil, true, nil
 	}
 	if sel.Selector != nil {
-		ls, err = metav1.LabelSelectorAsSelector(sel.Selector)
+		selector, err = metav1.LabelSelectorAsSelector(sel.Selector)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -73,7 +75,7 @@ func compileSelector(sel *repackv1alpha1.RepackSelector) (ls labels.Selector, na
 			names[n] = true
 		}
 	}
-	return ls, names, false, nil
+	return selector, names, false, nil
 }
 
 func compileTerm(t *repackv1alpha1.RepackSelectorTerm) (*compiledTerm, error) {
@@ -94,44 +96,62 @@ func compileTerm(t *repackv1alpha1.RepackSelectorTerm) (*compiledTerm, error) {
 	return c, nil
 }
 
-// ResolveScope compiles a RepackScope into the in-scope (gang) and node-in-scope
-// predicates the driver consumes (to build the scope Movable and to filter the
-// snapshot's nodes). Selectors are parsed once; a malformed selector is a
-// resolve-time error. A nil scope/axis means "whole domain" for that axis;
-// exclude wins.
-func ResolveScope(scope *repackv1alpha1.RepackScope, gangInfo GangInfo) (
-	inScope func(schedapi.JobID) bool, nodeInScope func(*schedapi.NodeInfo) bool, err error) {
+// ScopeMatcher decides, for one repack pass, which gangs may move and which nodes
+// may be drain targets. It is the compiled form of a RepackScope: NewScopeMatcher
+// parses the selectors once, and the two methods are called during planning.
+// Passing this one named value (instead of two loose predicate funcs) keeps the
+// scope logic readable and discoverable — a reader can jump straight to InScope /
+// NodeInScope to see exactly what "in scope" means.
+type ScopeMatcher struct {
+	lookupGang      GangScopeLookup
+	podGroupMatcher *compiledTerm // scope.podGroups (include − exclude)
+	nodeMatcher     *compiledTerm // scope.nodes (include − exclude)
+}
 
-	var pgTerm, nodeTerm *repackv1alpha1.RepackSelectorTerm
+// InScope reports whether the gang (PodGroup) with this JobID is in scope: it is
+// looked up to its "namespace/name" and labels, then matched against
+// scope.podGroups. An unknown gang is out of scope.
+func (m *ScopeMatcher) InScope(id schedapi.JobID) bool {
+	podGroupName, gangLabels, found := m.lookupGang(id)
+	if !found {
+		return false
+	}
+	if gangLabels == nil {
+		gangLabels = labels.Set{}
+	}
+	return m.podGroupMatcher.matches(podGroupName, gangLabels)
+}
+
+// NodeInScope reports whether a node may be a drain target, matching its name and
+// labels against scope.nodes. A nil node is never in scope.
+func (m *ScopeMatcher) NodeInScope(n *schedapi.NodeInfo) bool {
+	if n == nil {
+		return false
+	}
+	return m.nodeMatcher.matches(n.Name, nodeLabels(n))
+}
+
+// NewScopeMatcher compiles a RepackScope into a ScopeMatcher. Selectors are parsed
+// once; a malformed selector is a compile-time error. A nil scope/axis means
+// "whole domain" for that axis; exclude wins.
+func NewScopeMatcher(scope *repackv1alpha1.RepackScope, lookupGang GangScopeLookup) (*ScopeMatcher, error) {
+	var podGroupTerm, nodeTerm *repackv1alpha1.RepackSelectorTerm
 	if scope != nil {
-		pgTerm, nodeTerm = scope.PodGroups, scope.Nodes
+		podGroupTerm, nodeTerm = scope.PodGroups, scope.Nodes
 	}
-	pg, err := compileTerm(pgTerm)
+	podGroupMatcher, err := compileTerm(podGroupTerm)
 	if err != nil {
-		return nil, nil, fmt.Errorf("scope.podGroups: %w", err)
+		return nil, fmt.Errorf("scope.podGroups: %w", err)
 	}
-	nd, err := compileTerm(nodeTerm)
+	nodeMatcher, err := compileTerm(nodeTerm)
 	if err != nil {
-		return nil, nil, fmt.Errorf("scope.nodes: %w", err)
+		return nil, fmt.Errorf("scope.nodes: %w", err)
 	}
-
-	inScope = func(id schedapi.JobID) bool {
-		nn, lbls, ok := gangInfo(id)
-		if !ok {
-			return false
-		}
-		if lbls == nil {
-			lbls = labels.Set{}
-		}
-		return pg.matches(nn, lbls)
-	}
-	nodeInScope = func(n *schedapi.NodeInfo) bool {
-		if n == nil {
-			return false
-		}
-		return nd.matches(n.Name, nodeLabels(n))
-	}
-	return inScope, nodeInScope, nil
+	return &ScopeMatcher{
+		lookupGang:      lookupGang,
+		podGroupMatcher: podGroupMatcher,
+		nodeMatcher:     nodeMatcher,
+	}, nil
 }
 
 func nodeLabels(n *schedapi.NodeInfo) labels.Labels {

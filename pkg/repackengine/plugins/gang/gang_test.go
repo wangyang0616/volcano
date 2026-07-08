@@ -38,13 +38,16 @@ func tk(name, gang string, g int64) *schedapi.TaskInfo {
 
 func mv(t *schedapi.TaskInfo) *api.Move { return &api.Move{Task: t, From: "n0", To: "n1"} }
 
+// fixedView is a test PodGroupViewer returning the same gang facts for every id.
+type fixedView struct{ view api.PodGroupView }
+
+func (f fixedView) PodGroupView(schedapi.JobID) api.PodGroupView { return f.view }
+
 // gang g: Running=4, MinAvailable=3 → slack=1, Footprint=8.
 func gangCtx() *api.PlanContext {
 	return &api.PlanContext{
-		GPU: gpu,
-		PodGroup: func(schedapi.JobID) api.PodGroupView {
-			return api.PodGroupView{MinAvailable: 3, Running: 4, Footprint: 8}
-		},
+		GPU:   gpu,
+		Views: fixedView{view: api.PodGroupView{MinAvailable: 3, Running: 4, Footprint: 8}},
 	}
 }
 

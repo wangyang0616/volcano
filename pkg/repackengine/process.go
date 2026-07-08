@@ -64,14 +64,14 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	// allocated) — that is the scheduler's job and a second writer would race it.
 	defer schedframework.CloseSessionReadOnly(sched)
 
-	gen := work.Generation
+	generation := work.Generation
 	res := e.resolveResource(work)
 	if res == "" {
 		// No target accelerator resolvable: spec.goals is empty AND the engine's
 		// --repack-default-resource is unset. Measuring fragmentation on the empty
 		// resource would count every node as empty and silently report
 		// NoFragmentation, so fail fast with an actionable reason instead.
-		e.fail(work, gen, "NoTargetResource",
+		e.fail(work, generation, "NoTargetResource",
 			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
 		return
 	}
@@ -82,7 +82,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		// Scalar() reads 0 for them and the run would be a silent no-op reporting
 		// NoFragmentation. CEL rejects this on spec.goals, but the --repack-default-
 		// resource fallback bypasses CEL, so guard it here too.
-		e.fail(work, gen, "UnsupportedResource",
+		e.fail(work, generation, "UnsupportedResource",
 			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", res))
 		return
 	}
@@ -91,21 +91,21 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		reason = state.ReasonEvicting
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", gen)
-	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", gen)
+	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", generation)
+	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", generation)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 	e.updateStatus(work)
 
-	inScope, nodeInScope, err := engineframework.ResolveScope(work.Spec.Scope, adapter.SessionGangInfo(sched))
+	scope, err := engineframework.NewScopeMatcher(work.Spec.Scope, adapter.SessionGangScopeLookup(sched))
 	if err != nil {
-		e.fail(work, gen, "ScopeError", err)
+		e.fail(work, generation, "ScopeError", err)
 		return
 	}
 
-	snap := adapter.NewSessionSnapshot(sched, res, nodeInScope)
+	snapshot := adapter.NewSessionSnapshot(sched, res, scope)
 	maxPG, maxRes := maxPerRun(work, res)
 	engineSsn := engineframework.OpenSession(engineframework.SessionConfig{
-		Snapshot:                  snap,
+		Snapshot:                  snapshot,
 		Run:                       work,
 		Resource:                  res,
 		Mode:                      work.Spec.Mode,
@@ -115,8 +115,9 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		MaxPodGroups:              maxPG,
 		MaxResource:               maxRes,
 		Hooks:                     hooksFor(work.Spec.Mode, e.cache.Client()),
+		Free:                      adapter.NodeFreeCapacity,
 	}, e.cfg.Plugins)
-	engineSsn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return inScope(t.Job) })
+	engineSsn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
 	defer engineframework.CloseSession(engineSsn)
 
 	// The repack action runs the core and (Execute) evicts via Hooks; open-loop —
@@ -150,7 +151,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
 	// the repack achieved nothing — fail rather than falsely reporting Executed.
 	if execute && worthwhile && evicted == 0 && rejected > 0 {
-		e.fail(work, gen, state.ReasonExecuteFailed,
+		e.fail(work, generation, state.ReasonExecuteFailed,
 			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejected))
 		return
 	}
@@ -170,8 +171,8 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	default:
 		done, msg = state.ReasonRepackRecommended, "engine finished"
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, gen)
-	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, gen)
+	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
+	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 	klog.V(3).InfoS("RepackRun finished", "run", work.Name, "mode", work.Spec.Mode, "outcome", done)
 	e.updateStatusTerminal(work)
