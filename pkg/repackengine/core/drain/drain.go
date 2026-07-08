@@ -119,7 +119,7 @@ func drainGreedy(
 	// already proven un-vacatable this pass.
 	snap := ssn.Snapshot()
 	prefer := func(n *schedapi.NodeInfo) int {
-		if !api.NodeFreeable(n, movable) || provenStuck[n.Name] || !snap.NodeInScope(n) {
+		if !api.NodeFreeable(n, movable, res) || provenStuck[n.Name] || !snap.NodeInScope(n) {
 			return 2
 		}
 		return 1
@@ -136,7 +136,7 @@ func drainGreedy(
 	for {
 		var feas []cand
 		for _, unit := range units {
-			inUnit, ok := freeableNow(unit, byName, drained, filled, movable)
+			inUnit, ok := freeableNow(unit, byName, drained, filled, movable, res)
 			if !ok {
 				continue
 			}
@@ -154,7 +154,7 @@ func drainGreedy(
 			}
 			var victims []*schedapi.TaskInfo
 			for _, nn := range unit.Nodes {
-				victims = append(victims, api.VictimsOf(byName[nn], movable)...)
+				victims = append(victims, api.VictimsOf(byName[nn], movable, res)...)
 			}
 			if len(victims) == 0 {
 				continue
@@ -247,11 +247,11 @@ func drainGreedy(
 // freeableNow reports whether every node of the unit can still be a drain target
 // (present, not already drained, not a receiver/filled, and freeable), returning
 // the unit's node set.
-func freeableNow(unit api.FreeableUnit, byName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable) (map[string]bool, bool) {
+func freeableNow(unit api.FreeableUnit, byName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable, res v1.ResourceName) (map[string]bool, bool) {
 	inUnit := make(map[string]bool, len(unit.Nodes))
 	for _, nn := range unit.Nodes {
 		n := byName[nn]
-		if n == nil || drained[nn] || filled[nn] || !api.NodeFreeable(n, movable) {
+		if n == nil || drained[nn] || filled[nn] || !api.NodeFreeable(n, movable, res) {
 			return nil, false
 		}
 		inUnit[nn] = true

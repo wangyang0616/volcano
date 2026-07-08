@@ -48,7 +48,15 @@ func (*repackAction) Execute(ssn *framework.Session) {
 
 	plan, found := core.Plan(ssn)
 	ssn.SetPlan(plan)
-	ssn.SetReport(framework.RenderReport(plan))
+	report := framework.RenderReport(plan)
+	if plan == nil {
+		// No plan: still record the cluster's current fragmentation so the driver
+		// can tell NoFragmentation (clean) apart from BelowGoalThreshold (fragmented
+		// but no worthwhile plan). RenderReport(nil) leaves FragRateBefore at 0.
+		f := ssn.CurrentFragRate()
+		report.FragRateBefore, report.FragRateAfter = f, f
+	}
+	ssn.SetReport(report)
 	if !found || plan == nil {
 		return // NoRepackNeeded
 	}

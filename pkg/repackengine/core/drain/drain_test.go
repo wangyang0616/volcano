@@ -59,6 +59,12 @@ func gpuTask(name, gang string, g int64) *schedapi.TaskInfo {
 	return &schedapi.TaskInfo{Name: name, Job: schedapi.JobID(gang), InitResreq: gpuRes(g)}
 }
 
+// sysTask is a non-accelerator pod (e.g. a system DaemonSet): CPU-only request,
+// no gang. It must not count toward node-freeability of the accelerator.
+func sysTask(name string) *schedapi.TaskInfo {
+	return &schedapi.TaskInfo{Name: name, InitResreq: &schedapi.Resource{MilliCPU: 100}}
+}
+
 func capNode(name string, capGPU int64, tasks ...*schedapi.TaskInfo) *schedapi.NodeInfo {
 	m := map[schedapi.TaskID]*schedapi.TaskInfo{}
 	var used int64
@@ -282,6 +288,31 @@ func TestDrain_ExcludedNodeIsReceiverNotTarget(t *testing.T) {
 	}
 	if len(plan.FreedNodes) != 2 {
 		t.Fatalf("freed=%v, want 2 (n0,n1; n2 absorbs as preferred receiver)", plan.FreedNodes)
+	}
+}
+
+// A node running a non-movable, non-accelerator pod (a system DaemonSet) is still
+// freeable: only its accelerator pods must be movable, and only they are evicted.
+// Regression for the bug where any pinned system pod made every real accelerator
+// node unfreeable (repack no-op in production).
+func TestDrain_SystemPodDoesNotBlockFreeing(t *testing.T) {
+	a := gpuTask("a", "g-a", 2)  // movable GPU pod on n0
+	sys := sysTask("kube-proxy") // pinned, non-accelerator, out-of-scope pod on n0
+	b := gpuTask("b", "g-b", 6)  // n1 stays occupied
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a, sys), capNode("n1", 8, b)}}
+
+	// Everything movable except the system pod (no gang → out of scope in reality).
+	movable := func(t *schedapi.TaskInfo) bool { return t.Name != "kube-proxy" }
+
+	plan, ok := (&drainCore{}).Plan(drainSession(snap, movable, 1, 0, 0))
+	if !ok || plan == nil {
+		t.Fatal("expected a feasible plan: n0's GPU pod can move; the system pod stays")
+	}
+	if len(plan.FreedNodes) != 1 || plan.FreedNodes[0] != "n0" {
+		t.Fatalf("freed=%v, want [n0]", plan.FreedNodes)
+	}
+	if mv := realMoves(plan); len(mv) != 1 || mv[0].Task.Name != "a" {
+		t.Fatalf("moves=%+v, want only the GPU pod a (system pod must not move)", mv)
 	}
 }
 

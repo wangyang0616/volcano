@@ -258,6 +258,14 @@ func (s *Session) PlanContext() *api.PlanContext {
 	return &api.PlanContext{GPU: s.cfg.Resource, PodGroup: s.cfg.Snapshot.PodGroupView}
 }
 
+// CurrentFragRate is the target resource's fragmentation rate over the snapshot's
+// nodes, independent of any plan. Used to fill report.FragRateBefore when the core
+// returns no plan, so the driver can tell a clean cluster (NoFragmentation) apart
+// from a fragmented one with no worthwhile plan (BelowGoalThreshold).
+func (s *Session) CurrentFragRate() float64 {
+	return api.MeasureResource(s.Nodes(), s.cfg.Resource).FragRate()
+}
+
 // LeastDisruptive returns the index of the least-disruptive candidate, applying
 // the registered score terms with min-max normalization across the batch (a term
 // where all candidates tie contributes nothing). Ties keep the earliest index, so

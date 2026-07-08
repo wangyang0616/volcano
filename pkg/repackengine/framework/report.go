@@ -17,22 +17,16 @@ limitations under the License.
 package framework
 
 import (
-	"sort"
-
 	"volcano.sh/volcano/pkg/repackengine/api"
 )
 
-// Report is the DryRun payload rendered from a RepackPlan — the engine-side,
-// CRD-independent shape that populates RepackRun.status.report (§4.6).
+// Report is the search outcome rendered from a RepackPlan — the engine-side,
+// CRD-independent shape the driver projects into RepackRun.status.plan (§4.6).
 type Report struct {
-	RecommendedPodGroups []string // affected gangs (PodGroup ids), sorted distinct
-	RecommendedNodes     []string // nodes that would be freed, sorted
-	NodesFreed           int      // realized node-level benefit
-	Benefit              float64  // realized weighted benefit (node + hypernode units)
-	MovedPods            int64
-	MovedResource        int64
-	AffectedPodGroups    int64
-	FragRateDelta        float64
+	NodesFreed        int   // realized node-level benefit (whole nodes freed)
+	MovedResource     int64 // target-resource units relocated
+	AffectedPodGroups int64 // distinct gangs disrupted
+	FragRateDelta     float64
 	// FragRateBefore/After are the resource fragmentation rate (0-1) before/after
 	// the plan, feeding status.plan.summary.frag{Before,After}Percent. after =
 	// before + FragRateDelta (freeing a node drops B by 1: (B-A-freed)/M).
@@ -40,28 +34,17 @@ type Report struct {
 	FragRateAfter  float64
 }
 
-// RenderReport turns a plan into the DryRun report. Nil plan → empty report.
+// RenderReport turns a plan into the report. Nil plan → empty report.
 func RenderReport(plan *api.RepackPlan) Report {
 	if plan == nil {
 		return Report{}
 	}
-	pgs := plan.AffectedPodGroups()
-	rec := make([]string, 0, len(pgs))
-	for _, j := range pgs {
-		rec = append(rec, string(j))
-	}
-	nodes := append([]string(nil), plan.FreedNodes...)
-	sort.Strings(nodes)
 	return Report{
-		RecommendedPodGroups: rec,
-		RecommendedNodes:     nodes,
-		NodesFreed:           plan.NodesFreed(),
-		Benefit:              plan.Benefit(),
-		MovedPods:            plan.Cost.MovedPods,
-		MovedResource:        plan.Cost.MovedGPU,
-		AffectedPodGroups:    plan.Cost.AffectedPodGroups,
-		FragRateDelta:        plan.FragRateDelta(),
-		FragRateBefore:       plan.Before.FragRate(),
-		FragRateAfter:        plan.Before.FragRate() + plan.FragRateDelta(),
+		NodesFreed:        plan.NodesFreed(),
+		MovedResource:     plan.Cost.MovedGPU,
+		AffectedPodGroups: plan.Cost.AffectedPodGroups,
+		FragRateDelta:     plan.FragRateDelta(),
+		FragRateBefore:    plan.Before.FragRate(),
+		FragRateAfter:     plan.Before.FragRate() + plan.FragRateDelta(),
 	}
 }

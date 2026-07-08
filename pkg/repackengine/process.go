@@ -139,20 +139,20 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		ttl = e.cfg.NominationTTL
 	}
 	applyPlan(work, report, plan, res, execute, ttl)
-	if commit := esn.Commit(); commit != nil {
-		metrics.ObserveEvictions(len(commit.Evicted), len(commit.Failed))
-		klog.V(3).InfoS("evictions issued", "run", work.Name,
-			"evicted", len(commit.Evicted), "rejected", len(commit.Failed))
+	commit := esn.Commit()
+	evicted, rejected := 0, 0
+	if commit != nil {
+		evicted, rejected = len(commit.Evicted), len(commit.Failed)
+		metrics.ObserveEvictions(evicted, rejected)
+		klog.V(3).InfoS("evictions issued", "run", work.Name, "evicted", evicted, "rejected", rejected)
 	}
 
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
 	// the repack achieved nothing — fail rather than falsely reporting Executed.
-	if execute && worthwhile {
-		if commit := esn.Commit(); commit != nil && len(commit.Evicted) == 0 && len(commit.Failed) > 0 {
-			e.fail(work, gen, state.ReasonExecuteFailed,
-				fmt.Errorf("all %d evictions were rejected; no pods were moved", len(commit.Failed)))
-			return
-		}
+	if execute && worthwhile && evicted == 0 && rejected > 0 {
+		e.fail(work, gen, state.ReasonExecuteFailed,
+			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejected))
+		return
 	}
 
 	var done, msg string
@@ -164,8 +164,8 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	case execute:
 		done, msg = state.ReasonExecuted, "engine finished"
 		// Partial success: some evictions were rejected but at least one succeeded.
-		if commit := esn.Commit(); commit != nil && len(commit.Failed) > 0 {
-			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", len(commit.Evicted), len(commit.Failed))
+		if rejected > 0 {
+			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", evicted, rejected)
 		}
 	default:
 		done, msg = state.ReasonRepackRecommended, "engine finished"
