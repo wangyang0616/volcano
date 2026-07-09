@@ -18,6 +18,7 @@ package api
 
 import (
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
@@ -70,6 +71,9 @@ func VictimsOf(node *api.NodeInfo, movable Movable, res v1.ResourceName) []*api.
 		}
 		if movable == nil || movable(t) {
 			out = append(out, t)
+		} else {
+			klog.V(5).InfoS("repack: accelerator pod is NOT movable (frozen/out-of-scope), stays on node",
+				"pod", t.Name, "node", node.Name, "podGroup", t.Job)
 		}
 	}
 	return out

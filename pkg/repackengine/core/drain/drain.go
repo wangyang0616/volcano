@@ -34,6 +34,7 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
@@ -75,18 +76,28 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 		}
 	}
 
+	before := api.MeasureResource(nodes, res)
+	klog.V(4).InfoS("repack drain: starting pass", "resource", res,
+		"nodes", len(nodes), "freeableUnits", len(units),
+		"occupiedNodes", before.B, "optimalNodes", before.A, "providingNodes", before.M)
+
 	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, free, res)
 	if plan == nil {
+		klog.V(4).InfoS("repack drain: no plan — nothing could be freed", "resource", res)
 		return nil, false
 	}
-	plan.Before = api.MeasureResource(nodes, res)
+	plan.Before = before
 	// Hard admissibility gate: the built-in benefit constraints (MinNodesFreed,
 	// MinFragImprovementPercent) plus any plugin-registered plan constraints (e.g.
 	// disruptionPolicy.maxDisruptionScore in P1). A rejected plan = NoRepackNeeded.
 	if !ssn.PlanAdmissible(plan) {
+		klog.V(3).InfoS("repack drain: plan rejected by benefit gate (below MinNodesFreed / MinFragImprovement)",
+			"resource", res, "freedNodes", len(plan.FreedNodes), "moves", len(plan.Moves))
 		return nil, false
 	}
 	plan.Cost = api.CostOf(plan.Moves, res)
+	klog.V(3).InfoS("repack drain: plan accepted", "resource", res,
+		"freedNodes", plan.FreedNodes, "moves", len(plan.Moves))
 	return plan, true
 }
 
@@ -133,9 +144,15 @@ var _ api.ReceiverPolicy = (*drainState)(nil)
 func (s *drainState) Free(n *schedapi.NodeInfo) *schedapi.Resource { return s.ledger[n.Name] }
 
 // Fit tests whether a victim can reschedule onto a receiver (affinity/taint/
-// topology/device), treating the victim as unbound.
+// topology/device), treating the victim as unbound. On rejection it logs the
+// predicate's reason at V(5) so a "why can't this pod move here?" question is
+// answerable from the logs.
 func (s *drainState) Fit(t *schedapi.TaskInfo, n *schedapi.NodeInfo) bool {
-	return s.ssn.PredicateForReschedule(t, n) == nil
+	if err := s.ssn.PredicateForReschedule(t, n); err != nil {
+		klog.V(5).InfoS("repack drain: predicate rejects placement", "pod", t.Name, "node", n.Name, "reason", err.Error())
+		return false
+	}
+	return true
 }
 
 // Prefer: nodes that will definitely stay occupied are the best receivers —
@@ -164,7 +181,7 @@ func drainGreedy(
 	res v1.ResourceName,
 ) *api.RepackPlan {
 	s := newDrainState(nodes, nodesByName, ssn, movable, free, res)
-	for {
+	for step := 1; ; step++ {
 		// 1. Evaluate every still-freeable unit against the current ledger.
 		var feasible []candidate
 		for _, unit := range units {
@@ -172,11 +189,16 @@ func drainGreedy(
 				feasible = append(feasible, c)
 			}
 		}
+		klog.V(4).InfoS("repack drain: step evaluated units", "step", step,
+			"totalUnits", len(units), "feasibleThisStep", len(feasible), "nodesFreedSoFar", len(s.freedNodes))
 		if len(feasible) == 0 {
 			break
 		}
 		// 2. Pick the least-disruptive one and 3. commit it.
-		s.commit(s.chooseLeastDisruptive(feasible))
+		chosen := s.chooseLeastDisruptive(feasible)
+		klog.V(4).InfoS("repack drain: committing unit", "step", step, "unit", chosen.key,
+			"freesNodes", chosen.unit.Nodes, "moves", len(chosen.placed), "cards", chosen.newCards)
+		s.commit(chosen)
 	}
 	// 4. A pass that freed nothing yields no plan.
 	return s.plan()
@@ -221,8 +243,10 @@ func newDrainState(
 // onto a surviving receiver within the disruption budget — and returns the moves
 // that vacate it. ok=false means "not freeable this step".
 func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
+	key := unitKey(unit)
 	inUnit, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
 	if !ok {
+		klog.V(5).InfoS("repack drain: unit not freeable now (drained/filled/has-immovable-pod)", "unit", key, "nodes", unit.Nodes)
 		return candidate{}, false
 	}
 	// Skip accelerator-empty units: freeing a node that runs no accelerator pod
@@ -235,6 +259,7 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		}
 	}
 	if !accelerated {
+		klog.V(5).InfoS("repack drain: skip unit — no accelerator pods on it", "unit", key, "nodes", unit.Nodes)
 		return candidate{}, false
 	}
 	var victims []*schedapi.TaskInfo
@@ -242,12 +267,19 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		victims = append(victims, api.VictimsOf(s.nodesByName[nodeName], s.movable, s.resource)...)
 	}
 	if len(victims) == 0 {
+		klog.V(5).InfoS("repack drain: skip unit — no movable accelerator victims", "unit", key, "nodes", unit.Nodes)
 		return candidate{}, false
 	}
-	placed, feasible := api.NewDomain(s.receiversExcluding(inUnit), s).Feasible(victims)
+	receivers := s.receiversExcluding(inUnit)
+	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
+		"victims", taskNames(victims), "victimCount", len(victims),
+		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
+	placed, feasible := api.NewDomain(receivers, s).Feasible(victims)
 	if !feasible {
 		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
 		// stays infeasible — cache its nodes as preferred receivers.
+		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all reschedule onto receivers; marking stuck",
+			"unit", key, "victims", len(victims), "receivers", len(receivers))
 		for _, nodeName := range unit.Nodes {
 			s.provenStuck[nodeName] = true
 		}
@@ -263,12 +295,23 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		newCards += api.Scalar(v.InitResreq, s.resource)
 	}
 	if s.maxPodGroups > 0 && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
+		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.podGroups", "unit", key,
+			"wouldBe", len(s.movedPodGroups)+len(newPodGroups), "max", s.maxPodGroups)
 		return candidate{}, false
 	}
 	if s.maxResource > 0 && s.movedCards+newCards > s.maxResource {
+		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.resources", "unit", key,
+			"wouldBe", s.movedCards+newCards, "max", s.maxResource)
 		return candidate{}, false
 	}
-	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, newCards: newCards, key: unitKey(unit)}, true
+	if klog.V(5).Enabled() {
+		for _, m := range placed {
+			klog.V(5).InfoS("repack drain: victim placement", "unit", key,
+				"pod", m.Task.Name, "from", m.From, "to", m.To)
+		}
+	}
+	klog.V(5).InfoS("repack drain: unit FEASIBLE", "unit", key, "moves", len(placed), "cards", newCards)
+	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, newCards: newCards, key: key}, true
 }
 
 // receiversExcluding returns the nodes that may receive relocated pods: not in the
@@ -363,6 +406,27 @@ func occupiesAccelerator(n *schedapi.NodeInfo, res v1.ResourceName) bool {
 }
 
 // unitKey is a deterministic identifier for a unit (sorted member node names).
+// taskNames and nodeNames render slices as plain name lists for readable logs.
+func taskNames(tasks []*schedapi.TaskInfo) []string {
+	names := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		if t != nil {
+			names = append(names, t.Name)
+		}
+	}
+	return names
+}
+
+func nodeNames(nodes []*schedapi.NodeInfo) []string {
+	names := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil {
+			names = append(names, n.Name)
+		}
+	}
+	return names
+}
+
 func unitKey(u api.FreeableUnit) string {
 	ns := append([]string(nil), u.Nodes...)
 	sort.Strings(ns)

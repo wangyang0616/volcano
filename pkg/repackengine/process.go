@@ -64,6 +64,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	// allocated) — that is the scheduler's job and a second writer would race it.
 	defer schedframework.CloseSessionReadOnly(sched)
 
+	klog.V(4).InfoS("repack: processing run", "run", work.Name, "mode", work.Spec.Mode)
 	generation := work.Generation
 	res := e.resolveResource(work)
 	if res == "" {
@@ -104,6 +105,8 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 
 	snapshot := adapter.NewSessionSnapshot(sched, res, scope)
 	maxPG, maxRes := maxPerRun(work, res)
+	klog.V(5).InfoS("repack: engine session opened", "run", work.Name, "resource", res,
+		"nodes", len(snapshot.Nodes()), "maxPodGroups", maxPG, "maxResource", maxRes)
 	engineSsn := engineframework.OpenSession(engineframework.SessionConfig{
 		Snapshot:                  snapshot,
 		Run:                       work,

@@ -33,6 +33,8 @@ package api
 import (
 	"sort"
 
+	"k8s.io/klog/v2"
+
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
@@ -152,12 +154,16 @@ func (d *Domain) assign(order []*api.TaskInfo, i int, moves *[]*Move) bool {
 	candidates := make([]*freeNode, 0, len(d.nodes))
 	for _, n := range d.nodes {
 		if !req.LessEqual(n.free, api.Zero) {
+			klog.V(5).InfoS("repack solver: node lacks free capacity for pod", "pod", task.Name, "node", n.info.Name)
 			continue // not enough room on this node
 		}
 		if !d.policy.Fit(task, n.info) {
-			continue // predicate (affinity/taint/topology/...) rejects it
+			continue // predicate rejects it — policy.Fit logs the reason at V(5)
 		}
 		candidates = append(candidates, n)
+	}
+	if len(candidates) == 0 {
+		klog.V(5).InfoS("repack solver: pod has NO feasible receiver (capacity+predicate exhausted)", "pod", task.Name)
 	}
 	sort.SliceStable(candidates, func(a, b int) bool {
 		pa, pb := d.policy.Prefer(candidates[a].info), d.policy.Prefer(candidates[b].info)

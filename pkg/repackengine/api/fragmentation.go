@@ -31,6 +31,7 @@ package api
 
 import (
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
@@ -114,9 +115,15 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 		} else if cap != capacity {
 			homogeneous = false
 		}
-		if node.Used != nil && Scalar(node.Used, resource) > 0 {
+		used := int64(0)
+		if node.Used != nil {
+			used = Scalar(node.Used, resource)
+		}
+		if used > 0 {
 			out.B++
 		}
+		klog.V(5).InfoS("repack frag: node accelerator usage", "node", node.Name,
+			"resource", resource, "capacity", cap, "used", used)
 		for _, task := range node.Tasks {
 			if task == nil || task.Resreq == nil {
 				continue
@@ -128,6 +135,7 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 	}
 
 	if out.M == 0 || capacity == 0 {
+		klog.V(5).InfoS("repack frag: no node provides this resource (M=0)", "resource", resource)
 		return out
 	}
 	out.A, out.Exact = OptimalNodes(requests, capacity)
