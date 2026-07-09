@@ -98,14 +98,15 @@ func (s *SessionSnapshot) FeasibleReschedule(committed []*api.Move, victims []*s
 	ctx := context.TODO()
 	placements := make([]*api.Move, 0, len(victims))
 	for _, victim := range s.victimsLargestFirst(victims) {
+		simVictim := clearNodeBinding(victim)
 		// Build the victim's PreFilter state once (running pods are not pre-inited
 		// like pending pods are); every candidate then clones it.
-		if err := s.ssn.PrePredicateFn(victim); err != nil {
+		if err := s.ssn.PrePredicateFn(simVictim); err != nil {
 			return nil, false
 		}
 		baseState := s.ssn.GetCycleState(victim.UID)
 
-		target := s.firstFeasibleReceiver(ctx, victim, baseState, receivers, landed)
+		target := s.firstFeasibleReceiver(ctx, simVictim, baseState, receivers, landed)
 		if target == "" {
 			return nil, false
 		}
@@ -113,6 +114,24 @@ func (s *SessionSnapshot) FeasibleReschedule(committed []*api.Move, victims []*s
 		placements = append(placements, &api.Move{Task: victim, From: victim.NodeName, To: target})
 	}
 	return placements, true
+}
+
+// clearNodeBinding returns a task clone with node binding cleared so reschedule
+// simulation can AddTask onto a different node and run filter plugins as if the
+// pod were unbound.
+func clearNodeBinding(task *schedapi.TaskInfo) *schedapi.TaskInfo {
+	if task == nil {
+		return nil
+	}
+	t := task.Clone()
+	t.NodeName = ""
+	if t.Pod != nil {
+		p := t.Pod.DeepCopy()
+		p.Spec.NodeName = ""
+		p.Status.NominatedNodeName = ""
+		t.Pod = p
+	}
+	return t
 }
 
 // firstFeasibleReceiver returns the first receiver (in the caller's preference
@@ -135,10 +154,11 @@ func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *scheda
 	nodeCopy := node.Clone()
 	stateCopy := baseState.Clone()
 	for _, pod := range alreadyLanded {
-		if err := s.ssn.SimulateAddTaskFn(ctx, stateCopy, victim, pod, nodeCopy); err != nil {
+		simLanded := clearNodeBinding(pod)
+		if err := s.ssn.SimulateAddTaskFn(ctx, stateCopy, victim, simLanded, nodeCopy); err != nil {
 			return false
 		}
-		if err := nodeCopy.AddTask(pod); err != nil {
+		if err := nodeCopy.AddTask(simLanded); err != nil {
 			return false
 		}
 	}

@@ -36,9 +36,33 @@ function kind-up-cluster {
   if [[ "${E2E_TYPE}" == "REPACK" ]]; then
     kind load docker-image ${IMAGE_PREFIX}/vc-repack-engine:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   fi
+  if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+    ensure-repack-test-images
+  fi
   if [[ "${E2E_TYPE}" == "DRA" || "${E2E_TYPE}" == "ALL" ]]; then
     ensure-dra-test-images
   fi
+}
+
+function ensure-repack-test-images {
+  local repack_images=(
+    "nginx:1.29.3-alpine"
+  )
+
+  echo
+  echo "Ensuring repack test images are available locally"
+  for image in "${repack_images[@]}"; do
+    if ! docker image inspect "${image}" >/dev/null 2>&1; then
+      echo "Pulling image ${image} ..."
+      docker pull "${image}" >/dev/null || exit 1
+    fi
+  done
+
+  echo
+  echo "Loading repack test images into kind cluster"
+  for image in "${repack_images[@]}"; do
+    kind load docker-image "${image}" "${CLUSTER_CONTEXT[@]}" || exit 1
+  done
 }
 
 function ensure-dra-test-images {

@@ -19,6 +19,9 @@ package adapter
 import (
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 
@@ -48,6 +51,27 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 	}
 	if z := snap.PodGroupView("ns/unknown"); z != (api.PodGroupView{}) {
 		t.Errorf("unknown gang should yield zero view, got %+v", z)
+	}
+}
+
+// clearNodeBinding must clear node binding so simulated AddTask/filter checks
+// treat the pod as scheduling onto a new node.
+func TestClearNodeBinding_AddTask(t *testing.T) {
+	hosted := gpuTask(0, "n0", 2)
+	hosted.Resreq = gpuRes(2)
+	hosted.NumaInfo = &schedapi.TopologyInfo{}
+	hosted.Pod = &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "t0", Namespace: "default"},
+		Spec:       v1.PodSpec{NodeName: "n0"},
+	}
+	dest := capNode("n1", 8)
+	dest.Idle = gpuRes(8)
+	dest.Node = &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	if err := dest.AddTask(hosted); err == nil {
+		t.Fatal("expected AddTask to reject task bound to a different node")
+	}
+	if err := dest.AddTask(clearNodeBinding(hosted)); err != nil {
+		t.Fatalf("AddTask on reschedule sim clone: %v", err)
 	}
 }
 

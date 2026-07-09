@@ -34,9 +34,17 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 
 // fakeSnap is a minimal framework.Snapshot for solver tests (every node fits).
 type fakeSnap struct {
+	resource   v1.ResourceName // default nvidia.com/gpu when empty
 	nodes      []*schedapi.NodeInfo
 	views      map[schedapi.JobID]api.PodGroupView
 	notInScope map[string]bool // node name → excluded from draining (receiver only)
+}
+
+func (f *fakeSnap) res() v1.ResourceName {
+	if f.resource != "" {
+		return f.resource
+	}
+	return gpu
 }
 
 func (f *fakeSnap) Nodes() []*schedapi.NodeInfo { return f.nodes }
@@ -55,28 +63,34 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 // capacity (Allocatable − Used − pods already placed this pass), solved with the
 // pure api.Domain best-fit solver.
 func (f *fakeSnap) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
-	placedGPU := map[string]int64{}
+	res := f.res()
+	placed := map[string]int64{}
 	for _, m := range committed {
 		if m != nil && m.Task != nil {
-			placedGPU[m.To] += int64(m.Task.InitResreq.ScalarResources[gpu] + 0.5)
+			placed[m.To] += api.Scalar(m.Task.InitResreq, res)
 		}
 	}
-	return api.NewDomain(receivers, capacityPolicy{placedGPU: placedGPU}).Feasible(victims)
+	return api.NewDomain(receivers, capacityPolicy{resource: res, placed: placed}).Feasible(victims)
 }
 
-// capacityPolicy is the test ReceiverPolicy: GPU capacity minus pods already placed
+// capacityPolicy is the test ReceiverPolicy: capacity minus pods already placed
 // this pass, no Fit constraint, neutral (best-fit) preference.
-type capacityPolicy struct{ placedGPU map[string]int64 }
+type capacityPolicy struct {
+	resource v1.ResourceName
+	placed   map[string]int64
+}
 
 func (p capacityPolicy) Free(n *schedapi.NodeInfo) *schedapi.Resource {
-	free := int64(n.Allocatable.ScalarResources[gpu]-n.Used.ScalarResources[gpu]) - p.placedGPU[n.Name]
-	return gpuRes(free)
+	free := api.Scalar(n.Allocatable, p.resource) - api.Scalar(n.Used, p.resource) - p.placed[n.Name]
+	return scalarRes(p.resource, free)
 }
 func (p capacityPolicy) Fit(*schedapi.TaskInfo, *schedapi.NodeInfo) bool { return true }
 func (p capacityPolicy) Prefer(*schedapi.NodeInfo) int                   { return 0 }
 
-func gpuRes(n int64) *schedapi.Resource {
-	return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: float64(n)}}
+func gpuRes(n int64) *schedapi.Resource { return scalarRes(gpu, n) }
+
+func scalarRes(name v1.ResourceName, n int64) *schedapi.Resource {
+	return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{name: float64(n)}}
 }
 
 func gpuTask(name, gang string, g int64) *schedapi.TaskInfo {
@@ -167,6 +181,24 @@ func TestDrain_FreesOneNode(t *testing.T) {
 	}
 	if plan.Benefit() != 1 {
 		t.Errorf("benefit=%v, want 1", plan.Benefit())
+	}
+}
+
+// four-small-into-one mirrors the e2e defrag scenario: four nodes each holding 2
+// GPUs should consolidate onto one node and free three.
+func TestDrain_FourSmallIntoOne(t *testing.T) {
+	nodes := make([]*schedapi.NodeInfo, 4)
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("n%d", i)
+		nodes[i] = capNode(name, 8, gpuTask(fmt.Sprintf("w%d", i), fmt.Sprintf("g%d", i), 2))
+	}
+	snap := &fakeSnap{nodes: nodes}
+	plan, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0))
+	if !ok || plan == nil {
+		t.Fatal("expected a feasible plan")
+	}
+	if len(plan.FreedNodes) < 3 {
+		t.Fatalf("freed=%v, want >= 3", plan.FreedNodes)
 	}
 }
 
@@ -405,7 +437,7 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 
 	a := npuTask("a", "g-a", 4000)
 	b := npuTask("b", "g-b", 2000)
-	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+	snap := &fakeSnap{resource: e2eNPU, nodes: []*schedapi.NodeInfo{
 		capNPUNode("n0", 8000, 4000, a),
 		capNPUNode("n1", 8000, 2000, b),
 		capNPUNode("n2", 8000, 0),

@@ -38,6 +38,7 @@ import (
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app/options"
 	"volcano.sh/volcano/pkg/kube"
 	"volcano.sh/volcano/pkg/repackengine"
+	schedmetrics "volcano.sh/volcano/pkg/scheduler/metrics"
 	"volcano.sh/volcano/pkg/signals"
 	commonutil "volcano.sh/volcano/pkg/util"
 )
@@ -50,6 +51,10 @@ func Run(opt *options.ServerOption) error {
 	if err != nil {
 		return err
 	}
+
+	// k8s scheduler framework plugins (interpodaffinity PreFilter, etc.) use
+	// k8smetrics.Goroutines via Parallelizer.Until; init before opening sessions.
+	schedmetrics.InitKubeSchedulerRelatedMetrics()
 
 	// Liveness: /healthz so Kubernetes can restart a wedged engine. Started before
 	// leader election so standby replicas are also live.

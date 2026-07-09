@@ -63,13 +63,15 @@ func untaintNode(ctx *e2eutil.TestContext, node string) {
 // host, so the pod can never be relocated to any other node — the oracle must then
 // judge its gang un-drainable.
 func occupyPinnedToHost(ctx *e2eutil.TestContext, name, node string, cards int) {
+	npuQty := resource.MustParse(fmt.Sprintf("%d", cards))
+	npuList := v1.ResourceList{npuResource: npuQty}
 	spec := &e2eutil.JobSpec{
 		Name:      name,
 		Namespace: ctx.Namespace,
 		NodeName:  node,
 		Tasks: []e2eutil.TaskSpec{{
 			Name: "w", Min: 1, Rep: 1, Img: e2eutil.DefaultNginxImage,
-			Req: v1.ResourceList{npuResource: resource.MustParse(fmt.Sprintf("%d", cards))},
+			Req: npuList, Limit: npuList,
 			Affinity: &v1.Affinity{NodeAffinity: &v1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
 					NodeSelectorTerms: []v1.NodeSelectorTerm{{MatchExpressions: []v1.NodeSelectorRequirement{{
@@ -107,12 +109,14 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", fu
 	// tainted, neither gang can re-land on the other, and the empty node is excluded
 	// as a receiver — so a fragmented cluster has no worthwhile plan. If taints were
 	// ignored (the old bug) this would wrongly recommend a move that bounces back.
+	// Pods must be Running BEFORE tainting: NoSchedule blocks new placements onto
+	// the node, but already-running pods stay put.
 	It("does not relocate onto a tainted node (BelowGoalThreshold)", func() {
+		occupy(ctx, "taint-a", nodes[0], 4)
+		occupy(ctx, "taint-b", nodes[1], 4)
 		taintNode(ctx, nodes[0])
 		taintNode(ctx, nodes[1])
 		tainted = []string{nodes[0], nodes[1]}
-		occupy(ctx, "taint-a", nodes[0], 4)
-		occupy(ctx, "taint-b", nodes[1], 4)
 
 		run, err := newRun("taint-block", repackv1alpha1.RepackModeDryRun).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
@@ -128,11 +132,12 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", fu
 	// A single tainted node can still be DRAINED (its pods relocate onto the
 	// untainted node); the tainted node is freed and never used as a receiver.
 	It("still drains a tainted node onto an untainted receiver", func() {
-		// node0 untainted with room, node1 tainted and occupied.
+		// node0 untainted with room, node1 occupied then tainted (NoSchedule only
+		// blocks new placements; the running pod stays).
 		occupy(ctx, "recv", nodes[0], 2)
+		occupy(ctx, "tainted-src", nodes[1], 4)
 		taintNode(ctx, nodes[1])
 		tainted = []string{nodes[1]}
-		occupy(ctx, "tainted-src", nodes[1], 4)
 
 		run, err := newRun("taint-drain", repackv1alpha1.RepackModeDryRun).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())

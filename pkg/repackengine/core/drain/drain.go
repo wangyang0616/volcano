@@ -16,8 +16,8 @@ limitations under the License.
 
 // Package drain is the P0 core (algorithm A): node-anchored, incremental,
 // gang-aware greedy. A single dynamic pass repeatedly re-evaluates every
-// still-freeable unit against the current ledger and commits the feasible one
-// whose prospective plan is least disruptive — because gang damage is scored over
+// still-freeable unit against the committed moves so far and commits the feasible
+// one whose prospective plan is least disruptive — because gang damage is scored over
 // the whole plan, a unit that reuses an already-broken gang is cheap, so the
 // dynamic re-pick naturally prefers it (that's the "incremental gang-aware"
 // part). Vacating a unit is atomic (all member nodes must empty via the
@@ -141,7 +141,7 @@ func drainGreedy(
 ) *api.RepackPlan {
 	s := newDrainState(nodes, nodesByName, ssn, movable, res)
 	for step := 1; ; step++ {
-		// 1. Evaluate every still-freeable unit against the current ledger.
+		// 1. Evaluate every still-freeable unit against the committed moves so far.
 		var feasible []candidate
 		for _, unit := range units {
 			if c, ok := s.evaluateUnit(unit); ok {
@@ -180,7 +180,6 @@ func newDrainState(
 		resource:       res,
 		maxPodGroups:   ssn.MaxPodGroups(),
 		maxResource:    ssn.MaxResource(),
-		ledger:         ledger,
 		drained:        make(map[string]bool),
 		filled:         make(map[string]bool),
 		provenStuck:    make(map[string]bool),
@@ -290,9 +289,29 @@ func (s *drainState) receiversInPreferenceOrder(inUnit map[string]bool) []*sched
 		if si != sj {
 			return si // staying nodes first
 		}
-		return api.Scalar(receivers[i].FutureIdle(), s.resource) < api.Scalar(receivers[j].FutureIdle(), s.resource)
+		return receiverSlack(receivers[i], s.resource) < receiverSlack(receivers[j], s.resource)
 	})
 	return receivers
+}
+
+// receiverSlack is the target-resource free capacity used to best-fit sort receivers.
+// Prefer FutureIdle (scheduler cache); fall back to Allocatable−Used for test nodes
+// that only set Used/Allocatable without initializing Idle.
+func receiverSlack(n *schedapi.NodeInfo, res v1.ResourceName) int64 {
+	if n == nil {
+		return 0
+	}
+	if n.Idle != nil {
+		return api.Scalar(n.FutureIdle(), res)
+	}
+	if n.Allocatable == nil {
+		return 0
+	}
+	free := n.Allocatable.Clone()
+	if n.Used != nil {
+		free.SubWithoutAssert(n.Used)
+	}
+	return api.Scalar(free, res)
 }
 
 // staying reports whether a node will remain occupied regardless of this pass — so
