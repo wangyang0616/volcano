@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 // This file intentionally holds no code: the reserved Statement-based feasibility
-// oracle (EngineFit / ValidatePlan) was removed as dead code — the P0 drain path
-// does its own incremental, gang-aware feasibility (framework.Session.Predicate +
-// api.Domain). Delete this file with `git rm`; it is kept empty only because the
-// build sandbox cannot remove files.
+// check (EngineFit / ValidatePlan) was removed as dead code — repack feasibility
+// now runs through Snapshot.FeasibleRelocation, which clones the node + cycle-state
+// and evaluates the scheduler's full filter stack via ssn.SimulatePredicateFn (see
+// snapshot_session.go). Delete this file with `git rm`; it is kept empty only
+// because the build sandbox cannot remove files.
 package adapter

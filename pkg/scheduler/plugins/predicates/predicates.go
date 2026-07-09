@@ -357,8 +357,8 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 			}
 		}
 
-		// Keep topology-spread state in sync too, so a full-filter simulation
-		// (SimulateFilterFn) sees the added pod when checking spread constraints.
+		// Keep topology-spread state in sync too, so the full-filter
+		// SimulatePredicateFn sees the added pod when checking spread constraints.
 		if pp.enabledPredicates.podTopologySpreadEnable {
 			if topologyFilter, exist := pp.FilterPlugins[podtopologyspread.Name].(*podtopologyspread.PodTopologySpread); exist {
 				if !handleSkipPredicatePlugin(cycleState, topologyFilter.Name()) {
@@ -397,8 +397,8 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 			}
 		}
 
-		// Keep topology-spread state in sync too, so a full-filter simulation
-		// (SimulateFilterFn) sees the removed pod when checking spread constraints.
+		// Keep topology-spread state in sync too, so the full-filter
+		// SimulatePredicateFn sees the removed pod when checking spread constraints.
 		if pp.enabledPredicates.podTopologySpreadEnable {
 			if topologyFilter, exist := pp.FilterPlugins[podtopologyspread.Name].(*podtopologyspread.PodTopologySpread); exist {
 				if !handleSkipPredicatePlugin(cycleState, topologyFilter.Name()) {
@@ -412,38 +412,12 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		return nil
 	})
 
-	// Add SimulatePredicate function
+	// Add SimulatePredicate function: the FULL filter stack for rescheduling
+	// feasibility (repack) and preemption dry-run. It mirrors Predicate's filter
+	// phase, but runs every enabled Filter plugin against the caller's simulated
+	// node — a NodeInfo built from node.Pods() (reflecting simulated
+	// evictions/placements) rather than the shared cache snapshot Predicate reads.
 	ssn.AddSimulatePredicateFn(pp.Name(), func(ctx context.Context, cycleState fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
-		k8sNodeInfo := k8sframework.NewNodeInfo(node.Pods()...)
-		k8sNodeInfo.SetNode(node.Node)
-
-		if pp.enabledPredicates.podAffinityEnable {
-			isSkipInterPodAffinity := handleSkipPredicatePlugin(cycleState, interpodaffinity.Name)
-			if !isSkipInterPodAffinity {
-				if podAffinityFilter, exist := pp.FilterPlugins[interpodaffinity.Name]; exist {
-					status := podAffinityFilter.Filter(ctx, cycleState, task.Pod, k8sNodeInfo)
-					if !status.IsSuccess() {
-						return fmt.Errorf("failed to filter pod on node %s: %w", node.Name, status.AsError())
-					} else {
-						klog.Infof("pod affinity for task %s/%s filter success on node %s", task.Namespace, task.Name, node.Name)
-					}
-				} else {
-					return fmt.Errorf("failed to call %s plugin for task %s/%s on node %s, plugin does not exist", interpodaffinity.Name, task.Namespace, task.Name, node.Name)
-				}
-			}
-		}
-
-		// Device-aware check (shared with SimulateFilterFn).
-		return pp.filterDevices(task, node)
-	})
-
-	// Add SimulateFilter function: the FULL filter stack for rescheduling
-	// feasibility (repack). It mirrors Predicate's filter phase, but runs every
-	// enabled Filter plugin against the caller's simulated node — a NodeInfo built
-	// from node.Pods() (reflecting simulated evictions/placements) rather than the
-	// shared cache snapshot Predicate reads. Preemption keeps using the lean
-	// SimulatePredicateFn above; this is its superset.
-	ssn.AddSimulateFilterFn(pp.Name(), func(ctx context.Context, cycleState fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
 		k8sNodeInfo := k8sframework.NewNodeInfo(node.Pods()...)
 		k8sNodeInfo.SetNode(node.Node)
 		if err := pp.simulateFilter(ctx, cycleState, task, k8sNodeInfo); err != nil {
@@ -451,15 +425,15 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 		// Device-aware feasibility (GPU/NPU sharing, topology) lives on the Volcano
 		// node.Others, not the k8s NodeInfo, so it is not one of the Filter plugins —
-		// check it separately, the same as SimulatePredicateFn does.
+		// check it separately.
 		return pp.filterDevices(task, node)
 	})
 }
 
 // filterDevices runs the Volcano device predicates (GPU/NPU sharing, topology) for
 // task on node, using each registered device's FilterNode (a pure read, no side
-// effects). Shared by SimulatePredicateFn (preemption dry-run) and SimulateFilterFn
-// (repack rescheduling), so both judge device availability identically.
+// effects). Shared by SimulatePredicateFn so both preemption and repack judge
+// device availability identically.
 func (pp *PredicatesPlugin) filterDevices(task *api.TaskInfo, node *api.NodeInfo) error {
 	for _, val := range api.RegisteredDevices {
 		devObj, ok := node.Others[val]
@@ -497,8 +471,7 @@ func (pp *PredicatesPlugin) simulateFilter(ctx context.Context, state fwk.CycleS
 			return nil
 		}
 		status := plugin.Filter(ctx, state, task.Pod, nodeInfo)
-		filterStatus := api.ConvertPredicateStatus(status)
-		if filterStatus.Code != api.Success && util.ShouldAbort(filterStatus) {
+		if !status.IsSuccess() {
 			return fmt.Errorf("plugin %s predicates failed: %s", name, status.Message())
 		}
 		return nil

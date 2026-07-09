@@ -1083,7 +1083,7 @@ spec:
 
 ### 可调度性兜底（INV-RESCHED）
 
-**规划时判据**：在驱逐前确认"若此刻执行，每个被驱逐 Pod 都能在域内重新调度"。实现为一个**可调度性预言机** `Domain.Feasible`：在内存快照里把所有待落 Pod 用 FFD + best-fit + 回溯做完整装箱，复用引擎的 `predicate` 与节点 `FutureIdle`。任一 Pod 无解 → 本轮不驱逐。
+**规划时判据**：在驱逐前确认"若此刻执行，每个被驱逐 Pod 都能在域内重新调度"。实现为一个**可调度性检查** `Snapshot.FeasibleRelocation`：在**克隆**出的节点副本 + cycle-state 上模拟驱逐这批 victim、再按接收方偏好逐个重落，落点用调度器**完整过滤栈** `ssn.SimulatePredicateFn`（亲和/污点/拓扑/设备…）+ 节点 `FutureIdle` 判定；全程只读、不碰真集群。任一 Pod 无解 → 本轮不驱逐。（纯 FFD + best-fit + 回溯的装箱求解器 `api.Domain.Feasible` 保留为**参考模型**，供 drain 单测 fake 复用，不在生产路径。）
 
 它与 descheduler 的"纯策略驱逐"区别在于：repack **不会在'当前明显放不下'时还去驱逐**。但**这不是运行期保证**——因为不预留：
 
@@ -1103,9 +1103,9 @@ type Core interface {
 }
 ```
 
-core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.Predicate()`（落点预选）、以及 gang/movecost 插件注册的扰动维度（见下方"增量代价"）。
+core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.FeasibleRelocation()`（克隆式可调度性检查，见上"可调度性兜底"）、以及 gang/movecost 插件注册的扰动维度（见下方"增量代价"）。
 
-- **A（drain，P0）**：**增量破组感知的贪心，单趟动态、产出唯一 plan**。每步挑"当前**增量代价最小**"的可释放单元腾空，把其 victim 用 `api.Domain.Feasible` 重排进其余碎片，单元成员节点**全空才提交**（原子：放不下则跳过、ledger 不受影响）；提交后更新状态、**动态重选**下一个单元，遍历到无可腾为止，再校验 `MinNodesFreed`。可释放单元来自 `node` 插件（一节点一单元）；`hypernode` 启用则并入超节点单元（权重更高），core 优化二者**综合收益**。
+- **A（drain，P0）**：**增量破组感知的贪心，单趟动态、产出唯一 plan**。每步挑"当前**增量代价最小**"的可释放单元腾空，把其 victim 用 `ssn.FeasibleRelocation`（克隆式 feasibility check）重排进其余碎片，单元成员节点**全空才提交**（原子：放不下则跳过、已提交的 moves 不受影响）；提交后更新状态、**动态重选**下一个单元，遍历到无可腾为止，再校验 `MinNodesFreed`。可释放单元来自 `node` 插件（一节点一单元）；`hypernode` 启用则并入超节点单元（权重更高），core 优化二者**综合收益**。
 
   **增量代价 = 字典序（关键）**：单元的腾空代价是一个**按维度排序的字典序键**，逐项比较、取最小：
   1. **增量破组受损卡**（gang 阶跃）——core 维护"**已破组 gang 集合**"，随每次提交更新；victim 若属于**已破组** gang，该部分**记 0**（破组后再搬同一 gang 影响性不变，见 §扰动控制阶跃函数）；未破组内按搬走卡、这一搬会破组则按 footprint；
@@ -1132,7 +1132,7 @@ P0 流水线只有一个 action `repack`：
 ```mermaid
 flowchart TD
     P["OpenSession：跑各 plugin.OnSessionOpen<br/>注册 域 / 可动性 / 评分 回调"] --> A["action: repack"]
-    A --> B["选定 core(drain).Plan(ssn)<br/>FreeableUnits → 腾空 → Domain.Feasible(INV-RESCHED) → LeastDisruptive"]
+    A --> B["选定 core(drain).Plan(ssn)<br/>FreeableUnits → 腾空 → FeasibleRelocation(INV-RESCHED) → LeastDisruptive"]
     B --> C{"mode?"}
     C -->|DryRun| E["RenderPlan → status.plan"]
     C -->|Execute| F["CommitPlan(Evict) + 提名 reconciler → status.plan / nominations"]
@@ -1146,8 +1146,8 @@ flowchart TD
 |---|---|
 | `--scheduler-conf` + `UnmarshalSchedulerConf` | 读取**与调度器同一份**插件配置（同一 ConfigMap），得到 `tiers`/`configurations` |
 | `schedcache.New` + `cache.Run` | 与调度器同源的 informer 热缓存 |
-| `framework.OpenSession(cache, tiers, conf)` | 用同一插件集打开 Session，得到真实 `Nodes`/`Jobs` + `PredicateFn` |
-| `framework.Statement`（Evict/Pipeline/Commit/Discard） | 沙箱事务：DryRun 只 Discard；Execute Commit |
+| `framework.OpenSession(cache, tiers, conf)` | 用同一插件集打开 Session，得到真实 `Nodes`/`Jobs` + `SimulatePredicateFn`（模拟落点的完整过滤栈） |
+| 克隆式重排可行性检查 `Snapshot.FeasibleRelocation` | 克隆 node + cycle-state，用 `ssn.SimulatePredicateFn` 跑完整过滤栈模拟"驱逐 victim → 逐个重落"；DryRun/Execute 同源，只读、不碰真集群（取代早期设计里的 `framework.Statement` 沙箱事务——后者因 `unPipeline` 置空 `NodeName` 无法用于 repack） |
 
 只复用 `tiers/configurations`（过滤/打分能力），**忽略 `actions`**（repack 有自己的 action）。这样 predicate 语义与调度器同源同演进，避免"整理算出的落点被调度器拒掉"的不一致。
 
@@ -1204,12 +1204,12 @@ flowchart TD
 | `staging/src/volcano.sh/apis/.../repack/v1alpha1` | `RepackRun` CRD 类型 |
 | `staging/src/volcano.sh/repack-controller` | **独立模块**：RepackRun 控制器（**只做 TTL 回收**）+ 提名 reconciler（watch Pod → patch `nominatedNodeName`）+ 纯决策 `state` 包（仅依赖 apis，可单独编译；含 `EvaluateGate`，由引擎调用） |
 | `pkg/controllers/repack` | 主模块 shim：`framework.Controller` 适配器，把上面的库注册进 volcano-controller-manager（默认随其编译运行） |
-| `pkg/repackengine/api` | 纯模型与算法原语：`Move`/`Fit`/`Domain·Feasible`、碎片度量、`RepackPlan`/`FreeableUnit`、可动性、扰动聚合（零框架依赖） |
+| `pkg/repackengine/api` | 纯模型与算法原语：`Move`、碎片度量、`RepackPlan`/`FreeableUnit`、可动性、扰动聚合，以及参考求解器 `Domain.Feasible`（仅单测 fake 复用，非生产路径）（零框架依赖） |
 | `pkg/repackengine/framework` | 引擎契约：`Session`（plugin 注册 + 聚合消费）、`Plugin`/`Action`/`Core` 接口与注册表、`Report`、`CommitPlan`、scope 解析 |
 | `pkg/repackengine/core/drain` | 核心算法 A（`drain`，P0）；`core/concentration` 为未来槽位 |
 | `pkg/repackengine/plugins/{base,node,gang}` | 能力插件（init 自注册）；`hypernode`/`pdb` 后续 |
 | `pkg/repackengine/actions/repack` | P0 动作 |
-| `pkg/repackengine/session` | 唯一耦合 `scheduler/framework` 的适配层：`SessionSnapshot`/`EngineFit`/`ValidatePlan`/`SessionGangInfo` |
+| `pkg/repackengine/adapter` | 唯一耦合 `scheduler/framework` 的适配层：`SessionSnapshot`（含 `FeasibleRelocation` 克隆 feasibility check，走 `ssn.SimulatePredicateFn`）/`SessionGangScopeLookup`/`NodeFreeCapacity` |
 | `pkg/repackengine/repackengine.go` | 驱动：cache + `OpenSession`(tiers) + 跑 plugin/action/core + 写 status |
 | `cmd/volcano-repack-engine` | 独立引擎二进制入口（leader + 周期驱动；提名 reconciler 在控制器模块内） |
 

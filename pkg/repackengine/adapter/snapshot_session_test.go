@@ -71,7 +71,7 @@ func TestClearNodeBinding_AddTask(t *testing.T) {
 		t.Fatal("expected AddTask to reject task bound to a different node")
 	}
 	if err := dest.AddTask(clearNodeBinding(hosted)); err != nil {
-		t.Fatalf("AddTask on reschedule sim clone: %v", err)
+		t.Fatalf("AddTask on relocation sim clone: %v", err)
 	}
 }
 

@@ -102,8 +102,8 @@ type candidate struct {
 }
 
 // drainState is the running state of one drain pass. Feasibility (which victims
-// can reschedule where) is delegated to the snapshot's scheduler-faithful oracle
-// (Snapshot.FeasibleReschedule); this struct only tracks the greedy pass progress
+// can relocate where) is delegated to the snapshot's scheduler-faithful feasibility check
+// (Snapshot.FeasibleRelocation); this struct only tracks the greedy pass progress
 // and the disruption budget.
 type drainState struct {
 	// Fixed for the whole pass.
@@ -187,7 +187,7 @@ func newDrainState(
 	}
 }
 
-// evaluateUnit checks whether `unit` can be vacated now — every victim reschedules
+// evaluateUnit checks whether `unit` can be vacated now — every victim relocates
 // onto a surviving receiver within the disruption budget — and returns the moves
 // that vacate it. ok=false means "not freeable this step".
 func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
@@ -222,15 +222,15 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
 		"victims", taskNames(victims), "victimCount", len(victims),
 		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
-	// Feasibility = the scheduler-faithful reschedule oracle: it simulates evicting
+	// Feasibility = the scheduler-faithful relocation feasibility check: it simulates evicting
 	// these victims and greedily placing them onto the receivers (in the preference
 	// order we pass) with the full scheduler filter stack, over the moves already
 	// committed this pass.
-	placed, feasible := s.snapshot.FeasibleReschedule(s.moves, victims, receivers)
+	placed, feasible := s.snapshot.FeasibleRelocation(s.moves, victims, receivers)
 	if !feasible {
 		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
 		// stays infeasible — remember its nodes as preferred (staying) receivers.
-		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all reschedule onto receivers",
+		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
 			"unit", key, "victims", len(victims), "receivers", len(receivers))
 		for _, nodeName := range unit.Nodes {
 			s.provenStuck[nodeName] = true

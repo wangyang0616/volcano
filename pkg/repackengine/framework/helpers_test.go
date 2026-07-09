@@ -37,9 +37,9 @@ func (f *fakeSnap) Nodes() []*schedapi.NodeInfo                     { return f.n
 func (f *fakeSnap) NodeInScope(*schedapi.NodeInfo) bool             { return true }
 func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView { return f.views[id] }
 
-// FeasibleReschedule is not exercised by the framework-level tests (they cover
+// FeasibleRelocation is not exercised by the framework-level tests (they cover
 // session plumbing, not the drain core), so this is an inert stand-in.
-func (f *fakeSnap) FeasibleReschedule([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (f *fakeSnap) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	return nil, false
 }
 

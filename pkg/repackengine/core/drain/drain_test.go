@@ -58,11 +58,11 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 	return f.views[id]
 }
 
-// FeasibleReschedule is a capacity-only stand-in for the scheduler oracle: every
+// FeasibleRelocation is a capacity-only stand-in for the scheduler feasibility check: every
 // node "fits" (no predicate constraints in tests), so feasibility is pure GPU
 // capacity (Allocatable − Used − pods already placed this pass), solved with the
 // pure api.Domain best-fit solver.
-func (f *fakeSnap) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (f *fakeSnap) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	res := f.res()
 	placed := map[string]int64{}
 	for _, m := range committed {

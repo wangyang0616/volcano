@@ -70,15 +70,15 @@ func (s *SessionSnapshot) NodeInScope(n *schedapi.NodeInfo) bool {
 	return s.scope == nil || s.scope.NodeInScope(n)
 }
 
-// FeasibleReschedule simulates evicting `victims` and greedily rescheduling them
+// FeasibleRelocation simulates evicting `victims` and greedily relocating them
 // onto `receivers`, with feasibility decided by the scheduler's FULL filter stack
-// (SimulateFilterFn) — so a plan matches exactly what the scheduler will accept at
+// (SimulatePredicateFn) — so a plan matches exactly what the scheduler will accept at
 // Execute time. It runs entirely on CLONES (a node copy + a cycle-state copy per
 // candidate), never mutating the shared session, which is the same isolation the
 // preempt action relies on. `committed` are the relocations already decided earlier
 // this pass; their pods count as present on their receiver nodes so capacity and
 // topology stay consistent across steps. Resource fit is checked via FutureIdle
-// (the scheduler's own model), everything else via SimulateFilterFn.
+// (the scheduler's own model), everything else via SimulatePredicateFn.
 //
 // `receivers` are tried in the ORDER GIVEN (first that fits wins): the caller is
 // responsible for the receiver preference (e.g. the drain orders staying nodes
@@ -86,7 +86,7 @@ func (s *SessionSnapshot) NodeInScope(n *schedapi.NodeInfo) bool {
 // defrag placement policy at the call site.
 //
 // Returns the per-victim placements (from -> to) and whether every victim fit.
-func (s *SessionSnapshot) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	// Pods that already landed on each receiver this pass (prior committed moves).
 	landed := map[string][]*schedapi.TaskInfo{}
 	for _, m := range committed {
@@ -116,7 +116,7 @@ func (s *SessionSnapshot) FeasibleReschedule(committed []*api.Move, victims []*s
 	return placements, true
 }
 
-// clearNodeBinding returns a task clone with node binding cleared so reschedule
+// clearNodeBinding returns a task clone with node binding cleared so relocation
 // simulation can AddTask onto a different node and run filter plugins as if the
 // pod were unbound.
 func clearNodeBinding(task *schedapi.TaskInfo) *schedapi.TaskInfo {
@@ -149,7 +149,7 @@ func (s *SessionSnapshot) firstFeasibleReceiver(ctx context.Context, victim *sch
 // node after the pods that already landed there this pass. Resource fit uses
 // FutureIdle (the scheduler's own accounting); everything else — taints, node
 // affinity, inter-pod affinity, topology spread, devices, volumes, DRA — is the
-// full SimulateFilterFn stack.
+// full SimulatePredicateFn stack.
 func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, node *schedapi.NodeInfo, alreadyLanded []*schedapi.TaskInfo) bool {
 	nodeCopy := node.Clone()
 	stateCopy := baseState.Clone()
@@ -165,7 +165,7 @@ func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *scheda
 	if !victim.InitResreq.LessEqual(nodeCopy.FutureIdle(), schedapi.Zero) {
 		return false
 	}
-	return s.ssn.SimulateFilterFn(ctx, stateCopy, victim, nodeCopy) == nil
+	return s.ssn.SimulatePredicateFn(ctx, stateCopy, victim, nodeCopy) == nil
 }
 
 // victimsLargestFirst orders victims by descending target-resource request (first-

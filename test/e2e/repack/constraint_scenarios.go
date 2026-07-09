@@ -33,13 +33,13 @@ import (
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
 
-// This suite verifies the scheduler-faithful feasibility oracle: repack must honor
+// This suite verifies the scheduler-faithful feasibility check: repack must honor
 // the SAME node constraints the scheduler enforces at bind time (taints, node
 // affinity, ...), otherwise an Execute'd relocation bounces straight back. It also
 // checks the drain's "prefer staying nodes" receiver ordering.
 //
 // Every case pins its workloads with the Job template's spec.nodeName to build a
-// deterministic layout; the constraints (taint / affinity) are what the oracle must
+// deterministic layout; the constraints (taint / affinity) are what the feasibility check must
 // respect when deciding where a victim could re-land.
 
 const hostnameLabel = "kubernetes.io/hostname"
@@ -60,7 +60,7 @@ func untaintNode(ctx *e2eutil.TestContext, node string) {
 }
 
 // occupyPinnedToHost is occupy() plus a REQUIRED node affinity to the pod's own
-// host, so the pod can never be relocated to any other node — the oracle must then
+// host, so the pod can never be relocated to any other node — the feasibility check must then
 // judge its gang un-drainable.
 func occupyPinnedToHost(ctx *e2eutil.TestContext, name, node string, cards int) {
 	npuQty := resource.MustParse(fmt.Sprintf("%d", cards))

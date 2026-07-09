@@ -49,7 +49,7 @@ func TestSession_MovableEmptyAllMovable(t *testing.T) {
 }
 
 // Node feasibility (taints/affinity/topology/resources) now lives in the scheduler-
-// faithful Snapshot.FeasibleReschedule oracle (adapter), exercised by the drain and
+// faithful Snapshot.FeasibleRelocation feasibility check (adapter), exercised by the drain and
 // e2e suites — the session no longer has a Predicate path to unit-test here.
 
 // FreeableUnits is the union across domain plugins (node + hypernode here).

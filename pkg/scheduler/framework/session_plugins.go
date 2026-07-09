@@ -196,11 +196,6 @@ func (ssn *Session) AddSimulatePredicateFn(name string, fn api.SimulatePredicate
 	ssn.simulatePredicateFns[name] = fn
 }
 
-// AddSimulateFilterFn add SimulateFilter function
-func (ssn *Session) AddSimulateFilterFn(name string, fn api.SimulateFilterFn) {
-	ssn.simulateFilterFns[name] = fn
-}
-
 // AddSubJobReadyFn add SubJobReady function
 func (ssn *Session) AddSubJobReadyFn(name string, vf api.ValidateFn) {
 	ssn.subJobReadyFns[name] = vf
@@ -903,30 +898,6 @@ func (ssn *Session) SimulatePredicateFn(ctx context.Context, state fwk.CycleStat
 			}
 			err := pfn(ctx, state, task, node)
 			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// SimulateFilterFn invokes each plugin's full-filter simulation: the COMPLETE
-// enabled Filter stack (taints, node affinity, ports, inter-pod affinity, topology
-// spread, devices, volume, DRA, ...) evaluated against the caller's simulated node
-// and CycleState. Unlike SimulatePredicateFn (the lean, state-dependent subset
-// preemption uses), this matches exactly what the scheduler accepts at bind time,
-// so a rescheduling-feasibility caller (e.g. repack) can trust it.
-func (ssn *Session) SimulateFilterFn(ctx context.Context, state fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
-	for _, tier := range ssn.Tiers {
-		for _, plugin := range tier.Plugins {
-			if !isEnabled(plugin.EnabledPredicate) {
-				continue
-			}
-			fn, found := ssn.simulateFilterFns[plugin.Name]
-			if !found {
-				continue
-			}
-			if err := fn(ctx, state, task, node); err != nil {
 				return err
 			}
 		}

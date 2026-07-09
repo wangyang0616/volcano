@@ -203,11 +203,11 @@ func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
 // Nodes returns the snapshot's candidate nodes.
 func (s *Session) Nodes() []*schedapi.NodeInfo { return s.cfg.Snapshot.Nodes() }
 
-// FeasibleReschedule delegates to the snapshot's scheduler-faithful reschedule
-// oracle: simulate evicting victims and greedily place them onto receivers with the
-// full scheduler filter stack. See Snapshot.FeasibleReschedule.
-func (s *Session) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
-	return s.cfg.Snapshot.FeasibleReschedule(committed, victims, receivers)
+// FeasibleRelocation delegates to the snapshot's scheduler-faithful relocation
+// feasibility check: simulate evicting victims and greedily place them onto receivers with the
+// full scheduler filter stack. See Snapshot.FeasibleRelocation.
+func (s *Session) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	return s.cfg.Snapshot.FeasibleRelocation(committed, victims, receivers)
 }
 
 // Movable returns an api.Movable that is the AND of all registered MovableFns

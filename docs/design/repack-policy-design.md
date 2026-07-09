@@ -33,7 +33,7 @@ Repack 面向 AI 负载在 **Node 级 + 多层 HyperNode 级** 的运行期碎�
 7. RepackRun 对齐 **Job 一次性语义**：`ttlSecondsAfterFinished` 终态自动清理；**不设运行超时字段**——「卡在 Running」由引擎启动时**崩溃孤儿回收**兜底；P1 Policy 有扁平 `successfulRunsHistoryLimit`/`failedRunsHistoryLimit` 历史上限。
 8. **并发模型**：Execute 全局 **K=1 + `executeCooldown`**（集群/策略级），**DryRun 自由排队**；长期规划 scope 不相交并行（§4.5.5）。
 9. **`status.phase` + `conditions`**：**conditions 权威、phase 派生**；参考 Job 的 Complete/Failed/Progressing，结合排队、DryRun/Execute 划分 Succeeded/Failed（**准入=CEL，无 `Admitted` 条件**，§4.6.1）。
-10. **引擎三件套（§4A）共用一个可调度性预言机**（repack 包的 `ValidatePlan` + `Domain.Feasible`，与 gangpreempt 同款 `Statement` 沙箱模拟）：**碎片整理指数**（§4.12）、**收益门控**（碎片改善达阈值才整理，否则 `NoRepackNeeded`，§4.13）、**模拟匹配**（沙箱里把被挪 gang 填进碎片、逐个重落，§4.14）。**硬不变量 INV-RESCHED**：repack 是搬家非抢占——**每个被挪的 pod 都必须能重新落下**，否则方案不可行、不驱逐（§4.14.2）。**P0 为 consolidation-driven**；relief-driven 的"目标落点（相位1）"为 **P1**。全部建立在 Volcano 现有引擎之上。
+10. **引擎三件套（§4A）共用一个可调度性检查**（repack 包的 `ValidatePlan` + `Domain.Feasible`，与 gangpreempt 同款 `Statement` 沙箱模拟）：**碎片整理指数**（§4.12）、**收益门控**（碎片改善达阈值才整理，否则 `NoRepackNeeded`，§4.13）、**模拟匹配**（沙箱里把被挪 gang 填进碎片、逐个重落，§4.14）。**硬不变量 INV-RESCHED**：repack 是搬家非抢占——**每个被挪的 pod 都必须能重新落下**，否则方案不可行、不驱逐（§4.14.2）。**P0 为 consolidation-driven**；relief-driven 的"目标落点（相位1）"为 **P1**。全部建立在 Volcano 现有引擎之上。
 11. **PDB 兼容（P0，§4.13.4）**：模拟期经 `UnifiedEvictable` 过滤（需扩展 `pdb` 插件注册 `UnifiedEvictableFn`）+ 执行期 **Eviction 子资源** 服务端兜底（区别于主调度裸 delete）。
 12. **P1 扩展已预留方案（§4.15）**：多级 HyperNode 拓扑、队列配额感知、最优成本整理（最少作业/卡）、单作业抗反复中断；spec 注释占位、引擎扩展点接入，不改 P0 契约。
 13. **策略可插拔（§4.16）**：repack 全程沿用 Volcano **action+plugin** 范式，关键策略点（碎片度量 `FragmentScoreFn`、收益门控 `RepackBenefitFn`、中断代价 `DisruptionCostFn`、目标画像 `TargetProfileFn`、P1 plan 择优 `RepackPlanScoreFn`）暴露为 **`ssn.AddXxxFn` 扩展函数**，核心库只编排、不写死口径。
@@ -997,7 +997,7 @@ flowchart TB
 
 > **命名**：组件名 **`volcano-repack-engine`**；实现路径建议 `cmd/volcano-repack-engine`；与主调度器 **`volcano-scheduler`** 区分，避免「在 scheduler 里加 repack action」。
 >
-> **命名定稿（v9.8）**：执行组件定名 **`volcano-repack-engine`**。理由：该组件**只做模拟 + 驱逐、不 bind Pod**，避免 `-scheduler` 后缀与真正负责 allocate 的 `volcano-scheduler` 混淆；`-engine` 更贴合「在热 cache 上跑模拟引擎」的职责。实现入口 `cmd/volcano-repack-engine`，核心库仍为 `pkg/scheduler/repack`。
+> **命名定稿（v9.8）**：执行组件定名 **`volcano-repack-engine`**。理由：该组件**只做模拟 + 驱逐、不 bind Pod**，避免 `-scheduler` 后缀与真正负责 allocate 的 `volcano-scheduler` 混淆；`-engine` 更贴合「在热 cache 上跑模拟引擎」的职责。实现入口 `cmd/volcano-repack-engine`，核心库仍为 `pkg/repackengine`。
 
 #### 4.7.0 复用 scheduler 框架与插件（独立部署，但不重复造）
 
@@ -1009,13 +1009,13 @@ flowchart TB
 |---|---|---|
 | **`--scheduler-conf` + `UnmarshalSchedulerConf`** | 解析**与 `volcano-scheduler` 完全相同的插件配置文件**（tiers/plugins/arguments）→ `tiers`/`configurations` | engine **指向同一个 ConfigMap**、用**同一个解析函数**，保证 predicate 过滤原则与调度器**逐字一致**；同 watch ConfigMap 热加载 |
 | `schedcache.New(...)` + `cache.Run` | 与调度器**同一套** informer 热 cache（Node/Pod/PodGroup/PV…） | engine 进程内建一份自己的 cache（独立 Pod，不共享内存，但代码同源） |
-| `framework.OpenSession(cache, tiers, conf)` | 用**上面解析出的同一套插件 tiers** 打开 `Session`，得到真实 `Nodes`/`Jobs` + `PredicateFn`/`PrePredicateFn` | 每个整理周期开一个 Session，复用与调度器**同名同义**的 predicate（亲和/污点/拓扑/设备/NUMA…） |
-| `framework.Statement`(`Evict`/`Pipeline`/`Commit`/`Discard`) | 沙箱事务：模拟驱逐与落子、原子提交或回滚 | DryRun 只 `Discard`；Execute `Commit` → 写 `NominatedNodeName` |
-| `framework.CloseSession` | 收尾 | 周期结束关闭 |
+| `framework.OpenSession(cache, tiers, conf)` | 用**上面解析出的同一套插件 tiers** 打开 `Session`，得到真实 `Nodes`/`Jobs` + `SimulatePredicateFn`/`PrePredicateFn` | 每个整理周期开一个 Session，复用与调度器**同名同义**的 predicate（亲和/污点/拓扑/设备/NUMA…） |
+| `ssn.SimulatePredicateFn` + 克隆式重排可行性检查 | `PrePredicateFn` 建 cycle-state，克隆 node + state 后用 `SimulatePredicateFn` 跑**完整过滤栈**模拟"驱逐 victim → 逐个重落"，只读不碰真集群 | 可行性判定（INV-RESCHED），DryRun/Execute 同源；取代早期设计的 `framework.Statement` 沙箱（后者 `unPipeline` 置空 `NodeName`，不能用于 repack） |
+| `framework.CloseSession` | 收尾 | 周期结束关闭（只读，不回写 PodGroup/Queue 状态） |
 
 > **插件过滤一致性（关键诉求）**：repack-engine **读取 `volcano-scheduler` 的同一份插件配置**（默认指向同一个 `volcano-scheduler-configmap`，`--scheduler-conf` 同值），用**同一个 `UnmarshalSchedulerConf`** 解析、喂给**同一个 `OpenSession`**。于是「一个 pod 能不能放到某节点」的判定（亲和/反亲和、污点容忍、拓扑/NUMA、设备、节点资源…）与调度器**完全同源、同演进**——调度器升级插件或改 predicate 语义，repack **自动跟随**，不会出现"整理算出的落点调度器又拒掉"的不一致。
 >
-> **只复用 tiers/configurations，不复用 actions**：`UnmarshalSchedulerConf` 还返回调度器的 `actions`（allocate/preempt/backfill 主循环），repack **忽略**之——它有自己的"action"（§4.16.6 planner）。即**插件（过滤/打分能力）全盘复用，调度主循环不复用**。repack 只调用 `PredicateFn`/`PrePredicateFn` 与 `Statement`；纯 allocate/order 类插件函数不会被 repack 触发，故复用同一配置安全无副作用。
+> **只复用 tiers/configurations，不复用 actions**：`UnmarshalSchedulerConf` 还返回调度器的 `actions`（allocate/preempt/backfill 主循环），repack **忽略**之——它有自己的"action"（§4.16.6）。即**插件（过滤/打分能力）全盘复用，调度主循环不复用**。repack 只调用 `SimulatePredicateFn`/`PrePredicateFn`（克隆式重排模拟），不用 `Statement`；纯 allocate/order 类插件函数不会被 repack 触发，故复用同一配置安全无副作用。
 
 > **与本设计的衔接**：引擎主体已对 **`Snapshot` 接口**编程（§4.16.6）；**生产实现就是 `SessionSnapshot`**（包一个 `OpenSession` 得到的 `*framework.Session`）。于是"独立部署 + 复用框架"= 复用 `schedcache`+`OpenSession` 拿 Session → `NewSessionSnapshot(ssn, resource)` → `PlanRun`。**无需自建 informer NodeInfo/JobInfo 缓存、无需重写 predicate**；插件演进自动跟随。`repack-engine` 相当于一个"只跑 repack、不跑 allocate/bind"的**迷你调度器**：和 `volcano-scheduler` 同框架同插件，只是 action 换成"整理 + 驱逐 + nominate"。
 
@@ -1025,9 +1025,9 @@ flowchart LR
     RT --> C["schedcache.New + Run（复用）"]
     C --> OS["framework.OpenSession(tiers, conf)（复用插件）"]
     OS --> SS["SessionSnapshot(ssn, resource)"]
-    SS --> PR["PlanRun（选 planner A/B）"]
+    SS --> PR["RunActions → core(drain).Plan"]
     PR -->|DryRun| RP["RenderReport → status.plan"]
-    PR -->|Execute| ST["Statement Evict/Pipeline/Commit → NominatedNodeName → status.plan"]
+    PR -->|Execute| ST["Eviction API 驱逐 + 提名 reconciler patch NominatedNodeName → status.plan / nominations"]
     OS --> CL["CloseSession"]
 ```
 
@@ -1224,7 +1224,7 @@ kubectl get repackrun
 | 空节点整合口径 `(B_R−A_R)/M_R` + `/B_R`（§4.12.2a） | **P0** |
 | 策略扩展框架：关键策略点 plugin 化（`FragmentScoreFn`/`RepackBenefitFn`/`DisruptionCostFn`/`TargetProfileFn`，§4.16） | **P0** |
 | 收益门控（解开 pending / 碎片改善阈值，§4.13）+ disruptionScore 排序 | **P0** |
-| 模拟匹配 + INV-RESCHED 重落校验（`ValidatePlan`/`Domain.Feasible`，沙箱 `Statement`，§4.14） | **P0** |
+| 模拟匹配 + INV-RESCHED 重落校验（`Snapshot.FeasibleRelocation`：克隆 + `SimulatePredicateFn`，§4.14） | **P0** |
 | relief 的"目标落点（相位1）"双向匹配 | **P1** |
 | **PDB 兼容**（模拟期过滤 + 执行期 Eviction 子资源兜底，§4.13.4） | **P0** |
 | 引擎内置 Execute **K=1**（+ 可选启动参数 cooldown，§4.5.5） | **P0** |
@@ -1273,10 +1273,10 @@ kubectl get repackrun
 
 ## 4A. 引擎设计：碎片度量 · 收益门控 · 模拟匹配
 
-> 本章补齐功能思路里尚未展开的三块**算法核心**，全部建立在 Volcano 现有引擎上（见需求文档 §2 可复用地基）。三块共用**同一个可调度性预言机**，避免两条链路口径打架。
+> 本章补齐功能思路里尚未展开的三块**算法核心**，全部建立在 Volcano 现有引擎上（见需求文档 §2 可复用地基）。三块共用**同一个可调度性检查**，避免两条链路口径打架。
 >
-> **一个预言机贯穿三块**：`Feasible := ValidatePlan(ssn, victims, place, domain) 返回 ok`（repack 包 `schedulability_engine.go`，内部用 `Domain.Feasible` + `Statement` 沙箱模拟，§4.14.1）
-> （repack 包 `pkg/scheduler/repack/`）。它用**真实** predicate（`ssn.PredicateFn`：亲和/污点/拓扑/设备）+ 资源 `FutureIdle` 回答「这批 pod 能不能在该域放下」；P1 relief 再叠加 gang 目标落点（`JobPipelined`）。
+> **一个可行性检查贯穿三块**：`ok := Snapshot.FeasibleRelocation(committed, victims, receivers)`（repack 包 `adapter/snapshot_session.go`，克隆 node + cycle-state、`ssn.SimulatePredicateFn` 模拟重落，§4.14.1）
+> （repack 包 `pkg/repackengine/`）。它用**真实完整过滤栈**（`ssn.SimulatePredicateFn`：亲和/污点/拓扑/设备）+ 资源 `FutureIdle` 回答「这批 pod 能不能在该域放下」；P1 relief 再叠加 gang 目标落点（`JobPipelined`）。
 > - **碎片度量**（§4.12）：`victims=nil` 时，画像放不下的空闲容量即碎片。
 > - **收益评估**（§4.13）：整理前后 `Feasible` 翻转的画像数 = relief；前后碎片率差 = 改善。
 > - **模拟匹配**（§4.14）：`victims≠nil` 时返回的 plan 即 PodGroup↔Node 的落点方案。
@@ -1370,13 +1370,13 @@ O(任务数)、纯求和+向上取整、**无搜索、结果即真实最优**；
 #### 4.12.3 计算位置与复用
 
 - 度量在 `volcano-repack-engine` 的**热 cache / Session 快照**上算，**不阻塞主调度**（需求 NFR）。
-- 节点空闲取 `NodeInfo.Idle`；模拟「整理后」用 `FutureIdle()`（已计入 releasing），与 `ValidatePlan` 同源。
+- 节点空闲取 `NodeInfo.Idle`；模拟「整理后」用 `FutureIdle()`（已计入 releasing），与 `FeasibleRelocation` 同源。
 - 度量**可独立开关、DryRun 友好**：DryRun 只算度量 + 模拟，不驱逐（§4.5.4 `mode` 语义）。
 - 产出写入 `status.plan.summary.fragBeforePercent/fragAfterPercent`（聚合）与 `plan.freedNodes[]`（腾空节点名）（结构见 §4.6.2.1；逐资源 `perResource` 为 P2+）。
 
 ### 4.13 收益评估与整理门控（"效果有限就不整理"）
 
-模拟出可行 plan **不等于值得整理**。在 `ValidatePlan` 返回可行（INV-RESCHED：被挪 pod 都能重落）之上，再过一道**收益门控**；不达标则**不整理**——DryRun 出空 `plan.moves`、`conditions[Complete].reason` 为 `NoFragmentation`/`BelowGoalThreshold`；Execute 直接终态 `Succeeded`、`plan.moves` 为空。
+模拟出可行 plan **不等于值得整理**。在 `FeasibleRelocation` 返回可行（INV-RESCHED：被挪 pod 都能重落）之上，再过一道**收益门控**；不达标则**不整理**——DryRun 出空 `plan.moves`、`conditions[Complete].reason` 为 `NoFragmentation`/`BelowGoalThreshold`；Execute 直接终态 `Succeeded`、`plan.moves` 为空。
 
 #### 4.13.1 收益与代价信号
 
@@ -1457,7 +1457,7 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
 
 ### 4.14 模拟匹配：PodGroup ↔ Node（引擎流程）
 
-回答「整理时怎么模拟各 PodGroup 与 Node 的匹配关系」。整理算法的总体编排见 §4.14.0；单 task 在域内的落点判定与 gangpreempt 同构（§4.14.1）；被驱逐 pod 的可行性硬校验由 repack 包的 `ValidatePlan`（Statement 模拟驱逐+重落，与 gangpreempt 同构）落地（§4.14.2）。
+回答「整理时怎么模拟各 PodGroup 与 Node 的匹配关系」。整理算法的总体编排见 §4.14.0；单 task 在域内的落点判定复用调度器过滤栈（§4.14.1）；被驱逐 pod 的可行性硬校验由 `Snapshot.FeasibleRelocation`（**克隆** node + cycle-state、`ssn.SimulatePredicateFn` 模拟驱逐+重落）落地（§4.14.2）。
 
 #### 4.14.0 整理算法总览：节点定收益 · PodGroup 定动作
 
@@ -1494,7 +1494,7 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
        moves   ← 对每个 gang，best-fit 填入 retained 的碎片
                  （留原地优先、不点亮空节点；§4.14.0 落点规则）
        # INV-RESCHED 硬校验（§4.14.2）：所有被挪 pod 都要有可行落点
-       if not ValidatePlan(victims, place=moves, retained):  放弃 n，continue
+       if not FeasibleRelocation(committed, victims, retained):  放弃 n，continue
        # 扰动预算
        if 受影响 gang 数/卡数 + 本轮 > 预算:                  放弃 n，continue
        # 原子提交：只有 n 真被清空才算收益
@@ -1515,14 +1515,14 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
 2. 落点用 **best-fit**：优先填**已被占用**的 retained 节点的碎片（剩余越紧越好），**绝不点亮空节点**——否则刚腾空一个又点亮一个，等于搬运碎片、净收益为 0。
 3. 整 gang 作为整体落，受 `bundlePolicy` 约束（`SurplusPodsOnly` 只动盈余 pod，不破 `minAvailable`；`EntireJobPermitted` 整 job 搬迁）。
 
-**三块积木对应（已实现，`pkg/scheduler/repack/`）：**
+**三块积木对应（已实现，`pkg/repackengine/`）：**
 
 | 步骤 | 能力 | 实现 |
 |------|------|------|
-| 第 1 步 | 碎片度量、理论最优 A、收益上界 B−A | `fragmentation.go`：`MeasureResource` / `OptimalNodes` / `WeightedFragRate` |
-| 第 2/3 步划片 | 可动判定、可腾空判定、victim 提取 | `disruption.go`：`Movable` / `NodeFreeable` / `VictimsOf` |
-| 第 3 步落点+硬校验 | FFD + 回溯 + best-fit 的可行性求解（INV-RESCHED） | `schedulability.go`：`Domain.Feasible`；`schedulability_engine.go`：`ValidatePlan` |
-| 第 5 步择优 | 归一化加权扰动评分（可插拔策略，§4.13.3/§4.16） | `disruption.go`：`WeightedDisruption` + `ScoreXxx` |
+| 第 1 步 | 碎片度量、理论最优 A、收益上界 B−A | `api/fragmentation.go`：`MeasureResource` / `OptimalNodes` / `WeightedFragRate`（后者多资源聚合，P1 预留） |
+| 第 2/3 步划片 | 可动判定、可腾空判定、victim 提取 | `api/movability.go`：`Movable` / `NodeFreeable` / `VictimsOf` |
+| 第 3 步落点+硬校验 | 克隆 node + cycle-state、`SimulatePredicateFn` 跑完整过滤栈模拟重落（INV-RESCHED） | `adapter/snapshot_session.go`：`FeasibleRelocation`。（纯 FFD+回溯求解器 `api/schedulability.go`：`Domain.Feasible` 保留为参考模型，仅单测 fake 复用） |
+| 第 5 步择优 | 归一化加权扰动评分（可插拔策略，§4.13.3/§4.16） | `framework/session.go`：`LeastDisruptive`；评分项由 `plugins/base`、`plugins/gang` 注册 |
 
 **整理前后效果（同一批作业拢紧、腾出 2 个整空节点、作业全程不停）：**
 
@@ -1536,15 +1536,15 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
 
 腾空成本排序  N4(1 gang,2卡) < N3(2 gang,4卡) < N2(1 gang) < N1(2 gang)
 
-drain N4:  U(2) best-fit 填 N1 的空2 → N1 满(8)；ValidatePlan ok；N4 清空 ✔ nodesFreed=1
-drain N3:  S(2)→N2空4, T(2)→N2 → N2 满(8)；ValidatePlan ok；N3 清空 ✔ nodesFreed=2
+drain N4:  U(2) best-fit 填 N1 的空2 → N1 满(8)；FeasibleRelocation ok；N4 清空 ✔ nodesFreed=1
+drain N3:  S(2)→N2空4, T(2)→N2 → N2 满(8)；FeasibleRelocation ok；N3 清空 ✔ nodesFreed=2
 drain N2:  已满 → 跳过      drain N1: 已满 → 跳过
 
 结果：腾出 2 个空节点（达到理论最优）；动作 = 3 个 gang(U,S,T)/6 卡；
       ΔFragRate = −2/4。全程只碰被选中腾空的节点，gang 整体迁移、未劈开。
 ```
 
-> 与 §4.14.1/4.14.2 的关系：4.14.1 描述**单 task 在域内**的落点打分（与 gangpreempt 同构，落点不反向制造碎片）；4.14.2 给出 **INV-RESCHED** 硬不变量及其 `ValidatePlan` 实现。本节（4.14.0）是把两者**编排**成「逐节点 drain、逐 gang FFD 安置、原子提交」的总流程。
+> 与 §4.14.1/4.14.2 的关系：4.14.1 描述**单 task 在域内**的落点判定（复用调度器过滤栈，落点不反向制造碎片）；4.14.2 给出 **INV-RESCHED** 硬不变量及其 `FeasibleRelocation` 实现。本节（4.14.0）是把两者**编排**成「逐节点 drain、逐 gang FFD 安置、原子提交」的总流程。
 
 #### 4.14.1 「模拟匹配」是什么：沙箱事务心智模型
 
@@ -1556,15 +1556,16 @@ drain N2:  已满 → 跳过      drain N1: 已满 → 跳过
 2. **一次整理要试很多候选**：腾哪个节点、victim 怎么搬，会枚举出多个候选方案，绝大多数被丢弃，只有**最优且达标**的那个才落地。
 3. **驱逐前必须确认能落回去**：这正是 INV-RESCHED（§4.14.2）——副本上先验证「人人有家」，真集群才不会被打出新的 pending。
 
-**三个引擎原语**（已实现，`framework.Statement`，与 gangpreempt 同款）：
+**实现方式：克隆隔离，不是 `Statement`。** 早期设计想复用 gangpreempt 的 `framework.Statement`（Evict/Pipeline/Commit/Discard 沙箱事务），但 `Statement.unPipeline` 会把 `task.NodeName` 置空——对同一 pod evict+pipeline+discard 会污染真实状态，无法用于 repack。故改为**克隆隔离**：每次判定都克隆候选 node 副本 + `cycle-state` 副本，只在副本上推演，丢弃即天然回滚，从不触碰共享 Session。这正是 preempt 的 `SimulatePredicateFn` 依赖的同款隔离。
 
-| 原语 | 在副本里做什么 |
+| 副本原语 | 在克隆副本里做什么 |
 |------|----------------|
-| `Evict(task)` | 「假装驱逐」：该 task 释放，其所在节点 `FutureIdle`（可用余量）增大 |
-| `Pipeline(task,node)` / 账本占用 | 「假装放置」：占用目标节点的 `FutureIdle`（落点判定即 `Domain.Feasible` 的余量账本，§4.14.0） |
-| `Discard()` / `Commit()` | `Discard` 整笔回滚（**DryRun 永远回滚**）；`Commit` 真正落地（仅 Execute） |
+| `node.Clone()` + `state.Clone()` | 起一份沙箱：候选节点与其 cycle-state 的独立副本 |
+| `SimulateAddTaskFn` + `nodeCopy.AddTask` | 「假装放置」：把已落 pod 加进副本，占用其 `FutureIdle`、并更新拓扑/亲和的 cycle-state |
+| `SimulatePredicateFn` | 「校验落点」：在副本上跑**完整过滤栈**（亲和/污点/拓扑/设备…）+ `InitResreq ≤ FutureIdle` |
+| 丢弃克隆 | 整笔回滚（**DryRun/Execute 判定期都不碰真集群**）；真正落地由 Execute 的 Eviction API 完成 |
 
-**到底「匹配」什么**：把每个要安置的 task（被挪 gang 的 pod），在**保留节点**里找一个落点——既要**放得下**（`InitResreq ≤ FutureIdle`），又要**通过 predicate**（亲和/污点/拓扑/设备约束，`ssn.PredicateFn`）。这就是 `schedulability.go` 的 `Domain.Feasible`（大 gang 先落 FFD + best-fit 填碎片 + 回溯）。整段「驱逐全部 victim → 逐个重落 → 是否全部成功」由 `ValidatePlan` 串起来，`defer Discard()` 保证全程只读、不碰真集群。
+**到底「匹配」什么**：把每个要安置的 task（被挪 gang 的 pod），在**保留节点**里找一个落点——既要**放得下**（`InitResreq ≤ FutureIdle`），又要**通过完整过滤栈**（亲和/污点/拓扑/设备约束，`ssn.SimulatePredicateFn`）。整段「驱逐全部 victim → 逐个重落 → 是否全部成功」由 `Snapshot.FeasibleRelocation` 串起来（`api/schedulability.go` 的 `Domain.Feasible` 是等价的纯 FFD+回溯参考求解器，仅测试 fake 复用）；全程只在克隆副本上进行、不碰真集群。
 
 #### 4.14.2 硬不变量 INV-RESCHED：被挪的 pod 都要有新家
 
@@ -1574,7 +1575,7 @@ drain N2:  已满 → 跳过      drain N1: 已满 → 跳过
 
 **与 preempt 的区别**：preempt 是**单向**的（腾出 victim 接住 pending，victim 被牺牲、留作 pending 也无妨）；repack 必须保证**所有被挪的 pod 都重新落下**，一个都不能掉。
 
-**怎么验证**：就是 §4.14.1 的 `ValidatePlan`——沙箱里 `Evict` 全部 victim → `Domain.Feasible` 给全部被挪 pod 找落点 → **全部成功才算可行** → `Discard` 回滚。等价表述：**repack 永不降低集群整体可调度性**。
+**怎么验证**：就是 §4.14.1 的 `Snapshot.FeasibleRelocation`——在克隆副本上把全部 victim 视作已驱逐 → 用 `ssn.SimulatePredicateFn` 给全部被挪 pod 逐个找落点 → **全部成功才算可行** → 丢弃克隆。等价表述：**repack 永不降低集群整体可调度性**。
 
 - 与 §4.7.1 区分：victim「能否落下」是**硬**可行性（驱逐前必查）；nomination「落到**哪个**节点」是**软**引导（实际调度漂移可接受）。
 
@@ -1589,28 +1590,28 @@ flowchart TB
     A["度量碎片 (M,B,A)<br/>MeasureResource（§4.12）"] --> B["挑候选腾空节点<br/>NodeFreeable + 腾空成本低优先"]
     B --> C["取其上可动 gang<br/>FFD 大 gang 先"]
     C --> D["沙箱：逐 gang best-fit<br/>填保留节点的碎片"]
-    D --> E{"ValidatePlan<br/>人人有家? (INV-RESCHED)"}
+    D --> E{"FeasibleRelocation<br/>人人有家? (INV-RESCHED)"}
     E -->|否| B
     E -->|是| F{"够本?<br/>ΔFragRate≥门槛 且 ≤maxPerRun"}
     F -->|不达标| X["NoRepackNeeded<br/>不驱逐"]
-    F -->|达标| G["多候选 → WeightedDisruption.Best<br/>选扰动最小方案"]
+    F -->|达标| G["多候选 → LeastDisruptive<br/>选扰动最小方案"]
     G --> H{mode}
     H -->|DryRun| R1["写 plan：moves/freedNodes"]
-    H -->|Execute| R2["patch NominatedNodeName（§4.7.1）<br/>→ Statement.Commit / Eviction → result"]
+    H -->|Execute| R2["Eviction API 驱逐 + 提名 reconciler<br/>patch NominatedNodeName（§4.7.1）→ result"]
 ```
 
-> 注：图中省略了 relief 的"目标落点（相位1）"——那是 P1（§4.14.2 P1 注）。P0 的"模拟匹配"就是 D→E 这两步：沙箱里把 gang 填进碎片、`ValidatePlan` 确认人人有家。
+> 注：图中省略了 relief 的"目标落点（相位1）"——那是 P1（§4.14.2 P1 注）。P0 的"模拟匹配"就是 D→E 这两步：克隆副本上把 gang 填进碎片、`FeasibleRelocation` 确认人人有家。
 
 #### 4.14.4 victim 选择映射（repack 复用现有 Bundle 模型）
 
 | repack 概念 | 引擎实现 | 位置 |
 |-------------|----------|------|
-| 搬迁单元（**P0 默认整 gang 完整搬迁**） | 直接整 gang 重落，靠 INV-RESCHED 保证有新家 | `schedulability.go` |
+| 搬迁单元（**P0 默认整 gang 完整搬迁**） | 直接整 gang 重落，靠 INV-RESCHED 保证有新家 | `core/drain/drain.go` |
 | `disruptionPolicy.bundlePolicy: SurplusPodsOnly`（**P1**） | **`BundleSafe`**（只动 gang 盈余 Pod，不破 `MinAvailable`/`MinSubJobs`） | `actions/utils/bundle.go` |
 | `disruptionPolicy.bundlePolicy: EntireJobPermitted`（**P1**） | **`BundleWhole`**（整 Job 原子搬迁） | 同上 |
-| `scope` 划片（谁能动/冻结） | **`Movable`/`NodeFreeable`/`VictimsOf`**（§4.14.0）；P1 叠加 `ssn.UnifiedEvictable` 插件门控 | `disruption.go` / `framework` |
-| 触发来源标识 | 新增 **`EvictionKindRepack`** | `api/types.go`（现有 `EvictionKindGangPreempt` 等同构扩展） |
-| 模拟 / 提交 / 回滚 | **`ValidatePlan`** + `Statement` `Evict`/`Commit`/`Discard`（先沙箱模拟、达标再原子提交） | `schedulability_engine.go` / `framework/statement.go` |
+| `scope` 划片（谁能动/冻结） | **`Movable`/`NodeFreeable`/`VictimsOf`**（§4.14.0）；P1 叠加 `ssn.UnifiedEvictable` 插件门控 | `api/movability.go` / `framework/scope.go` |
+| 触发来源标识 | Eviction 子资源驱逐（无需自定义 EvictionKind；开环、走标准 Eviction API） | `process.go`（`hooksFor` 注入 Eviction 提交器） |
+| 模拟 / 校验 / 回滚 | **克隆 node + cycle-state → `SimulatePredicateFn` 逐个重落**（`FeasibleRelocation`）；DryRun/Execute 判定期均只读，丢弃克隆即回滚 | `adapter/snapshot_session.go` |
 | 落点提名 | `pod.status.NominatedNodeName`（§4.7.1，软引导） | `actions/utils/util.go` |
 
 > **多层 HyperNode 整理顺序**（需求开放问题 §6.2）：P0 按目标画像所需 tier、沿 `HyperNodeGradientForSubJobFn` 的梯度自底向上搜索（与 gangpreempt 一致）；「按最严重层优先 / 跨层迁移代价计入收益」留 P1。
@@ -1624,11 +1625,11 @@ flowchart TB
 | 被挪 pod 是否要重落 | 否（victim 被抢占即可） | **是**（INV-RESCHED，所有被挪 pod 都要有新家，§4.14.2） |
 | 提交判据 | `JobPipelined` 即提交 | INV-RESCHED 可行 **且** 收益门控达标（§4.13） |
 | 落子 | 同进程 Statement.Commit | 跨进程：Eviction + 主调度 allocate + nomination 引导（§4.7.1） |
-| 模拟原语 | `Statement` Evict/Pipeline/Discard | **同款 `Statement`**，由 repack 的 `ValidatePlan`+`Domain.Feasible` 驱动（§4.14.1） |
+| 模拟原语 | `Statement` Evict/Pipeline/Discard（进程内） | **克隆 node + cycle-state**，用 `ssn.SimulatePredicateFn` 跑完整过滤栈（不用 `Statement`：其 `unPipeline` 置空 `NodeName`，会污染真实状态），§4.14.1 |
 
 #### 4.14.6 整理精修：势函数局部搜索（**P1**，思路记录）
 
-> **本节为 P1 精修思路，非 P0 契约**。P0 用 §4.14.0 的 drain-anchored 构造式贪心即可；本节记录一个可叠加的**局部搜索精修器**（拟实现 `pkg/scheduler/repack/refine.go`），用于捡起构造式贪心因定序错过的多节点协同 consolidation，并天然支持**在线/增量**整理。
+> **本节为 P1 精修思路，非 P0 契约**。P0 用 §4.14.0 的 drain-anchored 构造式贪心即可；本节记录一个可叠加的**局部搜索精修器**（拟实现 `pkg/repackengine/refine.go`），用于捡起构造式贪心因定序错过的多节点协同 consolidation，并天然支持**在线/增量**整理。
 
 ##### 一句话讲清（对外讲解版，不必出现"势函数"三个字）
 
@@ -1812,7 +1813,7 @@ disruptionPolicy:
 #### 4.16.1 复用 Volcano 框架的方式
 
 - repack-engine 用 **`framework.OpenSession(ownCache, tiers, conf)`** 构建自己的 Session（独立进程、自有 cache，§4.5b/需求 §4.5），**直接复用全部既有插件**：`predicates`/`nodeorder`/`binpack`/`resource-strategy-fit`/gang(`SubJobReady`…)/`hypernode`/`pdb` —— 模拟与落点打分天然与主调度一致。
-- 在此之上，repack 插件用 `OnSessionOpen` 注册 **repack 专属扩展函数**；repack 核心库（`pkg/scheduler/repack`）只负责**编排**（度量 → 选 victim → 模拟 → 门控 → 提交），具体口径全走扩展函数的组合结果。
+- 在此之上，repack 插件用 `OnSessionOpen` 注册 **repack 专属扩展函数**；repack 核心库（`pkg/repackengine`）只负责**编排**（度量 → 选 victim → 模拟 → 门控 → 提交），具体口径全走扩展函数的组合结果。
 - 启停与顺序走 **scheduler 配置的 tiers/plugins**（与主调度一致），未启用即零开销。
 
 #### 4.16.2 关键策略点 → 扩展函数 → 默认实现
@@ -1845,12 +1846,12 @@ disruptionPolicy:
 > **注（与落地的关系）**：下面这段伪代码是**早期概念草图**，其 `TargetProfileFn`/`FragmentScoreFn`/`RepackBenefitFn`/`AddDisruptionCostFn` 等已按 §4.16.2「落地口径」收敛为五维插件面。**实际编排**为:`Action`(P0 `repack`) 调选定 `Core`(P0 `drain`) 的 `Plan(ssn)` → 增量破组感知贪心出计划 → `ssn.PlanAdmissible(plan)` 过硬约束闸(内置收益门控 + 插件 constraint) → `LeastDisruptive` 用软打分择优。碎片度量在 `api.MeasureResource`，不再是一个插件 Fn。下图仅存档设计意图。
 
 ```text
-RepackEngine.Run(ssn, scope):                      // pkg/scheduler/repack
+RepackEngine.Run(ssn, scope):                      // pkg/repackengine
   profiles  = ssn.TargetProfileFn(snapshot, scope)            // 可插拔
   before    = ssn.FragmentScoreFn(snapshot, scope, profiles)  // 可插拔（默认空节点口径）
   for domain in HyperNodeGradientForSubJobFn(...):            // 可插拔（拓扑顺序）
     victims = pick by AddDisruptionCostFn 升序 ∩ UnifiedEvictable // 可插拔（代价+资格）
-    plan    = ValidatePlan(...)                               // repack 可调度性预言机
+    plan    = ValidatePlan(...)                               // repack 可调度性检查
     after   = ssn.FragmentScoreFn(plan 应用后快照, ...)        // 可插拔
     if ssn.RepackBenefitFn(before, after, planCost).worth:     // 可插拔（门控）
         (P1) 收集候选 plan，AddRepackPlanScoreFn 取 argmin
@@ -2225,8 +2226,8 @@ sequenceDiagram
 
 #### 4.17.1 两个方案一句话定性
 
-- **方案 A · 节点腾空法（drain-anchored，§4.14.0）**：**自顶向下、以节点为决策单元**。按"腾空成本"挑节点，把它整组负载搬进别处碎片，**整空才提交**。构造式贪心。**已实现**（`orchestrator.go` + 单测，Python 交叉验证）。
-- **方案 B · 集中度法（势函数局部搜索，§4.14.6）**：**自底向上、以负载为决策单元**。从当前态出发，逐 gang 挪到更满的节点，只走"集中度分数 Σused² 涨分"的步，爬山到局部最优。局部搜索。**已实现**（`consolidate.go` + 单测：确定性/无收益/冻结/trim 去 churn/与 A 交叉对照，Python 先行验证）。
+- **方案 A · 节点腾空法（drain-anchored，§4.14.0）**：**自顶向下、以节点为决策单元**。按"腾空成本"挑节点，把它整组负载搬进别处碎片，**整空才提交**。构造式贪心。**已实现**（`core/drain/drain.go` + 单测，Python 交叉验证）——**P0 唯一落地的 Core**。
+- **方案 B · 集中度法（势函数局部搜索，§4.14.6）**：**自底向上、以负载为决策单元**。从当前态出发，逐 gang 挪到更满的节点，只走"集中度分数 Σused² 涨分"的步，爬山到局部最优。局部搜索。**未实现**——仅设计完成，`Core` 接口已留槽位（`core/concentration`），P1 再编码。
 
 > 深层关系：**A 是 B 的"批量特例"**——"腾空一个节点"就是集中度分数的一次大跳变。所以不是两个目标，是**同一目标的两种搜索范式**（构造 vs 局部搜索）。
 
@@ -2293,7 +2294,7 @@ sequenceDiagram
 
 记 **N**=域内节点数，**P**=可动 pod 数（≈C·N，C=每节点 pod 数，常数），**R**=实际搬迁步数（≈O(P)）。
 
-| 维度 | 方案 A（drain，`orchestrator.go`） | 方案 B（集中度，`consolidate.go`） |
+| 维度 | 方案 A（drain，`core/drain/drain.go`，已实现） | 方案 B（集中度，未实现） |
 |------|-----------------------------------|------------------------------------|
 | **核心计算** | 3 排序 × 逐节点 drain，每候选 O(N) 建域 + Feasible → **O(N²)** | steepest-ascent 每步全扫 P×N，共 R 步 → **O(P²·N)=O(C²·N³)** |
 | **最坏情况** | Feasible 回溯**理论指数**（对抗性非 2 幂），常态 ≈O(1) | **纯多项式、无指数爆炸**，但次数高 |
@@ -2577,7 +2578,7 @@ flowchart TB
     subgraph L2["L2 控制面 + 执行面"]
         CTRL["Repack Controller<br/>提名 reconciler · RunGC（+P1 Policy 生成）"]
         VR["volcano-repack-engine 容器<br/>常驻 · watch Run only"]
-        LIB["pkg/scheduler/repack<br/>Engine · EvictionCommitter"]
+        LIB["pkg/repackengine<br/>Engine · EvictionCommitter"]
     end
 
     subgraph L3["L3 调度底座 · 库级复用"]
@@ -2729,7 +2730,7 @@ flowchart LR
         GC[RunGC / TTL]
     end
 
-    subgraph LIB["pkg/scheduler/repack"]
+    subgraph LIB["pkg/repackengine"]
         FD[FragmentationDetector]
         ENG[Engine]
         EVC[EvictionCommitter]
@@ -2920,7 +2921,7 @@ flowchart TB
         VS --> JOB
     end
 
-    CORE[pkg/scheduler/repack]
+    CORE[pkg/repackengine]
     CM -.-> CORE
     VR -.-> CORE
     VS -.->|allocate only| CORE
@@ -2945,8 +2946,8 @@ flowchart TB
 | 提名 reconciler | `pkg/controllers/repack` | Run.status.nominations | patch Pod nominatedNodeName |
 | RunGC / TTL | `pkg/controllers/repack` | RepackRun | delete Run |
 | volcano-repack-engine loop | `cmd/volcano-repack-engine` | RepackRun.spec | RepackRun.status |
-| Engine | `pkg/scheduler/repack` | RepackRun.spec | — |
-| FragmentationDetector | `pkg/scheduler/repack` | Session | — |
+| Engine | `pkg/repackengine` | RepackRun.spec | — |
+| FragmentationDetector | `pkg/repackengine` | Session | — |
 
 **边界**：Controller **不驱逐**；**volcano-repack-engine 不读 RepackPolicy**；**volcano-scheduler 不碰 Repack CR**。
 
@@ -3030,14 +3031,14 @@ P0 为 **Execute 全局 K=1 + `executeCooldown`**（§4.5.5）。规划方向：
 |------|------|
 | Repack Controller + Admit | `pkg/controllers/repack/` |
 | **volcano-repack-engine** 入口 | `cmd/volcano-repack-engine` |
-| 共享核心库 | `pkg/scheduler/repack/`（Engine；与主 scheduler 库级复用） |
-| 模拟计划 / 落点匹配 | `pkg/scheduler/repack/schedulability_engine.go::ValidatePlan` + `schedulability.go::Domain.Feasible`（`Statement` 沙箱模拟） |
+| 共享核心库 | `pkg/repackengine/`（Engine；与主 scheduler 库级复用） |
+| 模拟计划 / 落点匹配 | `pkg/repackengine/schedulability_engine.go::ValidatePlan` + `schedulability.go::Domain.Feasible`（`Statement` 沙箱模拟） |
 | 事务提交 / 回滚 | `pkg/scheduler/framework/statement.go`（`SaveOperations`/`RecoverOperations`/`Commit`/`Discard`） |
 | Bundle 语义（SurplusPodsOnly/EntireJob） | `pkg/scheduler/actions/utils/bundle.go`（`BundleSafe`/`BundleWhole`） |
 | victim 资格门控 | `framework`：`ssn.UnifiedEvictable` + 新增 `EvictionKindRepack`（`api/types.go`） |
 | 候选域 / 提名 | `utils.GetCandidateDomains` / `utils.ApplySubJobNominations` |
 | HyperNode 多层 | `api/hyper_node_info.go`（`hyperNodesSetByTier`/`realNodesSet`）；`ssn.HyperNodeGradientForSubJobFn` |
-| 碎片度量 / 收益（新增） | `pkg/scheduler/repack/`：`FragmentationDetector`（§4.12）+ 收益门控（§4.13） |
+| 碎片度量 / 收益（新增） | `pkg/repackengine/`：`FragmentationDetector`（§4.12）+ 收益门控（§4.13） |
 | 参考 action | `pkg/scheduler/actions/gangpreempt/gangpreempt.go` |
 | Gang 设计 | [gang-aware-eviction-design.md](./gang-aware-eviction-design.md) |
 
@@ -3049,7 +3050,7 @@ P0 为 **Execute 全局 K=1 + `executeCooldown`**（§4.5.5）。规划方向：
 | **`volcano-repack-engine`**（**独立 Pod**） | **`RepackRun` only** | DryRun/Execute 引擎、写 status、Eviction API |
 | **volcano-scheduler**（现网，**不扩展 Repack**） | Pod / Job / Node 等 | 正常调度；驱逐后 **allocate** 重排 |
 
-一套核心库（`pkg/scheduler/repack`）、**三个进程**（Controller / **volcano-repack-engine** / volcano-scheduler）；**跨进程契约是 `RepackRun`**。
+一套核心库（`pkg/repackengine`）、**三个进程**（Controller / **volcano-repack-engine** / volcano-scheduler）；**跨进程契约是 `RepackRun`**。
 
 ---
 
@@ -3244,7 +3245,7 @@ type RepackRunStatus struct {
 1. **Repack 与 gangpreempt 同周期互斥**：是否禁止同一 Session 内既抢占又 Repack？
 2. **Controller 与 Scheduler 抢 Run**：多 scheduler 副本时，谁将 `Pending` 置为 `Running`（Lease / annotation）？
 3. ~~**收益函数默认值**~~ **已定稿（§4.13.2）**：P0 门控 = 可行 && (解开≥`relief.minRelieved`(默认1) 或 `−ΔWeightedFragRate`≥`minFragRateImprovement`) && 预算内；效率项 P1。剩余待定：阈值默认值随实测调参。
-4. ~~**收益口径与 `WeightedFragRate` 对齐**~~ **已定稿（§4.12、§4.13）**：度量、收益、模拟共用同一可调度性预言机（`ValidatePlan`/`Domain.Feasible`），口径统一；待定：多维背包精度（P0 GPU 单维近似 → P1 全维）。
+4. ~~**收益口径与 `WeightedFragRate` 对齐**~~ **已定稿（§4.12、§4.13）**：度量、收益、模拟共用同一可调度性检查（`ValidatePlan`/`Domain.Feasible`），口径统一；待定：多维背包精度（P0 GPU 单维近似 → P1 全维）。
 9. **目标画像冷启动**：`PendingAndDefault` 中 default 画像集如何取默认、是否随集群规格自适应（§4.12.1）。
 10. **中断代价信号获取**：`disruptionScore` 依赖的运行时长 / checkpoint 友好度 / 恢复耗时，部分需业务侧注解配合（§4.13.3）。
 11. **PDB 插件改造为上游前置**：§4.13.4 模拟期过滤依赖给 `pdb` 插件补注册 `UnifiedEvictableFn`——这是对 Volcano 主仓的改动（同时惠及 gangpreempt/gangreclaim），需作为独立 PR 推进；在其落地前 repack 仅靠执行期 Eviction 子资源兜底（功能正确但可能多一次"模拟通过却被 429"的浪费）。
@@ -3262,6 +3263,7 @@ type RepackRunStatus struct {
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v11.0** | 2026-07-10 | **架构 pivot 定稿：可行性从 `Statement` 沙箱改为克隆式 `SimulatePredicateFn` 可行性检查**。早期设计想复用 gangpreempt 的 `framework.Statement`(Evict/Pipeline/Commit/Discard)做沙箱模拟,但 `Statement.unPipeline` 会把 `task.NodeName` 置空——对同一 pod evict+pipeline+discard 会污染真实状态,不能用于 repack。**实际落地**改为:`Snapshot.FeasibleRelocation` **克隆** node 副本 + cycle-state 副本,用调度器**完整过滤栈** `ssn.SimulatePredicateFn`(收编了原 preempt 精简版 `SimulatePredicateFn`,现跑全量 filter)逐个模拟重落,丢弃克隆即回滚。`schedulability_engine.go`(`ValidatePlan`/`EngineFit`)已成空壳(待 `git rm`);`api/schedulability.go` 的 `Domain.Feasible` 降为**仅单测 fake 复用的参考求解器**,不在生产路径。**同步刷新**:§4.7.0 复用表、§4.14 全段(沙箱心智模型/三原语/INV-RESCHED/端到端流程/victim 映射/与 gangpreempt 对照)、全文路径 `pkg/scheduler/repack`→`pkg/repackengine`、`session/`→`adapter/`、`orchestrator.go`→`core/drain/drain.go`,并纠正**算法 B(集中度/`consolidate.go`)"已实现"为事实错误→改标未实现(仅设计、`core/concentration` 留槽,P1)**。proposal(`repack-runtime-defragmentation.md`)机制段同批对齐。**待办**:§4.16.6/§4.17.0 的引擎接线与 A/B 时序图、§5 架构图仍建立在旧 `PlanRun(snap,algorithm,EngineParams)`+双 planner 注册表框架上(现实为 `RunActions→Core.Plan` 单 Core),属结构性重写,尚未完成 |
 | **v10.12** | 2026-07-08 | **移除「Execute 必须带非空 scope」CEL 约束**：原规则要求 `mode=Execute` 时 `scope.podGroups.include` 或 `scope.nodes.include` 至少一条非空(禁止全集群 Execute)。经评审,该约束与"空=全部"的统一语义相冲突、并造成 DryRun→Execute 转换摩擦(spec 不可变,需新建 CR 时被迫补 scope);而迁移规模本就由引擎计划兜底(`maxPerRun`/cooldown/K=1/PDB)。**决定直接去掉**:两种 mode 下 scope 均可省略=全集群。改动:①删 `RepackRunSpec` 的 XValidation marker;②从 4 份生成 CRD yaml(config + helm 的 repackruns/repackpolicies)剔除该 CEL,并清理 RepackPolicy 模板下遗留的空 `x-kubernetes-validations`;③同步 `state.go`/applyconfiguration/design 文档(§CEL 块 + 两处散文)注释。仅 `self==oldSelf` 不可变规则保留。**待用户本地 `make manifests` 复核生成一致** |
 | **v10.11** | 2026-07-08 | **命名风格对齐 + 消除魔鬼数字**：① **魔鬼数字→具名常量**:扰动评分权重(`weightAffectedPodGroups/MovedResource/MovedPods=1.0/0.3/0.1`、`weightGangBreaches/DamagedGPU=0.8/0.6`)、drain 接收方偏好层(`preferDrainable=1`/`preferStaying=2`)、`defaultNominationTTL=10m`、cmd 侧 `defaultHealthzAddress/MetricsAddress/ExecuteCooldown/NominationTTL/ResyncPeriod`。② **命名对齐 Volcano/云原生风格**:引擎会话 `esn`→`engineSsn`(与 Volcano `ssn` 对齐,和调度器会话 `sched` 区分);布尔谓词 `candidate()`→`isCandidate()`(Go `is/has` 惯例)。`ssn`/短 receiver 等本就符合 Volcano 约定,保留;`supportedTarget` 保留(与既有单测一致)。评分权重加注释说明 P0 默认值语义(P1 由 disruptionPolicy 覆盖) |
 | **v10.10** | 2026-07-08 | **全量代码检视（3+轮）修复**：① **关键 bug——`NodeFreeable` 全任务判定**：调度器 cache 把节点上**每个** pod(含系统 DaemonSet:kube-proxy/CNI)都加进 `NodeInfo.Tasks`,而它们无 PodGroup→不可迁移;原 `NodeFreeable` 要求"所有 task 可迁移"→**任何真实加速卡节点都不可腾空→生产环境 repack 恒空操作**。改为**只看申请目标卡的 task**(`NodeFreeable`/`VictimsOf` 加 `res` 参数,`Scalar(t.InitResreq,res)>0` 才计入);"腾空"=腾出加速卡而非清空节点,系统 pod 留在原地。加回归测试 `TestDrain_SystemPodDoesNotBlockFreeing`。② **`BelowGoalThreshold` 不可达**:nil plan 时 `RenderReport` 的 `FragRateBefore=0`,使"有碎片但无收益计划"被误判 `NoFragmentation`。加 `Session.CurrentFragRate()`,action 在无 plan 时补测当前碎片率→可区分。③ **死代码**:`adapter/schedulability_engine.go`(`ValidatePlan`/`EngineFit`)未被引用、与实际 drain 路径分叉→标注为 P1 保留(并记录其 `PrePredicateFn` 是 P0 drain 未覆盖的可行性缺口);`Report` 删 4 个无消费死字段(`RecommendedPodGroups`/`RecommendedNodes`/`Benefit`/`MovedPods`)+ `sort` import。④ 小整理:`process` 里 `esn.Commit()` 由 3 次取值合并为 1 次。检视亦确认可接受项:drain 候选 plan 重建/nominate 匹配的 O(N²)(P0 规模小、评分/匹配模型固有)、event broadcaster 不 Shutdown(随进程退出)、ctx 未透传 process(单 worker 同步、优雅退出靠循环收尾) |
@@ -3282,7 +3284,7 @@ type RepackRunStatus struct {
 | **v9.74** | 2026-06-25 | **补齐 nominate 两个硬问题（§4.7.1.2）**：(1) **谁给重建 pod 打提名**——点破"驱逐前给 victim 打提名零作用"(旧 pod 随驱逐消亡、新 pod 空 status 且身份无链接)，且 gang 内同 role pod 可互换→提名只能 **gang+role 意图级**；P1 方案=**durable 提名意图(`RepackRun.status.nominations[]` 或 PodGroup 注解)+ 引擎侧提名 reconciler(watch pending pod→patch `NominatedNodeName`→重申至绑定/`nominationTTL` 到期)**；P0 不打、靠自稳定。(2) **优雅删除窗口(秒～10min)**——`Releasing/FutureIdle` 只桥接 preempt(抢占者已存在)、桥接不了 recreate(重建 pod 窗口期不存在)→ 出现"空位真空期"，**无 Reservation 下长窗口覆盖不住**；缓解=`maxGracePeriodForRepack` 护栏(规避长优雅期作业)+ 限时意图 + 承认漂移 + P1 软保留窄化；根治需 Reservation(明确不做)。阶段裁剪表加护栏/reconciler/软保留行 |
 | **v9.73** | 2026-06-25 | **Execute 落子（nominate/驱逐）提交契约落地（§4.7.1.1 + `apply.go`）**：把 §4.7.1 概念落成可实现契约——`CommitHooks{Evict(必填), Nominate(P1)}` + `CommitPlan(plan, hooks) → CommitResult{Evicted/Failed/Nominated}`；P0 算法=**提名先行(P0 为空,relief P1 才有 pending 目标)→ 开环驱逐(腾空源优先+task 名稳定序,失败只记不回滚)→ 结果交控制器渲染 status.result**;漂移由后续观测落点核对(结果导向)。纯编排、注入副作用,**CRD/framework 无关、fake 钩子可单测**(排序/部分失败/无提名/nil plan/缺 Evict 报错)。唯一剩边缘层=`Evict`/`Nominate` 钩子的真实实现(Eviction API+status patch)。`RunOnce` 的 `apply` 即包 `CommitPlan` |
 | **v9.72** | 2026-06-25 | **装配入口 `RunOnce` 落地（`runtime/runonce.go`）**：把"一个 RepackRun 在已开 Session 上跑完"串起来——`BuildEngineParams`(纯函数:`goals[0]→Resource`/缺省回退、`scope→ResolveScope→InScope/NodeInScope`、`maxPerRun.{podGroups,resources[R]}→MaxPodGroups/MaxResource`) + `RunOnce`(`NewSessionSnapshot`→组 `ActionContext`→`RunActions`;DryRun 出 `Report`、Execute 经注入 `apply` 落子,与驱逐/nominate 机制解耦)。`BuildEngineParams` 与 Session 解耦、fake `GangInfo` 单测(goals/缺省/无资源报错/坏 scope 报错/maxPerRun 映射/InScope 生效)。§4.16.6 加"装配入口"说明 |
-| **v9.71** | 2026-06-25 | **scope selector 解析落地（`runtime` 包）**：新增 `pkg/scheduler/repack/runtime/scope.go` 的 **`ResolveScope`**——把 `RepackRun.spec.scope`(podGroups/nodes × include/exclude × **LabelSelector+names**) 编译成 `InScope(JobID)`/`NodeInScope(*NodeInfo)` 谓词喂 `EngineParams`；语义 `included(空=全)∪names∪selector AND NOT excluded`、**exclude 优先**、selector 一次编译(坏 selector=resolve 期报错)。节点标签取 `NodeInfo.Node.Labels`，gang 标签经 `GangInfo` 抽象(生产实现 `SessionGangInfo` 从 `ssn.Jobs[].PodGroup` 取 ns/name+labels，隔离单文件)。**核心 `scope.go` 纯净无 framework 依赖**，纯 fake 可测。单测 `scope_test.go`(nil=全域/节点 selector+exclude 优先/PG names/include 并集/坏 selector 报错)。§4.16.6 接线表 scope 行同步指向 `ResolveScope` |
+| **v9.71** | 2026-06-25 | **scope selector 解析落地（`runtime` 包）**：新增 `pkg/repackengine/runtime/scope.go` 的 **`ResolveScope`**——把 `RepackRun.spec.scope`(podGroups/nodes × include/exclude × **LabelSelector+names**) 编译成 `InScope(JobID)`/`NodeInScope(*NodeInfo)` 谓词喂 `EngineParams`；语义 `included(空=全)∪names∪selector AND NOT excluded`、**exclude 优先**、selector 一次编译(坏 selector=resolve 期报错)。节点标签取 `NodeInfo.Node.Labels`，gang 标签经 `GangInfo` 抽象(生产实现 `SessionGangInfo` 从 `ssn.Jobs[].PodGroup` 取 ns/name+labels，隔离单文件)。**核心 `scope.go` 纯净无 framework 依赖**，纯 fake 可测。单测 `scope_test.go`(nil=全域/节点 selector+exclude 优先/PG names/include 并集/坏 selector 报错)。§4.16.6 接线表 scope 行同步指向 `ResolveScope` |
 | **v9.70** | 2026-06-25 | **repack-engine action 架构落地：P0 单 action、多 action 可演进（§4.16.4.1 + `actions.go`）**（回应：架构要支持多 action 演进，如 relief/调度模拟器）：镜像 scheduler `action+registry+有序流水线`——`Action` 接口(`Name`/`Execute`)、`ActionContext` 共享黑板(**CRD/framework 双解耦**：`EngineParams`/`Snapshot` + `Apply` 闭包)、`RegisterAction`/`RunActions`/`DefaultActions`；P0 注册唯一 `repack` action(度量→A/B 规划→report/Execute 经 Apply 落子)。未来 `relief`(§4.14.2 相位1)/`simulate`(调度 what-if) 只注册+进配置顺序,不动 runner。单测 `actions_test.go`(注册表/DryRun 不 Apply/Execute 落子/NoRepackNeeded/坏算法报错/未知 action 报错);零 framework 依赖、纯 `fakeSnapshot` 可测 |
 | **v9.69** | 2026-06-25 | **repack-engine 读取 `volcano-scheduler` 同一份插件配置（保证过滤原则一致）**：§4.7.0 复用点表加 `--scheduler-conf`+`UnmarshalSchedulerConf` 行——engine 指向**同一个 `volcano-scheduler-configmap`**、用**同一解析函数**得到 `tiers`/`configurations` 喂 `OpenSession`，predicate 过滤（亲和/污点/拓扑/NUMA/设备）与调度器**同源同演进、自动跟随**；明确**只复用 tiers/configurations、忽略 actions**（repack 有自己的 planner，纯 allocate/order 插件函数不被触发，复用安全） |
 | **v9.68** | 2026-06-25 | **架构定稿：独立部署但复用 scheduler 框架与插件（§4.7.0）**：明确 `volcano-repack-engine` 独立进程，但**复用 `schedcache.New`+`framework.OpenSession(tiers,conf)`+插件 tiers**（同名同义 predicate）+`framework.Statement`，**不自建 node/job 缓存、不重写 predicate**，避免重复开发与演进不兼容。生产 `Snapshot` 实现即 `SessionSnapshot`（包 `OpenSession` 得到的 Session）；repack-engine = "只跑 repack、不 allocate/bind 的迷你调度器"。新增 §4.7.0(复用点表 + 时序图)，修正 v9.67 中"自建 informer 快照"说法 |
@@ -3303,7 +3305,7 @@ type RepackRunStatus struct {
 | **v9.53** | 2026-06-25 | **补 AI 场景多目标碎片整理（泛化框架 + NVLink + 超节点，实现 P1）**：① §4.15.5 **三轴框架**——目标粒度(整node/NVLink island/HyperNode 内 k-node 块)×目标形状(全局最大/每域配额/拓扑相干块)×整理域(全域/逐HyperNode/逐island);P0=〈整node×全局最大×全域〉为特例;② §4.15.6 **NVLink 节点内拓扑整理**——资源带节点内拓扑、Fit NVLink 感知、把整理下沉到 island 粒度(A=drain island/B=island 粒度 Σused²);③ §4.15.7 **超节点维度整理**——不腾空整超节点,而是**每 HyperNode 内腾 k 或其倍数空 node**,目标形状=每域配额、域=逐HyperNode、门控按域(A=drain 到 k 倍数即停/B=per-domain k 对齐门控);均映射到既有 §4.16 扩展点(FragmentScoreFn/RepackBenefitFn/TargetProfileFn+域枚举),主干与 A/B 算法不变;§4.16.2、§4.12.2a KPI 表同步加"特例/泛化"注 |
 | **v9.52** | 2026-06-25 | **§4.17 补"复杂度与性能"(§4.17.8) + "可运维性与可定位性"(§4.17.9)**：① 复杂度——A≈O(N²)(分配重、回溯尾险)、B 朴素≈O(N³)(计算重、GC 友好);附 Python 实测增长(N50→400,B/A 37×→602×) + 优化路径(B 增量重评分+堆→O(R·N);A 账本复用→O(N)分配);实践=离线周期+按域分片 N 小,两者亚秒,整集群单次大规模 B 需先优化;② **可运维/可定位:A 显著更优**——动作单元=节点=cordon/drain 心智模型、每 move 自带"为腾哪个节点"理由、零配置、故障半径有界、契合维护窗口;B 的统一打分/可调权重/在线是平台级优势但对一线 SRE 是负担。**商用倾向:P0 重运维选 A,B 留作 P1 演进引擎**。§4.17.7 倾向性建议同步加"大规模商用且重运维→路线一" |
 | **v9.51** | 2026-06-25 | **方案B 补"提交前裁剪"消除无效腾挪**（回应评审场景：B用6→4卡pod挪A、C的4卡挪B 腾空C 但 B 的业务被无效搬迁）：`consolidate.go` 爬山收敛后新增 `trimRedundantMoves`——按每 task **净位移**(原节点→最终节点)重建，再贪心**撤销"源非腾空节点且能放回原处"的位移**(纯 Φ-churn、对腾空无贡献)，迭代到不动点；保证已腾空集合不变、无超分、**零冗余 move**。新增 `TestConsolidate_NoChurn`(fragCluster + 2000 随机碎片) 断言"非腾空源的 move 必不可放回";Python 交叉验证 4626 随机计划**残留冗余 churn=0**。注：steepest-ascent 的"腾空=最大增益"本就使常见场景不产生 churn，trim 是异构极端下的兜底，使 B 在"零无效腾挪"上与方案A(原子提交)持平 |
-| **v9.50** | 2026-06-25 | **全文清除幽灵函数引用**：把正文中所有不存在的 `BuildNominationPlanInDomain`（§4.5 选择单元、§4.12.1 预言机、§4.13 门控、§4.15.3/§4.16.3 编排骨架、§5 时序/架构图、§9/§11 引擎对接表等共 12 处）统一改为真实实现 **`ValidatePlan` + `Domain.Feasible`（`Statement` 沙箱）**；并清掉另两处幽灵符号——`actions/utils/simulate.go`→`pkg/scheduler/repack/`、`runSimulateTrialAtHyperNode`→`Fit`/predicate 阶段。仅修订记录里的历史描述保留原字样 |
+| **v9.50** | 2026-06-25 | **全文清除幽灵函数引用**：把正文中所有不存在的 `BuildNominationPlanInDomain`（§4.5 选择单元、§4.12.1 可行性检查、§4.13 门控、§4.15.3/§4.16.3 编排骨架、§5 时序/架构图、§9/§11 引擎对接表等共 12 处）统一改为真实实现 **`ValidatePlan` + `Domain.Feasible`（`Statement` 沙箱）**；并清掉另两处幽灵符号——`actions/utils/simulate.go`→`pkg/repackengine/`、`runSimulateTrialAtHyperNode`→`Fit`/predicate 阶段。仅修订记录里的历史描述保留原字样 |
 | **v9.49** | 2026-06-25 | **集中度算法(方案B)初稿落地 `consolidate.go` + 单测；修正 ΔΦ 公式 typo**：① 实现 `Consolidate`(steepest-ascent 爬 Φ=Σused²、整数严格涨分、稳定排序+稳定 tiebreak 保确定性、防瞎搬 MinNodesFreed 闸门、frozen/优先级硬地板、λ+整数权重摩擦)；`ConcentrationGain(cards,usedFrom,usedTo)=2·cards·(cards+usedTo−usedFrom)`；复用 `RepackPlan`/`MeasureResource`/`CostOf`；② 单测：4 节点腾 2、**30 次打乱输入 moves 逐字节一致(确定性)**、无收益→NoRepackNeeded、frozen/优先级地板、**与方案A(`BuildPlan`)3000 例交叉对照腾出节点数持平**；Python 先行交叉验证(确定性/无收益/冻结/vs-A 全过)；③ **修 §4.14.6/§4.16.5 ΔΦ 公式**——原写成 `2g(g+used_D−(used_S−g))` 多了一个 g，正确为 **`2g(g+used_D−used_S)`**(代码实现时发现) |
 | **v9.48** | 2026-06-24 | **配图落库并内嵌**：交流过程中的三张图存为独立 SVG（颜色内联、GitHub/浏览器/PPT 直接可渲染）置于 `docs/design/images/repack/`——`defrag-before-after.svg`(§4.14.0 整理前后效果)、`concentration-score.svg`(§4.14.6 集中度分数讲解)、`algorithm-selection.svg`(§4.17 评审一页图 A vs B)；三处章节内嵌 `![](images/repack/*.svg)`；加 `images/repack/README.md` 索引 |
 | **v9.47** | 2026-06-24 | **新增 §4.17 整理算法方案对比与选型（评审决策材料）**：系统对比方案 A(节点腾空 drain-anchored，已实现) vs 方案 B(集中度/势函数局部搜索，设计完成待编码)——一句话定性 + 多维对比表(决策单元/对KPI/效果上限/2幂场景实际差距/扰动可控/确定性/thrashing/可解释/在线增量/INV-RESCHED复杂度/实现状态) + 收益性分析(理论上限同受 A 约束、目标场景差距可忽略、收益/扰动比) + 实现复杂度表 + 可演进性(B 统一插件化净分明显占优) + 风险与适用场景 + **三条选型路线(只A/只B/A基线+B精修)** 及倾向性建议(抉择点=快速稳妥 vs 统一可演进，非"谁腾的多")。点明 A 是 B 的批量特例、同一目标两种搜索范式 |
@@ -3369,7 +3371,7 @@ type RepackRunStatus struct {
 | **v9.16** | 2026-06-18 | **P0 面向异构加速资源**：碎片度量从 GPU 专用泛化为**逐目标资源**（GPU/NPU/…，`criteria.targetResources` 可配置、留空自动探测）；引擎统一以 `Resource.ScalarResources[R]` 建模，算法对资源名无感；主 KPI 改为逐资源 `(B_R−A_R)/M_R` 经 `FragWeightFn` 合成，GPU/NPU 互不混淆（各自 `M_R/B_R/A_R` 仅在提供该资源的节点上算）；2 的幂闭式 A 与资源类型无关；Go 类型 `DominantResource→TargetResources []`、`TargetProfile.Resource`；§4.4 配置、§4.12.2/2a、§4.9 阶段裁剪、§1 摘要 14/15 同步 |
 | **v9.15** | 2026-06-18 | **A 精确化（产品前提）**：§4.12.2a 增「2 的幂申请」产品约束 C1–C3——AI 负载 GPU 申请为 2 的幂构成整除链，可无碎片铺满 2 的幂节点容量，**FFD 必达最优、体积下界即精确值**，A 退化为 **O(n) 闭式**（≥整机任务占整数节点 + 子节点任务体积装箱），NP-hard 消失、虚高碎片消除；C3 不成立时回退逐维下界取 max；开放问题 #13 据此收口 |
 | **v9.14** | 2026-06-18 | **主 KPI 定稿**：`WeightedFragRate` = **空节点整合 `(B−A)/M`**（集群级、跨时间/集群可比、利好 autoscaler），`(B−A)/B` 降为辅助视角；§4.12.2/§4.12.2a、§4.13 门控求差对象、§1 摘要、开放问题 #13 同步收口（仅余 A 下界紧度待定） |
-| **v9.13** | 2026-06-18 | **碎片率空节点口径 + 策略插件化**：① **§4.12.2a 空节点整合口径** `(B−A)/M`（A=理论最优占用节点数）——评估为合理的「节点整合/降本」KPI，落实三注意点：A 是 NP-hard 故取**约束感知下界 + FFD**、装箱须尊重 gang/拓扑（复用 `Feasible` 预言机）、低利用率稀释故并出 `(B−A)/B`；与画像/HyperNode 可调度口径**互补并存**；② **§4.16 策略扩展框架**——repack 全程沿用 Volcano **action+plugin**：关键策略点暴露为 `ssn.AddXxxFn`（`FragmentScoreFn`/`FragWeightFn`/`RepackBenefitFn`/`TargetProfileFn`/`DisruptionCostFn`/`RepackPlanScoreFn`），repack-engine 用 `framework.OpenSession(ownCache,tiers,conf)` 复用全部既有插件、核心库只编排不写死口径；「整理效果评估」=`FragmentScoreFn`+`RepackBenefitFn` 两个扩展点；③ 同步 §4.9 阶段裁剪、§1 摘要第 13/14 条 |
+| **v9.13** | 2026-06-18 | **碎片率空节点口径 + 策略插件化**：① **§4.12.2a 空节点整合口径** `(B−A)/M`（A=理论最优占用节点数）——评估为合理的「节点整合/降本」KPI，落实三注意点：A 是 NP-hard 故取**约束感知下界 + FFD**、装箱须尊重 gang/拓扑（复用 `Feasible` 可行性检查）、低利用率稀释故并出 `(B−A)/B`；与画像/HyperNode 可调度口径**互补并存**；② **§4.16 策略扩展框架**——repack 全程沿用 Volcano **action+plugin**：关键策略点暴露为 `ssn.AddXxxFn`（`FragmentScoreFn`/`FragWeightFn`/`RepackBenefitFn`/`TargetProfileFn`/`DisruptionCostFn`/`RepackPlanScoreFn`），repack-engine 用 `framework.OpenSession(ownCache,tiers,conf)` 复用全部既有插件、核心库只编排不写死口径；「整理效果评估」=`FragmentScoreFn`+`RepackBenefitFn` 两个扩展点；③ 同步 §4.9 阶段裁剪、§1 摘要第 13/14 条 |
 | **v9.12** | 2026-06-18 | **选择单元改为 PodGroup（更通用）**：scope 圈选对象从「Volcano Job」泛化为 **PodGroup**——依据引擎 `api.JobInfo.UID = "<pg.ns>/<pg.name>"`（`getJobID(pg)`），覆盖 vcjob/原生/Kubeflow 等所有 gang 负载，且 `podGroupRefs` 即引擎 `JobID` 无歧义。字段全量改名：`jobSelector→podGroupSelector`、`jobRefs→podGroupRefs`、`excludedJobSelector→excludedPodGroupSelector`、`objective.pendingJobRefs→pendingPodGroupRefs`、`limits.maxRepackedJobs→maxRepackedPodGroups`、report/result `recommendedJobs→recommendedPodGroups`/`repackedJobs→repackedPodGroups`/`jobRef→podGroupRef`/`relief[].pendingJobRef→pendingPodGroupRef`，及对应 Go 类型；§6/§7/§8 v5 历史段保留原字段名 |
 | **v9.11** | 2026-06-18 | **P0 PDB 兼容 + P1 扩展规划**：① **§4.13.4 PDB 兼容（P0）**——实证两前提（现有 `pdb` 插件只挂旧 `VictimTasksFn` 不入 `UnifiedEvictable`；主调度 evictor 走裸 delete 不强制 PDB），定两层方案：扩展 `pdb` 插件注册 `UnifiedEvictableFn` 使模拟期过滤流入 repack/gangpreempt，执行期 Committer 用 **Eviction 子资源** 服务端兜底；Policy 增 `constraints.respectPDB`；② **§4.15 P1 扩展规划（设计预留）**——多级 HyperNode 拓扑（逐层 metrics/整理顺序/跨层代价）、队列配额感知（victim 不破 guarantee、偏好超配队列、跨队列双侧校验）、最优成本整理（有界搜索 + `criteria.optimize`/`costWeights`/`maxCandidatePlans`）、单作业抗反复中断（`perJobRepackBudget` 计数+冷却，注入 `UnifiedEvictableFn`，与集群 `executeCooldown` 正交）；③ 同步 Go 类型（`DisruptionBudget`/`PerJobRepackBudget`）、§4.9 阶段裁剪、§1 摘要第 11/12 条 |
-| **v9.10** | 2026-06-18 | **新增 §4A 引擎设计（系统性补齐算法核心）**：① **§4.12 碎片整理指数**——以「目标画像」为参照，Node/HyperNode{tier}/Weighted 三层口径，复用同一可调度性预言机；Policy 增 `criteria.profiles`/`dominantResource`；② **§4.13 收益门控**——「效果有限就不整理」，阈值式（解开 pending / 碎片改善）+ `disruptionScore` 中断代价分，不达标 `NoRepackNeeded`；Policy 增 `goals`；③ **§4.14 PodGroup↔Node 模拟匹配**——pipeline 落点本质、repack 双向匹配（相位 1 腾空 + 相位 2 自稳定）、端到端流程图、victim 选择映射到 `BundleSafe/BundleWhole`+`UnifiedEvictable`+`EvictionKindRepack`，与 gangpreempt 对照；全部 grounded 到 `simulate.go`/`statement.go`/`bundle.go`/`hyper_node_info.go`；④ 同步 Go 类型、§4.9 阶段裁剪、§11 锚点、开放问题 #3/#4 收口、§1 摘要第 10 条 |
+| **v9.10** | 2026-06-18 | **新增 §4A 引擎设计（系统性补齐算法核心）**：① **§4.12 碎片整理指数**——以「目标画像」为参照，Node/HyperNode{tier}/Weighted 三层口径，复用同一可调度性检查；Policy 增 `criteria.profiles`/`dominantResource`；② **§4.13 收益门控**——「效果有限就不整理」，阈值式（解开 pending / 碎片改善）+ `disruptionScore` 中断代价分，不达标 `NoRepackNeeded`；Policy 增 `goals`；③ **§4.14 PodGroup↔Node 模拟匹配**——pipeline 落点本质、repack 双向匹配（相位 1 腾空 + 相位 2 自稳定）、端到端流程图、victim 选择映射到 `BundleSafe/BundleWhole`+`UnifiedEvictable`+`EvictionKindRepack`，与 gangpreempt 对照；全部 grounded 到 `simulate.go`/`statement.go`/`bundle.go`/`hyper_node_info.go`；④ 同步 Go 类型、§4.9 阶段裁剪、§11 锚点、开放问题 #3/#4 收口、§1 摘要第 10 条 |

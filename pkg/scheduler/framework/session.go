@@ -146,7 +146,6 @@ type Session struct {
 	simulateRemoveTaskFns         map[string]api.SimulateRemoveTaskFn
 	simulateAddTaskFns            map[string]api.SimulateAddTaskFn
 	simulatePredicateFns          map[string]api.SimulatePredicateFn
-	simulateFilterFns             map[string]api.SimulateFilterFn
 	simulateAllocatableFns        map[string]api.SimulateAllocatableFn
 	subJobReadyFns                map[string]api.ValidateFn
 	subJobPipelinedFns            map[string]api.VoteFn
@@ -219,7 +218,6 @@ func openSession(cache cache.Cache) *Session {
 		simulateRemoveTaskFns:         map[string]api.SimulateRemoveTaskFn{},
 		simulateAddTaskFns:            map[string]api.SimulateAddTaskFn{},
 		simulatePredicateFns:          map[string]api.SimulatePredicateFn{},
-		simulateFilterFns:             map[string]api.SimulateFilterFn{},
 		simulateAllocatableFns:        map[string]api.SimulateAllocatableFn{},
 		subJobReadyFns:                map[string]api.ValidateFn{},
 		subJobPipelinedFns:            map[string]api.VoteFn{},
