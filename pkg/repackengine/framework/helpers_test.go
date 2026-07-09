@@ -31,17 +31,16 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 type fakeSnap struct {
 	nodes []*schedapi.NodeInfo
 	views map[schedapi.JobID]api.PodGroupView
-	pred  func(*schedapi.TaskInfo, *schedapi.NodeInfo) error
 }
 
 func (f *fakeSnap) Nodes() []*schedapi.NodeInfo                     { return f.nodes }
 func (f *fakeSnap) NodeInScope(*schedapi.NodeInfo) bool             { return true }
 func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView { return f.views[id] }
-func (f *fakeSnap) Predicate(t *schedapi.TaskInfo, n *schedapi.NodeInfo) error {
-	if f.pred != nil {
-		return f.pred(t, n)
-	}
-	return nil
+
+// FeasibleReschedule is not exercised by the framework-level tests (they cover
+// session plumbing, not the drain core), so this is an inert stand-in.
+func (f *fakeSnap) FeasibleReschedule([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	return nil, false
 }
 
 func node(name string, labels map[string]string) *schedapi.NodeInfo {

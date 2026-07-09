@@ -22,7 +22,11 @@ limitations under the License.
 package adapter
 
 import (
+	"context"
+	"sort"
+
 	v1 "k8s.io/api/core/v1"
+	fwk "k8s.io/kube-scheduler/framework"
 
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
@@ -66,16 +70,94 @@ func (s *SessionSnapshot) NodeInScope(n *schedapi.NodeInfo) bool {
 	return s.scope == nil || s.scope.NodeInScope(n)
 }
 
-// Predicate skips the scheduler's full PredicateFn stack for P0 drain feasibility.
-// Resource fit is enforced by the drain ledger (Allocatable−Used); calling
-// ssn.PredicateFn here false-negates feasible reshuffles because the bundled
-// predicates plugin re-checks capacity via stale cache Idle/FutureIdle and runs
-// PreFilter-dependent filters (DRA, inter-pod affinity) without the matching
-// PreFilter state. Engine plugins may add constraint checks via AddPredicateFn
-// in P1; until then nil means "constraints not modeled at this layer".
-func (s *SessionSnapshot) Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
-	return nil
+// FeasibleReschedule simulates evicting `victims` and greedily rescheduling them
+// onto `receivers`, with feasibility decided by the scheduler's FULL filter stack
+// (SimulateFilterFn) — so a plan matches exactly what the scheduler will accept at
+// Execute time. It runs entirely on CLONES (a node copy + a cycle-state copy per
+// candidate), never mutating the shared session, which is the same isolation the
+// preempt action relies on. `committed` are the relocations already decided earlier
+// this pass; their pods count as present on their receiver nodes so capacity and
+// topology stay consistent across steps. Resource fit is checked via FutureIdle
+// (the scheduler's own model), everything else via SimulateFilterFn.
+//
+// `receivers` are tried in the ORDER GIVEN (first that fits wins): the caller is
+// responsible for the receiver preference (e.g. the drain orders staying nodes
+// first, then best-fit). This keeps the scheduler-feasibility concern here and the
+// defrag placement policy at the call site.
+//
+// Returns the per-victim placements (from -> to) and whether every victim fit.
+func (s *SessionSnapshot) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	// Pods that already landed on each receiver this pass (prior committed moves).
+	landed := map[string][]*schedapi.TaskInfo{}
+	for _, m := range committed {
+		if m != nil && m.Task != nil {
+			landed[m.To] = append(landed[m.To], m.Task)
+		}
+	}
+
+	ctx := context.TODO()
+	placements := make([]*api.Move, 0, len(victims))
+	for _, victim := range s.victimsLargestFirst(victims) {
+		// Build the victim's PreFilter state once (running pods are not pre-inited
+		// like pending pods are); every candidate then clones it.
+		if err := s.ssn.PrePredicateFn(victim); err != nil {
+			return nil, false
+		}
+		baseState := s.ssn.GetCycleState(victim.UID)
+
+		target := s.firstFeasibleReceiver(ctx, victim, baseState, receivers, landed)
+		if target == "" {
+			return nil, false
+		}
+		landed[target] = append(landed[target], victim)
+		placements = append(placements, &api.Move{Task: victim, From: victim.NodeName, To: target})
+	}
+	return placements, true
 }
+
+// firstFeasibleReceiver returns the first receiver (in the caller's preference
+// order) that passes the full scheduler filters for victim, or "" if none fit.
+func (s *SessionSnapshot) firstFeasibleReceiver(ctx context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, receivers []*schedapi.NodeInfo, landed map[string][]*schedapi.TaskInfo) string {
+	for _, node := range receivers {
+		if s.victimFitsReceiver(ctx, victim, baseState, node, landed[node.Name]) {
+			return node.Name
+		}
+	}
+	return ""
+}
+
+// victimFitsReceiver checks, on CLONES only, whether victim can be scheduled onto
+// node after the pods that already landed there this pass. Resource fit uses
+// FutureIdle (the scheduler's own accounting); everything else — taints, node
+// affinity, inter-pod affinity, topology spread, devices, volumes, DRA — is the
+// full SimulateFilterFn stack.
+func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, node *schedapi.NodeInfo, alreadyLanded []*schedapi.TaskInfo) bool {
+	nodeCopy := node.Clone()
+	stateCopy := baseState.Clone()
+	for _, pod := range alreadyLanded {
+		if err := s.ssn.SimulateAddTaskFn(ctx, stateCopy, victim, pod, nodeCopy); err != nil {
+			return false
+		}
+		if err := nodeCopy.AddTask(pod); err != nil {
+			return false
+		}
+	}
+	if !victim.InitResreq.LessEqual(nodeCopy.FutureIdle(), schedapi.Zero) {
+		return false
+	}
+	return s.ssn.SimulateFilterFn(ctx, stateCopy, victim, nodeCopy) == nil
+}
+
+// victimsLargestFirst orders victims by descending target-resource request (first-
+// fit-decreasing): place the biggest pods first to fail fast and pack tightly.
+func (s *SessionSnapshot) victimsLargestFirst(victims []*schedapi.TaskInfo) []*schedapi.TaskInfo {
+	ordered := append([]*schedapi.TaskInfo(nil), victims...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return api.Scalar(ordered[i].InitResreq, s.resource) > api.Scalar(ordered[j].InitResreq, s.resource)
+	})
+	return ordered
+}
+
 
 // PodGroupView reads MinAvailable/Running/Priority/Footprint off the JobInfo.
 func (s *SessionSnapshot) PodGroupView(id schedapi.JobID) api.PodGroupView {

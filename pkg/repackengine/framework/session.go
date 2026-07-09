@@ -27,9 +27,6 @@ import (
 
 // Callback contracts plugins register into a Session.
 type (
-	// PredicateFn reports extra node fit beyond the snapshot's own predicate
-	// (nil = fits). Aggregated with AND.
-	PredicateFn func(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error
 	// MovableFn reports whether a task may be moved. Aggregated with AND — any
 	// plugin may veto a move (gang breach, PDB, frozen scope).
 	MovableFn func(task *schedapi.TaskInfo) bool
@@ -80,7 +77,6 @@ type Session struct {
 	cfg     SessionConfig
 	plugins []Plugin // opened plugins, for OnSessionClose
 
-	predicateFns  []PredicateFn
 	movableFns    []MovableFn
 	domainFns     []DomainFn
 	scoreTerms    []scoreTerm
@@ -145,11 +141,6 @@ func CloseSession(ssn *Session) {
 
 // ---- registration (called by plugins in OnSessionOpen) ----
 
-func (s *Session) AddPredicateFn(fn PredicateFn) {
-	if fn != nil {
-		s.predicateFns = append(s.predicateFns, fn)
-	}
-}
 func (s *Session) AddMovableFn(fn MovableFn) {
 	if fn != nil {
 		s.movableFns = append(s.movableFns, fn)
@@ -212,41 +203,11 @@ func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
 // Nodes returns the snapshot's candidate nodes.
 func (s *Session) Nodes() []*schedapi.NodeInfo { return s.cfg.Snapshot.Nodes() }
 
-// Predicate is the AND of the snapshot predicate and all registered PredicateFns.
-func (s *Session) Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
-	if err := s.cfg.Snapshot.Predicate(task, node); err != nil {
-		return err
-	}
-	for _, fn := range s.predicateFns {
-		if err := fn(task, node); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// PredicateForReschedule is Predicate on a task treated as an unbound reschedule
-// candidate: pod.spec.nodeName and the task's bound node are cleared so
-// INV-RESCHED feasibility is not blocked by the pod's current assignment.
-func (s *Session) PredicateForReschedule(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error {
-	return s.Predicate(taskForReschedule(task), node)
-}
-
-func taskForReschedule(task *schedapi.TaskInfo) *schedapi.TaskInfo {
-	if task == nil {
-		return nil
-	}
-	if task.NodeName == "" && (task.Pod == nil || task.Pod.Spec.NodeName == "") {
-		return task
-	}
-	t := *task
-	if task.Pod != nil {
-		pod := task.Pod.DeepCopy()
-		pod.Spec.NodeName = ""
-		t.Pod = pod
-	}
-	t.NodeName = ""
-	return &t
+// FeasibleReschedule delegates to the snapshot's scheduler-faithful reschedule
+// oracle: simulate evicting victims and greedily place them onto receivers with the
+// full scheduler filter stack. See Snapshot.FeasibleReschedule.
+func (s *Session) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	return s.cfg.Snapshot.FeasibleReschedule(committed, victims, receivers)
 }
 
 // Movable returns an api.Movable that is the AND of all registered MovableFns

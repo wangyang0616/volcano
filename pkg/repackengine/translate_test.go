@@ -70,8 +70,9 @@ func TestMaxPerRun(t *testing.T) {
 		PodGroups: &pgCap,
 		Resources: v1.ResourceList{gpuResource: resource.MustParse("6")},
 	}
-	if pg, res := maxPerRun(run, gpuResource); pg != 3 || res != 6 {
-		t.Errorf("maxPerRun -> 3,6; got %d,%d", pg, res)
+	// 6 whole GPUs -> 6000 milli, matching the drain budget's api.Scalar unit.
+	if pg, res := maxPerRun(run, gpuResource); pg != 3 || res != 6000 {
+		t.Errorf("maxPerRun -> 3,6000; got %d,%d", pg, res)
 	}
 
 	// cap set for a different resource -> res cap is 0 (unlimited) for gpu.

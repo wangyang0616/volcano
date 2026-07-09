@@ -49,7 +49,31 @@ func (f *fakeSnap) NodeInScope(n *schedapi.NodeInfo) bool {
 func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 	return f.views[id]
 }
-func (f *fakeSnap) Predicate(*schedapi.TaskInfo, *schedapi.NodeInfo) error { return nil }
+
+// FeasibleReschedule is a capacity-only stand-in for the scheduler oracle: every
+// node "fits" (no predicate constraints in tests), so feasibility is pure GPU
+// capacity (Allocatable − Used − pods already placed this pass), solved with the
+// pure api.Domain best-fit solver.
+func (f *fakeSnap) FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	placedGPU := map[string]int64{}
+	for _, m := range committed {
+		if m != nil && m.Task != nil {
+			placedGPU[m.To] += int64(m.Task.InitResreq.ScalarResources[gpu] + 0.5)
+		}
+	}
+	return api.NewDomain(receivers, capacityPolicy{placedGPU: placedGPU}).Feasible(victims)
+}
+
+// capacityPolicy is the test ReceiverPolicy: GPU capacity minus pods already placed
+// this pass, no Fit constraint, neutral (best-fit) preference.
+type capacityPolicy struct{ placedGPU map[string]int64 }
+
+func (p capacityPolicy) Free(n *schedapi.NodeInfo) *schedapi.Resource {
+	free := int64(n.Allocatable.ScalarResources[gpu]-n.Used.ScalarResources[gpu]) - p.placedGPU[n.Name]
+	return gpuRes(free)
+}
+func (p capacityPolicy) Fit(*schedapi.TaskInfo, *schedapi.NodeInfo) bool { return true }
+func (p capacityPolicy) Prefer(*schedapi.NodeInfo) int                   { return 0 }
 
 func gpuRes(n int64) *schedapi.Resource {
 	return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: float64(n)}}

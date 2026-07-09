@@ -46,7 +46,10 @@ type Snapshot interface {
 	NodeInScope(node *schedapi.NodeInfo) bool
 	// PodGroupView returns gang/priority facts for a PodGroup (zero if absent).
 	PodGroupView(schedapi.JobID) api.PodGroupView
-	// Predicate reports node fit for affinity/taint/topology/device constraints
-	// (nil = fits). Resource fit is handled by the core's own ledger.
-	Predicate(task *schedapi.TaskInfo, node *schedapi.NodeInfo) error
+	// FeasibleReschedule simulates evicting victims and greedily rescheduling them
+	// onto receivers using the scheduler's full filter stack, returning the per-pod
+	// placements and whether every victim fit. committed are the moves already
+	// decided this pass (their pods count as present on their receivers). The
+	// implementation must be non-destructive (no shared-state mutation).
+	FeasibleReschedule(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool)
 }

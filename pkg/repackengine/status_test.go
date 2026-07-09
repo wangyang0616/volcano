@@ -37,7 +37,9 @@ func mkMove(name, job string, cards float64, from, to string) *engineapi.Move {
 	return &engineapi.Move{
 		Task: &schedapi.TaskInfo{
 			Name: name, Job: schedapi.JobID(job),
-			Resreq: &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpuResource: cards}},
+			// Volcano stores extended resources in milli (1 device = 1000); mirror
+			// production so movesOf's milli->whole conversion is exercised faithfully.
+			Resreq: &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpuResource: cards * 1000}},
 		},
 		From: from, To: to,
 	}

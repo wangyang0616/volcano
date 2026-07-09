@@ -41,7 +41,10 @@ func maxPerRun(run *repackv1alpha1.RepackRun, res v1.ResourceName) (maxPG int, m
 		maxPG = int(*run.Spec.MaxPerRun.PodGroups)
 	}
 	if q, ok := run.Spec.MaxPerRun.Resources[res]; ok {
-		maxRes = q.Value()
+		// The user writes whole devices (e.g. "6" GPUs), but the drain budget counts
+		// cards in Volcano's milli-units (1 device = 1000, via api.Scalar). Convert to
+		// milli so maxRes and the running movedCards are the same unit.
+		maxRes = q.MilliValue()
 	}
 	return maxPG, maxRes
 }

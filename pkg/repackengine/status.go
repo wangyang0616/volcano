@@ -46,8 +46,24 @@ func (e *Engine) fail(run *repackv1alpha1.RepackRun, generation int64, reason st
 
 func (e *Engine) updateStatus(run *repackv1alpha1.RepackRun) {
 	stampLifecycle(run, time.Now())
-	if _, err := e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), run, metav1.UpdateOptions{}); err != nil {
-		klog.ErrorS(err, "repack: update status", "run", run.Name)
+	desired := run.Status.DeepCopy()
+	name := run.Name
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(context.Background(), name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil // deleted (e.g. TTL GC); nothing to write
+		}
+		if err != nil {
+			return err
+		}
+		// Re-apply the intended status onto the freshest object so a concurrent
+		// write (e.g. the controller, or our own later update) does not 409 us.
+		desired.DeepCopyInto(&latest.Status)
+		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		klog.ErrorS(err, "repack: update status", "run", name)
 	}
 }
 
@@ -162,7 +178,8 @@ func movesOf(plan *engineapi.RepackPlan, res v1.ResourceName) []repackv1alpha1.R
 		}
 		var cards int64
 		if m.Task.Resreq != nil {
-			cards = int64(m.Task.Resreq.Get(res))
+			// Report whole devices to users; Resreq is stored in milli-units.
+			cards = engineapi.Cards(m.Task.Resreq, res)
 		}
 		out[i].Cards += cards
 		out[i].Pods = append(out[i].Pods, repackv1alpha1.PodMove{

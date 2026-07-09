@@ -24,7 +24,6 @@ import "sort"
 // aggregated result. Mirrors a scheduler plugin. The dimensions are:
 //
 //   - AddMovableFn         — may a task move? (veto: gang breach, PDB, minRunDuration, scope)
-//   - AddPredicateFn       — may a task land on a node? (extra fit: DRA, topology)
 //   - AddDomainFn          — what is a freeable unit? (node, hypernode/topology level)
 //   - AddDisruptionScoreFn — soft cost of a plan on one dimension (ranking only)
 //   - AddConstraintFn      — hard admissibility gate on a finished plan (veto: maxDisruptionScore)

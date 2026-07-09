@@ -167,8 +167,18 @@ func Scalar(r *api.Resource, name v1.ResourceName) int64 {
 	if r == nil || r.ScalarResources == nil {
 		return 0
 	}
-	// Resource stores scalars as float64 device counts; round to nearest int.
+	// Volcano stores scalar/extended resources in MILLI-units (1 device = 1000),
+	// see scheduler/api NewResource. This returns that raw milli value, rounded;
+	// it is the internal unit the fragmentation math and drain budget both use.
+	// For a human/user-facing whole-device count use Cards.
 	return int64(r.ScalarResources[name] + 0.5)
+}
+
+// Cards returns the whole number of accelerator devices in r for the given
+// resource (Scalar / 1000). This is the unit users deal in — status.plan card
+// counts and spec.maxPerRun.resources — as opposed to the internal milli Scalar.
+func Cards(r *api.Resource, name v1.ResourceName) int64 {
+	return Scalar(r, name) / 1000
 }
 
 func ceilDiv(a, b int64) int64 {

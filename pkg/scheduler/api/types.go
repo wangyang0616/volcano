@@ -394,6 +394,16 @@ type SimulateAddTaskFn func(ctx context.Context, state fwk.CycleState, taskToSch
 // Plugins implement this function to verify if the task can be scheduled to the node while maintaining topology constraints
 type SimulatePredicateFn func(ctx context.Context, state fwk.CycleState, task *TaskInfo, nodeInfo *NodeInfo) error
 
+// SimulateFilterFn runs the FULL enabled Filter stack (taints, node affinity,
+// ports, inter-pod affinity, topology spread, devices, volume, DRA, ...) for a
+// task on a node, evaluated against the caller-supplied nodeInfo and CycleState
+// so it can be used over a simulated (evicted/relocated) node state. It is the
+// superset of SimulatePredicateFn (which covers only the state-dependent filters
+// preemption needs): a rescheduling-feasibility caller (e.g. repack) uses this to
+// get exactly what the scheduler would accept at bind time. Resource fit stays the
+// caller's responsibility (via NodeInfo.FutureIdle), matching the scheduler model.
+type SimulateFilterFn func(ctx context.Context, state fwk.CycleState, task *TaskInfo, nodeInfo *NodeInfo) error
+
 // Simulate the allocatable check for a node
 // Plugins implement this function to verify if the queue has enough resources to schedule the task while maintaining topology constraints
 type SimulateAllocatableFn func(ctx context.Context, state fwk.CycleState, queue *QueueInfo, task *TaskInfo) bool

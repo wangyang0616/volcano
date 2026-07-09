@@ -50,21 +50,11 @@ type drainCore struct{}
 
 func (*drainCore) Name() string { return framework.CoreDrain }
 
-// Receiver-preference tiers for the drain (higher = filled first). A node that
-// will definitely stay occupied is the best receiver — filling its slack never
-// wastes a drainable node's empty-ability; a still-drainable node is filled only
-// when necessary, so its own empty-ability is preserved.
-const (
-	preferDrainable = 1
-	preferStaying   = 2
-)
-
 // Plan runs the incremental, gang-aware drain over the session's freeable units.
 func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	res := ssn.Resource()
 	nodes := ssn.Nodes()
 	movable := ssn.Movable()
-	free := ssn.Free()
 	units := ssn.FreeableUnits()
 	if len(units) == 0 || len(nodes) == 0 {
 		return nil, false
@@ -81,7 +71,7 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 		"nodes", len(nodes), "freeableUnits", len(units),
 		"occupiedNodes", before.B, "optimalNodes", before.A, "providingNodes", before.M)
 
-	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, free, res)
+	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, res)
 	if plan == nil {
 		klog.V(4).InfoS("repack drain: no plan — nothing could be freed", "resource", res)
 		return nil, false
@@ -111,10 +101,10 @@ type candidate struct {
 	key          string
 }
 
-// drainState is the running state of one drain pass. It also implements
-// api.ReceiverPolicy (Free/Fit/Prefer) so it can be handed straight to the
-// feasibility solver — the receiver rules read the same live ledger and progress
-// the pass mutates, with no closures threaded around.
+// drainState is the running state of one drain pass. Feasibility (which victims
+// can reschedule where) is delegated to the snapshot's scheduler-faithful oracle
+// (Snapshot.FeasibleReschedule); this struct only tracks the greedy pass progress
+// and the disruption budget.
 type drainState struct {
 	// Fixed for the whole pass.
 	ssn          *framework.Session
@@ -127,10 +117,9 @@ type drainState struct {
 	maxResource  int64
 
 	// Mutated as units are committed.
-	ledger         map[string]*schedapi.Resource // node -> remaining free capacity
-	drained        map[string]bool               // emptied — no longer a receiver
-	filled         map[string]bool               // received a moved-in pod
-	provenStuck    map[string]bool               // proven un-vacatable → preferred receiver
+	drained        map[string]bool // emptied — no longer a receiver
+	filled         map[string]bool // received a moved-in pod
+	provenStuck    map[string]bool // proven un-vacatable this pass → prefer as receiver
 	movedPodGroups map[schedapi.JobID]bool
 	movedCards     int64
 	moves          []*api.Move
@@ -138,49 +127,19 @@ type drainState struct {
 	freedUnits     []api.FreeableUnit
 }
 
-var _ api.ReceiverPolicy = (*drainState)(nil)
-
-// Free is a receiver's remaining capacity from the running ledger.
-func (s *drainState) Free(n *schedapi.NodeInfo) *schedapi.Resource { return s.ledger[n.Name] }
-
-// Fit tests whether a victim can reschedule onto a receiver (affinity/taint/
-// topology/device), treating the victim as unbound. On rejection it logs the
-// predicate's reason at V(5) so a "why can't this pod move here?" question is
-// answerable from the logs.
-func (s *drainState) Fit(t *schedapi.TaskInfo, n *schedapi.NodeInfo) bool {
-	if err := s.ssn.PredicateForReschedule(t, n); err != nil {
-		klog.V(5).InfoS("repack drain: predicate rejects placement", "pod", t.Name, "node", n.Name, "reason", err.Error())
-		return false
-	}
-	return true
-}
-
-// Prefer: nodes that will definitely stay occupied are the best receivers —
-// filling their slack never wastes a drainable node. Staying = has an immovable
-// pod (e.g. an excluded PodGroup, so the node can never be vacated), out of
-// scope.nodes (user excluded it from draining — receiver only), or already proven
-// un-vacatable this pass.
-func (s *drainState) Prefer(n *schedapi.NodeInfo) int {
-	if !api.NodeFreeable(n, s.movable, s.resource) || s.provenStuck[n.Name] || !s.snapshot.NodeInScope(n) {
-		return preferStaying
-	}
-	return preferDrainable
-}
-
 // drainGreedy is the single dynamic pass. Each step re-evaluates every still-
-// freeable unit against the current ledger and commits the feasible one whose
-// prospective plan is least disruptive. Terminates because each commit drains
-// >= 1 node, and a drained node never becomes freeable again.
+// freeable unit and commits the feasible one whose prospective plan is least
+// disruptive. Terminates because each commit drains >= 1 node, and a drained node
+// never becomes freeable again.
 func drainGreedy(
 	nodes []*schedapi.NodeInfo,
 	nodesByName map[string]*schedapi.NodeInfo,
 	units []api.FreeableUnit,
 	ssn *framework.Session,
 	movable api.Movable,
-	free func(*schedapi.NodeInfo) *schedapi.Resource,
 	res v1.ResourceName,
 ) *api.RepackPlan {
-	s := newDrainState(nodes, nodesByName, ssn, movable, free, res)
+	s := newDrainState(nodes, nodesByName, ssn, movable, res)
 	for step := 1; ; step++ {
 		// 1. Evaluate every still-freeable unit against the current ledger.
 		var feasible []candidate
@@ -204,24 +163,14 @@ func drainGreedy(
 	return s.plan()
 }
 
-// newDrainState seeds the ledger from each node's free-capacity basis (cloned so
-// the caller's NodeInfo is never mutated) and caches the per-pass budget caps.
+// newDrainState caches the per-pass budget caps and initializes progress maps.
 func newDrainState(
 	nodes []*schedapi.NodeInfo,
 	nodesByName map[string]*schedapi.NodeInfo,
 	ssn *framework.Session,
 	movable api.Movable,
-	free func(*schedapi.NodeInfo) *schedapi.Resource,
 	res v1.ResourceName,
 ) *drainState {
-	ledger := make(map[string]*schedapi.Resource, len(nodes))
-	for _, n := range nodes {
-		f := free(n)
-		if f == nil {
-			f = schedapi.EmptyResource()
-		}
-		ledger[n.Name] = f.Clone()
-	}
 	return &drainState{
 		ssn:            ssn,
 		snapshot:       ssn.Snapshot(),
@@ -270,15 +219,19 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		klog.V(5).InfoS("repack drain: skip unit — no movable accelerator victims", "unit", key, "nodes", unit.Nodes)
 		return candidate{}, false
 	}
-	receivers := s.receiversExcluding(inUnit)
+	receivers := s.receiversInPreferenceOrder(inUnit)
 	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
 		"victims", taskNames(victims), "victimCount", len(victims),
 		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
-	placed, feasible := api.NewDomain(receivers, s).Feasible(victims)
+	// Feasibility = the scheduler-faithful reschedule oracle: it simulates evicting
+	// these victims and greedily placing them onto the receivers (in the preference
+	// order we pass) with the full scheduler filter stack, over the moves already
+	// committed this pass.
+	placed, feasible := s.snapshot.FeasibleReschedule(s.moves, victims, receivers)
 	if !feasible {
 		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
-		// stays infeasible — cache its nodes as preferred receivers.
-		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all reschedule onto receivers; marking stuck",
+		// stays infeasible — remember its nodes as preferred (staying) receivers.
+		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all reschedule onto receivers",
 			"unit", key, "victims", len(victims), "receivers", len(receivers))
 		for _, nodeName := range unit.Nodes {
 			s.provenStuck[nodeName] = true
@@ -314,12 +267,17 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, newCards: newCards, key: key}, true
 }
 
-// receiversExcluding returns the nodes that may receive relocated pods: not in the
+// receiversInPreferenceOrder returns the nodes that may receive relocated pods, in
+// the order the drain prefers to fill them. A node is eligible if it is not in the
 // unit being vacated, not already drained, and not accelerator-EMPTY (0 pods
 // requesting the accelerator — a CPU/memory-only node counts as empty too):
-// draining onto one just relights a free accelerator node (net-zero shuffle). Full
-// nodes (no slack) are filtered by the solver.
-func (s *drainState) receiversExcluding(inUnit map[string]bool) []*schedapi.NodeInfo {
+// draining onto one just relights a free accelerator node (net-zero shuffle).
+//
+// Order: STAYING nodes first (they remain occupied regardless, so filling their
+// slack never wastes a drainable node's empty-ability), then best-fit (tightest
+// target-resource FutureIdle) within a tier so relocations consolidate onto
+// already-loaded nodes rather than lighting up near-empty ones (§4.9).
+func (s *drainState) receiversInPreferenceOrder(inUnit map[string]bool) []*schedapi.NodeInfo {
 	receivers := make([]*schedapi.NodeInfo, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		if inUnit[n.Name] || s.drained[n.Name] || !occupiesAccelerator(n, s.resource) {
@@ -327,7 +285,22 @@ func (s *drainState) receiversExcluding(inUnit map[string]bool) []*schedapi.Node
 		}
 		receivers = append(receivers, n)
 	}
+	sort.SliceStable(receivers, func(i, j int) bool {
+		si, sj := s.staying(receivers[i]), s.staying(receivers[j])
+		if si != sj {
+			return si // staying nodes first
+		}
+		return api.Scalar(receivers[i].FutureIdle(), s.resource) < api.Scalar(receivers[j].FutureIdle(), s.resource)
+	})
 	return receivers
+}
+
+// staying reports whether a node will remain occupied regardless of this pass — so
+// it is a preferred receiver. A node stays if it has an immovable accelerator pod
+// (not freeable), is receiver-only (excluded from draining by scope.nodes), or was
+// already proven un-vacatable this pass.
+func (s *drainState) staying(n *schedapi.NodeInfo) bool {
+	return !api.NodeFreeable(n, s.movable, s.resource) || !s.snapshot.NodeInScope(n) || s.provenStuck[n.Name]
 }
 
 // chooseLeastDisruptive orders the feasible candidates deterministically (higher
@@ -350,13 +323,10 @@ func (s *drainState) chooseLeastDisruptive(feasible []candidate) candidate {
 	return feasible[s.ssn.LeastDisruptive(candidatePlans)]
 }
 
-// commit applies the chosen candidate to the pass state: debit receiver ledgers,
-// record moved PodGroups/cards, mark the unit's nodes drained, and append moves.
+// commit applies the chosen candidate to the pass state: mark receivers filled and
+// the unit's nodes drained, record moved PodGroups/cards, and append the moves.
 func (s *drainState) commit(chosen candidate) {
 	for _, m := range chosen.placed {
-		if r := s.ledger[m.To]; r != nil {
-			r.Sub(m.Task.InitResreq)
-		}
 		s.filled[m.To] = true
 	}
 	for pg := range chosen.newPodGroups {
