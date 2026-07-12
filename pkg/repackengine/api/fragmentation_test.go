@@ -163,7 +163,7 @@ func TestOptimalNodes_LowerBound_NonPow2(t *testing.T) {
 
 func TestFragRateAndWeighted(t *testing.T) {
 	per := map[v1.ResourceName]ResourceFrag{
-		gpu: {Resource: gpu, M: 20, B: 18, A: 16},
+		gpu:                    {Resource: gpu, M: 20, B: 18, A: 16},
 		"huawei.com/Ascend910": {Resource: "huawei.com/Ascend910", M: 8, B: 5, A: 5},
 	}
 	if got := per[gpu].FragRate(); math.Abs(got-0.10) > 1e-9 {
@@ -200,5 +200,30 @@ func TestMeasureResource(t *testing.T) {
 	}
 	if got := f.FragRate(); math.Abs(got-1.0/3.0) > 1e-9 { // (2-1)/3
 		t.Errorf("FragRate=%v want %v", got, 1.0/3.0)
+	}
+}
+
+func TestMeasureResourceHeterogeneousIsOrderIndependentAndBounded(t *testing.T) {
+	mkRes := func(n int64) *api.Resource {
+		return &api.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: float64(n)}}
+	}
+	node := func(name string, cap, used, req int64) *api.NodeInfo {
+		tasks := map[api.TaskID]*api.TaskInfo{}
+		if req > 0 {
+			tasks[api.TaskID(name+"-pod")] = &api.TaskInfo{Resreq: mkRes(req)}
+		}
+		return &api.NodeInfo{Name: name, Allocatable: mkRes(cap), Used: mkRes(used), Tasks: tasks}
+	}
+	four := node("four", 4, 4, 4)
+	eight := node("eight", 8, 8, 8)
+	emptyEight := node("empty-eight", 8, 0, 0)
+
+	a := MeasureResource([]*api.NodeInfo{four, eight, emptyEight}, gpu)
+	b := MeasureResource([]*api.NodeInfo{emptyEight, eight, four}, gpu)
+	if a.A != b.A || a.B != b.B || a.M != b.M {
+		t.Fatalf("heterogeneous metric depends on node order: first=%+v reversed=%+v", a, b)
+	}
+	if a.Exact || a.A < 0 || a.A > a.B || a.FragRate() < 0 || a.FragRate() > 1 {
+		t.Fatalf("heterogeneous metric must be inexact and bounded: %+v rate=%v", a, a.FragRate())
 	}
 }

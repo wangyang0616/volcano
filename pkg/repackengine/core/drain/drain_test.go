@@ -224,6 +224,27 @@ func TestDrain_BudgetBlocks(t *testing.T) {
 	}
 }
 
+func TestDrain_ExplicitZeroBudgetBlocks(t *testing.T) {
+	a := gpuTask("a", "g-a", 2)
+	b := gpuTask("b", "g-b", 6)
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Snapshot:       snap,
+		Resource:       gpu,
+		Mode:           repackv1alpha1.RepackModeDryRun,
+		CoreName:       framework.CoreDrain,
+		MinNodesFreed:  1,
+		MaxPodGroups:   0,
+		LimitPodGroups: true,
+		Free:           freeByCapMinusUsed,
+	}, nil)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+	if plan, ok := (&drainCore{}).Plan(ssn); ok {
+		t.Fatalf("explicit podGroups=0 must block every move, got %+v", plan)
+	}
+}
+
 // A frozen task makes its node un-vacatable as a drain TARGET, but the node is
 // still a valid RECEIVER: here g-a (on n0) is frozen, so drain frees n1 instead
 // by moving b onto n0's slack.

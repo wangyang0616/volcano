@@ -109,12 +109,11 @@ spec:
             - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
             - --leader-elect=true
             - --leader-elect-resource-namespace=volcano-system
-            - --schedule-period=5m
+            - --resync-period=5m
             # default accelerator when a RepackRun's spec.goals is empty:
             - --repack-default-resource=nvidia.com/gpu
-            - --repack-core=drain
+            - --repack-algorithm=drain
             - -v=3
-            - 2>&1
           volumeMounts:
             - name: scheduler-config
               mountPath: /volcano.scheduler

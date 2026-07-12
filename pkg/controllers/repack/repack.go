@@ -61,8 +61,8 @@ func (c *repackController) Initialize(opt *framework.ControllerOption) error {
 	})
 
 	podInformer := opt.SharedInformerFactory.Core().V1().Pods()
-	repackLister := opt.VCSharedInformerFactory.Repack().V1alpha1().RepackRuns().Lister()
-	c.nominator = rc.NewNominator(opt.KubeClient, opt.VolcanoClient, podInformer, repackLister)
+	repackInformer := opt.VCSharedInformerFactory.Repack().V1alpha1().RepackRuns()
+	c.nominator = rc.NewNominator(opt.KubeClient, opt.VolcanoClient, podInformer, repackInformer)
 	return nil
 }
 

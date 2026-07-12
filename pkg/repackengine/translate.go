@@ -31,20 +31,22 @@ func minFragImprovement(run *repackv1alpha1.RepackRun) int {
 	return 0
 }
 
-// maxPerRun reads the run's blast-radius caps for the target resource (0 = unset
-// = unlimited), feeding the core's disruption budget.
-func maxPerRun(run *repackv1alpha1.RepackRun, res v1.ResourceName) (maxPG int, maxRes int64) {
+// maxPerRun reads the run's blast-radius caps for the target resource. The bools
+// distinguish an omitted cap (unlimited) from an explicit zero (move nothing).
+func maxPerRun(run *repackv1alpha1.RepackRun, res v1.ResourceName) (maxPG int, maxRes int64, limitPG bool, limitRes bool) {
 	if run.Spec.MaxPerRun == nil {
-		return 0, 0
+		return 0, 0, false, false
 	}
 	if run.Spec.MaxPerRun.PodGroups != nil {
 		maxPG = int(*run.Spec.MaxPerRun.PodGroups)
+		limitPG = true
 	}
 	if q, ok := run.Spec.MaxPerRun.Resources[res]; ok {
 		// The user writes whole devices (e.g. "6" GPUs), but the drain budget counts
 		// cards in Volcano's milli-units (1 device = 1000, via api.Scalar). Convert to
 		// milli so maxRes and the running movedCards are the same unit.
 		maxRes = q.MilliValue()
+		limitRes = true
 	}
-	return maxPG, maxRes
+	return maxPG, maxRes, limitPG, limitRes
 }

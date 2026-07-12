@@ -53,7 +53,7 @@ kubectl apply -f installer/repack/repack-engine.yaml
 
 The engine mounts `volcano-scheduler-configmap` for `--scheduler-conf`, so it sees
 the cluster exactly as the scheduler does. Adjust `--repack-default-resource`
-(e.g. `nvidia.com/gpu`) and `--repack-core` (P0: `drain`) as needed.
+(e.g. `nvidia.com/gpu`) and `--repack-algorithm` (P0: `drain`) as needed.
 
 ## Notes
 

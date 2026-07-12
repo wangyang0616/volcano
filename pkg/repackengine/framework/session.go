@@ -68,7 +68,9 @@ type SessionConfig struct {
 	MinFragImprovementPercent int
 	MaxPodGroups              int
 	MaxResource               int64
-	Free          func(*schedapi.NodeInfo) *schedapi.Resource // nil = FutureIdle
+	LimitPodGroups            bool                                        // distinguishes omitted from explicit zero
+	LimitResource             bool                                        // distinguishes omitted from explicit zero
+	Free                      func(*schedapi.NodeInfo) *schedapi.Resource // nil = FutureIdle
 }
 
 // Session is one repack pass: a snapshot plus the callbacks plugins register,
@@ -179,16 +181,18 @@ func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
 
 // ---- config accessors ----
 
-func (s *Session) Snapshot() Snapshot                  { return s.cfg.Snapshot }
-func (s *Session) Run() *repackv1alpha1.RepackRun      { return s.cfg.Run }
-func (s *Session) Resource() v1.ResourceName           { return s.cfg.Resource }
-func (s *Session) Mode() repackv1alpha1.RepackMode     { return s.cfg.Mode }
-func (s *Session) CoreName() string                    { return s.cfg.CoreName }
-func (s *Session) Hooks() CommitHooks                  { return s.cfg.Hooks }
-func (s *Session) MinNodesFreed() int                  { return s.cfg.MinNodesFreed }
-func (s *Session) MinFragImprovementPercent() int      { return s.cfg.MinFragImprovementPercent }
-func (s *Session) MaxPodGroups() int                   { return s.cfg.MaxPodGroups }
-func (s *Session) MaxResource() int64                  { return s.cfg.MaxResource }
+func (s *Session) Snapshot() Snapshot              { return s.cfg.Snapshot }
+func (s *Session) Run() *repackv1alpha1.RepackRun  { return s.cfg.Run }
+func (s *Session) Resource() v1.ResourceName       { return s.cfg.Resource }
+func (s *Session) Mode() repackv1alpha1.RepackMode { return s.cfg.Mode }
+func (s *Session) CoreName() string                { return s.cfg.CoreName }
+func (s *Session) Hooks() CommitHooks              { return s.cfg.Hooks }
+func (s *Session) MinNodesFreed() int              { return s.cfg.MinNodesFreed }
+func (s *Session) MinFragImprovementPercent() int  { return s.cfg.MinFragImprovementPercent }
+func (s *Session) MaxPodGroups() int               { return s.cfg.MaxPodGroups }
+func (s *Session) MaxResource() int64              { return s.cfg.MaxResource }
+func (s *Session) LimitPodGroups() bool            { return s.cfg.LimitPodGroups }
+func (s *Session) LimitResource() bool             { return s.cfg.LimitResource }
 
 // Free returns the node free-capacity basis (default NodeInfo.FutureIdle).
 func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {

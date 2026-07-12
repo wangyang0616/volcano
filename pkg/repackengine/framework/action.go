@@ -25,9 +25,9 @@ import (
 // Built-in action names (config repack.actions).
 const ActionRepack = "repack"
 
-// Action is one ordered stage of a repack pass (mirrors framework.Action in the
-// scheduler). Ships a single "repack" action (run the selected core, then
-// commit on Execute); future stages (relief, simulate) compose after it.
+// Action is one ordered planning stage of a repack pass (mirrors
+// framework.Action in the scheduler). Side effects are committed by the engine
+// driver only after the resulting plan has been durably persisted.
 type Action interface {
 	Name() string
 	Execute(ssn *Session)
@@ -60,8 +60,9 @@ func ActionNames() []string {
 // DefaultActions is the default pipeline when config names none.
 func DefaultActions() []string { return []string{ActionRepack} }
 
-// RunActions executes the named actions in order against the session. Unknown
-// names are skipped with a warning (config typo shouldn't crash the engine).
+// RunActions executes the named planning actions in order against the session.
+// Unknown names are skipped with a warning (startup validation is responsible
+// for rejecting invalid production configuration).
 func RunActions(names []string, ssn *Session) {
 	if len(names) == 0 {
 		names = DefaultActions()

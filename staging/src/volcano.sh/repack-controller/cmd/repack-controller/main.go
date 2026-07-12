@@ -75,8 +75,8 @@ func main() {
 
 		ctrl := repackcontroller.New(vc, vcFactory, repackcontroller.Options{Workers: *workers, ExecuteCooldown: *execCooldown})
 		podInformer := kubeFactory.Core().V1().Pods()
-		repackLister := vcFactory.Repack().V1alpha1().RepackRuns().Lister()
-		nom := repackcontroller.NewNominator(kube, vc, podInformer, repackLister)
+		repackInformer := vcFactory.Repack().V1alpha1().RepackRuns()
+		nom := repackcontroller.NewNominator(kube, vc, podInformer, repackInformer)
 
 		kubeFactory.Start(ctx.Done())
 		go func() {

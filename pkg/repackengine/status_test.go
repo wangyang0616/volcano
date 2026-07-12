@@ -187,6 +187,36 @@ func TestApplyPlan(t *testing.T) {
 	}
 }
 
+func TestRealizedPlanDropsFailedMovesAndFreedNodes(t *testing.T) {
+	a := mkMove("a", "ns/g", 2, "n0", "n2")
+	a.Task.Namespace = "ns"
+	b := mkMove("b", "ns/g", 2, "n1", "n2")
+	b.Task.Namespace = "ns"
+	plan := &engineapi.RepackPlan{
+		Moves:      []*engineapi.Move{a, b},
+		FreedNodes: []string{"n0", "n1"},
+		FreedUnits: []engineapi.FreeableUnit{
+			{Level: "node", Nodes: []string{"n0"}, Weight: 1},
+			{Level: "node", Nodes: []string{"n1"}, Weight: 1},
+		},
+		Before: engineapi.ResourceFrag{Resource: gpuResource, M: 3, B: 2, A: 1},
+	}
+	commit := &engineframework.CommitResult{
+		Evicted: []engineframework.MoveOutcome{{Namespace: "ns", Task: "a", From: "n0", To: "n2"}},
+		Failed:  []engineframework.MoveOutcome{{Namespace: "ns", Task: "b", From: "n1", To: "n2", Err: "pdb"}},
+	}
+	realized := realizedPlan(plan, commit)
+	if len(realized.Moves) != 1 || realized.Moves[0].Task.Name != "a" {
+		t.Fatalf("realized moves=%+v, want only a", realized.Moves)
+	}
+	if len(realized.FreedNodes) != 1 || realized.FreedNodes[0] != "n0" {
+		t.Fatalf("realized freed nodes=%v, want [n0]", realized.FreedNodes)
+	}
+	if len(realized.FreedUnits) != 1 || realized.FreedUnits[0].Nodes[0] != "n0" {
+		t.Fatalf("realized freed units=%+v, want n0 unit", realized.FreedUnits)
+	}
+}
+
 func TestTerminalOutcome(t *testing.T) {
 	mk := func(condType, reason string) *repackv1alpha1.RepackRun {
 		r := &repackv1alpha1.RepackRun{}
@@ -201,5 +231,14 @@ func TestTerminalOutcome(t *testing.T) {
 	}
 	if got := terminalOutcome(&repackv1alpha1.RepackRun{}); got != "Unknown" {
 		t.Errorf("no condition outcome=%q, want Unknown", got)
+	}
+}
+
+func TestMergeNominationPhasesPreservesControllerOwnedTerminalPhase(t *testing.T) {
+	desired := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: "Pending"}}
+	latest := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: "Bound"}}
+	mergeNominationPhases(desired, latest)
+	if desired[0].Phase != "Bound" {
+		t.Fatalf("phase=%q, want Bound", desired[0].Phase)
 	}
 }

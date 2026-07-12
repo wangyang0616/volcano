@@ -14,15 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package repack is the action: run the selected core to produce a plan, render
-// the report, and — in Execute mode — commit it (evict + steer via nomination).
-// Future actions (relief, simulate) compose after it in the pipeline.
+// Package repack is the planning action: run the selected core to produce a plan
+// and render the report. Execute side effects deliberately live in the engine
+// driver, after the plan and nomination intents have been durably persisted.
+// Future planning actions (relief, simulate) compose after it in the pipeline.
 package repack
 
 import (
 	"k8s.io/klog/v2"
-
-	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 
 	"volcano.sh/volcano/pkg/repackengine/framework"
 )
@@ -59,15 +58,5 @@ func (*repackAction) Execute(ssn *framework.Session) {
 	ssn.SetReport(report)
 	if !found || plan == nil {
 		return // NoRepackNeeded
-	}
-
-	if ssn.Mode() == repackv1alpha1.RepackModeExecute {
-		res, err := framework.CommitPlan(plan, ssn.Hooks())
-		if err != nil {
-			klog.ErrorS(err, "repack: commit failed")
-		}
-		// Keep the result (evicted vs failed per-pod) so the driver can distinguish
-		// a real Execute from one where every eviction was rejected (e.g. by PDBs).
-		ssn.SetCommit(&res)
 	}
 }

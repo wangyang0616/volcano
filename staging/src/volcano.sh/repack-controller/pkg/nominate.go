@@ -32,11 +32,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
+	repackinformers "volcano.sh/apis/pkg/client/informers/externalversions/repack/v1alpha1"
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 )
 
@@ -72,20 +74,28 @@ type Nominator struct {
 	now          func() time.Time
 }
 
-// NewNominator wires the reconciler to a pod informer and the RepackRun lister.
-func NewNominator(kube kubernetes.Interface, repack vcclientset.Interface, podInformer coreinformers.PodInformer, repackLister repacklisters.RepackRunLister) *Nominator {
+// NewNominator wires the reconciler to Pod and RepackRun informers. Watching
+// both sides is important: a replacement Pod can be observed before the
+// prepared nomination status reaches this controller's informer. A later
+// RepackRun update must therefore wake the already-existing Pending Pod.
+func NewNominator(kube kubernetes.Interface, repack vcclientset.Interface, podInformer coreinformers.PodInformer, repackInformer repackinformers.RepackRunInformer) *Nominator {
 	n := &Nominator{
 		kube:         kube,
 		repack:       repack,
 		podLister:    podInformer.Lister(),
-		repackLister: repackLister,
-		synced:       []cache.InformerSynced{podInformer.Informer().HasSynced},
+		repackLister: repackInformer.Lister(),
+		synced:       []cache.InformerSynced{podInformer.Informer().HasSynced, repackInformer.Informer().HasSynced},
 		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		now:          time.Now,
 	}
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueue,
 		UpdateFunc: func(_, newObj interface{}) { n.enqueue(newObj) },
+		DeleteFunc: n.enqueueAfterVictimDeleted,
+	})
+	repackInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    n.enqueuePendingForRun,
+		UpdateFunc: func(_, newObj interface{}) { n.enqueuePendingForRun(newObj) },
 	})
 	return n
 }
@@ -104,6 +114,64 @@ func (n *Nominator) enqueue(obj interface{}) {
 		return
 	}
 	n.queue.Add(key)
+}
+
+// enqueuePendingForRun closes the informer-ordering race: when nomination
+// intents become visible, revisit Pending Pods that may already have emitted
+// their Add event. RepackRun updates are rare, and the scan is restricted to the
+// namespaces referenced by active nominations.
+func (n *Nominator) enqueuePendingForRun(obj interface{}) {
+	run, ok := obj.(*repackv1alpha1.RepackRun)
+	if !ok {
+		return
+	}
+	namespaces := map[string]bool{}
+	for i := range run.Status.Nominations {
+		rec := &run.Status.Nominations[i]
+		if rec.Phase != nomBound && rec.Phase != nomExpired {
+			namespaces[rec.Namespace] = true
+		}
+	}
+	for ns := range namespaces {
+		pods, err := n.podLister.Pods(ns).List(labels.Everything())
+		if err != nil {
+			utilruntime.HandleError(err)
+			continue
+		}
+		for _, pod := range pods {
+			n.enqueue(pod)
+		}
+	}
+}
+
+// enqueueAfterVictimDeleted wakes a renamed/fungible replacement that was held
+// back while the original victim still existed. Exact-name replacements are
+// naturally handled by their own Add event.
+func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		if tombstone, tombstoneOK := obj.(cache.DeletedFinalStateUnknown); tombstoneOK {
+			pod, ok = tombstone.Obj.(*corev1.Pod)
+		}
+	}
+	if !ok || pod == nil {
+		return
+	}
+	runs, err := n.repackLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	for _, run := range runs {
+		for i := range run.Status.Nominations {
+			rec := &run.Status.Nominations[i]
+			if rec.Namespace == pod.Namespace && rec.VictimPodName == pod.Name &&
+				rec.Phase != nomBound && rec.Phase != nomExpired {
+				n.enqueuePendingForRun(run)
+				return
+			}
+		}
+	}
 }
 
 // Run launches the reconciler until ctx is cancelled. The caller starts the
@@ -230,18 +298,32 @@ func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNominat
 			}
 			if len(rec.IdentityLabels) > 0 {
 				// 2. label-superset identity match.
-				if labelsMatch(pod.Labels, rec.IdentityLabels) {
+				if labelsMatch(pod.Labels, rec.IdentityLabels) && n.victimGone(rec) {
 					return rec, run.Name
 				}
 				continue
 			}
 			// 3. fungible: first pending record for this PodGroup.
+			// Do not consume it while the original victim still exists: prepared
+			// nominations are persisted before eviction, and a failed eviction must
+			// not redirect an unrelated Pending gang member.
+			if !n.victimGone(rec) {
+				continue
+			}
 			if fungible == nil {
 				fungible, fungibleOwner = rec, run.Name
 			}
 		}
 	}
 	return fungible, fungibleOwner
+}
+
+func (n *Nominator) victimGone(rec *repackv1alpha1.PodNomination) bool {
+	if rec == nil || rec.VictimPodName == "" || n.podLister == nil {
+		return true
+	}
+	_, err := n.podLister.Pods(rec.Namespace).Get(rec.VictimPodName)
+	return apierrors.IsNotFound(err)
 }
 
 // labelsMatch reports whether podLabels is a superset of want (all want entries
@@ -271,25 +353,28 @@ func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, nod
 // markBound flips the matched record to Bound on the owning RepackRun so it is
 // consumed once. Re-reads the run to avoid clobbering a concurrent status write.
 func (n *Nominator) markBound(ctx context.Context, owner string, target *repackv1alpha1.PodNomination) error {
-	run, err := n.repackLister.Get(owner)
-	if err != nil {
-		return ignoreNotFound(err)
-	}
-	updated := run.DeepCopy()
-	changed := false
-	for i := range updated.Status.Nominations {
-		r := &updated.Status.Nominations[i]
-		if r.Namespace == target.Namespace && r.PodGroupName == target.PodGroupName &&
-			r.VictimPodName == target.VictimPodName && r.NodeName == target.NodeName {
-			if r.Phase != nomBound {
-				r.Phase = nomBound
-				changed = true
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Use an API read, not the informer lister: a stale cached status could
+		// otherwise overwrite the engine's just-written terminal result.
+		updated, err := n.repack.RepackV1alpha1().RepackRuns().Get(ctx, owner, metav1.GetOptions{})
+		if err != nil {
+			return ignoreNotFound(err)
+		}
+		changed := false
+		for i := range updated.Status.Nominations {
+			r := &updated.Status.Nominations[i]
+			if r.Namespace == target.Namespace && r.PodGroupName == target.PodGroupName &&
+				r.VictimPodName == target.VictimPodName && r.NodeName == target.NodeName {
+				if r.Phase != nomBound {
+					r.Phase = nomBound
+					changed = true
+				}
 			}
 		}
-	}
-	if !changed {
-		return nil
-	}
-	_, err = n.repack.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-	return ignoreNotFound(err)
+		if !changed {
+			return nil
+		}
+		_, err = n.repack.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+		return ignoreNotFound(err)
+	})
 }

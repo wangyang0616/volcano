@@ -101,9 +101,9 @@ type Engine struct {
 	vc    vcclientset.Interface
 	cfg   Config
 
-	factory vcinformers.SharedInformerFactory
-	lister  repacklisters.RepackRunLister
-	synced  cache.InformerSynced
+	factory  vcinformers.SharedInformerFactory
+	lister   repacklisters.RepackRunLister
+	synced   cache.InformerSynced
 	queue    workqueue.TypedRateLimitingInterface[string]
 	recorder record.EventRecorder
 	now      func() time.Time
@@ -197,8 +197,21 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 		now:     time.Now,
 	}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    e.enqueue,
-		UpdateFunc: func(_, n interface{}) { e.enqueue(n) },
+		AddFunc: e.enqueue,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldRun, oldOK := oldObj.(*repackv1alpha1.RepackRun)
+			newRun, newOK := newObj.(*repackv1alpha1.RepackRun)
+			if !oldOK || !newOK {
+				return
+			}
+			// Spec is immutable, so a real update is one of our own status writes
+			// (which must not dirty the workqueue while the key is processing).
+			// A same-RV update is an informer resync safety-net and may recover a
+			// dropped Add event.
+			if oldRun.ResourceVersion == newRun.ResourceVersion {
+				e.enqueue(newRun)
+			}
+		},
 	})
 	return e, nil
 }
@@ -211,6 +224,7 @@ func (e *Engine) Run(ctx context.Context) {
 
 	if err := e.loadConf(); err != nil {
 		klog.ErrorS(err, "repack: load scheduler conf")
+		return // fail closed: never plan/evict without the scheduler's filter stack
 	}
 	e.factory.Start(ctx.Done())
 	e.cache.Run(ctx.Done())
@@ -218,7 +232,7 @@ func (e *Engine) Run(ctx context.Context) {
 		klog.Error("repack: RepackRun cache failed to sync")
 		return
 	}
-	e.recoverOrphans() // fail runs left Running by a crashed predecessor
+	e.recoverOrphans(ctx) // fail runs left Running by a crashed predecessor
 	klog.V(3).InfoS("repack-engine started (event-driven)",
 		"core", e.cfg.Core, "plugins", e.cfg.Plugins,
 		"defaultResource", e.cfg.DefaultResource, "cooldown", e.cfg.Cooldown, "resyncPeriod", e.cfg.ResyncPeriod)
@@ -258,12 +272,14 @@ func (e *Engine) enqueue(obj interface{}) {
 	e.queue.Add(run.Name)
 }
 
-// isCandidate reports whether a run is ready for the engine: not yet processed
-// (phase empty or Pending) and not terminal/Running. Admission is enforced by
-// CEL at the apiserver, so any RepackRun that exists is already valid.
+// isCandidate reports whether a run is ready for the engine. Running without a
+// persisted plan is safe to retry: no Execute side effect can happen before the
+// prepare barrier writes status.plan. Running with a plan is deliberately not
+// retried, because it may have been interrupted mid-commit.
 func isCandidate(run *repackv1alpha1.RepackRun) bool {
 	p := run.Status.Phase
-	return p == "" || p == repackv1alpha1.RepackPending
+	return p == "" || p == repackv1alpha1.RepackPending ||
+		(p == repackv1alpha1.RepackRunning && run.Status.Plan == nil)
 }
 
 // maxReconcileRetries caps how many times a failing RepackRun is retried before
@@ -288,7 +304,7 @@ func (e *Engine) processNext(ctx context.Context) bool {
 		// Poison pill: stop retrying and fail the run so it does not loop forever
 		// (and its Execute slot, if any, was already released by process's defer).
 		e.queue.Forget(key)
-		e.failByName(key, "ReconcileGaveUp", fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
+		e.failByName(ctx, key, "ReconcileGaveUp", fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
 		return true
 	}
 	e.queue.Forget(key)
@@ -310,19 +326,21 @@ func (e *Engine) reconcileSafely(ctx context.Context, name string) (err error) {
 }
 
 // failByName marks a run Failed by name (poison-pill path); best-effort.
-func (e *Engine) failByName(name, reason string, cause error) {
+func (e *Engine) failByName(ctx context.Context, name, reason string, cause error) {
 	run, err := e.lister.Get(name)
 	if err != nil {
 		return // gone or lister error; nothing to write
 	}
 	work := run.DeepCopy()
-	e.fail(work, work.Generation, reason, cause)
+	if err := e.fail(ctx, work, work.Generation, reason, cause); err != nil {
+		klog.ErrorS(err, "repack: persist poison-pill failure", "run", name)
+	}
 }
 
 // reconcile processes one RepackRun: re-check it's still a candidate, apply the
 // Execute serialization gate (one-at-a-time + cooldown — it lives here, in the
 // worker that actually evicts), then plan/act.
-func (e *Engine) reconcile(_ context.Context, name string) error {
+func (e *Engine) reconcile(ctx context.Context, name string) error {
 	run, err := e.lister.Get(name)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -340,7 +358,9 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 	// engine starts (deferred Execute runs also settle here via the gate below).
 	if work.Status.Phase == "" {
 		work.Status.Phase = repackv1alpha1.RepackPending
-		e.updateStatus(work)
+		if err := e.updateStatus(ctx, work); err != nil {
+			return err
+		}
 	}
 
 	active, lastFinish := e.executeGateState(work.Name)
@@ -358,7 +378,9 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 		state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
 			gate.Reason, "waiting for an execute slot", work.Generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-		e.updateStatus(work)
+		if err := e.updateStatus(ctx, work); err != nil {
+			return err
+		}
 		if gate.RequeueAfter > 0 {
 			e.queue.AddAfter(name, gate.RequeueAfter)
 		}
@@ -368,8 +390,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 		e.markExecuteActive(work.Name) // hold the K=1 slot across this synchronous process
 		klog.V(4).InfoS("acquired execute slot", "run", work.Name)
 	}
-	e.process(work)
-	return nil
+	return e.process(ctx, work)
 }
 
 // recoverOrphans fails any run left in Running by a crashed predecessor. With a
@@ -377,7 +398,7 @@ func (e *Engine) reconcile(_ context.Context, name string) error {
 // (this instance just started), so it is orphaned: mark it Failed to release the
 // Execute slot and let TTL GC collect it. Conservative on purpose — we do not
 // re-run, since a mid-eviction Execute must not be blindly repeated.
-func (e *Engine) recoverOrphans() {
+func (e *Engine) recoverOrphans(ctx context.Context) {
 	runs, err := e.lister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "repack: list for orphan recovery")
@@ -394,7 +415,10 @@ func (e *Engine) recoverOrphans() {
 		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, generation)
 		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-		e.updateStatusTerminal(work)
+		if err := e.updateStatusTerminal(ctx, work); err != nil {
+			klog.ErrorS(err, "repack: persist orphan recovery", "run", work.Name)
+			return
+		}
 		klog.V(3).InfoS("recovered orphaned Running RepackRun -> Failed", "run", work.Name)
 	}
 }

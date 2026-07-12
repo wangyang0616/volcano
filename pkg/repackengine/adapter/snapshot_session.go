@@ -97,14 +97,23 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 
 	ctx := context.TODO()
 	placements := make([]*api.Move, 0, len(victims))
+	removed := make([]*schedapi.TaskInfo, 0, len(committed)+len(victims))
+	for _, m := range committed {
+		if m != nil && m.Task != nil {
+			removed = append(removed, m.Task)
+		}
+	}
+	removed = append(removed, victims...)
 	for _, victim := range s.victimsLargestFirst(victims) {
 		simVictim := clearNodeBinding(victim)
-		// Build the victim's PreFilter state once (running pods are not pre-inited
-		// like pending pods are); every candidate then clones it.
-		if err := s.ssn.PrePredicateFn(simVictim); err != nil {
+		// Build a plan-wide PreFilter state: every source victim is absent and
+		// every previously placed victim is present on its receiver. Without this,
+		// affinity/topology-spread filters would still see moved pods on old nodes
+		// and only see additions on the candidate receiver.
+		baseState, err := s.relocationState(ctx, simVictim, removed, landed)
+		if err != nil {
 			return nil, false
 		}
-		baseState := s.ssn.GetCycleState(victim.UID)
 
 		target := s.firstFeasibleReceiver(ctx, simVictim, baseState, receivers, landed)
 		if target == "" {
@@ -114,6 +123,42 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 		placements = append(placements, &api.Move{Task: victim, From: victim.NodeName, To: target})
 	}
 	return placements, true
+}
+
+func (s *SessionSnapshot) relocationState(ctx context.Context, victim *schedapi.TaskInfo, removed []*schedapi.TaskInfo, landed map[string][]*schedapi.TaskInfo) (fwk.CycleState, error) {
+	if err := s.ssn.PrePredicateFn(victim); err != nil {
+		return nil, err
+	}
+	state := s.ssn.GetCycleState(victim.UID).Clone()
+	for _, task := range removed {
+		if task == nil || task.NodeName == "" {
+			continue
+		}
+		source := s.ssn.Nodes[task.NodeName]
+		if source == nil {
+			continue
+		}
+		if err := s.ssn.SimulateRemoveTaskFn(ctx, state, victim, task, source.Clone()); err != nil {
+			return nil, err
+		}
+	}
+	for nodeName, pods := range landed {
+		node := s.ssn.Nodes[nodeName]
+		if node == nil {
+			continue
+		}
+		nodeCopy := node.Clone()
+		for _, task := range pods {
+			simLanded := clearNodeBinding(task)
+			if err := s.ssn.SimulateAddTaskFn(ctx, state, victim, simLanded, nodeCopy); err != nil {
+				return nil, err
+			}
+			if err := nodeCopy.AddTask(simLanded); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return state, nil
 }
 
 // clearNodeBinding returns a task clone with node binding cleared so relocation
@@ -155,9 +200,6 @@ func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *scheda
 	stateCopy := baseState.Clone()
 	for _, pod := range alreadyLanded {
 		simLanded := clearNodeBinding(pod)
-		if err := s.ssn.SimulateAddTaskFn(ctx, stateCopy, victim, simLanded, nodeCopy); err != nil {
-			return false
-		}
 		if err := nodeCopy.AddTask(simLanded); err != nil {
 			return false
 		}
@@ -177,7 +219,6 @@ func (s *SessionSnapshot) victimsLargestFirst(victims []*schedapi.TaskInfo) []*s
 	})
 	return ordered
 }
-
 
 // PodGroupView reads MinAvailable/Running/Priority/Footprint off the JobInfo.
 func (s *SessionSnapshot) PodGroupView(id schedapi.JobID) api.PodGroupView {

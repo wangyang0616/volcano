@@ -59,9 +59,9 @@ func TestMinFragImprovement(t *testing.T) {
 }
 
 func TestMaxPerRun(t *testing.T) {
-	// nil MaxPerRun -> unlimited (0, 0).
-	if pg, res := maxPerRun(&repackv1alpha1.RepackRun{}, gpuResource); pg != 0 || res != 0 {
-		t.Errorf("nil maxPerRun -> 0,0; got %d,%d", pg, res)
+	// nil MaxPerRun -> unlimited (no active caps).
+	if pg, res, limitPG, limitRes := maxPerRun(&repackv1alpha1.RepackRun{}, gpuResource); pg != 0 || res != 0 || limitPG || limitRes {
+		t.Errorf("nil maxPerRun -> unlimited 0,0; got %d,%d limits=%v,%v", pg, res, limitPG, limitRes)
 	}
 
 	pgCap := int32(3)
@@ -71,8 +71,8 @@ func TestMaxPerRun(t *testing.T) {
 		Resources: v1.ResourceList{gpuResource: resource.MustParse("6")},
 	}
 	// 6 whole GPUs -> 6000 milli, matching the drain budget's api.Scalar unit.
-	if pg, res := maxPerRun(run, gpuResource); pg != 3 || res != 6000 {
-		t.Errorf("maxPerRun -> 3,6000; got %d,%d", pg, res)
+	if pg, res, limitPG, limitRes := maxPerRun(run, gpuResource); pg != 3 || res != 6000 || !limitPG || !limitRes {
+		t.Errorf("maxPerRun -> limited 3,6000; got %d,%d limits=%v,%v", pg, res, limitPG, limitRes)
 	}
 
 	// cap set for a different resource -> res cap is 0 (unlimited) for gpu.
@@ -80,7 +80,20 @@ func TestMaxPerRun(t *testing.T) {
 	run2.Spec.MaxPerRun = &repackv1alpha1.MaxPerRun{
 		Resources: v1.ResourceList{"amd.com/gpu": resource.MustParse("9")},
 	}
-	if _, res := maxPerRun(run2, gpuResource); res != 0 {
+	if _, res, _, limited := maxPerRun(run2, gpuResource); res != 0 || limited {
 		t.Errorf("cap for other resource -> 0 for gpu; got %d", res)
+	}
+}
+
+func TestMaxPerRunExplicitZeroIsLimited(t *testing.T) {
+	zero := int32(0)
+	run := &repackv1alpha1.RepackRun{}
+	run.Spec.MaxPerRun = &repackv1alpha1.MaxPerRun{
+		PodGroups: &zero,
+		Resources: v1.ResourceList{gpuResource: resource.MustParse("0")},
+	}
+	pg, res, limitPG, limitRes := maxPerRun(run, gpuResource)
+	if pg != 0 || res != 0 || !limitPG || !limitRes {
+		t.Fatalf("explicit zero must remain an active zero cap; got %d,%d limits=%v,%v", pg, res, limitPG, limitRes)
 	}
 }

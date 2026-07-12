@@ -30,6 +30,8 @@ limitations under the License.
 package api
 
 import (
+	"sort"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -99,6 +101,7 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 
 	var capacity int64
 	homogeneous := true
+	capacities := make([]int64, 0, len(nodes))
 	requests := make([]int64, 0, 64)
 
 	for _, node := range nodes {
@@ -110,6 +113,7 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 			continue // node does not provide this resource
 		}
 		out.M++
+		capacities = append(capacities, cap)
 		if capacity == 0 {
 			capacity = cap
 		} else if cap != capacity {
@@ -138,9 +142,33 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 		klog.V(5).InfoS("repack frag: no node provides this resource (M=0)", "resource", resource)
 		return out
 	}
-	out.A, out.Exact = OptimalNodes(requests, capacity)
-	if !homogeneous {
-		out.Exact = false // mixed-capacity pools: A is only a lower bound
+	if homogeneous {
+		out.A, out.Exact = OptimalNodes(requests, capacity)
+	} else {
+		// Heterogeneous pools cannot be evaluated with an arbitrary first-node
+		// capacity: that made the metric depend on map iteration order and could
+		// even produce A>B. Use the minimum number of largest real nodes whose
+		// aggregate capacity covers demand. This is a deterministic lower bound;
+		// exact bin packing remains intentionally out of the hot measurement path.
+		sort.Slice(capacities, func(i, j int) bool { return capacities[i] > capacities[j] })
+		var demand, covered int64
+		for _, req := range requests {
+			demand += req
+		}
+		for _, cap := range capacities {
+			if covered >= demand {
+				break
+			}
+			covered += cap
+			out.A++
+		}
+		out.Exact = false
+	}
+	// The current placement itself proves an optimum cannot require more than B
+	// occupied nodes. Clamp defensive lower-bound approximations and stale cache
+	// combinations so FragRate always remains in its documented [0,1] range.
+	if out.A > out.B {
+		out.A = out.B
 	}
 	return out
 }

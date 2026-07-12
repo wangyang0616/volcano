@@ -39,8 +39,11 @@ import (
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
-// process plans and acts on a cleared run (the gate already passed).
-func (e *Engine) process(work *repackv1alpha1.RepackRun) {
+// process plans and acts on a cleared run (the gate already passed). Execute is
+// deliberately two-phase: persist the complete plan and nomination intents
+// first, then issue evictions. This closes the replacement-pod race and ensures
+// a crash never performs an eviction whose intent was not durably recorded.
+func (e *Engine) process(ctx context.Context, work *repackv1alpha1.RepackRun) error {
 	start := time.Now()
 	defer func() { metrics.ObserveCycle(string(work.Spec.Mode), time.Since(start).Seconds()) }()
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
@@ -72,9 +75,8 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		// --repack-default-resource is unset. Measuring fragmentation on the empty
 		// resource would count every node as empty and silently report
 		// NoFragmentation, so fail fast with an actionable reason instead.
-		e.fail(work, generation, "NoTargetResource",
+		return e.fail(ctx, work, generation, "NoTargetResource",
 			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
-		return
 	}
 	if !supportedTarget(res) {
 		// Only fully-qualified extended resources (nvidia.com/gpu, huawei.com/Ascend910)
@@ -83,9 +85,28 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		// Scalar() reads 0 for them and the run would be a silent no-op reporting
 		// NoFragmentation. CEL rejects this on spec.goals, but the --repack-default-
 		// resource fallback bypasses CEL, so guard it here too.
-		e.fail(work, generation, "UnsupportedResource",
+		return e.fail(ctx, work, generation, "UnsupportedResource",
 			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", res))
-		return
+	}
+	if _, ok := engineframework.GetCore(e.cfg.Core); !ok {
+		return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
+			fmt.Errorf("unknown repack core %q (registered: %v)", e.cfg.Core, engineframework.CoreNames()))
+	}
+	actions := e.cfg.Actions
+	if len(actions) == 0 {
+		actions = engineframework.DefaultActions()
+	}
+	for _, name := range actions {
+		if _, ok := engineframework.GetAction(name); !ok {
+			return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
+				fmt.Errorf("unknown repack action %q (registered: %v)", name, engineframework.ActionNames()))
+		}
+	}
+	for _, name := range e.cfg.Plugins {
+		if _, ok := engineframework.GetPlugin(name); !ok {
+			return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
+				fmt.Errorf("unknown repack plugin %q", name))
+		}
 	}
 
 	reason := state.ReasonSimulating
@@ -95,16 +116,17 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", generation)
 	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", generation)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-	e.updateStatus(work)
+	if err := e.updateStatus(ctx, work); err != nil {
+		return fmt.Errorf("persist Running status: %w", err)
+	}
 
 	scope, err := engineframework.NewScopeMatcher(work.Spec.Scope, adapter.SessionGangScopeLookup(sched))
 	if err != nil {
-		e.fail(work, generation, "ScopeError", err)
-		return
+		return e.fail(ctx, work, generation, "ScopeError", err)
 	}
 
 	snapshot := adapter.NewSessionSnapshot(sched, res, scope)
-	maxPG, maxRes := maxPerRun(work, res)
+	maxPG, maxRes, limitPG, limitRes := maxPerRun(work, res)
 	klog.V(5).InfoS("repack: engine session opened", "run", work.Name, "resource", res,
 		"nodes", len(snapshot.Nodes()), "maxPodGroups", maxPG, "maxResource", maxRes)
 	engineSsn := engineframework.OpenSession(engineframework.SessionConfig{
@@ -117,14 +139,16 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		MinFragImprovementPercent: minFragImprovement(work),
 		MaxPodGroups:              maxPG,
 		MaxResource:               maxRes,
+		LimitPodGroups:            limitPG,
+		LimitResource:             limitRes,
 		Hooks:                     hooksFor(work.Spec.Mode, e.cache.Client()),
 		Free:                      adapter.NodeFreeCapacity,
 	}, e.cfg.Plugins)
 	engineSsn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
 	defer engineframework.CloseSession(engineSsn)
 
-	// The repack action runs the core and (Execute) evicts via Hooks; open-loop —
-	// a failed eviction is recorded, not fatal.
+	// Actions are planning-only. Execute is committed below, after applyPlan has
+	// been persisted successfully.
 	engineframework.RunActions(e.cfg.Actions, engineSsn)
 
 	report, plan := engineSsn.Report(), engineSsn.Plan()
@@ -143,7 +167,23 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 		ttl = e.cfg.NominationTTL
 	}
 	applyPlan(work, report, plan, res, execute, ttl)
-	commit := engineSsn.Commit()
+	if execute && worthwhile {
+		// This is the prepare barrier. In particular, nominations must be visible
+		// before an eviction can cause a replacement pod to appear.
+		if err := e.updateStatus(ctx, work); err != nil {
+			return fmt.Errorf("persist prepared Execute plan: %w", err)
+		}
+	}
+
+	var commit *engineframework.CommitResult
+	if execute && worthwhile {
+		result, err := engineframework.CommitPlan(plan, engineSsn.Hooks())
+		if err != nil {
+			return e.fail(ctx, work, generation, state.ReasonExecuteFailed, err)
+		}
+		commit = &result
+		engineSsn.SetCommit(commit)
+	}
 	evicted, rejected := 0, 0
 	if commit != nil {
 		evicted, rejected = len(commit.Evicted), len(commit.Failed)
@@ -153,10 +193,20 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
 	// the repack achieved nothing — fail rather than falsely reporting Executed.
+	if execute && worthwhile {
+		// Replace the optimistic prepared plan with the realized subset. Failed
+		// evictions must not leave stale nominations or claim nodes were freed.
+		plan = realizedPlan(plan, commit)
+		report = engineframework.RenderReport(plan)
+		applyPlan(work, report, plan, res, true, ttl)
+	}
 	if execute && worthwhile && evicted == 0 && rejected > 0 {
-		e.fail(work, generation, state.ReasonExecuteFailed,
+		return e.fail(ctx, work, generation, state.ReasonExecuteFailed,
 			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejected))
-		return
+	}
+	if execute && worthwhile && report.NodesFreed == 0 {
+		return e.fail(ctx, work, generation, state.ReasonExecuteFailed,
+			fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evicted, rejected))
 	}
 
 	var done, msg string
@@ -178,7 +228,7 @@ func (e *Engine) process(work *repackv1alpha1.RepackRun) {
 	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
 	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 	klog.V(3).InfoS("RepackRun finished", "run", work.Name, "mode", work.Spec.Mode, "outcome", done)
-	e.updateStatusTerminal(work)
+	return e.updateStatusTerminal(ctx, work)
 }
 
 // hooksFor returns the commit side effects. DryRun: none. Execute: evict each
@@ -215,4 +265,58 @@ func (e *Engine) resolveResource(run *repackv1alpha1.RepackRun) v1.ResourceName 
 // spec.goals[0].resource and also guards the --repack-default-resource fallback.
 func supportedTarget(res v1.ResourceName) bool {
 	return strings.Contains(string(res), "/")
+}
+
+// realizedPlan filters an optimistic plan through the actual eviction results.
+// A node is reported freed only when every planned move sourced from that node
+// was accepted. The returned plan retains the original fragmentation baseline so
+// RenderReport can describe the realized benefit without inventing a new metric.
+func realizedPlan(plan *engineapi.RepackPlan, commit *engineframework.CommitResult) *engineapi.RepackPlan {
+	if plan == nil || commit == nil {
+		return nil
+	}
+	succeeded := make(map[string]int, len(commit.Evicted))
+	failedSource := make(map[string]bool, len(commit.Failed))
+	for _, oc := range commit.Evicted {
+		succeeded[moveOutcomeKey(oc.Namespace, oc.Task, oc.From, oc.To)]++
+	}
+	for _, oc := range commit.Failed {
+		failedSource[oc.From] = true
+	}
+
+	realized := &engineapi.RepackPlan{Before: plan.Before}
+	for _, m := range plan.Moves {
+		if m == nil || m.Task == nil {
+			continue
+		}
+		key := moveOutcomeKey(m.Task.Namespace, m.Task.Name, m.From, m.To)
+		if succeeded[key] == 0 {
+			continue
+		}
+		succeeded[key]--
+		realized.Moves = append(realized.Moves, m)
+	}
+	for _, node := range plan.FreedNodes {
+		if !failedSource[node] {
+			realized.FreedNodes = append(realized.FreedNodes, node)
+		}
+	}
+	for _, unit := range plan.FreedUnits {
+		fullyFreed := true
+		for _, node := range unit.Nodes {
+			if failedSource[node] {
+				fullyFreed = false
+				break
+			}
+		}
+		if fullyFreed {
+			realized.FreedUnits = append(realized.FreedUnits, unit)
+		}
+	}
+	realized.Cost = engineapi.CostOf(realized.Moves, plan.Before.Resource)
+	return realized
+}
+
+func moveOutcomeKey(namespace, task, from, to string) string {
+	return namespace + "\x00" + task + "\x00" + from + "\x00" + to
 }

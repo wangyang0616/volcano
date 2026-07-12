@@ -18,6 +18,7 @@ package repackengine
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
@@ -36,43 +38,84 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/metrics"
 )
 
-func (e *Engine) fail(run *repackv1alpha1.RepackRun, generation int64, reason string, err error) {
+func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, generation int64, reason string, err error) error {
 	klog.ErrorS(err, "repack: run failed", "run", run.Name, "reason", reason)
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), generation)
 	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
-	e.updateStatusTerminal(run)
+	return e.updateStatusTerminal(ctx, run)
 }
 
-func (e *Engine) updateStatus(run *repackv1alpha1.RepackRun) {
+func (e *Engine) updateStatus(ctx context.Context, run *repackv1alpha1.RepackRun) error {
 	stampLifecycle(run, time.Now())
 	desired := run.Status.DeepCopy()
-	name := run.Name
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(context.Background(), name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil // deleted (e.g. TTL GC); nothing to write
-		}
+	err := e.writeStatus(ctx, run.Name, desired)
+	if err != nil {
+		klog.ErrorS(err, "repack: update status", "run", run.Name)
+	}
+	return err
+}
+
+func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1alpha1.RepackRunStatus) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
-		// Re-apply the intended status onto the freshest object so a concurrent
-		// write (e.g. the controller, or our own later update) does not 409 us.
-		desired.DeepCopyInto(&latest.Status)
-		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
+		// Re-apply the intended status onto the freshest object. Nomination phase is
+		// controller-owned; preserve a concurrently observed Bound/Expired phase
+		// instead of resetting it to Pending during the engine's terminal write.
+		merged := desired.DeepCopy()
+		mergeNominationPhases(merged.Nominations, latest.Status.Nominations)
+		merged.DeepCopyInto(&latest.Status)
+		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
 		return err
 	})
-	if err != nil {
-		klog.ErrorS(err, "repack: update status", "run", name)
+}
+
+func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
+	phases := make(map[string]string, len(latest))
+	for i := range latest {
+		r := &latest[i]
+		if r.Phase == "Bound" || r.Phase == "Expired" {
+			phases[nominationKey(r)] = r.Phase
+		}
+	}
+	for i := range desired {
+		if phase := phases[nominationKey(&desired[i])]; phase != "" {
+			desired[i].Phase = phase
+		}
 	}
 }
 
-// updateStatusTerminal writes a terminal status with conflict retry. Intermediate
-// writes are best-effort (a later reconcile re-derives them), but losing the
-// TERMINAL write would strand the run in Running until an orphan recovery — so on
-// conflict re-read the latest object and re-apply the computed status.
-func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
+func nominationKey(r *repackv1alpha1.PodNomination) string {
+	if r == nil {
+		return ""
+	}
+	return r.Namespace + "\x00" + r.PodGroupName + "\x00" + r.VictimPodName + "\x00" + r.NodeName
+}
+
+// updateStatusTerminal keeps retrying until the terminal result is durable or
+// leadership/context is lost. After Execute side effects have started, returning
+// success without this write would leave an ambiguous, non-replayable Run.
+func (e *Engine) updateStatusTerminal(ctx context.Context, run *repackv1alpha1.RepackRun) error {
 	stampLifecycle(run, time.Now())
+	desired := run.Status.DeepCopy()
+	name := run.Name
+	err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := e.writeStatus(ctx, name, desired); err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil // explicitly deleted; no terminal object remains to persist
+			}
+			klog.ErrorS(err, "repack: terminal status persistence failed; retrying", "run", name)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("persist terminal status for %s: %w", name, err)
+	}
+
 	outcome := terminalOutcome(run)
 	metrics.ObserveRun(string(run.Spec.Mode), outcome)
 	if e.recorder != nil {
@@ -82,23 +125,7 @@ func (e *Engine) updateStatusTerminal(run *repackv1alpha1.RepackRun) {
 		}
 		e.recorder.Event(run, etype, outcome, "repack run reached a terminal state")
 	}
-	desired := run.Status.DeepCopy()
-	name := run.Name
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(context.Background(), name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil // deleted (e.g. TTL GC); nothing to write
-		}
-		if err != nil {
-			return err
-		}
-		desired.DeepCopyInto(&latest.Status)
-		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
-		return err
-	})
-	if err != nil {
-		klog.ErrorS(err, "repack: write terminal status", "run", name)
-	}
+	return nil
 }
 
 // terminalOutcome is the reason of the True Complete/Failed/Cancelled condition

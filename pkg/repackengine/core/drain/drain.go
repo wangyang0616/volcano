@@ -115,11 +115,14 @@ type drainState struct {
 	resource     v1.ResourceName
 	maxPodGroups int
 	maxResource  int64
+	limitPG      bool
+	limitRes     bool
 
 	// Mutated as units are committed.
 	drained        map[string]bool // emptied — no longer a receiver
 	filled         map[string]bool // received a moved-in pod
 	provenStuck    map[string]bool // proven un-vacatable this pass → prefer as receiver
+	stuckUnits     map[string]bool // monotonic infeasibility cache; never re-simulate
 	movedPodGroups map[schedapi.JobID]bool
 	movedCards     int64
 	moves          []*api.Move
@@ -180,9 +183,12 @@ func newDrainState(
 		resource:       res,
 		maxPodGroups:   ssn.MaxPodGroups(),
 		maxResource:    ssn.MaxResource(),
+		limitPG:        ssn.LimitPodGroups(),
+		limitRes:       ssn.LimitResource(),
 		drained:        make(map[string]bool),
 		filled:         make(map[string]bool),
 		provenStuck:    make(map[string]bool),
+		stuckUnits:     make(map[string]bool),
 		movedPodGroups: make(map[schedapi.JobID]bool),
 	}
 }
@@ -192,6 +198,9 @@ func newDrainState(
 // that vacate it. ok=false means "not freeable this step".
 func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	key := unitKey(unit)
+	if s.stuckUnits[key] {
+		return candidate{}, false
+	}
 	inUnit, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
 	if !ok {
 		klog.V(5).InfoS("repack drain: unit not freeable now (drained/filled/has-immovable-pod)", "unit", key, "nodes", unit.Nodes)
@@ -235,6 +244,7 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		for _, nodeName := range unit.Nodes {
 			s.provenStuck[nodeName] = true
 		}
+		s.stuckUnits[key] = true
 		return candidate{}, false
 	}
 	// Disruption budget (maxPerRun): prospective deltas.
@@ -246,12 +256,12 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		}
 		newCards += api.Scalar(v.InitResreq, s.resource)
 	}
-	if s.maxPodGroups > 0 && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
+	if (s.limitPG || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.podGroups", "unit", key,
 			"wouldBe", len(s.movedPodGroups)+len(newPodGroups), "max", s.maxPodGroups)
 		return candidate{}, false
 	}
-	if s.maxResource > 0 && s.movedCards+newCards > s.maxResource {
+	if (s.limitRes || s.maxResource > 0) && s.movedCards+newCards > s.maxResource {
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.resources", "unit", key,
 			"wouldBe", s.movedCards+newCards, "max", s.maxResource)
 		return candidate{}, false

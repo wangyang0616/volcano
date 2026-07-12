@@ -130,10 +130,11 @@ func resolveIdentityLabels(pod *corev1.Pod) map[string]string {
 
 // MoveOutcome records one move's commit result (engine-internal).
 type MoveOutcome struct {
-	Task string
-	From string
-	To   string
-	Err  string // non-empty if the eviction failed (open-loop: not fatal)
+	Namespace string
+	Task      string
+	From      string
+	To        string
+	Err       string // non-empty if the eviction failed (open-loop: not fatal)
 }
 
 // CommitResult is what the commit attempted — raw material for status.result.
@@ -171,7 +172,7 @@ func CommitPlan(plan *api.RepackPlan, h CommitHooks) (CommitResult, error) {
 		}
 	}
 	for _, m := range orderedMoves(plan) {
-		oc := MoveOutcome{Task: taskName(m), From: m.From, To: m.To}
+		oc := MoveOutcome{Namespace: m.Task.Namespace, Task: taskName(m), From: m.From, To: m.To}
 		if err := h.Evict(m); err != nil {
 			oc.Err = err.Error()
 			res.Failed = append(res.Failed, oc)

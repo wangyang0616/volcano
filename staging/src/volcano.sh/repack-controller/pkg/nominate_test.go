@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
@@ -136,4 +137,28 @@ func TestMatchNomination(t *testing.T) {
 			t.Fatalf("should not match any (bound/expired/wrong pg/ns): got %+v", rec)
 		}
 	})
+}
+
+func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
+	future := metav1.NewTime(time.Unix(5000, 0))
+	n := nominatorWith(runWithNoms("r1", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "g", VictimPodName: "old", NodeName: "n2", ExpirationTime: &future,
+	}))
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	victim := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "old"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	if err := pods.Add(victim); err != nil {
+		t.Fatal(err)
+	}
+	n.podLister = corelisters.NewPodLister(pods)
+	replacement := pendingPod("ns", "new-random-name", "g", nil)
+
+	if rec, _ := n.matchNomination(replacement); rec != nil {
+		t.Fatalf("prepared nomination must not be consumed while victim exists: %+v", rec)
+	}
+	if err := pods.Delete(victim); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := n.matchNomination(replacement); rec == nil || rec.NodeName != "n2" {
+		t.Fatalf("nomination should activate after victim deletion: %+v", rec)
+	}
 }
