@@ -15,9 +15,8 @@ limitations under the License.
 */
 
 // Package v1alpha1 contains API Schema definitions for the repack v1alpha1
-// API group — the Repack (runtime defragmentation) CRDs. P0 ships only
-// RepackRun (a one-shot, user-immutable job); RepackPolicy is P1 (see design
-// docs/design/repack-policy-design.md §3.3).
+// API group — the Repack (runtime defragmentation) CRDs. It ships RepackRun, a
+// one-shot, user-immutable defragmentation job.
 //
 // +kubebuilder:object:generate=true
 // +groupName=repack.volcano.sh

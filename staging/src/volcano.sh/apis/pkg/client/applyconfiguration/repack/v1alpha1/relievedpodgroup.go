@@ -20,7 +20,7 @@ package v1alpha1
 // RelievedPodGroupApplyConfiguration represents a declarative configuration of the RelievedPodGroup type for use
 // with apply.
 //
-// RelievedPodGroup reports a pending gang that would become schedulable (P1).
+// RelievedPodGroup reports a pending gang that would become schedulable (reserved).
 type RelievedPodGroupApplyConfiguration struct {
 	Namespace    *string `json:"namespace,omitempty"`
 	PodGroupName *string `json:"podGroupName,omitempty"`

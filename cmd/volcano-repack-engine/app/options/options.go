@@ -37,7 +37,7 @@ const (
 	// collision — this is purely for a consistent, memorable convention.
 	defaultHealthzAddress = ":11251"
 	defaultMetricsAddress = ":8081"
-	// defaultExecuteCooldown / defaultNominationTTL are the P0 time defaults; keep
+	// defaultExecuteCooldown / defaultNominationTTL are the default times; keep
 	// defaultExecuteCooldown in sync with the controller's GC cooldown floor.
 	defaultExecuteCooldown = 10 * time.Minute
 	defaultNominationTTL   = 10 * time.Minute

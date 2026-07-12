@@ -32,7 +32,7 @@ type RepackPlanApplyConfiguration struct {
 	Moves []RepackMoveApplyConfiguration `json:"moves,omitempty"`
 	// FreedNodes are the names of nodes the plan empties.
 	FreedNodes []string `json:"freedNodes,omitempty"`
-	// Relief reports which pending PodGroups would be unblocked (P1).
+	// Relief reports which pending PodGroups would be unblocked (reserved).
 	Relief []RelievedPodGroupApplyConfiguration `json:"relief,omitempty"`
 }
 

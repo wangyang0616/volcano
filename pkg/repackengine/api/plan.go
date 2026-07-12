@@ -50,7 +50,7 @@ func (p *RepackPlan) NodesFreed() int { return len(p.FreedNodes) }
 
 // Benefit is the realized weighted benefit across all freed units (the objective
 // the core maximizes). Falls back to node count when no units are recorded
-// (node-only P0), so it equals NodesFreed in that case.
+// (node-only), so it equals NodesFreed in that case.
 func (p *RepackPlan) Benefit() float64 {
 	if p == nil {
 		return 0

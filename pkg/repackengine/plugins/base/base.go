@@ -16,8 +16,8 @@ limitations under the License.
 
 // Package base registers the gang-agnostic disruption scores every repack run
 // wants: number of affected PodGroups, moved cards, moved pods. Weights are the
-// P0 defaults (disruptionPolicy overrides them in P1). Gang-semantics scores live
-// in the gang plugin.
+// default values (disruptionPolicy may override them later). Gang-semantics scores
+// live in the gang plugin.
 package base
 
 import (
@@ -28,8 +28,8 @@ import (
 // Name is the config name for this plugin.
 const Name = "base"
 
-// Default P0 weights for the base disruption dimensions (disruptionPolicy overrides
-// them in P1). Breaking a whole gang matters most, then relocated cards, then pods.
+// Default weights for the base disruption dimensions (disruptionPolicy overrides
+// them later). Breaking a whole gang matters most, then relocated cards, then pods.
 const (
 	weightAffectedPodGroups = 1.0
 	weightMovedResource     = 0.3

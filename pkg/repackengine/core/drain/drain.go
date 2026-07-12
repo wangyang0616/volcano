@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package drain is the P0 core (algorithm A): node-anchored, incremental,
+// Package drain is the core (algorithm A): node-anchored, incremental,
 // gang-aware greedy. A single dynamic pass repeatedly re-evaluates every
 // still-freeable unit against the committed moves so far and commits the feasible
 // one whose prospective plan is least disruptive — because gang damage is scored over
@@ -25,7 +25,7 @@ limitations under the License.
 // runs until no unit can be freed, then the plan is kept iff it meets MinNodesFreed.
 //
 // "Unit" generalizes "node": a node-domain plugin yields one single-node unit per
-// node (P0); a hypernode-domain plugin yields multi-node units. With both enabled
+// node; a hypernode-domain plugin yields multi-node units. With both enabled
 // the units are a weighted union and the core prefers higher-benefit units first.
 package drain
 
@@ -79,7 +79,7 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	plan.Before = before
 	// Hard admissibility gate: the built-in benefit constraints (MinNodesFreed,
 	// MinFragImprovementPercent) plus any plugin-registered plan constraints (e.g.
-	// disruptionPolicy.maxDisruptionScore in P1). A rejected plan = NoRepackNeeded.
+	// disruptionPolicy.maxDisruptionScore, added later). A rejected plan = NoRepackNeeded.
 	if !ssn.PlanAdmissible(plan) {
 		klog.V(3).InfoS("repack drain: plan rejected by benefit gate (below MinNodesFreed / MinFragImprovement)",
 			"resource", res, "freedNodes", len(plan.FreedNodes), "moves", len(plan.Moves))

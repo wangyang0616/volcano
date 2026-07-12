@@ -59,9 +59,9 @@ const (
 // ---------- spec ----------
 
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
-// P0 is self-contained (hand-written in full); relief and disruptionPolicy are
-// P1 — fields are reserved here so the schema is stable, but the engine
-// honors engine defaults in P0.
+// The core spec is hand-written in full; the relief and disruptionPolicy fields
+// are reserved here so the schema is stable, but the engine currently honors its
+// own defaults for them.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
 // admission step): mode is an enum, goals is capped at one entry, and the spec is
@@ -77,17 +77,17 @@ type RepackRunSpec struct {
 	// +optional
 	Scope *RepackScope `json:"scope,omitempty"`
 
-	// Relief (P1): pending PodGroups this run aims to make schedulable.
+	// Relief (reserved): pending PodGroups this run aims to make schedulable.
 	// +optional
 	Relief *RepackRelief `json:"relief,omitempty"`
 
-	// Goals is the per-resource fragmentation target. P0/P1: exactly one entry
-	// (a run defragments a single accelerator resource); multi-resource is P2+.
+	// Goals is the per-resource fragmentation target: exactly one entry
+	// (a run defragments a single accelerator resource); multi-resource is reserved.
 	// +optional
 	// +kubebuilder:validation:MaxItems=1
 	Goals []RepackGoal `json:"goals,omitempty"`
 
-	// DisruptionPolicy (P1): how/whether running jobs may be disturbed.
+	// DisruptionPolicy (reserved): how/whether running jobs may be disturbed.
 	// +optional
 	DisruptionPolicy *DisruptionPolicy `json:"disruptionPolicy,omitempty"`
 
@@ -96,7 +96,7 @@ type RepackRunSpec struct {
 	MaxPerRun *MaxPerRun `json:"maxPerRun,omitempty"`
 
 	// TTLSecondsAfterFinished: auto-DELETE this Run that long after it finishes
-	// (like Job). Unset = not auto-deleted (P0; Policy default is P1).
+	// (like Job). Unset = not auto-deleted.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int64 `json:"ttlSecondsAfterFinished,omitempty"`
@@ -141,7 +141,7 @@ type RepackSelector struct {
 	Names []string `json:"names,omitempty"`
 }
 
-// RepackRelief (P1) names pending PodGroups to unblock (beneficiaries; they
+// RepackRelief (reserved) names pending PodGroups to unblock (beneficiaries; they
 // themselves are not moved).
 type RepackRelief struct {
 	// PodGroupRefs are "namespace/name" of pending PodGroups to relieve.
@@ -171,9 +171,9 @@ type RepackGoal struct {
 	MinFragImprovementPercent int32 `json:"minFragImprovementPercent,omitempty"`
 }
 
-// DisruptionPolicy (P1) tunes how running jobs may be disturbed. Lives on the
+// DisruptionPolicy (reserved) tunes how running jobs may be disturbed. Lives on the
 // Run (not in plugin config): plugin config only selects which scoring plugins
-// are enabled. P0 ignores these and uses engine defaults.
+// are enabled. The engine currently ignores these and uses its defaults.
 type DisruptionPolicy struct {
 	// +optional
 	BundlePolicy BundlePolicy `json:"bundlePolicy,omitempty"`
@@ -325,7 +325,7 @@ type RepackPlan struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=2048
 	FreedNodes []string `json:"freedNodes,omitempty"`
-	// Relief reports which pending PodGroups would be unblocked (P1).
+	// Relief reports which pending PodGroups would be unblocked (reserved).
 	// +optional
 	// +kubebuilder:validation:MaxItems=256
 	Relief []RelievedPodGroup `json:"relief,omitempty"`
@@ -334,7 +334,7 @@ type RepackPlan struct {
 // RepackSummary is the flat second layer of the plan. Single-resource per run
 // (goals maxItems=1): the fragmentation figures are for that one accelerator
 // resource (goals[0].resource) — no per-resource breakdown. Multi-resource is
-// P2+ (would add a per-resource layer then).
+// Reserved for multi-resource (would add a per-resource layer then).
 type RepackSummary struct {
 	// Fragmentation before/after for the run's resource, in percentage points
 	// (0-100). Improvement = before - after (derive client-side).
@@ -416,7 +416,7 @@ type WorkloadRef struct {
 	Name string `json:"name,omitempty"`
 }
 
-// RelievedPodGroup reports a pending gang that would become schedulable (P1).
+// RelievedPodGroup reports a pending gang that would become schedulable (reserved).
 type RelievedPodGroup struct {
 	// +kubebuilder:validation:Required
 	Namespace string `json:"namespace"`

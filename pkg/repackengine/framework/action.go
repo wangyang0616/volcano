@@ -26,7 +26,7 @@ import (
 const ActionRepack = "repack"
 
 // Action is one ordered stage of a repack pass (mirrors framework.Action in the
-// scheduler). P0 ships a single "repack" action (run the selected core, then
+// scheduler). Ships a single "repack" action (run the selected core, then
 // commit on Execute); future stages (relief, simulate) compose after it.
 type Action interface {
 	Name() string
@@ -57,7 +57,7 @@ func ActionNames() []string {
 	return out
 }
 
-// DefaultActions is the P0 pipeline when config names none.
+// DefaultActions is the default pipeline when config names none.
 func DefaultActions() []string { return []string{ActionRepack} }
 
 // RunActions executes the named actions in order against the session. Unknown

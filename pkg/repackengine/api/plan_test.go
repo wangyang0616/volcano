@@ -26,7 +26,7 @@ func TestBenefit_UnitsWeighted(t *testing.T) {
 	}
 }
 
-// With no units recorded, Benefit falls back to the freed-node count (node-only P0).
+// With no units recorded, Benefit falls back to the freed-node count (node-only).
 func TestBenefit_FallbackNodeCount(t *testing.T) {
 	p := &RepackPlan{FreedNodes: []string{"n0", "n1"}}
 	if p.Benefit() != 2 {

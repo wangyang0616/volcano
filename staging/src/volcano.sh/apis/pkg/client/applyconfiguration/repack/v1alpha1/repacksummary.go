@@ -23,7 +23,7 @@ package v1alpha1
 // RepackSummary is the flat second layer of the plan. Single-resource per run
 // (goals maxItems=1): the fragmentation figures are for that one accelerator
 // resource (goals[0].resource) — no per-resource breakdown. Multi-resource is
-// P2+ (would add a per-resource layer then).
+// Reserved for multi-resource (would add a per-resource layer then).
 type RepackSummaryApplyConfiguration struct {
 	// Fragmentation before/after for the run's resource, in percentage points
 	// (0-100). Improvement = before - after (derive client-side).

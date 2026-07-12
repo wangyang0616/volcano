@@ -49,7 +49,7 @@ const (
 )
 
 // Nomination is a landing hint written on a concrete pending pod
-// (pod.status.NominatedNodeName). The P0 steering primitive, written by the
+// (pod.status.NominatedNodeName). The steering primitive, written by the
 // nomination reconciler on each *replacement* pod, not on the dying victim.
 type Nomination struct {
 	PodRef string // "namespace/name"
@@ -144,7 +144,7 @@ type CommitResult struct {
 }
 
 // CommitHooks are the injected side effects. Evict is required; Nominate is for
-// relief pending targets (P1). Funcs so production supplies Eviction-API /
+// relief pending targets (added later). Funcs so production supplies Eviction-API /
 // status-patch impls while tests use fakes.
 type CommitHooks struct {
 	Evict    func(m *api.Move) error
@@ -205,8 +205,8 @@ func orderedMoves(plan *api.RepackPlan) []*api.Move {
 	return ms
 }
 
-// pendingNominations: landing hints for pods Pending at commit time (relief, P1).
-// Empty for P0 consolidation (replacement pods don't exist yet → steered async by
+// pendingNominations: landing hints for pods Pending at commit time (relief, added later).
+// Empty for consolidation (replacement pods don't exist yet → steered async by
 // the nomination reconciler over NominationIntents).
 func pendingNominations(_ *api.RepackPlan) []Nomination { return nil }
 

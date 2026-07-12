@@ -46,7 +46,6 @@ func Resource(resource string) schema.GroupResource {
 }
 
 // addKnownTypes adds the set of types defined in this package to the supplied scheme.
-// P0: only RepackRun. RepackPolicy is P1 (§3.3) and intentionally not registered yet.
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&RepackRun{},

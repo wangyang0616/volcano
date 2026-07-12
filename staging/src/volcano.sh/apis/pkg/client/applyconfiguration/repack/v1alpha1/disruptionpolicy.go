@@ -25,9 +25,9 @@ import (
 // DisruptionPolicyApplyConfiguration represents a declarative configuration of the DisruptionPolicy type for use
 // with apply.
 //
-// DisruptionPolicy (P1) tunes how running jobs may be disturbed. Lives on the
+// DisruptionPolicy (reserved) tunes how running jobs may be disturbed. Lives on the
 // Run (not in plugin config): plugin config only selects which scoring plugins
-// are enabled. P0 ignores these and uses engine defaults.
+// are enabled. The engine currently ignores these and uses its defaults.
 type DisruptionPolicyApplyConfiguration struct {
 	BundlePolicy *repackv1alpha1.BundlePolicy `json:"bundlePolicy,omitempty"`
 	// MinRunDuration: jobs running less than this are not moved.

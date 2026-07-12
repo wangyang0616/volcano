@@ -41,8 +41,8 @@ type (
 	// PlanConstraintFn is a HARD admissibility gate on a finished plan: return
 	// false to reject it outright. Aggregated with AND — any constraint may veto.
 	// Distinct from DisruptionScoreFn (soft ranking): a failed constraint discards
-	// the plan. The P0 benefit gates (MinNodesFreed, MinFragImprovementPercent) are
-	// registered as built-in constraints; P1 features like disruptionPolicy's
+	// the plan. The benefit gates (MinNodesFreed, MinFragImprovementPercent) are
+	// registered as built-in constraints; later features like disruptionPolicy's
 	// maxDisruptionScore add their own via AddConstraintFn.
 	PlanConstraintFn func(ctx *api.PlanContext, plan *api.RepackPlan) bool
 )
@@ -104,9 +104,9 @@ func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
 	return ssn
 }
 
-// registerBuiltinConstraints turns the run's P0 benefit gates into first-class
+// registerBuiltinConstraints turns the run's benefit gates into first-class
 // plan constraints, so the core just asks PlanAdmissible instead of hardcoding
-// them. P1 plan-level policies (e.g. disruptionPolicy.maxDisruptionScore) join
+// them. Additional plan-level policies (e.g. disruptionPolicy.maxDisruptionScore) join
 // the same seam via AddConstraintFn.
 func (s *Session) registerBuiltinConstraints() {
 	// MinNodesFreed: a plan must free at least this many nodes (default 1).

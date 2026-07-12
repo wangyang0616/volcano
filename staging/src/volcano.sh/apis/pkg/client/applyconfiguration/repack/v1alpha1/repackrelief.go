@@ -20,7 +20,7 @@ package v1alpha1
 // RepackReliefApplyConfiguration represents a declarative configuration of the RepackRelief type for use
 // with apply.
 //
-// RepackRelief (P1) names pending PodGroups to unblock (beneficiaries; they
+// RepackRelief (reserved) names pending PodGroups to unblock (beneficiaries; they
 // themselves are not moved).
 type RepackReliefApplyConfiguration struct {
 	// PodGroupRefs are "namespace/name" of pending PodGroups to relieve.

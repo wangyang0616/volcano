@@ -28,9 +28,9 @@ import (
 // Name is the config name for this plugin.
 const Name = "gang"
 
-// Default P0 weights for the gang-semantics disruption dimensions: pushing a gang
+// Default weights for the gang-semantics disruption dimensions: pushing a gang
 // below minAvailable (a breach) is weighted above merely churning a breached gang's
-// cards (disruptionPolicy overrides these in P1).
+// cards (disruptionPolicy overrides these later).
 const (
 	weightGangBreaches = 0.8
 	weightDamagedGPU   = 0.6

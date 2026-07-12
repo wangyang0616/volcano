@@ -140,7 +140,7 @@ func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFr
 	}
 	out.A, out.Exact = OptimalNodes(requests, capacity)
 	if !homogeneous {
-		out.Exact = false // mixed-capacity pools: A is only a lower bound (P1)
+		out.Exact = false // mixed-capacity pools: A is only a lower bound
 	}
 	return out
 }
@@ -162,7 +162,7 @@ func WeightedFragRate(per map[v1.ResourceName]ResourceFrag) float64 {
 }
 
 // scalar reads an accelerator (scalar) resource amount as a rounded int64.
-// Accelerator cards are whole units; CPU/memory (P1) would keep Quantity.
+// Accelerator cards are whole units; CPU/memory would keep Quantity.
 func Scalar(r *api.Resource, name v1.ResourceName) int64 {
 	if r == nil || r.ScalarResources == nil {
 		return 0

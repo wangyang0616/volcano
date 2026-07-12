@@ -24,7 +24,7 @@ import (
 
 // Built-in core names (config repack.core).
 const (
-	CoreDrain         = "drain"         // P0: node-anchored greedy (algorithm A)
+	CoreDrain         = "drain"         // node-anchored greedy (algorithm A)
 	CoreConcentration = "concentration" // future: Σused² hill-climb (algorithm B)
 )
 

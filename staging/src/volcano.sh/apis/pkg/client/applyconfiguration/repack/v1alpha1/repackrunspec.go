@@ -26,9 +26,9 @@ import (
 //
 // ---------- spec ----------
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
-// P0 is self-contained (hand-written in full); relief and disruptionPolicy are
-// P1 — fields are reserved here so the schema is stable, but the engine
-// honors engine defaults in P0.
+// The core spec is hand-written in full; the relief and disruptionPolicy fields
+// are reserved here so the schema is stable, but the engine currently honors its
+// own defaults for them.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
 // admission step): mode is an enum, goals is capped at one entry, and the spec is
@@ -40,17 +40,17 @@ type RepackRunSpecApplyConfiguration struct {
 	Mode *repackv1alpha1.RepackMode `json:"mode,omitempty"`
 	// Scope bounds which PodGroups may move and which nodes participate.
 	Scope *RepackScopeApplyConfiguration `json:"scope,omitempty"`
-	// Relief (P1): pending PodGroups this run aims to make schedulable.
+	// Relief (reserved): pending PodGroups this run aims to make schedulable.
 	Relief *RepackReliefApplyConfiguration `json:"relief,omitempty"`
-	// Goals is the per-resource fragmentation target. P0/P1: exactly one entry
-	// (a run defragments a single accelerator resource); multi-resource is P2+.
+	// Goals is the per-resource fragmentation target: exactly one entry
+	// (a run defragments a single accelerator resource); multi-resource is reserved.
 	Goals []RepackGoalApplyConfiguration `json:"goals,omitempty"`
-	// DisruptionPolicy (P1): how/whether running jobs may be disturbed.
+	// DisruptionPolicy (reserved): how/whether running jobs may be disturbed.
 	DisruptionPolicy *DisruptionPolicyApplyConfiguration `json:"disruptionPolicy,omitempty"`
 	// MaxPerRun caps the blast radius of a single run.
 	MaxPerRun *MaxPerRunApplyConfiguration `json:"maxPerRun,omitempty"`
 	// TTLSecondsAfterFinished: auto-DELETE this Run that long after it finishes
-	// (like Job). Unset = not auto-deleted (P0; Policy default is P1).
+	// (like Job). Unset = not auto-deleted.
 	TTLSecondsAfterFinished *int64 `json:"ttlSecondsAfterFinished,omitempty"`
 }
 

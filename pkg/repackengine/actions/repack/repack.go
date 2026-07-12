@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package repack is the P0 action: run the selected core to produce a plan, render
+// Package repack is the action: run the selected core to produce a plan, render
 // the report, and — in Execute mode — commit it (evict + steer via nomination).
 // Future actions (relief, simulate) compose after it in the pipeline.
 package repack
