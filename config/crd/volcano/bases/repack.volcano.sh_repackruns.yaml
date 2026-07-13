@@ -60,8 +60,8 @@ spec:
               a new Run).
             properties:
               disruptionPolicy:
-                description: 'DisruptionPolicy (P1): how/whether running jobs may
-                  be disturbed.'
+                description: 'DisruptionPolicy (reserved): how/whether running jobs
+                  may be disturbed.'
                 properties:
                   bundlePolicy:
                     description: BundlePolicy controls the unit of relocation for
@@ -102,7 +102,10 @@ spec:
                       not moved.'
                     type: string
                   respectPDB:
-                    description: RespectPDB enables PodDisruptionBudget compatibility.
+                    description: |-
+                      RespectPDB is retained as an unimplemented v1alpha1 compatibility field.
+                      Deprecated: Kubernetes Eviction API always respects PDBs; future planning
+                      and blocked-eviction controls live in spec.eviction.pdb.
                     type: boolean
                   weights:
                     additionalProperties:
@@ -113,10 +116,24 @@ spec:
                       scoring plugins enabled in config).
                     type: object
                 type: object
+              eviction:
+                description: |-
+                  Eviction configures how Execute issues Kubernetes Eviction requests. It is
+                  ignored by DryRun because no Pod is evicted in that mode.
+                properties:
+                  gracePeriodSeconds:
+                    description: |-
+                      GracePeriodSeconds overrides the graceful-termination period requested for
+                      every Pod eviction in this Run. Unset preserves each Pod's
+                      spec.terminationGracePeriodSeconds; 0 requests immediate termination.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                type: object
               goals:
                 description: |-
-                  Goals is the per-resource fragmentation target. P0/P1: exactly one entry
-                  (a run defragments a single accelerator resource); multi-resource is P2+.
+                  Goals is the per-resource fragmentation target: exactly one entry
+                  (a run defragments a single accelerator resource); multi-resource is reserved.
                 items:
                   description: RepackGoal is one resource's fragmentation target.
                   properties:
@@ -129,9 +146,17 @@ spec:
                       minimum: 0
                       type: integer
                     resource:
-                      description: Resource is the accelerator to defragment (e.g.
-                        nvidia.com/gpu).
+                      description: |-
+                        Resource is the accelerator to defragment (e.g. nvidia.com/gpu). Only
+                        fully-qualified extended resources (a name containing "/") are supported;
+                        core compute resources such as cpu, memory, ephemeral-storage and pods are
+                        rejected, because repack only consolidates scalar accelerator capacity.
                       type: string
+                      x-kubernetes-validations:
+                      - message: goals.resource must be a fully-qualified accelerator/extended
+                          resource (e.g. nvidia.com/gpu); core resources like cpu,
+                          memory and ephemeral-storage are not supported
+                        rule: self.contains('/')
                   required:
                   - resource
                   type: object
@@ -163,8 +188,8 @@ spec:
                 - Execute
                 type: string
               relief:
-                description: 'Relief (P1): pending PodGroups this run aims to make
-                  schedulable.'
+                description: 'Relief (reserved): pending PodGroups this run aims to
+                  make schedulable.'
                 properties:
                   minRelieved:
                     description: 'MinRelieved: at least this many must become schedulable
@@ -442,7 +467,7 @@ spec:
               ttlSecondsAfterFinished:
                 description: |-
                   TTLSecondsAfterFinished: auto-DELETE this Run that long after it finishes
-                  (like Job). Unset = not auto-deleted (P0; Policy default is P1).
+                  (like Job). Unset = not auto-deleted.
                 format: int64
                 minimum: 0
                 type: integer
@@ -685,10 +710,10 @@ spec:
                     type: array
                   relief:
                     description: Relief reports which pending PodGroups would be unblocked
-                      (P1).
+                      (reserved).
                     items:
                       description: RelievedPodGroup reports a pending gang that would
-                        become schedulable (P1).
+                        become schedulable (reserved).
                       properties:
                         namespace:
                           type: string

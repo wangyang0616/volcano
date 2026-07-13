@@ -34,7 +34,9 @@ type DisruptionPolicyApplyConfiguration struct {
 	MinRunDuration *v1.Duration `json:"minRunDuration,omitempty"`
 	// MaxDisruptionScore is the disruption-cost red line.
 	MaxDisruptionScore *int32 `json:"maxDisruptionScore,omitempty"`
-	// RespectPDB enables PodDisruptionBudget compatibility.
+	// RespectPDB is retained as an unimplemented v1alpha1 compatibility field.
+	// Deprecated: Kubernetes Eviction API always respects PDBs; future planning
+	// and blocked-eviction controls live in spec.eviction.pdb.
 	RespectPDB *bool `json:"respectPDB,omitempty"`
 	// Lambda is the benefit-vs-friction trade-off as an integer weight (default 1).
 	Lambda *int32 `json:"lambda,omitempty"`

@@ -145,7 +145,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		MaxResource:               maxResource,
 		LimitPodGroups:            hasPodGroupLimit,
 		LimitResource:             hasResourceLimit,
-		Hooks:                     hooksFor(run.Spec.Mode, e.schedulerCache.Client()),
+		Hooks:                     hooksFor(run, e.schedulerCache.Client()),
 		Free:                      adapter.NodeFreeCapacity,
 	}, e.config.Plugins)
 	engineSession.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
@@ -253,9 +253,13 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 // hooksFor returns the commit side effects. DryRun: none. Execute: evict each
 // victim via the Eviction API (PDB-respecting; the workload controller then
 // recreates the pod, steered by the nomination reconciler). No reservation/taint.
-func hooksFor(mode repackv1alpha1.RepackMode, kubernetesClient kubernetes.Interface) engineframework.CommitHooks {
-	if mode != repackv1alpha1.RepackModeExecute {
+func hooksFor(run *repackv1alpha1.RepackRun, kubernetesClient kubernetes.Interface) engineframework.CommitHooks {
+	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute {
 		return engineframework.CommitHooks{}
+	}
+	var gracePeriodSeconds *int64
+	if run.Spec.Eviction != nil {
+		gracePeriodSeconds = run.Spec.Eviction.GracePeriodSeconds
 	}
 	return engineframework.CommitHooks{
 		Evict: func(move *engineapi.Move) error {
@@ -263,9 +267,13 @@ func hooksFor(mode repackv1alpha1.RepackMode, kubernetesClient kubernetes.Interf
 				return nil
 			}
 			pod := move.Task.Pod
-			return kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), &policyv1.Eviction{
+			eviction := &policyv1.Eviction{
 				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
-			})
+			}
+			if gracePeriodSeconds != nil {
+				eviction.DeleteOptions = &metav1.DeleteOptions{GracePeriodSeconds: gracePeriodSeconds}
+			}
+			return kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), eviction)
 		},
 	}
 }

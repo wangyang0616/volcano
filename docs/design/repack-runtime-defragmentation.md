@@ -92,7 +92,8 @@ Volcano 已有基于 [kubernetes-sigs/descheduler](https://github.com/kubernetes
 | 排除受保护对象（单次） | RepackRun | `scope.podGroups.exclude`（按保护标签） | P0 |
 | 拓扑整域腾空 | RepackRun | 拓扑目标画像插件（NVLink/超节点） | P1 |
 | 解救排队 gang | RepackRun | `relief.podGroupRefs` / `relief.minRelieved` | P1 |
-| 可配扰动策略 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `disruptionPolicy.minRunDuration` / `.maxDisruptionScore` / `.respectPDB` | P1 |
+| 驱逐执行参数 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `eviction.gracePeriodSeconds` | P0 |
+| 可配扰动策略 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `disruptionPolicy.minRunDuration` / `.maxDisruptionScore`；PDB 预检与阻塞策略后续放在 `eviction.pdb` | P1 |
 | 集群级默认 + 硬护栏 / 跨 Run 强制保护 | 治理机制（另议） | CEL `ValidatingAdmissionPolicy` 或后续单开 CRD，**不在 RepackPolicy 内** | 待定 |
 
 **示例 1 · 集群管理员：一键腾空 a100 节点池（P0，RepackRun）** — 对应故事"一键腾整机 / 统一标签圈定 / 限定节点排除保护 / 控爆炸半径 / 自动清理"
@@ -180,10 +181,11 @@ spec:
         podGroups: 10
         resources:
           nvidia.com/gpu: 64
+      eviction:                     # P0：本次 Eviction 请求的执行参数
+        gracePeriodSeconds: 30      # 可选：不填则使用 Pod.spec.terminationGracePeriodSeconds
       disruptionPolicy:             # P1 扰动策略
         minRunDuration: 30m
         maxDisruptionScore: 80
-        respectPDB: true
 ```
 
 ## 3. 目标（Goals）
@@ -205,7 +207,7 @@ spec:
 **按整理语义与质量**
 
 - 支持 **Gang 感知的碎片整理**：以 PodGroup（gang）为动作与代价单位，按 gang 语义计"受损卡数"（**P0**）
-- 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；可配 `disruptionPolicy`（`minRunDuration` / `maxDisruptionScore` / PDB 兼容 `respectPDB` / 权重）（**P1**）
+- 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；`eviction.gracePeriodSeconds` 可覆盖本次驱逐的优雅终止等待；可配 `disruptionPolicy`（`minRunDuration` / `maxDisruptionScore` / 权重）（**P1**）
 - 支持**规划时可行性预检（尽力、非预留）**：驱逐前模拟"被驱逐 Pod 都有处可落"（INV-RESCHED），不过则不驱逐（**P0**）
 - 支持**落点引导**：驱逐后用 `pod.status.nominatedNodeName` 把重建 Pod 引导到目标节点；空间不保留、交还排队队列（**P0**）
 - 支持**复用调度器判断**：与 `volcano-scheduler` 同一份插件配置、同一 `framework`/`predicate`，判断同源、同演进（**P0**）
@@ -272,14 +274,44 @@ flowchart LR
 | 字段 | 含义 | 必填 | 阶段 |
 |---|---|---|---|
 | `mode` | `DryRun`（模拟出报告）/ `Execute`（真实执行） | 是 | P0 |
-| `scope.podGroups` | 候选被搬迁的作业范围（include/exclude，`selector` 按 PG 标签 + `names` 点名 PG 的 `ns/name`）——**万物皆 PodGroup**（见下方说明） | DryRun 可空，Execute 必填 | P0 |
+| `scope.podGroups` | 候选被搬迁的作业范围（include/exclude，`selector` 按 PG 标签 + `names` 点名 PG 的 `ns/name`）——**万物皆 PodGroup**（见下方说明） | 可选；省略即全部 PodGroup | P0 |
 | `scope.nodes` | 限定/排除参与整理的节点 | 可选 | P0 |
 | `goals[0].resource` | 整理哪类加速资源（如 `nvidia.com/gpu`），**单资源、至多一条** | 可选（留空=回落引擎 `--repack-default-resource`，皆空即 `NoTargetResource` 失败） | P0 |
 | `goals[0].minFragImprovementPercent` | 碎片率最小改善阈值（百分点 0–100 整数），达不到不整理 | 可选 | P0 |
 | `maxPerRun.podGroups` / `.resources` | 单轮最多动几个作业 / 几张卡 | 可选 | P0 |
+| `eviction.gracePeriodSeconds` | 本次 Eviction 请求的优雅终止等待秒数；不填沿用各 Pod 的 `terminationGracePeriodSeconds`，`0` 请求立即终止 | 可选，仅 Execute 生效 | P0 |
 | `ttlSecondsAfterFinished` | 终态后自动清理（对齐 Job，由控制器执行） | 可选 | P0 |
 | `relief` | 指定要"解救"的排队作业（反向整理出落点） | 可选 | **P1** |
-| `disruptionPolicy` | 扰动策略：搬迁单元 / 最小运行时长 / 中断分红线 / PDB 兼容 / 权重 | 可选 | **P1** |
+| `disruptionPolicy` | 扰动策略：搬迁单元 / 最小运行时长 / 中断分红线 / 权重 | 可选 | **P1** |
+
+#### Eviction 与 PDB 的职责边界
+
+`eviction.gracePeriodSeconds` 是**执行请求参数**：引擎把它原样写入
+`policy/v1 Eviction.deleteOptions.gracePeriodSeconds`。未设置时 API Server 使用
+Pod 自己的 `spec.terminationGracePeriodSeconds`；显式 `0` 表示请求立即终止。它不表示
+引擎等待 Pod 消失、替身 Ready，或节点真正腾空的超时；这些闭环等待若需要，后续另设
+`terminationWaitTimeoutSeconds` / `replacementReadyTimeoutSeconds`，不得复用 grace period。
+
+PDB 与优雅终止同属 Eviction API 的执行面，但解决的是不同问题：前者决定当前是否允许
+中断，后者决定已获准中断后可保留多久。每一次实际驱逐都必须使用 Kubernetes Eviction API，
+因此**始终受 PDB 约束，不能提供绕过 PDB 的开关**。现有
+`disruptionPolicy.respectPDB` 仅是未实现的 v1alpha1 兼容占位，不应据此推断可关闭 PDB。
+
+PDB 的后续 API 固定在 `eviction.pdb`，待完整行为确定后再暴露，而不是提前提供空字段：
+
+```yaml
+spec:
+  eviction:
+    gracePeriodSeconds: 30
+    pdb:                         # P1，尚未进入 CRD
+      preflight: Require          # None | Require：是否在规划阶段排除无 budget 的 victim
+      onBlocked: Retry            # Continue | Fail | Retry：Eviction 被 PDB 拒绝后的行为
+      retryTimeoutSeconds: 300    # 仅 Retry 时有效
+```
+
+`preflight` 只能减少“规划成功、提交时被 PDB 拒绝”的概率，因为 PDB 状态可在两者之间变化；
+最终 Eviction API 仍是唯一权威。默认行为保持当前开环语义：不做 PDB 预检，逐个尝试
+Eviction，继续其他 move；全部被拒绝时 Run 以 `ExecuteFailed` 结束。
 
 > **万物皆 PodGroup：工作负载选择统一到 PodGroup 维度**
 > repack 的动作/代价单位是 PodGroup（gang），因此**选择也统一表达在 PodGroup 上**：`selector`（PG 标签）与 `names`（PG 的 `ns/name`）指向同一种对象，语义自洽。这对三类负载一视同仁——Volcano 原生（vcjob）、K8s 原生（Deployment/StatefulSet…）、用户自定义 CRD。
@@ -309,9 +341,10 @@ type RepackRun struct {
 
 type RepackRunSpec struct {
     Mode                    RepackMode        `json:"mode"`                              // DryRun | Execute（必填）
-    Scope                   *RepackScope      `json:"scope,omitempty"`                   // 整理范围（Execute 必填非空 include）
+    Scope                   *RepackScope      `json:"scope,omitempty"`                   // 整理范围（可省略；省略即整个集群）
     Goals                   []RepackGoal      `json:"goals,omitempty"`                   // 单资源目标，maxItems=1
     MaxPerRun               *MaxPerRun        `json:"maxPerRun,omitempty"`               // 单轮规模封顶
+    Eviction                *EvictionPolicy   `json:"eviction,omitempty"`                // Execute 的 Eviction 请求参数
     TTLSecondsAfterFinished *int64            `json:"ttlSecondsAfterFinished,omitempty"` // 终态后自动删
     Relief                  *RepackRelief     `json:"relief,omitempty"`                  // P1：解救式整理
     DisruptionPolicy        *DisruptionPolicy `json:"disruptionPolicy,omitempty"`        // P1：可配扰动策略
@@ -338,6 +371,9 @@ type RepackGoal struct {
 type MaxPerRun struct {
     PodGroups *int32          `json:"podGroups,omitempty"` // 单轮最多动几个 PodGroup
     Resources v1.ResourceList `json:"resources,omitempty"` // 单轮最多动几张卡（按资源）
+}
+type EvictionPolicy struct {
+    GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"` // nil=沿用 Pod.spec.terminationGracePeriodSeconds；0=立即终止
 }
 
 type RepackRunStatus struct {
@@ -639,6 +675,8 @@ spec:                                         # 必选；创建后整体不可�
     podGroups: 20                             # 可选：单轮最多动几个 PodGroup
     resources:                                # 可选：单轮最多动几张卡（按资源）
       nvidia.com/gpu: 128
+  eviction:                                   # 可选：仅 Execute 生效，控制 Eviction 请求
+    gracePeriodSeconds: 30                    # 不填=沿用每个 Pod 的 terminationGracePeriodSeconds；0=立即终止
   ttlSecondsAfterFinished: 3600               # 可选：终态后自动回收（秒）；不填=不自动删
   relief:                                     # 可选（P1）：解救式整理
     podGroupRefs:                             # 必选（若配 relief）：想让其可调度的 pending PodGroup（"ns/name"）
@@ -648,7 +686,6 @@ spec:                                         # 必选；创建后整体不可�
     bundlePolicy: SurplusPodsOnly             # 可选：SurplusPodsOnly | EntireJobPermitted
     minRunDuration: 30m                       # 可选：运行不足此时长的作业不搬
     maxDisruptionScore: 80                    # 可选：中断代价红线（超则不选为 victim）
-    respectPDB: true                          # 可选：兼容 PodDisruptionBudget
     lambda: 1                                 # 可选：收益 vs 扰动 总权重（整数，默认 1）
     weights:                                  # 可选：各扰动项整数权重（键须匹配启用的评分插件）
       priority: 3
@@ -1049,7 +1086,6 @@ spec:
     bundlePolicy: SurplusPodsOnly    # 只动 gang 盈余 Pod / 或 EntireJobPermitted 整组搬
     minRunDuration: 30m              # 运行不足此时长的作业不搬
     maxDisruptionScore: 80           # 中断代价红线
-    respectPDB: true                 # 兼容 PodDisruptionBudget
     lambda: 1                        # 收益 vs 扰动 总权重（整数）
     weights:                         # 各扰动项整数权重（相对值）
       damagedGPU: 6

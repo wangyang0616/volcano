@@ -140,13 +140,19 @@ flowchart TB
 | 4 | **controller** | 把落点写到 Pod；Run 完成后按 TTL 删除 |
 | 5 | **scheduler** | 给被删后重建的 Pod 选 Node（可 honor nomination） |
 
+`eviction.gracePeriodSeconds` 只控制提交给 Kubernetes Eviction API 的
+`deleteOptions.gracePeriodSeconds`，不等待 Pod 终止或替身 Ready。Eviction API 始终受
+PDB 约束；未来 PDB 的预检和被阻塞后的处理策略统一演进到 `spec.eviction.pdb`。
+
 ### 2.2 RepackRun 上你要关心的字段
 
 ```text
 spec（创建后不能改）
   mode     DryRun = 只看报告；Execute = 真驱逐
-  scope    哪些 PodGroup / Node 可以动（Execute 必填）
+  scope    哪些 PodGroup / Node 可以动（可省略；省略即整个集群）
   goals    整理哪种资源，例如 nvidia.com/gpu
+  eviction.gracePeriodSeconds
+           Execute 的优雅终止请求秒数；不填沿用 Pod 自己的 terminationGracePeriodSeconds
   ttl…     跑完后多久自动删
 
 status（组件写，用户读）

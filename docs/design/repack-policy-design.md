@@ -1,7 +1,7 @@
 # Repack 平台治理设计初稿
 
 > **状态**：设计初稿 **v9.66**（**P0 仅 RepackRun**·**单资源**·**consolidation-driven**；`relief`、`disruptionPolicy`（含 PDB）、RepackPolicy 均 **P1**；多资源 **P2+**；§4.14 模拟匹配 P0 重写、§4.14.6 势函数精修 P1（含讲解版）、§4.16.5 策略可插拔（config 仅管插件启用；权重/λ/阈值/护栏归 RepackRun.spec.disruptionPolicy，P1）、§4.17 A/B 对比选型（含复杂度性能 §4.17.8、可运维性 §4.17.9、配图）；§4.15.5-7 多目标泛化(NVLink/超节点,P1)；A、B 双算法均已编码+单测；**API group = `repack.volcano.sh`**；**引擎对 `Snapshot` 接口编程；独立部署但复用 scheduler 框架/插件（读同一份 `--scheduler-conf`+`OpenSession`，过滤原则一致，§4.7.0）；action 架构 P0 单 `repack`、多 action 可演进（§4.16.4.1）；scope selector 解析 `runtime.ResolveScope`；装配入口 `runtime.RunOnce`；Execute 落子契约 `CommitPlan`（§4.7.1.1）；nominate 重建归属+优雅窗口诚实结论（§4.7.1.2）；nominatedNodeName 提名为 P0 主引导（§4.7.1.2，`NominationIntents`）；**腾空交还排队队列、不 cordon/不保留节点**（§4.7.1.2 问题2）；提名按"同名替身精确匹配/随机名 gang+role 兜底"写到重建 pod（§4.7.1.2 问题1）**；待评审）  
-> **P0 能力面（§3.3 权威）**：`mode`/`scope`/`goals`(恰一条)/`maxPerRun` + 生命周期；goals/consolidation-driven、INV-RESCHED 硬约束、引擎内部扰动评分。**`relief`(relief-driven) 与 `disruptionPolicy`(bundlePolicy/minRunDuration/maxDisruptionScore/respectPDB·含 PDB 兼容) 整体 P1**。  
+> **P0 能力面（§3.3 权威）**：`mode`/`scope`/`goals`(恰一条)/`maxPerRun`/`eviction.gracePeriodSeconds` + 生命周期；goals/consolidation-driven、INV-RESCHED 硬约束、引擎内部扰动评分。**`relief`(relief-driven) 与 `disruptionPolicy`(bundlePolicy/minRunDuration/maxDisruptionScore) 整体 P1**；PDB 的规划预检与阻塞策略后续归入 `eviction.pdb`。
 > **CRD 分期（§3.3）**：**P0 只交付 `RepackRun`**（自洽手写、手动 DryRun/Execute，准入=CEL）；**`RepackPolicy` 整体 P1**（按触发生成 Run 的模板，内嵌 `RepackRunSpec`；不做护栏/继承）。引擎只读 Run.spec，故分期不影响引擎能力。  
 > **单资源/Run（P0/P1）**：面向 GPU/NPU 等加速资源整理，每个 RepackRun **只整理一种资源**——`goals` **恰一条**（CEL `maxItems:1`），整理哪类由 `goals[0].resource` 指定（§4.12）。**多资源（一个 Run 同时整理 GPU+NPU、`goals` 多条、跨资源合成）= P2+**；`goals[]` 列表形状现已预留，P2 放开 `maxItems` 即可，schema 不变。  
 > **选择单元**：scope/report 以 **PodGroup** 为单元（引擎 `JobInfo` 即 PodGroup），覆盖 vcjob/原生/Kubeflow 等所有 gang 负载（§4.5.2）。  
@@ -103,7 +103,7 @@ Repack **不等于** gang 抢占：优化目标是 **降低碎片、解开 pendi
 > **能力分期（权威，覆盖全文）**：
 >
 > - **P0**：`mode`(DryRun/Execute) · `scope`(podGroups/nodes 两轴 include/exclude) · `goals` **恰一条**(单资源碎片门槛) · `maxPerRun`(规模上限) · `ttlSecondsAfterFinished`；**consolidation-driven**（为腾空节点而整理）；INV-RESCHED 硬约束 + 引擎内部扰动择优 + 整 gang 完整搬迁（默认）。
-> - **P1**：`RepackPolicy`（模板生成）；**`relief`（relief-driven，解开 pending gang）**；**`disruptionPolicy` 整块**（`bundlePolicy` / `minRunDuration` / `maxDisruptionScore` / **`respectPDB`——PDB 兼容**）；多级拓扑 / 队列配额 / 成本整理 / 防饿死等。
+> - **P1**：`RepackPolicy`（模板生成）；**`relief`（relief-driven，解开 pending gang）**；**`disruptionPolicy` 整块**（`bundlePolicy` / `minRunDuration` / `maxDisruptionScore`）；以及 `eviction.pdb` 的 PDB 规划预检和阻塞处理；多级拓扑 / 队列配额 / 成本整理 / 防饿死等。
 > - **P2+**：单个 Run **多资源整理**（`goals` 多条 + 跨资源合成）。
 >
 > 即 **P0 = 单资源、consolidation-driven、无 relief、无可配 disruptionPolicy/PDB**；扰动控制在 P0 仅靠引擎内部评分 + `scope` 划片 + `maxPerRun` + INV-RESCHED 保底。
@@ -269,7 +269,8 @@ metadata:
 | **`goals`** | **单资源碎片目标（P0/P1 至多一条）**：该类加速资源的碎片改善门槛；`resource` 必须是**扩展资源**（CEL `self.contains('/')`，如 `nvidia.com/gpu`；cpu/memory 等 native 资源被 apiserver 拒）；省略=回落引擎 `--repack-default-resource`，两者皆空即 `NoTargetResource` 失败、误配 native 即 `UnsupportedResource` 失败（§4.12.2b）。多条=多资源 **P2+** | 否（有默认） | P0 |
 | **`maxPerRun`** | **单轮规模封顶**：podGroups + resources(ResourceList，异构) | 否（有默认） | P0 |
 | **`relief`** | **想达成什么**：让哪些排队作业能被调度（`podGroupRefs`）、至少解开几个才值得（`minRelieved`）——relief-driven | — | **P1** |
-| **`disruptionPolicy`** | **怎么/能不能扰动在跑作业**：bundlePolicy/minRunDuration/maxDisruptionScore/**respectPDB（PDB 兼容）** | — | **P1** |
+| **`eviction`** | **如何提交已选 move**：`gracePeriodSeconds` 覆盖本次 Eviction 的优雅终止时间 | 否 | **P0** |
+| **`disruptionPolicy`** | **怎么/能不能扰动在跑作业**：bundlePolicy/minRunDuration/maxDisruptionScore | — | **P1** |
 | `ttlSecondsAfterFinished` | 终态后多久自动清理（不设运行超时字段，卡 Running 由崩溃孤儿回收兜底） | 否 |
 
 > **最容易混的两个，务必分清**：
@@ -372,12 +373,15 @@ spec:
       minFragRateImprovement: "0.05"        # 该资源碎片率绝对改善≥此值
   # 多资源（goals 多条、一个 Run 同时整理 GPU+NPU）= P2+；列表形状已预留，P2 放开 maxItems
 
-  # ④ 怎么/能不能扰动在跑作业（整块 P1；P0 不开放、用引擎默认评分，§3.3）
+  # ④ Execute 的 Eviction 请求参数（P0）；不填沿用每个 Pod 自己的终止宽限期
+  eviction:
+    gracePeriodSeconds: 30
+
+  # ⑤ 怎么/能不能扰动在跑作业（整块 P1；P0 不开放、用引擎默认评分，§3.3）
   disruptionPolicy:
     bundlePolicy: SurplusPodsOnly           # 搬迁单元：SurplusPodsOnly | EntireJobPermitted
     minRunDuration: 30m                     # 运行不足此时长的作业不搬
     maxDisruptionScore: 80                  # 中断代价分红线（§4.13.3）
-    respectPDB: true                        # 兼容 PodDisruptionBudget（§4.13.4）
     # 扰动评分调参（P1 放开，本次 Run 维度；省略=引擎默认 DefaultWeightedDisruption）：
     lambda: "0.5"                           # 收益 vs 扰动 总摩擦系数
     weights:                                # 各扰动评分项权重（仅对 config 启用的项生效，§4.16.5）
@@ -1433,27 +1437,26 @@ Commit / recommend  iff
 
 > 原则（需求 FR-4）：只迁「低代价、可中断、收益高」的负载；高代价负载优先作为**被保护对象**而非 victim。`disruptionScore > maxDisruptionScore` 的 Bundle 直接出局；其余按分**升序**优先选作 victim。
 
-#### 4.13.4 PDB 兼容（P0）
+#### 4.13.4 PDB 兼容（P1 规划扩展）
 
-repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）——不能把某 pod 集合的可用副本驱逐到低于 `minAvailable` / 超过 `maxUnavailable`。开启开关 **`disruptionPolicy.respectPDB: true`（P0 默认）**。
+repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）——不能把某 pod 集合的可用副本驱逐到低于 `minAvailable` / 超过 `maxUnavailable`。实际执行已经且始终使用 Kubernetes `policy/v1 Eviction`，因此 PDB 由 API Server 强制执行；**不存在关闭或绕过 PDB 的开关**。
 
 **两个实证前提（决定方案形态）**：
 
 1. Volcano 已有 **`pdb` 插件**（`plugins/pdb/pdb.go`）：按 PDB `Status.DisruptionsAllowed` **累计扣减**过滤候选 victim。但它只注册了 **`VictimTasksFn`/`Preemptable`/`Reclaimable`**（旧接口），**未注册 `UnifiedEvictableFn`** —— 而 repack/gangpreempt 走的是 **`ssn.UnifiedEvictable`**。**故现状下 PDB 过滤不会自动流入 repack 的 victim 路径。**
 2. Volcano 主调度器的 `defaultEvictor.Evict` 用 **裸 `Pods().Delete()`**（`cache.go`），**执行期不触发 apiserver 的 PDB 校验**。
 
-**P0 两层防护**：
+**P1 两层防护**：
 
 | 层 | 做法 | 价值 |
 |----|------|------|
-| **模拟/规划层** | **扩展 `pdb` 插件，额外注册一个 `UnifiedEvictableFn`**（包装现有累计扣减逻辑 `pdbFilterFn`），使 **gangpreempt / gangreclaim / repack 经 `UnifiedEvictable` 统一获得 PDB 过滤**；repack-engine 的 plugin tier **启用 `pdb`** + feature gate `PodDisruptionBudgetsSupport` + 自有 cache 的 PDB informer | DryRun `report` 与 Execute 规划**不会**给出违反 PDB 的方案；`BundleWhole`（整 Job）多 pod 由累计预算天然聚合 |
+| **模拟/规划层** | `spec.eviction.pdb.preflight: Require`（P1）时，扩展 `pdb` 插件注册 `UnifiedEvictableFn`，以当前 `Status.DisruptionsAllowed` 累计过滤候选 victim | 减少“规划成功、提交时被 PDB 拒绝”；PDB 状态会变化，因此不是最终保证 |
 | **执行层（backstop）** | repack-engine 的 **Committer 用真正的 Eviction 子资源（`policy/v1 Eviction`）**，**不复用**主调度器的裸 delete —— **apiserver 服务端强制 PDB**；被拒（429 TooManyRequests）→ 该 victim 跳过、计划部分失败 | 即便快照与真实状态有偏差，**服务端兜底**不破 PDB；这是 repack 区别于主调度 delete 路径的关键收益 |
 
 **语义细节**：
 
 - PDB `minAvailable` 与 gang `MinAvailable`/`MinSubJobs` **各自独立、都要满足**：前者保护任意 PDB 选中的 pod 集，后者保护 PodGroup gang。victim 过滤先过 gang/Bundle（`BundleSafe`/`BundleWhole`），再过 PDB `UnifiedEvictableFn`，**取交集**。
-- 被 PDB 挡住的 victim → 该 plan 在本域不可行 → 引擎换域/换 Bundle 重试；全被挡 → DryRun 出空 `plan.moves`（reason `BelowGoalThreshold`），Execute 终态据剩余可行性判 `Succeeded`（`reason: BelowGoalThreshold`）或部分完成 + `EvictionFailed`。（PDB 兼容整体 P1）
-- `respectPDB: false`（不建议）仅用于无 PDB 的实验集群；即便如此执行层仍走 Eviction 子资源。
+- 被 PDB 挡住后的行为由未来 `spec.eviction.pdb.onBlocked` 表达：`Continue`（保持当前开环行为）、`Fail`、`Retry`（配合 `retryTimeoutSeconds`）。PDB 兼容整体 P1，未完整实现前不在 CRD 暴露空对象。
 
 ### 4.14 模拟匹配：PodGroup ↔ Node（引擎流程）
 
@@ -1955,7 +1958,6 @@ disruptionPolicy:
   bundlePolicy: SurplusPodsOnly     # 搬迁单元：只动盈余 pod / 整 job
   minRunDuration: 30m               # 运行不足此时长的作业不搬
   maxDisruptionScore: 80            # 中断代价分红线（§4.13.3）
-  respectPDB: true                  # 兼容 PDB（§4.13.4）
   # —— 扰动评分调参（P1 放开；P0 用 DefaultWeightedDisruption 默认值）——
   lambda: "0.5"                     # 收益 vs 扰动 总摩擦系数
   weights:                          # 各已启用扰动项的权重（仅对 config 注册了的项生效）
@@ -2084,10 +2086,10 @@ repack:
 | （引擎内置） | `Free` | `NodeInfo.FutureIdle`（默认；可覆盖供 relief/测试） | P0 |
 | `Snapshot.PodGroupView` | `PodGroup` view | `SessionSnapshot` 从 `ssn.Jobs` 取 MinAvailable/Running/Priority/Footprint | P0 |
 | `maxPerRun.podGroups` / `.resources[R]` | `MaxPodGroups` / `MaxResource` | 直传 | P0 |
-| `disruptionPolicy.respectPDB` | `Movable` 再过滤 | `MovableInScope(…, PDBBlocks)` 第二参 | **P1 接缝** |
+| `eviction.pdb`（尚未暴露） | PDB 规划预检 / Eviction 被阻塞后的处理 | 将来在执行编排层实现；实际 Eviction 始终由 API Server 按 PDB 裁决 | **P1 接缝** |
 | `disruptionPolicy`(λ/权重/freeze) | `Disruption` / `Tuning` | 直传（P0 留零=引擎默认评分） | **P1** |
 
-> 这正是 §4.17.0 两张时序图"外层逐字相同"的代码化：`PlanRun` 之上（CR watch / 落盘）与之下（`planner.Plan`）都不分 A/B，**切 `algorithm` 即换算法**；且整条链对 `Snapshot` 编程，**换部署形态（scheduler 内 vs 独立组件）只换 `Snapshot` 实现**。`PDBBlocks`、`Disruption`/`Tuning` 是已留好的 P1 接缝。
+> 这正是 §4.17.0 两张时序图"外层逐字相同"的代码化：`PlanRun` 之上（CR watch / 落盘）与之下（`planner.Plan`）都不分 A/B，**切 `algorithm` 即换算法**；且整条链对 `Snapshot` 编程，**换部署形态（scheduler 内 vs 独立组件）只换 `Snapshot` 实现**。`eviction.pdb` 的预检/重试编排与 `Disruption`/`Tuning` 都是后续 P1 接缝。
 
 ---
 
@@ -2797,7 +2799,7 @@ flowchart TB
 
     subgraph RunSpec["RepackRun.spec（执行契约，创建后冻结）"]
         R1[mode]
-        R2[scope · relief · goals · disruptionPolicy · maxPerRun]
+        R2[scope · relief · goals · disruptionPolicy · maxPerRun · eviction]
     end
 
     subgraph RunStatus["RepackRun.status"]
@@ -3130,7 +3132,13 @@ type DisruptionPolicy struct {
     BundlePolicy       BundlePolicy     `json:"bundlePolicy,omitempty"`       // SurplusPodsOnly→BundleSafe | EntireJobPermitted→BundleWhole
     MinRunDuration     *metav1.Duration `json:"minRunDuration,omitempty"`     // 运行不足此时长的作业不搬
     MaxDisruptionScore *int32           `json:"maxDisruptionScore,omitempty"` // 中断代价分红线（§4.13.3）
-    RespectPDB         *bool            `json:"respectPDB,omitempty"`         // 默认 true，兼容 PDB（§4.13.4）
+}
+
+// EvictionPolicy — 已选 move 如何提交给 Kubernetes Eviction API（P0）。
+// 这不是选择/评分策略；未设置 grace 时沿用 Pod 自己的终止宽限期。
+type EvictionPolicy struct {
+    GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"` // nil=Pod.spec.terminationGracePeriodSeconds；0=立即终止
+    // PDB *PDBPolicy `json:"pdb,omitempty"` // P1：规划预检 + 被 PDB 阻塞后的 Continue/Fail/Retry；尚不暴露
 }
 
 // MaxPerRun — 单轮整理规模封顶（区别于 K8s 容器资源 limits）

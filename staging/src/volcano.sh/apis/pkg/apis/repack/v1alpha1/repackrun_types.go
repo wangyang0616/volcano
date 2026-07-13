@@ -95,11 +95,28 @@ type RepackRunSpec struct {
 	// +optional
 	MaxPerRun *MaxPerRun `json:"maxPerRun,omitempty"`
 
+	// Eviction configures how Execute issues Kubernetes Eviction requests. It is
+	// ignored by DryRun because no Pod is evicted in that mode.
+	// +optional
+	Eviction *EvictionPolicy `json:"eviction,omitempty"`
+
 	// TTLSecondsAfterFinished: auto-DELETE this Run that long after it finishes
 	// (like Job). Unset = not auto-deleted.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int64 `json:"ttlSecondsAfterFinished,omitempty"`
+}
+
+// EvictionPolicy configures the execution behavior of Kubernetes Eviction API
+// requests. Selection and scoring remain in DisruptionPolicy; this type owns
+// only the mechanics of submitting an accepted move.
+type EvictionPolicy struct {
+	// GracePeriodSeconds overrides the graceful-termination period requested for
+	// every Pod eviction in this Run. Unset preserves each Pod's
+	// spec.terminationGracePeriodSeconds; 0 requests immediate termination.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"`
 }
 
 // RepackScope bounds the run on two independent axes: which PodGroups may move
@@ -184,7 +201,9 @@ type DisruptionPolicy struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxDisruptionScore *int32 `json:"maxDisruptionScore,omitempty"`
-	// RespectPDB enables PodDisruptionBudget compatibility.
+	// RespectPDB is retained as an unimplemented v1alpha1 compatibility field.
+	// Deprecated: Kubernetes Eviction API always respects PDBs; future planning
+	// and blocked-eviction controls live in spec.eviction.pdb.
 	// +optional
 	RespectPDB *bool `json:"respectPDB,omitempty"`
 	// Lambda is the benefit-vs-friction trade-off as an integer weight (default 1).

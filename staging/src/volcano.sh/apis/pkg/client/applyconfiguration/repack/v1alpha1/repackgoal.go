@@ -26,7 +26,10 @@ import (
 //
 // RepackGoal is one resource's fragmentation target.
 type RepackGoalApplyConfiguration struct {
-	// Resource is the accelerator to defragment (e.g. nvidia.com/gpu).
+	// Resource is the accelerator to defragment (e.g. nvidia.com/gpu). Only
+	// fully-qualified extended resources (a name containing "/") are supported;
+	// core compute resources such as cpu, memory, ephemeral-storage and pods are
+	// rejected, because repack only consolidates scalar accelerator capacity.
 	Resource *v1.ResourceName `json:"resource,omitempty"`
 	// MinFragImprovementPercent is the required minimum drop in this resource's
 	// fragmentation, in percentage points (0-100). 0 = any benefit counts.

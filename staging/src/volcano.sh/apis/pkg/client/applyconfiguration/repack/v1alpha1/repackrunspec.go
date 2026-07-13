@@ -49,6 +49,9 @@ type RepackRunSpecApplyConfiguration struct {
 	DisruptionPolicy *DisruptionPolicyApplyConfiguration `json:"disruptionPolicy,omitempty"`
 	// MaxPerRun caps the blast radius of a single run.
 	MaxPerRun *MaxPerRunApplyConfiguration `json:"maxPerRun,omitempty"`
+	// Eviction configures how Execute issues Kubernetes Eviction requests. It is
+	// ignored by DryRun because no Pod is evicted in that mode.
+	Eviction *EvictionPolicyApplyConfiguration `json:"eviction,omitempty"`
 	// TTLSecondsAfterFinished: auto-DELETE this Run that long after it finishes
 	// (like Job). Unset = not auto-deleted.
 	TTLSecondsAfterFinished *int64 `json:"ttlSecondsAfterFinished,omitempty"`
@@ -110,6 +113,14 @@ func (b *RepackRunSpecApplyConfiguration) WithDisruptionPolicy(value *Disruption
 // If called multiple times, the MaxPerRun field is set to the value of the last call.
 func (b *RepackRunSpecApplyConfiguration) WithMaxPerRun(value *MaxPerRunApplyConfiguration) *RepackRunSpecApplyConfiguration {
 	b.MaxPerRun = value
+	return b
+}
+
+// WithEviction sets the Eviction field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Eviction field is set to the value of the last call.
+func (b *RepackRunSpecApplyConfiguration) WithEviction(value *EvictionPolicyApplyConfiguration) *RepackRunSpecApplyConfiguration {
+	b.Eviction = value
 	return b
 }
 
