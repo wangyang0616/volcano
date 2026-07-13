@@ -371,6 +371,9 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		Cooldown:          e.config.Cooldown,
 		Now:               e.now(),
 	})
+	klog.V(4).InfoS("repack: execute gate evaluated", "run", work.Name, "mode", work.Spec.Mode,
+		"executeActive", active, "lastExecuteFinish", lastFinish, "cooldown", e.config.Cooldown,
+		"admit", gate.Admit, "reason", gate.Reason, "requeueAfter", gate.RequeueAfter)
 	if !gate.Admit {
 		metrics.ObserveGateRejection(gate.Reason)
 		klog.V(3).InfoS("RepackRun deferred by execute gate",
@@ -388,7 +391,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 	}
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		e.markExecuteActive(work.Name) // hold the K=1 slot across this synchronous process
-		klog.V(4).InfoS("acquired execute slot", "run", work.Name)
+		klog.V(3).InfoS("repack: Execute slot acquired", "run", work.Name, "cooldown", e.config.Cooldown)
 	}
 	return e.process(ctx, work)
 }

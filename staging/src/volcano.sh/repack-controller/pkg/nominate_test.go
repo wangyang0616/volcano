@@ -17,15 +17,22 @@ limitations under the License.
 package repackcontroller
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 )
 
@@ -160,5 +167,118 @@ func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
 	}
 	if rec, _ := n.matchNomination(replacement); rec == nil || rec.NodeName != "n2" {
 		t.Fatalf("nomination should activate after victim deletion: %+v", rec)
+	}
+}
+
+func TestReconcilePatchesNominatedNodeAndMarksNominationBound(t *testing.T) {
+	pod := pendingPod("ns", "replacement", "group", nil)
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "replacement", NodeName: "n2", Phase: nomPending,
+	})
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := pods.Add(pod); err != nil {
+		t.Fatal(err)
+	}
+	runs := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := runs.Add(run); err != nil {
+		t.Fatal(err)
+	}
+	kubernetesClient := k8sfake.NewSimpleClientset()
+	var nominatedNodePatch string
+	kubernetesClient.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		patchAction, ok := action.(k8stesting.PatchAction)
+		if !ok || action.GetSubresource() != "status" {
+			t.Fatalf("unexpected pod patch action: %#v", action)
+		}
+		nominatedNodePatch = string(patchAction.GetPatch())
+		return true, pod, nil
+	})
+	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+	nominator := &Nominator{
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    volcanoClient,
+		podLister:        corelisters.NewPodLister(pods),
+		repackRunLister:  repacklisters.NewRepackRunLister(runs),
+		now:              time.Now,
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/replacement"); err != nil {
+		t.Fatalf("reconcile() error = %v", err)
+	}
+	if err := nominator.flushBoundNominations(context.Background(), "run"); err != nil {
+		t.Fatalf("flushBoundNominations() error = %v", err)
+	}
+	if !strings.Contains(nominatedNodePatch, `"nominatedNodeName":"n2"`) {
+		t.Errorf("pod status patch = %s, want nominatedNodeName n2", nominatedNodePatch)
+	}
+	updated, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), "run", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated RepackRun: %v", err)
+	}
+	if updated.Status.Nominations[0].Phase != nomBound {
+		t.Errorf("nomination phase = %q, want %q", updated.Status.Nominations[0].Phase, nomBound)
+	}
+}
+
+func TestBoundNominationsAreFlushedOncePerRun(t *testing.T) {
+	run := runWithNoms("run",
+		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p0", NodeName: "n1", Phase: nomPending},
+		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p1", NodeName: "n2", Phase: nomPending},
+	)
+	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+	nominator := &Nominator{volcanoClient: volcanoClient}
+	nominator.queueBoundNomination(run.Name, &run.Status.Nominations[0])
+	nominator.queueBoundNomination(run.Name, &run.Status.Nominations[1])
+
+	if err := nominator.flushBoundNominations(context.Background(), run.Name); err != nil {
+		t.Fatalf("flushBoundNominations() error = %v", err)
+	}
+	statusUpdates := 0
+	for _, action := range volcanoClient.Actions() {
+		if action.GetVerb() == "update" && action.GetResource().Resource == "repackruns" && action.GetSubresource() == "status" {
+			statusUpdates++
+		}
+	}
+	if statusUpdates != 1 {
+		t.Fatalf("status updates = %d, want one coalesced update", statusUpdates)
+	}
+	updated, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated RepackRun: %v", err)
+	}
+	for _, nomination := range updated.Status.Nominations {
+		if nomination.Phase != nomBound {
+			t.Errorf("nomination %q phase = %q, want %q", nomination.VictimPodName, nomination.Phase, nomBound)
+		}
+	}
+}
+
+func TestEnqueuePendingForRunUsesPodGroupIndex(t *testing.T) {
+	matchingPod := pendingPod("ns", "matching", "target", nil)
+	unrelatedPod := pendingPod("ns", "unrelated", "other", nil)
+	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{podGroupIndexName: podGroupIndex})
+	if err := podIndexer.Add(matchingPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := podIndexer.Add(unrelatedPod); err != nil {
+		t.Fatal(err)
+	}
+	nominator := &Nominator{
+		podLister:              corelisters.NewPodLister(podIndexer),
+		podIndexer:             podIndexer,
+		podGroupIndexAvailable: true,
+		workQueue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	defer nominator.workQueue.ShutDown()
+
+	run := runWithNoms("run", repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "target", VictimPodName: "gone", NodeName: "n1"})
+	nominator.enqueuePendingForRun(run)
+	if nominator.workQueue.Len() != 1 {
+		t.Fatalf("queued pods = %d, want only the indexed matching PodGroup", nominator.workQueue.Len())
+	}
+	key, _ := nominator.workQueue.Get()
+	defer nominator.workQueue.Done(key)
+	if key != "ns/matching" {
+		t.Errorf("queued key = %q, want ns/matching", key)
 	}
 }

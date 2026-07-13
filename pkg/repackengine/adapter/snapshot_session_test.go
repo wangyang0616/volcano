@@ -85,3 +85,18 @@ func TestSessionSnapshot_Nodes(t *testing.T) {
 		t.Fatalf("expected 2 nodes, got %d", len(snap.Nodes()))
 	}
 }
+
+func TestSessionSnapshot_ReceiverHasTargetResourceCapacity(t *testing.T) {
+	snap := &SessionSnapshot{resource: gpu}
+	node := capNode("n0", 8)
+	node.Idle = gpuRes(6)
+	node.Releasing = schedapi.EmptyResource()
+	node.Pipelined = schedapi.EmptyResource()
+
+	if !snap.receiverHasTargetResourceCapacity(gpuTask(0, "", 4), node, []*schedapi.TaskInfo{gpuTask(1, "", 2)}) {
+		t.Fatal("4 GPUs should fit after 2 GPUs already placed on a receiver with 6 GPUs free")
+	}
+	if snap.receiverHasTargetResourceCapacity(gpuTask(0, "", 5), node, []*schedapi.TaskInfo{gpuTask(1, "", 2)}) {
+		t.Fatal("5 GPUs must not fit after 2 GPUs already placed on a receiver with 6 GPUs free")
+	}
+}

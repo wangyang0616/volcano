@@ -17,13 +17,20 @@ limitations under the License.
 package repackengine
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	state "volcano.sh/repack-controller/pkg/state"
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
@@ -240,5 +247,51 @@ func TestMergeNominationPhasesPreservesControllerOwnedTerminalPhase(t *testing.T
 	mergeNominationPhases(desired, latest)
 	if desired[0].Phase != "Bound" {
 		t.Fatalf("phase=%q, want Bound", desired[0].Phase)
+	}
+}
+
+func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-conflict"},
+		Status: repackv1alpha1.RepackRunStatus{
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1", Phase: "Bound",
+			}},
+		},
+	}
+	volcanoClient := vcfake.NewSimpleClientset(run)
+	updateAttempts := 0
+	volcanoClient.PrependReactor("update", "repackruns", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		updateAttempts++
+		if updateAttempts == 1 {
+			return true, nil, apierrors.NewConflict(
+				schema.GroupResource{Group: repackv1alpha1.GroupName, Resource: "repackruns"},
+				"status-conflict", errors.New("simulated conflict"))
+		}
+		return false, nil, nil
+	})
+
+	desired := run.Status.DeepCopy()
+	desired.Nominations[0].Phase = "Pending" // engine's stale view must not undo Bound.
+	desired.Phase = repackv1alpha1.RepackSucceeded
+	engine := &Engine{volcanoClient: volcanoClient}
+	if err := engine.writeStatus(context.Background(), run.Name, desired); err != nil {
+		t.Fatalf("writeStatus() error = %v", err)
+	}
+	if updateAttempts != 2 {
+		t.Fatalf("status update attempts = %d, want conflict retry", updateAttempts)
+	}
+	updated, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated run: %v", err)
+	}
+	if updated.Status.Phase != repackv1alpha1.RepackSucceeded {
+		t.Errorf("phase = %q, want Succeeded", updated.Status.Phase)
+	}
+	if updated.Status.Nominations[0].Phase != "Bound" {
+		t.Errorf("nomination phase = %q, want controller-owned Bound", updated.Status.Nominations[0].Phase)
 	}
 }

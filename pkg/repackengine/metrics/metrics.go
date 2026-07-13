@@ -58,6 +58,33 @@ var (
 		Name:      "gate_rejections_total",
 		Help:      "Number of times the Execute serialization gate deferred a run, by reason.",
 	}, []string{"reason"})
+
+	// PlannerCandidatesEvaluated observes how many drain units are considered in
+	// one planning pass. It exposes the search width independently of the overall
+	// reconcile duration.
+	PlannerCandidatesEvaluated = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Subsystem: subsystem,
+		Name:      "planner_candidates_evaluated",
+		Help:      "Number of drain candidates evaluated in one planning pass.",
+		Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500},
+	}, []string{"mode"})
+
+	// PlannerFeasibilitySimulations observes how many candidates reached the
+	// expensive scheduler-faithful feasibility simulation in one planning pass.
+	PlannerFeasibilitySimulations = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Subsystem: subsystem,
+		Name:      "planner_feasibility_simulations",
+		Help:      "Number of drain candidates that invoked scheduler-feasibility simulation in one planning pass.",
+		Buckets:   []float64{0, 1, 5, 10, 25, 50, 100, 250, 500, 1000},
+	}, []string{"mode"})
+
+	// PlannerCandidatesPrunedTotal counts candidates rejected before or during
+	// feasibility evaluation. reason has a bounded internal vocabulary.
+	PlannerCandidatesPrunedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: subsystem,
+		Name:      "planner_candidates_pruned_total",
+		Help:      "Number of drain candidates rejected by planning stage and bounded reason.",
+	}, []string{"mode", "reason"})
 )
 
 // ObserveRun records a finished run's mode+outcome.
@@ -80,3 +107,15 @@ func ObserveCycle(mode string, seconds float64) {
 
 // ObserveGateRejection records one gate deferral by reason.
 func ObserveGateRejection(reason string) { GateRejectionsTotal.WithLabelValues(reason).Inc() }
+
+// ObservePlanner records search width, expensive feasibility-simulation usage and the bounded
+// preflight rejection reasons for one drain planning pass.
+func ObservePlanner(mode string, candidatesEvaluated, feasibilitySimulations int, prunedByReason map[string]int) {
+	PlannerCandidatesEvaluated.WithLabelValues(mode).Observe(float64(candidatesEvaluated))
+	PlannerFeasibilitySimulations.WithLabelValues(mode).Observe(float64(feasibilitySimulations))
+	for reason, count := range prunedByReason {
+		if count > 0 {
+			PlannerCandidatesPrunedTotal.WithLabelValues(mode, reason).Add(float64(count))
+		}
+	}
+}

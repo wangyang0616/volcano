@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 
+	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 
 	e2eutil "volcano.sh/volcano/test/e2e/util"
@@ -84,30 +85,38 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 	// C9: if every eviction is rejected (a maxUnavailable=0 PDB), Execute fails.
 	It("fails with ExecuteFailed when all evictions are blocked by a PDB", func() {
 		jobA := occupy(ctx, "pdb-a", nodes[0], 4)
-		occupy(ctx, "pdb-b", nodes[1], 2)
-		// A PDB that forbids evicting jobA's pods.
+		jobB := occupy(ctx, "pdb-b", nodes[1], 2)
+		// Every movable fixture pod is protected. This makes every possible plan
+		// eviction fail, rather than allowing the planner to choose an unprotected
+		// alternative and accidentally turn this into a non-asserting test.
 		blockAll := intstr.FromInt(0)
-		_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
-			&policyv1.PodDisruptionBudget{
-				ObjectMeta: metav1.ObjectMeta{Name: "block-all"},
-				Spec: policyv1.PodDisruptionBudgetSpec{
-					MaxUnavailable: &blockAll,
-					Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"volcano.sh/job-name": jobA.Name}},
-				},
-			}, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred())
+		for _, job := range []*batchv1alpha1.Job{jobA, jobB} {
+			pdbName := "block-" + job.Name
+			_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{Name: pdbName},
+					Spec: policyv1.PodDisruptionBudgetSpec{
+						MaxUnavailable: &blockAll,
+						Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"volcano.sh/job-name": job.Name}},
+					},
+				}, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() int32 {
+				pdb, getErr := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Get(context.TODO(), pdbName, metav1.GetOptions{})
+				if getErr != nil {
+					return -1
+				}
+				return pdb.Status.DisruptionsAllowed
+			}, repackTimeout, repackPoll).Should(Equal(int32(0)), "PDB must become effective before Execute")
+		}
 
 		run, err := newRun("execfail", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		defer deleteRun(ctx, run.Name)
 
 		got := waitTerminal(ctx, run.Name)
-		// Either the only feasible plan targeted jobA and every eviction was blocked
-		// (ExecuteFailed), or the engine found an alternative it executed. Assert the
-		// PDB-blocked outcome when the plan chose jobA.
-		if completeReason(got) == "ExecuteFailed" {
-			Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		}
+		Expect(completeReason(got)).To(Equal("ExecuteFailed"))
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
 	})
 
 	// E16: scope.nodes.exclude — an excluded node is never a drain target, so it is

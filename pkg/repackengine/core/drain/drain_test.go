@@ -34,10 +34,11 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 
 // fakeSnap is a minimal framework.Snapshot for solver tests (every node fits).
 type fakeSnap struct {
-	resource   v1.ResourceName // default nvidia.com/gpu when empty
-	nodes      []*schedapi.NodeInfo
-	views      map[schedapi.JobID]api.PodGroupView
-	notInScope map[string]bool // node name → excluded from draining (receiver only)
+	resource         v1.ResourceName // default nvidia.com/gpu when empty
+	nodes            []*schedapi.NodeInfo
+	views            map[schedapi.JobID]api.PodGroupView
+	notInScope       map[string]bool // node name → excluded from draining (receiver only)
+	feasibilityCalls int
 }
 
 func (f *fakeSnap) res() v1.ResourceName {
@@ -63,6 +64,7 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 // capacity (Allocatable − Used − pods already placed this pass), solved with the
 // pure api.Domain best-fit solver.
 func (f *fakeSnap) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	f.feasibilityCalls++
 	res := f.res()
 	placed := map[string]int64{}
 	for _, m := range committed {
@@ -221,6 +223,25 @@ func TestDrain_BudgetBlocks(t *testing.T) {
 
 	if _, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 1)); ok {
 		t.Fatal("expected NoRepack: maxResource=1 < victim 2")
+	}
+	if snap.feasibilityCalls != 0 {
+		t.Fatalf("budget-rejected candidates must not enter expensive feasibility simulation, calls=%d", snap.feasibilityCalls)
+	}
+}
+
+func TestDrain_ResourceCapacityPreflightSkipsFeasibilitySimulation(t *testing.T) {
+	// Neither node has enough slack to receive the other's accelerator task. The
+	// scalar capacity lower bound can reject both candidates before the scheduler
+	// predicate simulation is invoked.
+	a := gpuTask("a", "g-a", 5)
+	b := gpuTask("b", "g-b", 4)
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
+
+	if _, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0)); ok {
+		t.Fatal("expected no plan when neither receiver has enough resource capacity")
+	}
+	if snap.feasibilityCalls != 0 {
+		t.Fatalf("capacity-rejected candidates must not enter feasibility simulation, calls=%d", snap.feasibilityCalls)
 	}
 }
 

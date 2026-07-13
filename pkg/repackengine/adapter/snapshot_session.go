@@ -130,17 +130,29 @@ func (s *SessionSnapshot) buildRelocationCycleState(context context.Context, vic
 		return nil, err
 	}
 	state := s.ssn.GetCycleState(victim.UID).Clone()
+	// Keep one clone per source node for this cycle-state build. A candidate can
+	// remove several victims from the same node; cloning it for every task is both
+	// expensive and makes later simulation hooks see stale co-located pods. This
+	// mirrors the scheduler preemption path: run the hook, then update the working
+	// node copy before processing the next removal.
+	sourceNodeCopies := make(map[string]*schedapi.NodeInfo)
 	for _, task := range sourceTasksToRemove {
 		if task == nil || task.NodeName == "" {
 			continue
 		}
-		source := s.ssn.Nodes[task.NodeName]
-		if source == nil {
-			continue
+		sourceNodeCopy := sourceNodeCopies[task.NodeName]
+		if sourceNodeCopy == nil {
+			source := s.ssn.Nodes[task.NodeName]
+			if source == nil {
+				continue
+			}
+			sourceNodeCopy = source.Clone()
+			sourceNodeCopies[task.NodeName] = sourceNodeCopy
 		}
-		if err := s.ssn.SimulateRemoveTaskFn(context, state, victim, task, source.Clone()); err != nil {
+		if err := s.ssn.SimulateRemoveTaskFn(context, state, victim, task, sourceNodeCopy); err != nil {
 			return nil, err
 		}
+		sourceNodeCopy.RemoveTask(task)
 	}
 	for nodeName, pods := range tasksPlacedByNode {
 		node := s.ssn.Nodes[nodeName]
@@ -196,6 +208,15 @@ func (s *SessionSnapshot) firstFeasibleReceiver(context context.Context, victim 
 // affinity, inter-pod affinity, topology spread, devices, volumes, DRA — is the
 // full SimulatePredicateFn stack.
 func (s *SessionSnapshot) victimFitsReceiver(context context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, node *schedapi.NodeInfo, previouslyPlacedTasks []*schedapi.TaskInfo) bool {
+	// A receiver that cannot fit the target accelerator request after prior
+	// placements cannot pass the full predicate either. Check that necessary
+	// condition before cloning its NodeInfo and CycleState; those clones dominate
+	// the negative path when a fragmented cluster has many nearly-full nodes.
+	// Non-target resources and every scheduler predicate remain authoritative
+	// below, so passing this preflight never makes a placement feasible by itself.
+	if !s.receiverHasTargetResourceCapacity(victim, node, previouslyPlacedTasks) {
+		return false
+	}
 	nodeCopy := node.Clone()
 	stateCopy := baseState.Clone()
 	for _, task := range previouslyPlacedTasks {
@@ -208,6 +229,22 @@ func (s *SessionSnapshot) victimFitsReceiver(context context.Context, victim *sc
 		return false
 	}
 	return s.ssn.SimulatePredicateFn(context, stateCopy, victim, nodeCopy) == nil
+}
+
+// receiverHasTargetResourceCapacity is a cheap necessary preflight for one
+// receiver. It uses the target accelerator only: CPU, memory, topology, and
+// all other constraints are intentionally left to SimulatePredicateFn.
+func (s *SessionSnapshot) receiverHasTargetResourceCapacity(victim *schedapi.TaskInfo, node *schedapi.NodeInfo, previouslyPlacedTasks []*schedapi.TaskInfo) bool {
+	if victim == nil || node == nil || node.Idle == nil || node.Releasing == nil || node.Pipelined == nil {
+		return false
+	}
+	available := api.Scalar(node.FutureIdle(), s.resource)
+	for _, task := range previouslyPlacedTasks {
+		if task != nil {
+			available -= api.Scalar(task.InitResreq, s.resource)
+		}
+	}
+	return api.Scalar(victim.InitResreq, s.resource) <= available
 }
 
 // victimsLargestFirst orders victims by descending target-resource request (first-

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -47,6 +48,10 @@ const (
 	nomPending = "Pending"
 	nomBound   = "Bound"
 	nomExpired = "Expired"
+
+	podGroupIndexName         = "repack.volcano.sh/pod-group"
+	nominationVictimIndexName = "repack.volcano.sh/nomination-victim"
+	boundStatusFlushDelay     = 100 * time.Millisecond
 )
 
 // podGroupAnnotationKey is the pod annotation carrying its PodGroup name; the reconciler
@@ -65,13 +70,20 @@ const podGroupAnnotationKey = "scheduling.k8s.io/group-name"
 // lifecycle, and is conceptually part of the repack control loop — so it lives
 // with the RepackRun controller, decoupled from any single workload controller.
 type Nominator struct {
-	kubernetesClient kubernetes.Interface
-	volcanoClient    vcclientset.Interface
-	podLister        corelisters.PodLister
-	repackRunLister  repacklisters.RepackRunLister
-	informerSyncs    []cache.InformerSynced
-	workQueue        workqueue.TypedRateLimitingInterface[string]
-	now              func() time.Time
+	kubernetesClient       kubernetes.Interface
+	volcanoClient          vcclientset.Interface
+	podLister              corelisters.PodLister
+	repackRunLister        repacklisters.RepackRunLister
+	podIndexer             cache.Indexer
+	repackRunIndexer       cache.Indexer
+	podGroupIndexAvailable bool
+	victimIndexAvailable   bool
+	informerSyncs          []cache.InformerSynced
+	workQueue              workqueue.TypedRateLimitingInterface[string]
+	boundStatusQueue       workqueue.TypedRateLimitingInterface[string]
+	boundMutex             sync.Mutex
+	pendingBounds          map[string]map[string]struct{} // RepackRun name -> nomination keys
+	now                    func() time.Time
 }
 
 // NewNominator wires the reconciler to Pod and RepackRun informers. Watching
@@ -79,14 +91,30 @@ type Nominator struct {
 // prepared nomination status reaches this controller's informer. A later
 // RepackRun update must therefore wake the already-existing Pending Pod.
 func NewNominator(kubernetesClient kubernetes.Interface, volcanoClient vcclientset.Interface, podInformer coreinformers.PodInformer, repackRunInformer repackinformers.RepackRunInformer) *Nominator {
+	podGroupIndexAvailable := true
+	if err := podInformer.Informer().AddIndexers(cache.Indexers{podGroupIndexName: podGroupIndex}); err != nil {
+		klog.ErrorS(err, "repack nominator: add PodGroup index; falling back to namespace scan")
+		podGroupIndexAvailable = false
+	}
+	victimIndexAvailable := true
+	if err := repackRunInformer.Informer().AddIndexers(cache.Indexers{nominationVictimIndexName: nominationVictimIndex}); err != nil {
+		klog.ErrorS(err, "repack nominator: add nomination victim index; falling back to RepackRun scan")
+		victimIndexAvailable = false
+	}
 	n := &Nominator{
-		kubernetesClient: kubernetesClient,
-		volcanoClient:    volcanoClient,
-		podLister:        podInformer.Lister(),
-		repackRunLister:  repackRunInformer.Lister(),
-		informerSyncs:    []cache.InformerSynced{podInformer.Informer().HasSynced, repackRunInformer.Informer().HasSynced},
-		workQueue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		now:              time.Now,
+		kubernetesClient:       kubernetesClient,
+		volcanoClient:          volcanoClient,
+		podLister:              podInformer.Lister(),
+		repackRunLister:        repackRunInformer.Lister(),
+		podIndexer:             podInformer.Informer().GetIndexer(),
+		repackRunIndexer:       repackRunInformer.Informer().GetIndexer(),
+		podGroupIndexAvailable: podGroupIndexAvailable,
+		victimIndexAvailable:   victimIndexAvailable,
+		informerSyncs:          []cache.InformerSynced{podInformer.Informer().HasSynced, repackRunInformer.Informer().HasSynced},
+		workQueue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		boundStatusQueue:       workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		pendingBounds:          make(map[string]map[string]struct{}),
+		now:                    time.Now,
 	}
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueue,
@@ -116,30 +144,105 @@ func (n *Nominator) enqueue(obj interface{}) {
 	n.workQueue.Add(key)
 }
 
+func podGroupIndexKey(namespace, podGroupName string) string {
+	return namespace + "\x00" + podGroupName
+}
+
+func nominationVictimIndexKey(namespace, victimPodName string) string {
+	return namespace + "\x00" + victimPodName
+}
+
+func podGroupIndex(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, nil
+	}
+	podGroupName := pod.Annotations[podGroupAnnotationKey]
+	if podGroupName == "" {
+		return nil, nil
+	}
+	return []string{podGroupIndexKey(pod.Namespace, podGroupName)}, nil
+}
+
+func nominationVictimIndex(obj interface{}) ([]string, error) {
+	run, ok := obj.(*repackv1alpha1.RepackRun)
+	if !ok {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(run.Status.Nominations))
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nomination.Phase == nomBound || nomination.Phase == nomExpired || nomination.VictimPodName == "" {
+			continue
+		}
+		keys = append(keys, nominationVictimIndexKey(nomination.Namespace, nomination.VictimPodName))
+	}
+	return keys, nil
+}
+
+func (n *Nominator) enqueuePodByName(namespace, podName string) {
+	if namespace == "" || podName == "" {
+		return
+	}
+	pod, err := n.podLister.Pods(namespace).Get(podName)
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	n.enqueue(pod)
+}
+
 // enqueuePendingForRun closes the informer-ordering race: when nomination
 // intents become visible, revisit Pending Pods that may already have emitted
-// their Add event. RepackRun updates are rare, and the scan is restricted to the
-// namespaces referenced by active nominations.
+// their Add event. The PodGroup index limits this to pods that can actually
+// match an active nomination, rather than scanning an entire namespace on every
+// status update.
 func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 	run, ok := obj.(*repackv1alpha1.RepackRun)
 	if !ok {
 		return
 	}
+	podGroups := map[string]bool{}
 	namespaces := map[string]bool{}
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
 		if nomination.Phase != nomBound && nomination.Phase != nomExpired {
 			namespaces[nomination.Namespace] = true
+			if nomination.PodGroupName != "" {
+				podGroups[podGroupIndexKey(nomination.Namespace, nomination.PodGroupName)] = true
+			}
+			n.enqueuePodByName(nomination.Namespace, nomination.VictimPodName)
 		}
 	}
-	for namespace := range namespaces {
-		pods, err := n.podLister.Pods(namespace).List(labels.Everything())
+	for podGroupKey := range podGroups {
+		if !n.podGroupIndexAvailable || n.podIndexer == nil {
+			continue
+		}
+		objects, err := n.podIndexer.ByIndex(podGroupIndexName, podGroupKey)
 		if err != nil {
 			utilruntime.HandleError(err)
 			continue
 		}
-		for _, pod := range pods {
-			n.enqueue(pod)
+		for _, object := range objects {
+			n.enqueue(object)
+		}
+	}
+	klog.V(4).InfoS("repack nominator: nomination update enqueued candidate Pods", "run", run.Name,
+		"activeNominationPodGroups", len(podGroups), "podGroupIndexEnabled", n.podGroupIndexAvailable,
+		"namespaceFallbackCount", len(namespaces))
+	if !n.podGroupIndexAvailable {
+		for namespace := range namespaces {
+			pods, err := n.podLister.Pods(namespace).List(labels.Everything())
+			if err != nil {
+				utilruntime.HandleError(err)
+				continue
+			}
+			for _, pod := range pods {
+				n.enqueue(pod)
+			}
 		}
 	}
 }
@@ -155,6 +258,19 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 		}
 	}
 	if !ok || pod == nil {
+		return
+	}
+	if n.victimIndexAvailable && n.repackRunIndexer != nil {
+		objects, err := n.repackRunIndexer.ByIndex(nominationVictimIndexName, nominationVictimIndexKey(pod.Namespace, pod.Name))
+		if err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+		for _, object := range objects {
+			n.enqueuePendingForRun(object)
+		}
+		klog.V(4).InfoS("repack nominator: victim deletion matched nomination runs by index",
+			"namespace", pod.Namespace, "victimPod", pod.Name, "matchedRunCount", len(objects))
 		return
 	}
 	runs, err := n.repackRunLister.List(labels.Everything())
@@ -179,19 +295,26 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 func (n *Nominator) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
 	defer n.workQueue.ShutDown()
+	defer n.boundStatusQueue.ShutDown()
 	if !cache.WaitForCacheSync(ctx.Done(), n.informerSyncs...) {
 		return fmt.Errorf("nominator: cache failed to sync")
 	}
 	if workers < 1 {
 		workers = 1
 	}
-	klog.V(3).InfoS("Starting repack nominator", "workers", workers)
+	klog.V(3).InfoS("Starting repack nominator", "workers", workers,
+		"podGroupIndexEnabled", n.podGroupIndexAvailable, "victimIndexEnabled", n.victimIndexAvailable,
+		"boundStatusFlushDelay", boundStatusFlushDelay)
 	for i := 0; i < workers; i++ {
 		go func() {
 			for n.processNext(ctx) {
 			}
 		}()
 	}
+	go func() {
+		for n.processNextBoundStatus(ctx) {
+		}
+	}()
 	<-ctx.Done()
 	return nil
 }
@@ -237,11 +360,10 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		return err
 	}
 	klog.V(3).InfoS("nominated replacement pod", "pod", key, "node", nomination.NodeName, "repackRun", owningRunName)
-	// Best-effort: mark the record Bound so it is consumed once. A failure here
-	// only risks a redundant (idempotent) re-nomination, so it is not fatal.
-	if err := n.markBound(ctx, owningRunName, nomination); err != nil {
-		klog.V(4).InfoS("could not mark nomination Bound (will retry on next event)", "err", err)
-	}
+	// Bound is audit state, not part of the scheduling decision: the Pod status
+	// patch above is durable and needsNomination prevents duplicate patches. Batch
+	// run-status updates so N replacement pods do not produce N full-object writes.
+	n.queueBoundNomination(owningRunName, nomination)
 	return nil
 }
 
@@ -350,10 +472,84 @@ func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, nod
 	return ignoreNotFound(err)
 }
 
-// markBound flips the matched record to Bound on the owning RepackRun so it is
-// consumed once. Re-reads the run to avoid clobbering a concurrent status write.
-func (n *Nominator) markBound(ctx context.Context, owningRunName string, targetNomination *repackv1alpha1.PodNomination) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func nominationStatusKey(nomination *repackv1alpha1.PodNomination) string {
+	if nomination == nil {
+		return ""
+	}
+	return nomination.Namespace + "\x00" + nomination.PodGroupName + "\x00" + nomination.VictimPodName + "\x00" + nomination.NodeName
+}
+
+// queueBoundNomination coalesces Bound transitions for a RepackRun. The pod's
+// nominatedNodeName is written first and is the scheduling authority; this
+// status update is asynchronous audit/lifecycle state.
+func (n *Nominator) queueBoundNomination(owningRunName string, nomination *repackv1alpha1.PodNomination) {
+	key := nominationStatusKey(nomination)
+	if owningRunName == "" || key == "" {
+		return
+	}
+	n.boundMutex.Lock()
+	if n.pendingBounds == nil {
+		n.pendingBounds = make(map[string]map[string]struct{})
+	}
+	if n.pendingBounds[owningRunName] == nil {
+		n.pendingBounds[owningRunName] = make(map[string]struct{})
+	}
+	n.pendingBounds[owningRunName][key] = struct{}{}
+	pendingCount := len(n.pendingBounds[owningRunName])
+	n.boundMutex.Unlock()
+	klog.V(5).InfoS("repack nominator: queued Bound status transition", "run", owningRunName,
+		"pendingBoundCount", pendingCount)
+	if n.boundStatusQueue != nil {
+		n.boundStatusQueue.AddAfter(owningRunName, boundStatusFlushDelay)
+	}
+}
+
+func (n *Nominator) processNextBoundStatus(ctx context.Context) bool {
+	name, shutdown := n.boundStatusQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer n.boundStatusQueue.Done(name)
+	if err := n.flushBoundNominations(ctx, name); err != nil {
+		utilruntime.HandleError(fmt.Errorf("mark nominations Bound for RepackRun %q: %w", name, err))
+		n.boundStatusQueue.AddRateLimited(name)
+		return true
+	}
+	n.boundStatusQueue.Forget(name)
+	return true
+}
+
+func (n *Nominator) boundNominationKeys(owningRunName string) map[string]struct{} {
+	n.boundMutex.Lock()
+	defer n.boundMutex.Unlock()
+	pending := n.pendingBounds[owningRunName]
+	keys := make(map[string]struct{}, len(pending))
+	for key := range pending {
+		keys[key] = struct{}{}
+	}
+	return keys
+}
+
+func (n *Nominator) clearBoundNominationKeys(owningRunName string, keys map[string]struct{}) {
+	n.boundMutex.Lock()
+	defer n.boundMutex.Unlock()
+	for key := range keys {
+		delete(n.pendingBounds[owningRunName], key)
+	}
+	if len(n.pendingBounds[owningRunName]) == 0 {
+		delete(n.pendingBounds, owningRunName)
+	}
+}
+
+// flushBoundNominations flips all queued records to Bound in one status update.
+// Re-reading the run avoids clobbering a concurrent engine terminal write.
+func (n *Nominator) flushBoundNominations(ctx context.Context, owningRunName string) error {
+	keys := n.boundNominationKeys(owningRunName)
+	if len(keys) == 0 {
+		return nil
+	}
+	updatedCount := 0
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Use an API read, not the informer lister: a stale cached status could
 		// otherwise overwrite the engine's just-written terminal result.
 		updated, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, owningRunName, metav1.GetOptions{})
@@ -361,20 +557,31 @@ func (n *Nominator) markBound(ctx context.Context, owningRunName string, targetN
 			return ignoreNotFound(err)
 		}
 		changed := false
+		boundCount := 0
 		for index := range updated.Status.Nominations {
 			nomination := &updated.Status.Nominations[index]
-			if nomination.Namespace == targetNomination.Namespace && nomination.PodGroupName == targetNomination.PodGroupName &&
-				nomination.VictimPodName == targetNomination.VictimPodName && nomination.NodeName == targetNomination.NodeName {
+			if _, queued := keys[nominationStatusKey(nomination)]; queued {
 				if nomination.Phase != nomBound {
 					nomination.Phase = nomBound
 					changed = true
+					boundCount++
 				}
 			}
 		}
-		if !changed {
-			return nil
+		if changed {
+			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+			if err != nil {
+				return ignoreNotFound(err)
+			}
 		}
-		_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-		return ignoreNotFound(err)
+		updatedCount = boundCount
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	n.clearBoundNominationKeys(owningRunName, keys)
+	klog.V(3).InfoS("repack nominator: Bound nominations flushed", "run", owningRunName,
+		"queuedCount", len(keys), "updatedCount", updatedCount)
+	return nil
 }

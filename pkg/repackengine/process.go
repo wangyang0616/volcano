@@ -108,6 +108,9 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 				fmt.Errorf("unknown repack plugin %q", name))
 		}
 	}
+	klog.V(3).InfoS("repack: run execution started",
+		"run", run.Name, "mode", run.Spec.Mode, "resource", targetResource,
+		"core", e.config.Core, "actions", actions, "plugins", e.config.Plugins)
 
 	reason := state.ReasonSimulating
 	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
@@ -119,6 +122,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist Running status: %w", err)
 	}
+	klog.V(4).InfoS("repack: run status persisted as Running", "run", run.Name, "reason", reason)
 
 	scope, err := engineframework.NewScopeMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
 	if err != nil {
@@ -173,6 +177,9 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist prepared Execute plan: %w", err)
 		}
+		klog.V(3).InfoS("repack: Execute plan prepared before eviction",
+			"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
+			"nominationCount", len(run.Status.Nominations), "nominationTTL", nominationTTL)
 	}
 
 	var commitResult *engineframework.CommitResult
@@ -196,9 +203,14 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	if execute && worthwhile {
 		// Replace the optimistic prepared plan with the realized subset. Failed
 		// evictions must not leave stale nominations or claim nodes were freed.
+		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
 		plan = realizedPlan(plan, commitResult)
 		report = engineframework.RenderReport(plan)
 		applyPlan(run, report, plan, targetResource, true, nominationTTL)
+		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
+			"run", run.Name, "plannedMoveCount", plannedMoveCount, "realizedMoveCount", len(plan.Moves),
+			"plannedFreedNodeCount", plannedFreedNodeCount, "realizedFreedNodeCount", len(plan.FreedNodes),
+			"remainingNominationCount", len(run.Status.Nominations))
 	}
 	if execute && worthwhile && evictedCount == 0 && rejectedCount > 0 {
 		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
@@ -227,8 +239,15 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
 	state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
-	klog.V(3).InfoS("RepackRun finished", "run", run.Name, "mode", run.Spec.Mode, "outcome", done)
-	return e.updateStatusTerminal(ctx, run)
+	if err := e.updateStatusTerminal(ctx, run); err != nil {
+		return err
+	}
+	klog.V(3).InfoS("repack: run completed and terminal status persisted",
+		"run", run.Name, "mode", run.Spec.Mode, "phase", run.Status.Phase, "outcome", done,
+		"freedNodeCount", report.NodesFreed, "movedResource", report.MovedResource,
+		"affectedPodGroupCount", report.AffectedPodGroups, "evictedCount", evictedCount, "rejectedCount", rejectedCount,
+		"duration", time.Since(processingStartTime))
+	return nil
 }
 
 // hooksFor returns the commit side effects. DryRun: none. Execute: evict each

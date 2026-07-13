@@ -62,11 +62,15 @@ func (context *PlanContext) Resource() v1.ResourceName {
 	return context.TargetResource
 }
 
-// CandidatePlan is one rearrangement under comparison: the moves it implies.
-// Aggregates are computed once and cached.
+// CandidatePlan is one rearrangement under comparison. CommittedMoves are the
+// moves already selected in this planning pass; Moves are the candidate's
+// incremental moves. Keeping the slices separate avoids copying the growing
+// committed prefix for every candidate during disruption scoring. Aggregates are
+// computed once and cached.
 type CandidatePlan struct {
-	Moves     []*Move
-	aggregate *PlanMoveAggregate
+	CommittedMoves []*Move
+	Moves          []*Move
+	aggregate      *PlanMoveAggregate
 }
 
 // PodGroupMoveAggregate is the per-PodGroup move aggregate.
@@ -90,24 +94,31 @@ func (plan *CandidatePlan) MoveAggregate(context *PlanContext) *PlanMoveAggregat
 		return plan.aggregate
 	}
 	moveAggregate := &PlanMoveAggregate{ByPodGroup: map[api.JobID]*PodGroupMoveAggregate{}}
+	for _, move := range plan.CommittedMoves {
+		moveAggregate.addMove(context, move)
+	}
 	for _, move := range plan.Moves {
-		if move == nil || move.Task == nil || move.To == move.From {
-			continue // not actually relocated
-		}
-		requestedResource := Scalar(move.Task.InitResreq, context.Resource())
-		moveAggregate.MovedPods++
-		moveAggregate.MovedResource += requestedResource
-		podGroupAggregate := moveAggregate.ByPodGroup[move.Task.Job]
-		if podGroupAggregate == nil {
-			podGroupAggregate = &PodGroupMoveAggregate{}
-			moveAggregate.ByPodGroup[move.Task.Job] = podGroupAggregate
-		}
-		podGroupAggregate.MovedPods++
-		podGroupAggregate.MovedResource += requestedResource
+		moveAggregate.addMove(context, move)
 	}
 	moveAggregate.AffectedPodGroups = int64(len(moveAggregate.ByPodGroup))
 	plan.aggregate = moveAggregate
 	return moveAggregate
+}
+
+func (moveAggregate *PlanMoveAggregate) addMove(context *PlanContext, move *Move) {
+	if move == nil || move.Task == nil || move.To == move.From {
+		return // not actually relocated
+	}
+	requestedResource := Scalar(move.Task.InitResreq, context.Resource())
+	moveAggregate.MovedPods++
+	moveAggregate.MovedResource += requestedResource
+	podGroupAggregate := moveAggregate.ByPodGroup[move.Task.Job]
+	if podGroupAggregate == nil {
+		podGroupAggregate = &PodGroupMoveAggregate{}
+		moveAggregate.ByPodGroup[move.Task.Job] = podGroupAggregate
+	}
+	podGroupAggregate.MovedPods++
+	podGroupAggregate.MovedResource += requestedResource
 }
 
 // DisruptionCost is a flat summary of a plan's default dimensions, for

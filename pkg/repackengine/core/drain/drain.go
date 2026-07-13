@@ -32,6 +32,7 @@ package drain
 import (
 	"sort"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -40,6 +41,7 @@ import (
 
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
+	"volcano.sh/volcano/pkg/repackengine/metrics"
 )
 
 func init() {
@@ -52,6 +54,10 @@ func (*drainCore) Name() string { return framework.CoreDrain }
 
 // Plan runs the incremental, gang-aware drain over the session's freeable units.
 func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
+	runName := ""
+	if run := ssn.Run(); run != nil {
+		runName = run.Name
+	}
 	targetResource := ssn.Resource()
 	nodes := ssn.Nodes()
 	movable := ssn.Movable()
@@ -67,14 +73,15 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	}
 
 	before := api.MeasureResourceFragmentation(nodes, targetResource)
-	klog.V(4).InfoS("repack drain: starting pass", "resource", targetResource,
+	klog.V(3).InfoS("repack drain: planning pass started", "run", runName, "resource", targetResource,
 		"nodes", len(nodes), "freeableUnits", len(units),
 		"occupiedNodes", before.OccupiedNodeCount, "optimalNodes", before.OptimalOccupiedNodeCount,
 		"providingNodes", before.ProvidingNodeCount)
 
 	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, targetResource)
 	if plan == nil {
-		klog.V(4).InfoS("repack drain: no plan — nothing could be freed", "resource", targetResource)
+		klog.V(3).InfoS("repack drain: no plan produced", "run", runName, "resource", targetResource,
+			"reason", "NoFreeableUnit")
 		return nil, false
 	}
 	plan.Before = before
@@ -83,12 +90,17 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	// disruptionPolicy.maxDisruptionScore, added later). A rejected plan = NoRepackNeeded.
 	if !ssn.PlanAdmissible(plan) {
 		klog.V(3).InfoS("repack drain: plan rejected by benefit gate (below MinNodesFreed / MinFragImprovement)",
-			"resource", targetResource, "freedNodes", len(plan.FreedNodes), "moves", len(plan.Moves))
+			"run", runName, "resource", targetResource, "freedNodeCount", len(plan.FreedNodes), "moveCount", len(plan.Moves),
+			"fragmentationBefore", before.FragmentationRate(), "fragmentationDelta", plan.FragmentationRateDelta())
 		return nil, false
 	}
 	plan.Cost = api.CalculateDisruptionCost(plan.Moves, targetResource)
-	klog.V(3).InfoS("repack drain: plan accepted", "resource", targetResource,
-		"freedNodes", plan.FreedNodes, "moves", len(plan.Moves))
+	klog.V(3).InfoS("repack drain: plan accepted", "run", runName, "resource", targetResource,
+		"freedNodeCount", len(plan.FreedNodes), "moveCount", len(plan.Moves),
+		"movedResource", plan.Cost.MovedResource, "affectedPodGroupCount", plan.Cost.AffectedPodGroups,
+		"fragmentationBefore", before.FragmentationRate(), "fragmentationDelta", plan.FragmentationRateDelta())
+	klog.V(4).InfoS("repack drain: accepted plan details", "run", runName, "freedNodes", plan.FreedNodes,
+		"affectedPodGroups", plan.AffectedPodGroups())
 	return plan, true
 }
 
@@ -120,15 +132,19 @@ type drainState struct {
 	hasResourceLimit bool
 
 	// Mutated as units are committed.
-	drained        map[string]bool // emptied — no longer a receiver
-	filled         map[string]bool // received a moved-in pod
-	provenStuck    map[string]bool // proven un-vacatable this pass → prefer as receiver
-	stuckUnits     map[string]bool // monotonic infeasibility cache; never re-simulate
-	movedPodGroups map[schedapi.JobID]bool
-	movedResource  int64
-	moves          []*api.Move
-	freedNodes     []string
-	freedUnits     []api.FreeableUnit
+	drained                map[string]bool // emptied — no longer a receiver
+	filled                 map[string]bool // received a moved-in pod
+	provenStuck            map[string]bool // proven un-vacatable this pass → prefer as receiver
+	stuckUnits             map[string]bool // monotonic infeasibility cache; never re-simulate
+	movedPodGroups         map[schedapi.JobID]bool
+	movedResource          int64
+	placedResourceByNode   map[string]int64 // resource already assigned to a receiver by committed moves
+	candidatesEvaluated    int
+	feasibilitySimulations int
+	prunedByReason         map[string]int
+	moves                  []*api.Move
+	freedNodes             []string
+	freedUnits             []api.FreeableUnit
 }
 
 // drainGreedy is the single dynamic pass. Each step re-evaluates every still-
@@ -144,10 +160,18 @@ func drainGreedy(
 	targetResource v1.ResourceName,
 ) *api.RepackPlan {
 	s := newDrainState(nodes, nodesByName, ssn, movable, targetResource)
+	planningStartTime := time.Now()
+	defer func() {
+		metrics.ObservePlanner(string(ssn.Mode()), s.candidatesEvaluated, s.feasibilitySimulations, s.prunedByReason)
+		klog.V(4).InfoS("repack drain: planning performance summary", "run", runName(ssn),
+			"candidateEvaluations", s.candidatesEvaluated, "feasibilitySimulations", s.feasibilitySimulations,
+			"prunedByReason", s.prunedByReason, "duration", time.Since(planningStartTime))
+	}()
 	for step := 1; ; step++ {
 		// 1. Evaluate every still-freeable unit against the committed moves so far.
 		var feasible []candidate
 		for _, unit := range units {
+			s.candidatesEvaluated++
 			if c, ok := s.evaluateUnit(unit); ok {
 				feasible = append(feasible, c)
 			}
@@ -176,21 +200,23 @@ func newDrainState(
 	targetResource v1.ResourceName,
 ) *drainState {
 	return &drainState{
-		ssn:              ssn,
-		snapshot:         ssn.Snapshot(),
-		nodes:            nodes,
-		nodesByName:      nodesByName,
-		movable:          movable,
-		resource:         targetResource,
-		maxPodGroups:     ssn.MaxPodGroups(),
-		maxResource:      ssn.MaxResource(),
-		hasPodGroupLimit: ssn.LimitPodGroups(),
-		hasResourceLimit: ssn.LimitResource(),
-		drained:          make(map[string]bool),
-		filled:           make(map[string]bool),
-		provenStuck:      make(map[string]bool),
-		stuckUnits:       make(map[string]bool),
-		movedPodGroups:   make(map[schedapi.JobID]bool),
+		ssn:                  ssn,
+		snapshot:             ssn.Snapshot(),
+		nodes:                nodes,
+		nodesByName:          nodesByName,
+		movable:              movable,
+		resource:             targetResource,
+		maxPodGroups:         ssn.MaxPodGroups(),
+		maxResource:          ssn.MaxResource(),
+		hasPodGroupLimit:     ssn.LimitPodGroups(),
+		hasResourceLimit:     ssn.LimitResource(),
+		drained:              make(map[string]bool),
+		filled:               make(map[string]bool),
+		provenStuck:          make(map[string]bool),
+		stuckUnits:           make(map[string]bool),
+		movedPodGroups:       make(map[schedapi.JobID]bool),
+		placedResourceByNode: make(map[string]int64),
+		prunedByReason:       make(map[string]int),
 	}
 }
 
@@ -200,6 +226,7 @@ func newDrainState(
 func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	key := unitKey(unit)
 	if s.stuckUnits[key] {
+		s.recordPruned("cached_infeasible")
 		return candidate{}, false
 	}
 	inUnit, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
@@ -228,27 +255,9 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		klog.V(5).InfoS("repack drain: skip unit — no movable accelerator victims", "unit", key, "nodes", unit.Nodes)
 		return candidate{}, false
 	}
-	receivers := s.receiversInPreferenceOrder(inUnit)
-	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
-		"victims", taskNames(victims), "victimCount", len(victims),
-		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
-	// Feasibility = the scheduler-faithful relocation feasibility check: it simulates evicting
-	// these victims and greedily placing them onto the receivers (in the preference
-	// order we pass) with the full scheduler filter stack, over the moves already
-	// committed this pass.
-	placed, feasible := s.snapshot.FeasibleRelocation(s.moves, victims, receivers)
-	if !feasible {
-		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
-		// stays infeasible — remember its nodes as preferred (staying) receivers.
-		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
-			"unit", key, "victims", len(victims), "receivers", len(receivers))
-		for _, nodeName := range unit.Nodes {
-			s.provenStuck[nodeName] = true
-		}
-		s.stuckUnits[key] = true
-		return candidate{}, false
-	}
-	// Disruption budget (maxPerRun): prospective deltas.
+	// Calculate cheap, deterministic prospective deltas before invoking the full
+	// scheduler simulation. Under a tight maxPerRun this avoids cloning cycle
+	// state and running predicates for candidates that cannot be selected anyway.
 	newPodGroups := make(map[schedapi.JobID]bool)
 	var additionalResource int64
 	for _, v := range victims {
@@ -258,13 +267,43 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		additionalResource += api.Scalar(v.InitResreq, s.resource)
 	}
 	if (s.hasPodGroupLimit || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
+		s.recordPruned("max_pod_groups")
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.podGroups", "unit", key,
 			"wouldBe", len(s.movedPodGroups)+len(newPodGroups), "max", s.maxPodGroups)
 		return candidate{}, false
 	}
 	if (s.hasResourceLimit || s.maxResource > 0) && s.movedResource+additionalResource > s.maxResource {
+		s.recordPruned("max_resource")
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.resources", "unit", key,
 			"wouldBe", s.movedResource+additionalResource, "max", s.maxResource)
+		return candidate{}, false
+	}
+	receivers := s.receiversInPreferenceOrder(inUnit)
+	if !s.receiversHaveResourceCapacity(receivers, additionalResource) {
+		s.recordPruned("insufficient_receiver_resource")
+		// This is only a necessary resource-capacity check; scheduler predicates
+		// remain authoritative for every candidate that passes it.
+		klog.V(5).InfoS("repack drain: skip unit — receiver resource capacity is insufficient", "unit", key,
+			"required", additionalResource, "receivers", len(receivers))
+		s.markUnitInfeasible(key, unit)
+		return candidate{}, false
+	}
+	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
+		"victims", taskNames(victims), "victimCount", len(victims),
+		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
+	// Feasibility = the scheduler-faithful relocation feasibility check: it simulates evicting
+	// these victims and greedily placing them onto the receivers (in the preference
+	// order we pass) with the full scheduler filter stack, over the moves already
+	// committed this pass.
+	s.feasibilitySimulations++
+	placed, feasible := s.snapshot.FeasibleRelocation(s.moves, victims, receivers)
+	if !feasible {
+		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
+		// stays infeasible — remember its nodes as preferred (staying) receivers.
+		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
+			"unit", key, "victims", len(victims), "receivers", len(receivers))
+		s.markUnitInfeasible(key, unit)
+		s.recordPruned("scheduler_infeasible")
 		return candidate{}, false
 	}
 	if klog.V(5).Enabled() {
@@ -275,6 +314,38 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	}
 	klog.V(5).InfoS("repack drain: unit FEASIBLE", "unit", key, "moves", len(placed), "movedResource", additionalResource)
 	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, additionalResource: additionalResource, key: key}, true
+}
+
+func (s *drainState) recordPruned(reason string) {
+	s.prunedByReason[reason]++
+}
+
+func runName(ssn *framework.Session) string {
+	if run := ssn.Run(); run != nil {
+		return run.Name
+	}
+	return ""
+}
+
+// receiversHaveResourceCapacity is a necessary, intentionally predicate-free
+// preflight. It accounts for moves already committed to a receiver, then lets
+// FeasibleRelocation perform the authoritative multi-dimensional filter check.
+func (s *drainState) receiversHaveResourceCapacity(receivers []*schedapi.NodeInfo, requiredResource int64) bool {
+	var availableResource int64
+	for _, receiver := range receivers {
+		availableResource += receiverSlack(receiver, s.resource) - s.placedResourceByNode[receiver.Name]
+		if availableResource >= requiredResource {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *drainState) markUnitInfeasible(key string, unit api.FreeableUnit) {
+	for _, nodeName := range unit.Nodes {
+		s.provenStuck[nodeName] = true
+	}
+	s.stuckUnits[key] = true
 }
 
 // receiversInPreferenceOrder returns the nodes that may receive relocated pods, in
@@ -345,10 +416,7 @@ func (s *drainState) chooseLeastDisruptive(feasible []candidate) candidate {
 	})
 	candidatePlans := make([]*api.CandidatePlan, len(feasible))
 	for i, c := range feasible {
-		combinedMoves := make([]*api.Move, 0, len(s.moves)+len(c.placed))
-		combinedMoves = append(combinedMoves, s.moves...)
-		combinedMoves = append(combinedMoves, c.placed...)
-		candidatePlans[i] = &api.CandidatePlan{Moves: combinedMoves}
+		candidatePlans[i] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: c.placed}
 	}
 	return feasible[s.ssn.LeastDisruptive(candidatePlans)]
 }
@@ -358,6 +426,9 @@ func (s *drainState) chooseLeastDisruptive(feasible []candidate) candidate {
 func (s *drainState) commit(chosen candidate) {
 	for _, m := range chosen.placed {
 		s.filled[m.To] = true
+		if m.Task != nil {
+			s.placedResourceByNode[m.To] += api.Scalar(m.Task.InitResreq, s.resource)
+		}
 	}
 	for pg := range chosen.newPodGroups {
 		s.movedPodGroups[pg] = true

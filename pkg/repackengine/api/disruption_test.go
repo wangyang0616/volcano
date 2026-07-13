@@ -55,6 +55,18 @@ func TestAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateIncludesCommittedAndIncrementalMoves(t *testing.T) {
+	ctx := &PlanContext{TargetResource: gpu}
+	plan := &CandidatePlan{
+		CommittedMoves: []*Move{{Task: gpuJobTask("committed", "g1", 2), From: "n0", To: "n1"}},
+		Moves:          []*Move{{Task: gpuJobTask("candidate", "g2", 3), From: "n2", To: "n3"}},
+	}
+	aggregate := plan.MoveAggregate(ctx)
+	if aggregate.MovedPods != 2 || aggregate.MovedResource != 5 || aggregate.AffectedPodGroups != 2 {
+		t.Fatalf("aggregate=%+v, want two moves across two PodGroups", aggregate)
+	}
+}
+
 // CalculateDisruptionCost summarizes a move set's default dimensions.
 func TestCostOf(t *testing.T) {
 	c := CalculateDisruptionCost([]*Move{
