@@ -58,7 +58,7 @@ func (e *Engine) updateStatus(ctx context.Context, run *repackv1alpha1.RepackRun
 
 func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1alpha1.RepackRunStatus) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest, err := e.vc.RepackV1alpha1().RepackRuns().Get(ctx, name, metav1.GetOptions{})
+		latest, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -68,7 +68,7 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 		merged := desired.DeepCopy()
 		mergeNominationPhases(merged.Nominations, latest.Status.Nominations)
 		merged.DeepCopyInto(&latest.Status)
-		_, err = e.vc.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
+		_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
 		return err
 	})
 }
@@ -162,9 +162,9 @@ func stampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 // reconciler) and marks freed nodes as actuallyFreed. Per-move actual-landing /
 // drift (outcome/actualNode) is filled later by the reconciler as replacement pods
 // land; the engine's initial write leaves it empty.
-func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, res v1.ResourceName, execute bool, ttl time.Duration) {
-	moves := movesOf(plan, res)
-	summary := summaryOf(report)
+func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, targetResource v1.ResourceName, execute bool, nominationTTL time.Duration) {
+	moves := buildStatusMoves(plan, targetResource)
+	summary := buildRepackSummary(report)
 	if summary != nil {
 		var cards int64
 		for _, m := range moves {
@@ -175,55 +175,55 @@ func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, pla
 	run.Status.Plan = &repackv1alpha1.RepackPlan{
 		Summary:    summary,
 		Moves:      moves,
-		FreedNodes: freedNodesOf(plan),
+		FreedNodes: sortedFreedNodeNames(plan),
 	}
 	if execute {
-		run.Status.Nominations = nominationsOf(plan, ttl)
+		run.Status.Nominations = buildPodNominations(plan, nominationTTL)
 	}
 }
 
-// movesOf groups the plan's per-task relocations into per-PodGroup status moves;
+// buildStatusMoves groups the plan's per-task relocations into per-PodGroup status moves;
 // fromNode/toNode live per-pod in pods[] (a gang's pods may spread across nodes).
 // moves is a pure plan (identical in DryRun/Execute). Deterministic order.
-func movesOf(plan *engineapi.RepackPlan, res v1.ResourceName) []repackv1alpha1.RepackMove {
+func buildStatusMoves(plan *engineapi.RepackPlan, targetResource v1.ResourceName) []repackv1alpha1.RepackMove {
 	if plan == nil {
 		return nil
 	}
-	idx := map[string]int{} // JobID ("ns/name") -> index in out
-	out := []repackv1alpha1.RepackMove{}
-	for _, m := range plan.Moves {
-		if m == nil || m.Task == nil || m.To == m.From {
+	moveIndexByPodGroup := map[string]int{} // JobID ("ns/name") -> index in statusMoves
+	statusMoves := []repackv1alpha1.RepackMove{}
+	for _, move := range plan.Moves {
+		if move == nil || move.Task == nil || move.To == move.From {
 			continue
 		}
-		job := string(m.Task.Job)
-		i, ok := idx[job]
+		podGroupID := string(move.Task.Job)
+		moveIndex, ok := moveIndexByPodGroup[podGroupID]
 		if !ok {
-			i = len(out)
-			idx[job] = i
-			ns, name := splitJobID(job)
-			out = append(out, repackv1alpha1.RepackMove{Namespace: ns, PodGroupName: name})
+			moveIndex = len(statusMoves)
+			moveIndexByPodGroup[podGroupID] = moveIndex
+			namespace, podGroupName := splitPodGroupID(podGroupID)
+			statusMoves = append(statusMoves, repackv1alpha1.RepackMove{Namespace: namespace, PodGroupName: podGroupName})
 		}
 		var cards int64
-		if m.Task.Resreq != nil {
+		if move.Task.Resreq != nil {
 			// Report whole devices to users; Resreq is stored in milli-units.
-			cards = engineapi.Cards(m.Task.Resreq, res)
+			cards = engineapi.Cards(move.Task.Resreq, targetResource)
 		}
-		out[i].Cards += cards
-		out[i].Pods = append(out[i].Pods, repackv1alpha1.PodMove{
-			Name:     m.Task.Name,
-			FromNode: m.From,
-			ToNode:   m.To,
+		statusMoves[moveIndex].Cards += cards
+		statusMoves[moveIndex].Pods = append(statusMoves[moveIndex].Pods, repackv1alpha1.PodMove{
+			Name:     move.Task.Name,
+			FromNode: move.From,
+			ToNode:   move.To,
 			Cards:    cards,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Namespace != out[j].Namespace {
-			return out[i].Namespace < out[j].Namespace
+	sort.Slice(statusMoves, func(i, j int) bool {
+		if statusMoves[i].Namespace != statusMoves[j].Namespace {
+			return statusMoves[i].Namespace < statusMoves[j].Namespace
 		}
-		return out[i].PodGroupName < out[j].PodGroupName
+		return statusMoves[i].PodGroupName < statusMoves[j].PodGroupName
 	})
-	for k := range out {
-		pods := out[k].Pods
+	for moveIndex := range statusMoves {
+		pods := statusMoves[moveIndex].Pods
 		sort.Slice(pods, func(a, b int) bool {
 			switch {
 			case pods[a].Name != pods[b].Name:
@@ -235,72 +235,72 @@ func movesOf(plan *engineapi.RepackPlan, res v1.ResourceName) []repackv1alpha1.R
 			}
 		})
 	}
-	return out
+	return statusMoves
 }
 
-// splitJobID splits a "namespace/name" JobID; missing "/" -> ("", id).
-func splitJobID(id string) (ns, name string) {
-	if i := strings.IndexByte(id, '/'); i >= 0 {
-		return id[:i], id[i+1:]
+// splitPodGroupID splits a "namespace/name" JobID; missing "/" -> ("", id).
+func splitPodGroupID(podGroupID string) (namespace, name string) {
+	if separatorIndex := strings.IndexByte(podGroupID, '/'); separatorIndex >= 0 {
+		return podGroupID[:separatorIndex], podGroupID[separatorIndex+1:]
 	}
-	return "", id
+	return "", podGroupID
 }
 
-// freedNodesOf lists the names of nodes the plan empties (sorted).
-func freedNodesOf(plan *engineapi.RepackPlan) []string {
+// sortedFreedNodeNames lists the names of nodes the plan empties (sorted).
+func sortedFreedNodeNames(plan *engineapi.RepackPlan) []string {
 	if plan == nil {
 		return nil
 	}
-	out := append([]string(nil), plan.FreedNodes...)
-	sort.Strings(out)
-	return out
+	freedNodeNames := append([]string(nil), plan.FreedNodes...)
+	sort.Strings(freedNodeNames)
+	return freedNodeNames
 }
 
-// summaryOf renders the flat metrics layer. "Worth repacking?" is not here — it
+// buildRepackSummary renders the flat metrics layer. "Worth repacking?" is not here — it
 // is folded into the terminal condition's reason. MovedCardCount is filled by
 // applyPlan from moves; FragBefore/After come from the report (absolute rate).
-func summaryOf(r engineframework.Report) *repackv1alpha1.RepackSummary {
+func buildRepackSummary(report engineframework.Report) *repackv1alpha1.RepackSummary {
 	return &repackv1alpha1.RepackSummary{
-		FragBeforePercent: pct(r.FragRateBefore),
-		FragAfterPercent:  pct(r.FragRateAfter),
-		FreedNodeCount:    int32(r.NodesFreed),
+		FragBeforePercent: percentagePoints(report.FragmentationRateBefore),
+		FragAfterPercent:  percentagePoints(report.FragmentationRateAfter),
+		FreedNodeCount:    int32(report.NodesFreed),
 	}
 }
 
-// pct rounds a 0-1 fraction to an integer percentage point, clamped to [0,100].
-func pct(f float64) int32 {
-	p := int32(f*100 + 0.5)
-	if p < 0 {
+// percentagePoints rounds a 0-1 fraction to an integer percentage point, clamped to [0,100].
+func percentagePoints(fraction float64) int32 {
+	percentage := int32(fraction*100 + 0.5)
+	if percentage < 0 {
 		return 0
 	}
-	if p > 100 {
+	if percentage > 100 {
 		return 100
 	}
-	return p
+	return percentage
 }
 
-// nominationsOf renders per-pod landing-steering intents (Execute-only). Claiming
+// buildPodNominations renders per-pod landing-steering intents (Execute-only). Claiming
 // follows the landing-identity contract (proposal §5.2.2): victimPodName exact
 // match, then identityLabels (label-superset match), then fungible. IdentityLabels
 // are resolved from the victim pod's own well-known labels by the framework.
-func nominationsOf(plan *engineapi.RepackPlan, ttl time.Duration) []repackv1alpha1.PodNomination {
+func buildPodNominations(plan *engineapi.RepackPlan, nominationTTL time.Duration) []repackv1alpha1.PodNomination {
 	if plan == nil {
 		return nil
 	}
-	expire := metav1.NewTime(time.Now().Add(ttl))
+	expirationTime := metav1.NewTime(time.Now().Add(nominationTTL))
 	intents := engineframework.NominationIntents(plan)
-	out := make([]repackv1alpha1.PodNomination, 0, len(intents))
-	for _, in := range intents {
-		_, podGroupName := splitJobID(string(in.Gang))
-		out = append(out, repackv1alpha1.PodNomination{
-			Namespace:      in.Namespace,
+	nominations := make([]repackv1alpha1.PodNomination, 0, len(intents))
+	for _, intent := range intents {
+		_, podGroupName := splitPodGroupID(string(intent.Gang))
+		nominations = append(nominations, repackv1alpha1.PodNomination{
+			Namespace:      intent.Namespace,
 			PodGroupName:   podGroupName,
-			VictimPodName:  in.PodName,
-			IdentityLabels: in.IdentityLabels,
-			NodeName:       in.Node,
+			VictimPodName:  intent.PodName,
+			IdentityLabels: intent.IdentityLabels,
+			NodeName:       intent.Node,
 			Phase:          "Pending",
-			ExpirationTime: &expire,
+			ExpirationTime: &expirationTime,
 		})
 	}
-	return out
+	return nominations
 }

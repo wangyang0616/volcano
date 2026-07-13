@@ -49,8 +49,8 @@ type ServerOption struct {
 	KubeClientOptions kube.ClientOptions
 	// SchedulerConf is the SAME --scheduler-conf the volcano-scheduler uses, so
 	// the engine's tiers/plugins match the scheduler's exactly.
-	SchedulerConf  string
-	SchedulePeriod time.Duration
+	SchedulerConf string
+	ResyncPeriod  time.Duration
 
 	// Algorithm selects the planner ("" = drain). Actions overrides the pipeline
 	// ("" = DefaultActions). MinNodesFreed is the benefit gate. DefaultResource is
@@ -90,7 +90,7 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.KubeClientOptions.Burst, "kube-api-burst", defaultBurst, "Burst to use while talking with kubernetes apiserver")
 
 	fs.StringVar(&s.SchedulerConf, "scheduler-conf", "", "Absolute path of the shared scheduler configuration file (same as volcano-scheduler)")
-	fs.DurationVar(&s.SchedulePeriod, "resync-period", defaultResyncPeriod, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
+	fs.DurationVar(&s.ResyncPeriod, "resync-period", defaultResyncPeriod, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
 	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", defaultExecuteCooldown, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
 
 	fs.StringVar(&s.Algorithm, "repack-algorithm", "", "Planner: drain (default) or concentration")

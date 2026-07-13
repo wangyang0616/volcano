@@ -27,14 +27,15 @@ import (
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 )
 
-// The K=1 in-memory gate state (execActive/lastExecFinish, guarded by mu) is
+// The K=1 in-memory gate state (activeExecuteRunName/lastExecuteFinishTime,
+// guarded by engineStateMutex) is
 // designed to be safe even if Workers > 1. Hammer markExecuteActive/Done and
 // executeGateState from many goroutines; run with -race to catch data races.
 func TestExecuteGateState_ConcurrentAccess(t *testing.T) {
 	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	e := &Engine{
-		lister: repacklisters.NewRepackRunLister(idx),
-		now:    time.Now,
+		repackRunLister: repacklisters.NewRepackRunLister(idx),
+		now:             time.Now,
 	}
 
 	const goroutines, iters = 16, 500
@@ -56,8 +57,8 @@ func TestExecuteGateState_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 
 	// Every goroutine finished with markExecuteDone, which stamps the cooldown
-	// anchor, so lastExecFinish must be set (and reads must not have raced).
+	// anchor, so lastExecuteFinishTime must be set (and reads must not have raced).
 	if _, last := e.executeGateState("x"); last.IsZero() {
-		t.Error("lastExecFinish should be stamped after Execute completions")
+		t.Error("lastExecuteFinishTime should be stamped after Execute completions")
 	}
 }

@@ -24,25 +24,25 @@ import (
 )
 
 // RenderReport reports absolute fragmentation before/after: after = before +
-// delta, where freeing a node drops B by 1 → (B-A-freed)/M.
+// delta, where freeing a node reduces the occupied-node count by one.
 func TestRenderReport_FragBeforeAfter(t *testing.T) {
 	plan := &api.RepackPlan{
-		Before:     api.ResourceFrag{M: 10, B: 6, A: 2}, // before = (6-2)/10 = 0.4
-		FreedNodes: []string{"n0", "n1"},                // delta = -2/10; after = 0.2
+		Before:     api.ResourceFragmentation{ProvidingNodeCount: 10, OccupiedNodeCount: 6, OptimalOccupiedNodeCount: 2}, // before = (6-2)/10 = 0.4
+		FreedNodes: []string{"n0", "n1"},                                                                                 // delta = -2/10; after = 0.2
 	}
 	r := RenderReport(plan)
-	if math.Abs(r.FragRateBefore-0.4) > 1e-9 {
-		t.Errorf("before=%v, want 0.4", r.FragRateBefore)
+	if math.Abs(r.FragmentationRateBefore-0.4) > 1e-9 {
+		t.Errorf("before=%v, want 0.4", r.FragmentationRateBefore)
 	}
-	if math.Abs(r.FragRateAfter-0.2) > 1e-9 {
-		t.Errorf("after=%v, want 0.2", r.FragRateAfter)
+	if math.Abs(r.FragmentationRateAfter-0.2) > 1e-9 {
+		t.Errorf("after=%v, want 0.2", r.FragmentationRateAfter)
 	}
 	if r.NodesFreed != 2 {
 		t.Errorf("nodesFreed=%d, want 2", r.NodesFreed)
 	}
 
 	// Nil plan → empty report (all zero).
-	if r0 := RenderReport(nil); r0.FragRateBefore != 0 || r0.FragRateAfter != 0 {
+	if r0 := RenderReport(nil); r0.FragmentationRateBefore != 0 || r0.FragmentationRateAfter != 0 {
 		t.Errorf("nil plan report=%+v, want zero", r0)
 	}
 }

@@ -40,14 +40,14 @@ func TestNewEngineAppliesDefaults(t *testing.T) {
 	if e == nil {
 		t.Fatal("NewEngine() returned nil engine")
 	}
-	if e.cfg.Core != engineframework.CoreDrain {
-		t.Errorf("default Core = %q, want %q", e.cfg.Core, engineframework.CoreDrain)
+	if e.config.Core != engineframework.CoreDrain {
+		t.Errorf("default Core = %q, want %q", e.config.Core, engineframework.CoreDrain)
 	}
-	if len(e.cfg.Plugins) == 0 {
+	if len(e.config.Plugins) == 0 {
 		t.Error("default Plugins should be non-empty")
 	}
-	if e.cfg.NominationTTL != 10*time.Minute {
-		t.Errorf("default NominationTTL = %v, want 10m", e.cfg.NominationTTL)
+	if e.config.NominationTTL != 10*time.Minute {
+		t.Errorf("default NominationTTL = %v, want 10m", e.config.NominationTTL)
 	}
 }
 

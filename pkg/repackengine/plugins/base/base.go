@@ -46,13 +46,13 @@ func (*basePlugin) Name() string { return Name }
 
 func (*basePlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddDisruptionScoreFn("affectedPodGroups", weightAffectedPodGroups, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.Aggregate(ctx).AffectedPGs)
+		return float64(p.MoveAggregate(ctx).AffectedPodGroups)
 	})
-	ssn.AddDisruptionScoreFn("movedGPU", weightMovedResource, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.Aggregate(ctx).MovedGPU)
+	ssn.AddDisruptionScoreFn("movedResource", weightMovedResource, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+		return float64(p.MoveAggregate(ctx).MovedResource)
 	})
 	ssn.AddDisruptionScoreFn("movedPods", weightMovedPods, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.Aggregate(ctx).MovedPods)
+		return float64(p.MoveAggregate(ctx).MovedPods)
 	})
 }
 

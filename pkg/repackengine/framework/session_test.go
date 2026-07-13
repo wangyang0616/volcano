@@ -71,7 +71,7 @@ func TestSession_FreeableUnitsUnion(t *testing.T) {
 func TestSession_LeastDisruptive(t *testing.T) {
 	ssn := newSession(&fakeSnap{})
 	ssn.AddDisruptionScoreFn("movedPods", 1.0, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.Aggregate(ctx).MovedPods)
+		return float64(p.MoveAggregate(ctx).MovedPods)
 	})
 	cheap := &api.CandidatePlan{Moves: []*api.Move{move(task("a", "ga", 1), "n0", "n1")}}
 	costly := &api.CandidatePlan{Moves: []*api.Move{

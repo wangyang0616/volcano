@@ -42,11 +42,11 @@ func TestRequeueGatedRuns(t *testing.T) {
 
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	objs := []*repackv1alpha1.RepackRun{
-		mk("exec-blocked", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackPending),  // gated → requeue
-		mk("exec-running", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackRunning),  // non-terminal → requeue
-		mk("exec-done", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackSucceeded),   // terminal → skip
-		mk("exec-failed", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackFailed),    // terminal → skip
-		mk("dry-pending", repackv1alpha1.RepackModeDryRun, repackv1alpha1.RepackPending),    // DryRun → skip
+		mk("exec-blocked", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackPending), // gated → requeue
+		mk("exec-running", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackRunning), // non-terminal → requeue
+		mk("exec-done", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackSucceeded),  // terminal → skip
+		mk("exec-failed", repackv1alpha1.RepackModeExecute, repackv1alpha1.RepackFailed),   // terminal → skip
+		mk("dry-pending", repackv1alpha1.RepackModeDryRun, repackv1alpha1.RepackPending),   // DryRun → skip
 	}
 	for _, o := range objs {
 		if err := indexer.Add(o); err != nil {
@@ -55,16 +55,16 @@ func TestRequeueGatedRuns(t *testing.T) {
 	}
 
 	e := &Engine{
-		lister: repacklisters.NewRepackRunLister(indexer),
-		queue:  workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		repackRunLister: repacklisters.NewRepackRunLister(indexer),
+		workQueue:       workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 	}
 	e.requeueGatedRuns()
 
 	got := map[string]bool{}
-	for e.queue.Len() > 0 {
-		item, _ := e.queue.Get()
+	for e.workQueue.Len() > 0 {
+		item, _ := e.workQueue.Get()
 		got[item] = true
-		e.queue.Done(item)
+		e.workQueue.Done(item)
 	}
 	want := map[string]bool{"exec-blocked": true, "exec-running": true}
 	if !reflect.DeepEqual(got, want) {

@@ -59,7 +59,7 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 }
 
 // FeasibleRelocation is a capacity-only stand-in for the scheduler feasibility check: every
-// node "fits" (no predicate constraints in tests), so feasibility is pure GPU
+// node "fits" (no predicate constraints in tests), so feasibility is pure TargetResource
 // capacity (Allocatable − Used − pods already placed this pass), solved with the
 // pure api.Domain best-fit solver.
 func (f *fakeSnap) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
@@ -114,7 +114,7 @@ func capNode(name string, capGPU int64, tasks ...*schedapi.TaskInfo) *schedapi.N
 	return &schedapi.NodeInfo{Name: name, Tasks: m, Allocatable: gpuRes(capGPU), Used: gpuRes(used)}
 }
 
-// freeByCapMinusUsed gives each node free GPU = Allocatable − Used, so tests need
+// freeByCapMinusUsed gives each node free TargetResource = Allocatable − Used, so tests need
 // not wrangle NodeInfo.Idle/FutureIdle.
 func freeByCapMinusUsed(n *schedapi.NodeInfo) *schedapi.Resource {
 	return gpuRes(int64(n.Allocatable.ScalarResources[gpu] - n.Used.ScalarResources[gpu]))
@@ -161,8 +161,8 @@ func realMoves(plan *api.RepackPlan) []*api.Move {
 	return out
 }
 
-// n0 holds a small gang (2 GPU) that fits into n1's slack; draining n0 frees a
-// whole node with a single move. n1 (6 GPU used) cannot be freed.
+// n0 holds a small gang (2 TargetResource) that fits into n1's slack; draining n0 frees a
+// whole node with a single move. n1 (6 TargetResource used) cannot be freed.
 func TestDrain_FreesOneNode(t *testing.T) {
 	a := gpuTask("a", "g-a", 2)
 	b := gpuTask("b", "g-b", 6)
@@ -373,7 +373,7 @@ func TestDrain_ExcludedNodeIsReceiverNotTarget(t *testing.T) {
 // Regression for the bug where any pinned system pod made every real accelerator
 // node unfreeable (repack no-op in production).
 func TestDrain_SystemPodDoesNotBlockFreeing(t *testing.T) {
-	a := gpuTask("a", "g-a", 2)  // movable GPU pod on n0
+	a := gpuTask("a", "g-a", 2)  // movable TargetResource pod on n0
 	sys := sysTask("kube-proxy") // pinned, non-accelerator, out-of-scope pod on n0
 	b := gpuTask("b", "g-b", 6)  // n1 stays occupied
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a, sys), capNode("n1", 8, b)}}
@@ -383,13 +383,13 @@ func TestDrain_SystemPodDoesNotBlockFreeing(t *testing.T) {
 
 	plan, ok := (&drainCore{}).Plan(drainSession(snap, movable, 1, 0, 0))
 	if !ok || plan == nil {
-		t.Fatal("expected a feasible plan: n0's GPU pod can move; the system pod stays")
+		t.Fatal("expected a feasible plan: n0's TargetResource pod can move; the system pod stays")
 	}
 	if len(plan.FreedNodes) != 1 || plan.FreedNodes[0] != "n0" {
 		t.Fatalf("freed=%v, want [n0]", plan.FreedNodes)
 	}
 	if mv := realMoves(plan); len(mv) != 1 || mv[0].Task.Name != "a" {
-		t.Fatalf("moves=%+v, want only the GPU pod a (system pod must not move)", mv)
+		t.Fatalf("moves=%+v, want only the TargetResource pod a (system pod must not move)", mv)
 	}
 }
 
@@ -410,7 +410,7 @@ func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework
 	return ssn
 }
 
-// Freeing n0 of two GPU nodes cuts fragmentation by 1/2 = 50 percentage points.
+// Freeing n0 of two TargetResource nodes cuts fragmentation by 1/2 = 50 percentage points.
 // A gate at 50 admits the plan (improvement meets the bar); a gate at 60 rejects
 // it even though a node could be freed (below the run's benefit threshold).
 func TestDrain_FragImprovementGate(t *testing.T) {

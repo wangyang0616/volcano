@@ -38,14 +38,14 @@ func mkMove(name, job string, cards float64, from, to string) *engineapi.Move {
 		Task: &schedapi.TaskInfo{
 			Name: name, Job: schedapi.JobID(job),
 			// Volcano stores extended resources in milli (1 device = 1000); mirror
-			// production so movesOf's milli->whole conversion is exercised faithfully.
+			// production so buildStatusMoves's milli->whole conversion is exercised faithfully.
 			Resreq: &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpuResource: cards * 1000}},
 		},
 		From: from, To: to,
 	}
 }
 
-// pct rounds a 0-1 fraction to a percentage point, clamped to [0,100].
+// percentagePoints rounds a 0-1 fraction to a percentage point, clamped to [0,100].
 func TestPct(t *testing.T) {
 	cases := []struct {
 		in   float64
@@ -57,29 +57,29 @@ func TestPct(t *testing.T) {
 		{1.7, 100}, // clamp high
 	}
 	for _, c := range cases {
-		if got := pct(c.in); got != c.want {
-			t.Errorf("pct(%v)=%d, want %d", c.in, got, c.want)
+		if got := percentagePoints(c.in); got != c.want {
+			t.Errorf("percentagePoints(%v)=%d, want %d", c.in, got, c.want)
 		}
 	}
 }
 
 func TestSplitJobID(t *testing.T) {
-	if ns, n := splitJobID("team-a/gang-1"); ns != "team-a" || n != "gang-1" {
+	if ns, n := splitPodGroupID("team-a/gang-1"); ns != "team-a" || n != "gang-1" {
 		t.Errorf("split=%q/%q, want team-a/gang-1", ns, n)
 	}
-	if ns, n := splitJobID("bare"); ns != "" || n != "bare" {
+	if ns, n := splitPodGroupID("bare"); ns != "" || n != "bare" {
 		t.Errorf("split no-slash=%q/%q, want ''/bare", ns, n)
 	}
-	if ns, n := splitJobID(""); ns != "" || n != "" {
+	if ns, n := splitPodGroupID(""); ns != "" || n != "" {
 		t.Errorf("split empty=%q/%q, want ''/''", ns, n)
 	}
 }
 
 func TestFreedNodesOf(t *testing.T) {
-	if freedNodesOf(nil) != nil {
+	if sortedFreedNodeNames(nil) != nil {
 		t.Error("nil plan -> nil")
 	}
-	got := freedNodesOf(&engineapi.RepackPlan{FreedNodes: []string{"n2", "n0", "n1"}})
+	got := sortedFreedNodeNames(&engineapi.RepackPlan{FreedNodes: []string{"n2", "n0", "n1"}})
 	if len(got) != 3 || got[0] != "n0" || got[1] != "n1" || got[2] != "n2" {
 		t.Errorf("freedNodes=%v, want sorted [n0 n1 n2]", got)
 	}
@@ -87,7 +87,7 @@ func TestFreedNodesOf(t *testing.T) {
 
 func TestMovesOf(t *testing.T) {
 	// nil plan / no moves.
-	if movesOf(nil, gpuResource) != nil {
+	if buildStatusMoves(nil, gpuResource) != nil {
 		t.Error("nil plan -> nil")
 	}
 
@@ -99,7 +99,7 @@ func TestMovesOf(t *testing.T) {
 		mkMove("a0", "ns/ga", 4, "n0", "n3"),
 		mkMove("noop", "ns/ga", 1, "n5", "n5"), // To==From: filtered
 	}}
-	moves := movesOf(plan, gpuResource)
+	moves := buildStatusMoves(plan, gpuResource)
 	if len(moves) != 2 {
 		t.Fatalf("got %d podgroup moves, want 2", len(moves))
 	}
@@ -121,14 +121,14 @@ func TestMovesOf(t *testing.T) {
 }
 
 func TestSummaryOf(t *testing.T) {
-	s := summaryOf(engineframework.Report{FragRateBefore: 0.4, FragRateAfter: 0.2, NodesFreed: 3})
+	s := buildRepackSummary(engineframework.Report{FragmentationRateBefore: 0.4, FragmentationRateAfter: 0.2, NodesFreed: 3})
 	if s.FragBeforePercent != 40 || s.FragAfterPercent != 20 || s.FreedNodeCount != 3 {
 		t.Errorf("summary=%+v", s)
 	}
 }
 
 func TestNominationsOf(t *testing.T) {
-	if nominationsOf(nil, time.Minute) != nil {
+	if buildPodNominations(nil, time.Minute) != nil {
 		t.Error("nil plan -> nil")
 	}
 	plan := &engineapi.RepackPlan{Moves: []*engineapi.Move{
@@ -140,7 +140,7 @@ func TestNominationsOf(t *testing.T) {
 			From: "n0", To: "n2",
 		},
 	}}
-	noms := nominationsOf(plan, time.Hour)
+	noms := buildPodNominations(plan, time.Hour)
 	if len(noms) != 1 {
 		t.Fatalf("got %d nominations, want 1", len(noms))
 	}
@@ -164,7 +164,7 @@ func TestApplyPlan(t *testing.T) {
 		Moves:      []*engineapi.Move{mkMove("a", "ns/g", 3, "n0", "n1")},
 		FreedNodes: []string{"n0"},
 	}
-	report := engineframework.Report{FragRateBefore: 0.5, FragRateAfter: 0.25, NodesFreed: 1}
+	report := engineframework.Report{FragmentationRateBefore: 0.5, FragmentationRateAfter: 0.25, NodesFreed: 1}
 
 	// DryRun: plan populated, no nominations.
 	dry := &repackv1alpha1.RepackRun{}
@@ -199,7 +199,7 @@ func TestRealizedPlanDropsFailedMovesAndFreedNodes(t *testing.T) {
 			{Level: "node", Nodes: []string{"n0"}, Weight: 1},
 			{Level: "node", Nodes: []string{"n1"}, Weight: 1},
 		},
-		Before: engineapi.ResourceFrag{Resource: gpuResource, M: 3, B: 2, A: 1},
+		Before: engineapi.ResourceFragmentation{Resource: gpuResource, ProvidingNodeCount: 3, OccupiedNodeCount: 2, OptimalOccupiedNodeCount: 1},
 	}
 	commit := &engineframework.CommitResult{
 		Evicted: []engineframework.MoveOutcome{{Namespace: "ns", Task: "a", From: "n0", To: "n2"}},

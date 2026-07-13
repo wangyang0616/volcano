@@ -24,7 +24,7 @@ import (
 )
 
 // OptimalNodes is the fragmentation packing bound — the hot inner call of every
-// MeasureResource. Bench a large mixed request set.
+// MeasureResourceFragmentation. Bench a large mixed request set.
 func BenchmarkOptimalNodes(b *testing.B) {
 	reqs := make([]int64, 0, 2000)
 	for i := 0; i < 2000; i++ {

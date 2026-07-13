@@ -26,7 +26,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// gpuRes builds a single-resource (GPU) request/capacity.
+// gpuRes builds a single-resource (TargetResource) request/capacity.
 func gpuRes(n int64) *api.Resource {
 	return &api.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: float64(n)}}
 }
@@ -38,7 +38,7 @@ func gpuTask(idx int, from string, g int64) *api.TaskInfo {
 	return t
 }
 
-// gpuPolicy is a test ReceiverPolicy: node capacity from a per-node GPU map, an
+// gpuPolicy is a test ReceiverPolicy: node capacity from a per-node TargetResource map, an
 // optional Fit allow-map (taskName -> nodeName -> allowed; nil = fit everything),
 // and neutral receiver preference.
 type gpuPolicy struct {
@@ -63,11 +63,11 @@ func (p gpuPolicy) Prefer(*api.NodeInfo) int { return 0 }
 // constraint and neutral preference.
 type fixedPolicy struct{ capacity *api.Resource }
 
-func (p fixedPolicy) Free(*api.NodeInfo) *api.Resource       { return p.capacity }
-func (p fixedPolicy) Fit(*api.TaskInfo, *api.NodeInfo) bool  { return true }
-func (p fixedPolicy) Prefer(*api.NodeInfo) int               { return 0 }
+func (p fixedPolicy) Free(*api.NodeInfo) *api.Resource      { return p.capacity }
+func (p fixedPolicy) Fit(*api.TaskInfo, *api.NodeInfo) bool { return true }
+func (p fixedPolicy) Prefer(*api.NodeInfo) int              { return 0 }
 
-// buildDomain builds a GPU-only domain from per-node capacities, with an
+// buildDomain builds a TargetResource-only domain from per-node capacities, with an
 // optional Fit allow-map keyed taskName -> nodeName -> allowed.
 func buildDomain(caps map[string]int64, allow map[string]map[string]bool) ([]*api.NodeInfo, *Domain) {
 	nodes := make([]*api.NodeInfo, 0, len(caps))
@@ -168,7 +168,7 @@ func TestFeasible_FitExcludesNode(t *testing.T) {
 		}
 	}
 
-	// Now pin both 8-GPU tasks to n1: impossible (n1 holds only one).
+	// Now pin both 8-TargetResource tasks to n1: impossible (n1 holds only one).
 	allow2 := map[string]map[string]bool{
 		"t0": {"n0": false, "n1": true},
 		"t1": {"n0": false, "n1": true},

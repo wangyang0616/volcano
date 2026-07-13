@@ -19,14 +19,15 @@ limitations under the License.
 //
 // Per accelerator resource R (e.g. nvidia.com/gpu, huawei.com/Ascend910):
 //
-//	FragRate(R) = (B_R - A_R) / M_R
-//	  M_R = number of nodes providing R (Allocatable[R] > 0)
-//	  B_R = number of those nodes currently occupied (Used[R] > 0)
-//	  A_R = theoretical-optimal occupied nodes for R's demand (see OptimalNodes)
+//	FragmentationRate(R) = (occupied nodes - optimal occupied nodes) / providing nodes
+//	  providing nodes = nodes with Allocatable[R] > 0
+//	  occupied nodes = providing nodes with Used[R] > 0
+//	  optimal occupied nodes = theoretical minimum for R's demand (see OptimalNodes)
 //
-// The cluster KPI WeightedFragRate aggregates per-resource rates weighted by
-// node count M_R; since a node provides exactly one accelerator type the
-// node-count weighting collapses to Sum(B_R-A_R) / Sum(M_R).
+// The cluster KPI WeightedFragmentationRate aggregates per-resource rates weighted by
+// providing-node count; since a node provides exactly one accelerator type the
+// node-count weighting collapses to the total excess occupied nodes divided by
+// the total providing nodes.
 package api
 
 import (
@@ -38,28 +39,28 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// ResourceFrag is the fragmentation measurement for one accelerator resource.
-type ResourceFrag struct {
-	Resource v1.ResourceName
-	M        int64 // nodes providing this resource (in scope)
-	B        int64 // nodes currently occupied by this resource
-	A        int64 // theoretical-optimal occupied nodes for the demand
-	// Exact is true when A is computed exactly (powers-of-2 requests on a
+// ResourceFragmentation is the fragmentation measurement for one accelerator resource.
+type ResourceFragmentation struct {
+	Resource                 v1.ResourceName
+	ProvidingNodeCount       int64 // nodes providing this resource (in scope)
+	OccupiedNodeCount        int64 // nodes currently occupied by this resource
+	OptimalOccupiedNodeCount int64 // theoretical-optimal occupied nodes for the demand
+	// Exact is true when OptimalOccupiedNodeCount is computed exactly (powers-of-2 requests on a
 	// power-of-2, homogeneous node capacity, design §4.12.2a). When false,
-	// A is a constraint-aware lower bound and FragRate may over-estimate.
+	// OptimalOccupiedNodeCount is a constraint-aware lower bound and FragmentationRate may over-estimate.
 	Exact bool
 }
 
-// FragRate returns (B-A)/M; 0 when M==0.
-func (f ResourceFrag) FragRate() float64 {
-	if f.M == 0 {
+// FragmentationRate returns (occupiedNodes-optimalNodes)/providingNodes.
+func (fragmentation ResourceFragmentation) FragmentationRate() float64 {
+	if fragmentation.ProvidingNodeCount == 0 {
 		return 0
 	}
-	return float64(f.B-f.A) / float64(f.M)
+	return float64(fragmentation.OccupiedNodeCount-fragmentation.OptimalOccupiedNodeCount) / float64(fragmentation.ProvidingNodeCount)
 }
 
-// OptimalNodes returns A: the minimum number of nodes (each of the given
-// capacity) needed to host all requests, plus whether the result is exact.
+// OptimalNodes returns the minimum number of nodes (each of the given capacity)
+// needed to host all requests, plus whether the result is exact.
 //
 // Model (design §4.12.2a): a request g >= capacity is a multi-node task that
 // occupies ceil(g/capacity) whole nodes; requests < capacity are packed into
@@ -69,151 +70,154 @@ func (f ResourceFrag) FragRate() float64 {
 //
 // Validated against a brute-force optimal bin-packer: 5000 random powers-of-2
 // instances all matched (frag_validate.py / TestOptimalNodes_MatchesBruteForce).
-func OptimalNodes(requests []int64, capacity int64) (a int64, exact bool) {
-	if capacity <= 0 {
+func OptimalNodes(resourceRequests []int64, nodeCapacity int64) (optimalNodeCount int64, exact bool) {
+	if nodeCapacity <= 0 {
 		return 0, false
 	}
-	var big, small int64
-	exact = isPow2(capacity)
-	for _, g := range requests {
-		if g <= 0 {
+	var wholeNodeDemand, sharedNodeDemand int64
+	exact = isPowerOfTwo(nodeCapacity)
+	for _, requestedResource := range resourceRequests {
+		if requestedResource <= 0 {
 			continue
 		}
-		if !isPow2(g) {
+		if !isPowerOfTwo(requestedResource) {
 			exact = false
 		}
-		if g >= capacity {
-			big += ceilDiv(g, capacity) // whole nodes for multi-node tasks
+		if requestedResource >= nodeCapacity {
+			wholeNodeDemand += ceilDiv(requestedResource, nodeCapacity) // whole nodes for multi-node tasks
 		} else {
-			small += g // sub-node tasks share via volume packing
+			sharedNodeDemand += requestedResource // sub-node tasks share via volume packing
 		}
 	}
-	return big + ceilDiv(small, capacity), exact
+	return wholeNodeDemand + ceilDiv(sharedNodeDemand, nodeCapacity), exact
 }
 
-// MeasureResource computes the fragmentation of a single accelerator resource
+// MeasureResourceFragmentation computes the fragmentation of a single accelerator resource
 // over the given nodes (already restricted to the run's scope by the caller).
 // Demand is taken from the tasks currently placed on the resource-providing
-// nodes. When node capacities for the resource are not homogeneous, A falls
+// nodes. When node capacities for the resource are not homogeneous, the optimal
+// occupied-node count falls
 // back to a volume lower bound and Exact is false.
-func MeasureResource(nodes []*api.NodeInfo, resource v1.ResourceName) ResourceFrag {
-	out := ResourceFrag{Resource: resource}
+func MeasureResourceFragmentation(nodes []*api.NodeInfo, targetResource v1.ResourceName) ResourceFragmentation {
+	fragmentation := ResourceFragmentation{Resource: targetResource}
 
-	var capacity int64
+	var nodeCapacity int64
 	homogeneous := true
-	capacities := make([]int64, 0, len(nodes))
-	requests := make([]int64, 0, 64)
+	nodeCapacities := make([]int64, 0, len(nodes))
+	resourceRequests := make([]int64, 0, 64)
 
 	for _, node := range nodes {
 		if node == nil || node.Allocatable == nil {
 			continue
 		}
-		cap := Scalar(node.Allocatable, resource)
-		if cap <= 0 {
+		capacity := Scalar(node.Allocatable, targetResource)
+		if capacity <= 0 {
 			continue // node does not provide this resource
 		}
-		out.M++
-		capacities = append(capacities, cap)
-		if capacity == 0 {
-			capacity = cap
-		} else if cap != capacity {
+		fragmentation.ProvidingNodeCount++
+		nodeCapacities = append(nodeCapacities, capacity)
+		if nodeCapacity == 0 {
+			nodeCapacity = capacity
+		} else if capacity != nodeCapacity {
 			homogeneous = false
 		}
-		used := int64(0)
+		resourceUsage := int64(0)
 		if node.Used != nil {
-			used = Scalar(node.Used, resource)
+			resourceUsage = Scalar(node.Used, targetResource)
 		}
-		if used > 0 {
-			out.B++
+		if resourceUsage > 0 {
+			fragmentation.OccupiedNodeCount++
 		}
 		klog.V(5).InfoS("repack frag: node accelerator usage", "node", node.Name,
-			"resource", resource, "capacity", cap, "used", used)
+			"resource", targetResource, "capacity", capacity, "used", resourceUsage)
 		for _, task := range node.Tasks {
 			if task == nil || task.Resreq == nil {
 				continue
 			}
-			if g := Scalar(task.Resreq, resource); g > 0 {
-				requests = append(requests, g)
+			if requestedResource := Scalar(task.Resreq, targetResource); requestedResource > 0 {
+				resourceRequests = append(resourceRequests, requestedResource)
 			}
 		}
 	}
 
-	if out.M == 0 || capacity == 0 {
-		klog.V(5).InfoS("repack frag: no node provides this resource (M=0)", "resource", resource)
-		return out
+	if fragmentation.ProvidingNodeCount == 0 || nodeCapacity == 0 {
+		klog.V(5).InfoS("repack frag: no node provides this resource", "resource", targetResource)
+		return fragmentation
 	}
 	if homogeneous {
-		out.A, out.Exact = OptimalNodes(requests, capacity)
+		fragmentation.OptimalOccupiedNodeCount, fragmentation.Exact = OptimalNodes(resourceRequests, nodeCapacity)
 	} else {
 		// Heterogeneous pools cannot be evaluated with an arbitrary first-node
 		// capacity: that made the metric depend on map iteration order and could
-		// even produce A>B. Use the minimum number of largest real nodes whose
+		// even produce an optimal count above the occupied count. Use the minimum
+		// number of largest real nodes whose
 		// aggregate capacity covers demand. This is a deterministic lower bound;
 		// exact bin packing remains intentionally out of the hot measurement path.
-		sort.Slice(capacities, func(i, j int) bool { return capacities[i] > capacities[j] })
-		var demand, covered int64
-		for _, req := range requests {
-			demand += req
+		sort.Slice(nodeCapacities, func(i, j int) bool { return nodeCapacities[i] > nodeCapacities[j] })
+		var totalResourceDemand, coveredCapacity int64
+		for _, requestedResource := range resourceRequests {
+			totalResourceDemand += requestedResource
 		}
-		for _, cap := range capacities {
-			if covered >= demand {
+		for _, capacity := range nodeCapacities {
+			if coveredCapacity >= totalResourceDemand {
 				break
 			}
-			covered += cap
-			out.A++
+			coveredCapacity += capacity
+			fragmentation.OptimalOccupiedNodeCount++
 		}
-		out.Exact = false
+		fragmentation.Exact = false
 	}
-	// The current placement itself proves an optimum cannot require more than B
-	// occupied nodes. Clamp defensive lower-bound approximations and stale cache
-	// combinations so FragRate always remains in its documented [0,1] range.
-	if out.A > out.B {
-		out.A = out.B
+	// The current placement itself proves an optimum cannot require more than the
+	// current number of occupied nodes. Clamp defensive lower-bound approximations and stale cache
+	// combinations so FragmentationRate always remains in its documented [0,1] range.
+	if fragmentation.OptimalOccupiedNodeCount > fragmentation.OccupiedNodeCount {
+		fragmentation.OptimalOccupiedNodeCount = fragmentation.OccupiedNodeCount
 	}
-	return out
+	return fragmentation
 }
 
-// WeightedFragRate aggregates per-resource fragmentation into the cluster KPI
+// WeightedFragmentationRate aggregates per-resource fragmentation into the cluster KPI
 // using the default node-count weighting, which collapses to
-// Sum(B-A)/Sum(M) because accelerator nodes are disjoint per resource
+// total excess occupied nodes divided by total providing nodes because accelerator
+// nodes are disjoint per resource
 // (design §4.6.2 / §4.16 FragWeightFn). Returns 0 when no resource nodes exist.
-func WeightedFragRate(per map[v1.ResourceName]ResourceFrag) float64 {
-	var num, den int64
-	for _, f := range per {
-		num += f.B - f.A
-		den += f.M
+func WeightedFragmentationRate(fragmentationByResource map[v1.ResourceName]ResourceFragmentation) float64 {
+	var fragmentationExcess, providingNodeCount int64
+	for _, fragmentation := range fragmentationByResource {
+		fragmentationExcess += fragmentation.OccupiedNodeCount - fragmentation.OptimalOccupiedNodeCount
+		providingNodeCount += fragmentation.ProvidingNodeCount
 	}
-	if den == 0 {
+	if providingNodeCount == 0 {
 		return 0
 	}
-	return float64(num) / float64(den)
+	return float64(fragmentationExcess) / float64(providingNodeCount)
 }
 
 // scalar reads an accelerator (scalar) resource amount as a rounded int64.
 // Accelerator cards are whole units; CPU/memory would keep Quantity.
-func Scalar(r *api.Resource, name v1.ResourceName) int64 {
-	if r == nil || r.ScalarResources == nil {
+func Scalar(resource *api.Resource, resourceName v1.ResourceName) int64 {
+	if resource == nil || resource.ScalarResources == nil {
 		return 0
 	}
 	// Volcano stores scalar/extended resources in MILLI-units (1 device = 1000),
 	// see scheduler/api NewResource. This returns that raw milli value, rounded;
 	// it is the internal unit the fragmentation math and drain budget both use.
 	// For a human/user-facing whole-device count use Cards.
-	return int64(r.ScalarResources[name] + 0.5)
+	return int64(resource.ScalarResources[resourceName] + 0.5)
 }
 
 // Cards returns the whole number of accelerator devices in r for the given
 // resource (Scalar / 1000). This is the unit users deal in — status.plan card
 // counts and spec.maxPerRun.resources — as opposed to the internal milli Scalar.
-func Cards(r *api.Resource, name v1.ResourceName) int64 {
-	return Scalar(r, name) / 1000
+func Cards(resource *api.Resource, resourceName v1.ResourceName) int64 {
+	return Scalar(resource, resourceName) / 1000
 }
 
-func ceilDiv(a, b int64) int64 {
-	if b <= 0 {
+func ceilDiv(numerator, denominator int64) int64 {
+	if denominator <= 0 {
 		return 0
 	}
-	return (a + b - 1) / b
+	return (numerator + denominator - 1) / denominator
 }
 
-func isPow2(x int64) bool { return x > 0 && (x&(x-1)) == 0 }
+func isPowerOfTwo(value int64) bool { return value > 0 && (value&(value-1)) == 0 }

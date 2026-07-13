@@ -49,9 +49,9 @@ const (
 	nomExpired = "Expired"
 )
 
-// annPodGroup is the pod annotation carrying its PodGroup name; the reconciler
+// podGroupAnnotationKey is the pod annotation carrying its PodGroup name; the reconciler
 // matches identityLabels generically, so it needs no per-workload identity key.
-const annPodGroup = "scheduling.k8s.io/group-name"
+const podGroupAnnotationKey = "scheduling.k8s.io/group-name"
 
 // Nominator is the landing-steering reconciler: it watches Pods and, for a not-
 // yet-scheduled replacement pod, looks up a matching PodNomination in some
@@ -65,35 +65,35 @@ const annPodGroup = "scheduling.k8s.io/group-name"
 // lifecycle, and is conceptually part of the repack control loop — so it lives
 // with the RepackRun controller, decoupled from any single workload controller.
 type Nominator struct {
-	kube         kubernetes.Interface
-	repack       vcclientset.Interface
-	podLister    corelisters.PodLister
-	repackLister repacklisters.RepackRunLister
-	synced       []cache.InformerSynced
-	queue        workqueue.TypedRateLimitingInterface[string]
-	now          func() time.Time
+	kubernetesClient kubernetes.Interface
+	volcanoClient    vcclientset.Interface
+	podLister        corelisters.PodLister
+	repackRunLister  repacklisters.RepackRunLister
+	informerSyncs    []cache.InformerSynced
+	workQueue        workqueue.TypedRateLimitingInterface[string]
+	now              func() time.Time
 }
 
 // NewNominator wires the reconciler to Pod and RepackRun informers. Watching
 // both sides is important: a replacement Pod can be observed before the
 // prepared nomination status reaches this controller's informer. A later
 // RepackRun update must therefore wake the already-existing Pending Pod.
-func NewNominator(kube kubernetes.Interface, repack vcclientset.Interface, podInformer coreinformers.PodInformer, repackInformer repackinformers.RepackRunInformer) *Nominator {
+func NewNominator(kubernetesClient kubernetes.Interface, volcanoClient vcclientset.Interface, podInformer coreinformers.PodInformer, repackRunInformer repackinformers.RepackRunInformer) *Nominator {
 	n := &Nominator{
-		kube:         kube,
-		repack:       repack,
-		podLister:    podInformer.Lister(),
-		repackLister: repackInformer.Lister(),
-		synced:       []cache.InformerSynced{podInformer.Informer().HasSynced, repackInformer.Informer().HasSynced},
-		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		now:          time.Now,
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    volcanoClient,
+		podLister:        podInformer.Lister(),
+		repackRunLister:  repackRunInformer.Lister(),
+		informerSyncs:    []cache.InformerSynced{podInformer.Informer().HasSynced, repackRunInformer.Informer().HasSynced},
+		workQueue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		now:              time.Now,
 	}
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueue,
 		UpdateFunc: func(_, newObj interface{}) { n.enqueue(newObj) },
 		DeleteFunc: n.enqueueAfterVictimDeleted,
 	})
-	repackInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	repackRunInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueuePendingForRun,
 		UpdateFunc: func(_, newObj interface{}) { n.enqueuePendingForRun(newObj) },
 	})
@@ -113,7 +113,7 @@ func (n *Nominator) enqueue(obj interface{}) {
 		utilruntime.HandleError(err)
 		return
 	}
-	n.queue.Add(key)
+	n.workQueue.Add(key)
 }
 
 // enqueuePendingForRun closes the informer-ordering race: when nomination
@@ -126,14 +126,14 @@ func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 		return
 	}
 	namespaces := map[string]bool{}
-	for i := range run.Status.Nominations {
-		rec := &run.Status.Nominations[i]
-		if rec.Phase != nomBound && rec.Phase != nomExpired {
-			namespaces[rec.Namespace] = true
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nomination.Phase != nomBound && nomination.Phase != nomExpired {
+			namespaces[nomination.Namespace] = true
 		}
 	}
-	for ns := range namespaces {
-		pods, err := n.podLister.Pods(ns).List(labels.Everything())
+	for namespace := range namespaces {
+		pods, err := n.podLister.Pods(namespace).List(labels.Everything())
 		if err != nil {
 			utilruntime.HandleError(err)
 			continue
@@ -157,16 +157,16 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 	if !ok || pod == nil {
 		return
 	}
-	runs, err := n.repackLister.List(labels.Everything())
+	runs, err := n.repackRunLister.List(labels.Everything())
 	if err != nil {
 		utilruntime.HandleError(err)
 		return
 	}
 	for _, run := range runs {
-		for i := range run.Status.Nominations {
-			rec := &run.Status.Nominations[i]
-			if rec.Namespace == pod.Namespace && rec.VictimPodName == pod.Name &&
-				rec.Phase != nomBound && rec.Phase != nomExpired {
+		for index := range run.Status.Nominations {
+			nomination := &run.Status.Nominations[index]
+			if nomination.Namespace == pod.Namespace && nomination.VictimPodName == pod.Name &&
+				nomination.Phase != nomBound && nomination.Phase != nomExpired {
 				n.enqueuePendingForRun(run)
 				return
 			}
@@ -178,8 +178,8 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 // informer factories.
 func (n *Nominator) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
-	defer n.queue.ShutDown()
-	if !cache.WaitForCacheSync(ctx.Done(), n.synced...) {
+	defer n.workQueue.ShutDown()
+	if !cache.WaitForCacheSync(ctx.Done(), n.informerSyncs...) {
 		return fmt.Errorf("nominator: cache failed to sync")
 	}
 	if workers < 1 {
@@ -197,26 +197,26 @@ func (n *Nominator) Run(ctx context.Context, workers int) error {
 }
 
 func (n *Nominator) processNext(ctx context.Context) bool {
-	key, shutdown := n.queue.Get()
+	key, shutdown := n.workQueue.Get()
 	if shutdown {
 		return false
 	}
-	defer n.queue.Done(key)
+	defer n.workQueue.Done(key)
 	if err := n.reconcile(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("nominate pod %q: %w", key, err))
-		n.queue.AddRateLimited(key)
+		n.workQueue.AddRateLimited(key)
 		return true
 	}
-	n.queue.Forget(key)
+	n.workQueue.Forget(key)
 	return true
 }
 
 func (n *Nominator) reconcile(ctx context.Context, key string) error {
-	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	namespace, podName, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return nil
 	}
-	pod, err := n.podLister.Pods(ns).Get(name)
+	pod, err := n.podLister.Pods(namespace).Get(podName)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -227,19 +227,19 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
-	rec, owner := n.matchNomination(pod)
-	if rec == nil {
+	nomination, owningRunName := n.matchNomination(pod)
+	if nomination == nil {
 		klog.V(5).InfoS("no pending nomination matches this pod", "pod", key)
 		return nil // no pending nomination targets this pod
 	}
 
-	if err := n.patchNominatedNode(ctx, pod, rec.NodeName); err != nil {
+	if err := n.patchNominatedNode(ctx, pod, nomination.NodeName); err != nil {
 		return err
 	}
-	klog.V(3).InfoS("nominated replacement pod", "pod", key, "node", rec.NodeName, "repackRun", owner)
+	klog.V(3).InfoS("nominated replacement pod", "pod", key, "node", nomination.NodeName, "repackRun", owningRunName)
 	// Best-effort: mark the record Bound so it is consumed once. A failure here
 	// only risks a redundant (idempotent) re-nomination, so it is not fatal.
-	if err := n.markBound(ctx, owner, rec); err != nil {
+	if err := n.markBound(ctx, owningRunName, nomination); err != nil {
 		klog.V(4).InfoS("could not mark nomination Bound (will retry on next event)", "err", err)
 	}
 	return nil
@@ -258,48 +258,48 @@ func needsNomination(pod *corev1.Pod) bool {
 // that targets this pod, returning the record and the owning run's name.
 //
 // Match precedence — the landing-identity contract (§5.2.2):
-//  1. victimPodName exact: rec.VictimPodName equals the pod's name (same-name
+//  1. victimPodName exact: nomination.VictimPodName equals the pod's name (same-name
 //     rebuild — vcjob/StatefulSet/kthena ordinals);
 //  2. identityLabels: same namespace+PodGroup and the pod's labels are a superset
-//     of rec.IdentityLabels (renamed replacement; the recorded label key+value
+//     of nomination.IdentityLabels (renamed replacement; the recorded label key+value
 //     say exactly how to match — e.g. repack.volcano.sh/pod-identity=worker-3);
-//  3. fungible: rec.IdentityLabels empty — any pending pod in the same PodGroup
+//  3. fungible: nomination.IdentityLabels empty — any pending pod in the same PodGroup
 //     (single-role Deployment/ReplicaSet/Job).
 //
 // TODO(#46): when a native-kind pod exposes its identity only via env / ordinal
 // name (not a label), have the engine record the equivalent label key here so the
 // generic superset match still applies.
 func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNomination, string) {
-	runs, err := n.repackLister.List(labels.Everything())
+	runs, err := n.repackRunLister.List(labels.Everything())
 	if err != nil {
 		utilruntime.HandleError(err)
 		return nil, ""
 	}
 	now := n.now()
-	podPG := pod.Annotations[annPodGroup]
-	var fungible *repackv1alpha1.PodNomination
-	var fungibleOwner string
+	podGroupName := pod.Annotations[podGroupAnnotationKey]
+	var fungibleNomination *repackv1alpha1.PodNomination
+	var fungibleRunName string
 	for _, run := range runs {
-		for i := range run.Status.Nominations {
-			rec := &run.Status.Nominations[i]
-			if rec.Phase == nomBound || rec.Phase == nomExpired {
+		for index := range run.Status.Nominations {
+			nomination := &run.Status.Nominations[index]
+			if nomination.Phase == nomBound || nomination.Phase == nomExpired {
 				continue
 			}
-			if rec.ExpirationTime != nil && now.After(rec.ExpirationTime.Time) {
+			if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
 				continue
 			}
 			// 1. exact victim name wins immediately (globally unique in namespace).
-			if rec.VictimPodName != "" && rec.Namespace == pod.Namespace && rec.VictimPodName == pod.Name {
-				return rec, run.Name
+			if nomination.VictimPodName != "" && nomination.Namespace == pod.Namespace && nomination.VictimPodName == pod.Name {
+				return nomination, run.Name
 			}
 			// identity / fungible require same namespace + PodGroup.
-			if rec.Namespace != pod.Namespace || rec.PodGroupName == "" || rec.PodGroupName != podPG {
+			if nomination.Namespace != pod.Namespace || nomination.PodGroupName == "" || nomination.PodGroupName != podGroupName {
 				continue
 			}
-			if len(rec.IdentityLabels) > 0 {
+			if len(nomination.IdentityLabels) > 0 {
 				// 2. label-superset identity match.
-				if labelsMatch(pod.Labels, rec.IdentityLabels) && n.victimGone(rec) {
-					return rec, run.Name
+				if labelsMatch(pod.Labels, nomination.IdentityLabels) && n.victimGone(nomination) {
+					return nomination, run.Name
 				}
 				continue
 			}
@@ -307,22 +307,22 @@ func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNominat
 			// Do not consume it while the original victim still exists: prepared
 			// nominations are persisted before eviction, and a failed eviction must
 			// not redirect an unrelated Pending gang member.
-			if !n.victimGone(rec) {
+			if !n.victimGone(nomination) {
 				continue
 			}
-			if fungible == nil {
-				fungible, fungibleOwner = rec, run.Name
+			if fungibleNomination == nil {
+				fungibleNomination, fungibleRunName = nomination, run.Name
 			}
 		}
 	}
-	return fungible, fungibleOwner
+	return fungibleNomination, fungibleRunName
 }
 
-func (n *Nominator) victimGone(rec *repackv1alpha1.PodNomination) bool {
-	if rec == nil || rec.VictimPodName == "" || n.podLister == nil {
+func (n *Nominator) victimGone(nomination *repackv1alpha1.PodNomination) bool {
+	if nomination == nil || nomination.VictimPodName == "" || n.podLister == nil {
 		return true
 	}
-	_, err := n.podLister.Pods(rec.Namespace).Get(rec.VictimPodName)
+	_, err := n.podLister.Pods(nomination.Namespace).Get(nomination.VictimPodName)
 	return apierrors.IsNotFound(err)
 }
 
@@ -345,28 +345,28 @@ func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, nod
 	if err != nil {
 		return err
 	}
-	_, err = n.kube.CoreV1().Pods(pod.Namespace).Patch(
+	_, err = n.kubernetesClient.CoreV1().Pods(pod.Namespace).Patch(
 		ctx, pod.Name, types.StrategicMergePatchType, body, metav1.PatchOptions{}, "status")
 	return ignoreNotFound(err)
 }
 
 // markBound flips the matched record to Bound on the owning RepackRun so it is
 // consumed once. Re-reads the run to avoid clobbering a concurrent status write.
-func (n *Nominator) markBound(ctx context.Context, owner string, target *repackv1alpha1.PodNomination) error {
+func (n *Nominator) markBound(ctx context.Context, owningRunName string, targetNomination *repackv1alpha1.PodNomination) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Use an API read, not the informer lister: a stale cached status could
 		// otherwise overwrite the engine's just-written terminal result.
-		updated, err := n.repack.RepackV1alpha1().RepackRuns().Get(ctx, owner, metav1.GetOptions{})
+		updated, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, owningRunName, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)
 		}
 		changed := false
-		for i := range updated.Status.Nominations {
-			r := &updated.Status.Nominations[i]
-			if r.Namespace == target.Namespace && r.PodGroupName == target.PodGroupName &&
-				r.VictimPodName == target.VictimPodName && r.NodeName == target.NodeName {
-				if r.Phase != nomBound {
-					r.Phase = nomBound
+		for index := range updated.Status.Nominations {
+			nomination := &updated.Status.Nominations[index]
+			if nomination.Namespace == targetNomination.Namespace && nomination.PodGroupName == targetNomination.PodGroupName &&
+				nomination.VictimPodName == targetNomination.VictimPodName && nomination.NodeName == targetNomination.NodeName {
+				if nomination.Phase != nomBound {
+					nomination.Phase = nomBound
 					changed = true
 				}
 			}
@@ -374,7 +374,7 @@ func (n *Nominator) markBound(ctx context.Context, owner string, target *repackv
 		if !changed {
 			return nil
 		}
-		_, err = n.repack.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+		_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
 		return ignoreNotFound(err)
 	})
 }

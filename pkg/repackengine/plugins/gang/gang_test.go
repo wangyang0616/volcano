@@ -46,25 +46,25 @@ func (f fixedView) PodGroupView(schedapi.JobID) api.PodGroupView { return f.view
 // gang g: Running=4, MinAvailable=3 → slack=1, Footprint=8.
 func gangCtx() *api.PlanContext {
 	return &api.PlanContext{
-		GPU:   gpu,
-		Views: fixedView{view: api.PodGroupView{MinAvailable: 3, Running: 4, Footprint: 8}},
+		TargetResource: gpu,
+		PodGroupViews:  fixedView{view: api.PodGroupView{MinAvailable: 3, Running: 4, Footprint: 8}},
 	}
 }
 
-// ScoreDamagedGPU is a step function: within slack only the moved cards count;
+// ScoreDamagedResource is a step function: within slack only the moved cards count;
 // once minAvailable is breached the whole gang Footprint counts.
 func TestScoreDamagedGPU_StepFunction(t *testing.T) {
 	ctx := gangCtx()
 
 	within := &api.CandidatePlan{Moves: []*api.Move{mv(tk("p0", "ns/g", 2))}} // 1 pod ≤ slack 1
-	if s := scoreDamagedGPU(ctx, within); s != 2 {
+	if s := scoreDamagedResource(ctx, within); s != 2 {
 		t.Errorf("within slack: damaged=%v, want 2 (moved cards)", s)
 	}
 
 	breach := &api.CandidatePlan{Moves: []*api.Move{
 		mv(tk("p0", "ns/g", 2)), mv(tk("p1", "ns/g", 2)), // 2 pods > slack 1
 	}}
-	if s := scoreDamagedGPU(ctx, breach); s != 8 {
+	if s := scoreDamagedResource(ctx, breach); s != 8 {
 		t.Errorf("breach: damaged=%v, want 8 (whole footprint)", s)
 	}
 }

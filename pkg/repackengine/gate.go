@@ -31,58 +31,58 @@ import (
 // (which covers history across restarts / other leaders). active OR-s both; the
 // cooldown anchor takes the latest of the two, so a just-finished Execute's
 // cooldown is enforced even before its status write reaches the lister.
-func (e *Engine) executeGateState(self string) (active bool, lastFinish time.Time) {
-	e.mu.Lock()
-	imActive := e.execActive != "" && e.execActive != self
-	lastFinish = e.lastExecFinish
-	e.mu.Unlock()
+func (e *Engine) executeGateState(currentRunName string) (executeActive bool, latestExecuteFinishTime time.Time) {
+	e.engineStateMutex.Lock()
+	inMemoryExecuteActive := e.activeExecuteRunName != "" && e.activeExecuteRunName != currentRunName
+	latestExecuteFinishTime = e.lastExecuteFinishTime
+	e.engineStateMutex.Unlock()
 
-	cacheActive, cacheFinish := e.executeState(self)
-	active = imActive || cacheActive
-	if cacheFinish.After(lastFinish) {
-		lastFinish = cacheFinish
+	persistedExecuteActive, persistedExecuteFinishTime := e.persistedExecuteState(currentRunName)
+	executeActive = inMemoryExecuteActive || persistedExecuteActive
+	if persistedExecuteFinishTime.After(latestExecuteFinishTime) {
+		latestExecuteFinishTime = persistedExecuteFinishTime
 	}
-	return active, lastFinish
+	return executeActive, latestExecuteFinishTime
 }
 
 // markExecuteActive claims the in-memory K=1 slot for an Execute run.
 func (e *Engine) markExecuteActive(name string) {
-	e.mu.Lock()
-	e.execActive = name
-	e.mu.Unlock()
+	e.engineStateMutex.Lock()
+	e.activeExecuteRunName = name
+	e.engineStateMutex.Unlock()
 }
 
 // markExecuteDone releases the slot and stamps the cooldown anchor.
 func (e *Engine) markExecuteDone(name string) {
-	e.mu.Lock()
-	if e.execActive == name {
-		e.execActive = ""
+	e.engineStateMutex.Lock()
+	if e.activeExecuteRunName == name {
+		e.activeExecuteRunName = ""
 	}
-	e.lastExecFinish = e.now()
-	e.mu.Unlock()
+	e.lastExecuteFinishTime = e.now()
+	e.engineStateMutex.Unlock()
 }
 
-// executeState scans the lister for the Execute gate: whether another Execute is
+// persistedExecuteState scans the lister for the Execute gate: whether another Execute is
 // currently Running, and the most recent terminal Execute completion.
-func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
-	runs, err := e.lister.List(labels.Everything())
+func (e *Engine) persistedExecuteState(currentRunName string) (executeActive bool, latestExecuteFinishTime time.Time) {
+	runs, err := e.repackRunLister.List(labels.Everything())
 	if err != nil {
 		return true, time.Time{} // conservative: assume busy
 	}
-	for _, r := range runs {
-		if r.Spec.Mode != repackv1alpha1.RepackModeExecute {
+	for _, run := range runs {
+		if run.Spec.Mode != repackv1alpha1.RepackModeExecute {
 			continue
 		}
-		if r.Name != self && r.Status.Phase == repackv1alpha1.RepackRunning {
-			active = true
+		if run.Name != currentRunName && run.Status.Phase == repackv1alpha1.RepackRunning {
+			executeActive = true
 		}
-		if state.IsTerminal(r.Status.Phase) && r.Status.CompletionTime != nil {
-			if t := r.Status.CompletionTime.Time; t.After(lastFinish) {
-				lastFinish = t
+		if state.IsTerminal(run.Status.Phase) && run.Status.CompletionTime != nil {
+			if completionTime := run.Status.CompletionTime.Time; completionTime.After(latestExecuteFinishTime) {
+				latestExecuteFinishTime = completionTime
 			}
 		}
 	}
-	return active, lastFinish
+	return executeActive, latestExecuteFinishTime
 }
 
 // requeueGatedRuns re-enqueues every non-terminal Execute run so any run that was
@@ -91,15 +91,15 @@ func (e *Engine) executeState(self string) (active bool, lastFinish time.Time) {
 // terminal by then and is skipped. DryRun runs are never gated, so they are not
 // re-enqueued here.
 func (e *Engine) requeueGatedRuns() {
-	runs, err := e.lister.List(labels.Everything())
+	runs, err := e.repackRunLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "repack: list for gated-run requeue")
 		return
 	}
 	woken := 0
-	for _, r := range runs {
-		if r.Spec.Mode == repackv1alpha1.RepackModeExecute && !state.IsTerminal(r.Status.Phase) {
-			e.queue.Add(r.Name)
+	for _, run := range runs {
+		if run.Spec.Mode == repackv1alpha1.RepackModeExecute && !state.IsTerminal(run.Status.Phase) {
+			e.workQueue.Add(run.Name)
 			woken++
 		}
 	}

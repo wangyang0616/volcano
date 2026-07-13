@@ -141,7 +141,7 @@ func TestOptimalNodes_MatchesBruteForce_Pow2(t *testing.T) {
 }
 
 // Non-powers-of-2: closed form is a valid lower bound (<= optimum) and is
-// flagged inexact (so callers know FragRate may over-estimate).
+// flagged inexact (so callers know FragmentationRate may over-estimate).
 func TestOptimalNodes_LowerBound_NonPow2(t *testing.T) {
 	if a, exact := OptimalNodes([]int64{5, 5, 5}, 8); a != 2 || exact {
 		t.Errorf("{5,5,5}/8: got (%d,%v), want (2,false) — loose lower bound", a, exact)
@@ -162,16 +162,16 @@ func TestOptimalNodes_LowerBound_NonPow2(t *testing.T) {
 }
 
 func TestFragRateAndWeighted(t *testing.T) {
-	per := map[v1.ResourceName]ResourceFrag{
-		gpu:                    {Resource: gpu, M: 20, B: 18, A: 16},
-		"huawei.com/Ascend910": {Resource: "huawei.com/Ascend910", M: 8, B: 5, A: 5},
+	per := map[v1.ResourceName]ResourceFragmentation{
+		gpu:                    {Resource: gpu, ProvidingNodeCount: 20, OccupiedNodeCount: 18, OptimalOccupiedNodeCount: 16},
+		"huawei.com/Ascend910": {Resource: "huawei.com/Ascend910", ProvidingNodeCount: 8, OccupiedNodeCount: 5, OptimalOccupiedNodeCount: 5},
 	}
-	if got := per[gpu].FragRate(); math.Abs(got-0.10) > 1e-9 {
-		t.Errorf("gpu FragRate=%v want 0.10", got)
+	if got := per[gpu].FragmentationRate(); math.Abs(got-0.10) > 1e-9 {
+		t.Errorf("gpu FragmentationRate=%v want 0.10", got)
 	}
-	// Weighted = Sum(B-A)/Sum(M) = (2+0)/(20+8)
-	if got := WeightedFragRate(per); math.Abs(got-2.0/28.0) > 1e-9 {
-		t.Errorf("WeightedFragRate=%v want %v", got, 2.0/28.0)
+	// Weighted rate = total excess occupied nodes / total providing nodes = (2+0)/(20+8).
+	if got := WeightedFragmentationRate(per); math.Abs(got-2.0/28.0) > 1e-9 {
+		t.Errorf("WeightedFragmentationRate=%v want %v", got, 2.0/28.0)
 	}
 }
 
@@ -188,18 +188,19 @@ func TestMeasureResource(t *testing.T) {
 		return &api.NodeInfo{Allocatable: mkRes(cap), Used: mkRes(used), Tasks: tasks}
 	}
 	nodes := []*api.NodeInfo{
-		node(8, 4, 4),       // 8-GPU node, 4 used by one 4-GPU task
+		node(8, 4, 4),       // 8-TargetResource node, 4 used by one 4-TargetResource task
 		node(8, 4, 2, 1, 1), // fragmented: three small tasks summing 4
-		node(8, 0),          // empty 8-GPU node
-		{Allocatable: &api.Resource{ScalarResources: map[v1.ResourceName]float64{"cpu": 0}}}, // non-GPU node, ignored
+		node(8, 0),          // empty 8-TargetResource node
+		{Allocatable: &api.Resource{ScalarResources: map[v1.ResourceName]float64{"cpu": 0}}}, // non-TargetResource node, ignored
 	}
-	f := MeasureResource(nodes, gpu)
-	// M=3 GPU nodes; B=2 occupied; demand {4,2,1,1}=8 -> A=ceil(8/8)=1
-	if f.M != 3 || f.B != 2 || f.A != 1 || !f.Exact {
-		t.Fatalf("MeasureResource = %+v; want M=3 B=2 A=1 Exact=true", f)
+	f := MeasureResourceFragmentation(nodes, gpu)
+	// Three nodes provide the target resource; two are occupied; demand {4,2,1,1}=8
+	// means the optimal occupied-node count is ceil(8/8)=1.
+	if f.ProvidingNodeCount != 3 || f.OccupiedNodeCount != 2 || f.OptimalOccupiedNodeCount != 1 || !f.Exact {
+		t.Fatalf("MeasureResourceFragmentation = %+v; want providing=3 occupied=2 optimal=1 Exact=true", f)
 	}
-	if got := f.FragRate(); math.Abs(got-1.0/3.0) > 1e-9 { // (2-1)/3
-		t.Errorf("FragRate=%v want %v", got, 1.0/3.0)
+	if got := f.FragmentationRate(); math.Abs(got-1.0/3.0) > 1e-9 { // (2-1)/3
+		t.Errorf("FragmentationRate=%v want %v", got, 1.0/3.0)
 	}
 }
 
@@ -218,12 +219,12 @@ func TestMeasureResourceHeterogeneousIsOrderIndependentAndBounded(t *testing.T) 
 	eight := node("eight", 8, 8, 8)
 	emptyEight := node("empty-eight", 8, 0, 0)
 
-	a := MeasureResource([]*api.NodeInfo{four, eight, emptyEight}, gpu)
-	b := MeasureResource([]*api.NodeInfo{emptyEight, eight, four}, gpu)
-	if a.A != b.A || a.B != b.B || a.M != b.M {
+	a := MeasureResourceFragmentation([]*api.NodeInfo{four, eight, emptyEight}, gpu)
+	b := MeasureResourceFragmentation([]*api.NodeInfo{emptyEight, eight, four}, gpu)
+	if a.OptimalOccupiedNodeCount != b.OptimalOccupiedNodeCount || a.OccupiedNodeCount != b.OccupiedNodeCount || a.ProvidingNodeCount != b.ProvidingNodeCount {
 		t.Fatalf("heterogeneous metric depends on node order: first=%+v reversed=%+v", a, b)
 	}
-	if a.Exact || a.A < 0 || a.A > a.B || a.FragRate() < 0 || a.FragRate() > 1 {
-		t.Fatalf("heterogeneous metric must be inexact and bounded: %+v rate=%v", a, a.FragRate())
+	if a.Exact || a.OptimalOccupiedNodeCount < 0 || a.OptimalOccupiedNodeCount > a.OccupiedNodeCount || a.FragmentationRate() < 0 || a.FragmentationRate() > 1 {
+		t.Fatalf("heterogeneous metric must be inexact and bounded: %+v rate=%v", a, a.FragmentationRate())
 	}
 }

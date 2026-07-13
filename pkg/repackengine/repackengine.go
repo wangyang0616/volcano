@@ -97,27 +97,27 @@ type Config struct {
 // admitted RepackRun is reconciled once on arrival. A single worker + the Execute
 // gate (one-at-a-time + cooldown) serialize eviction.
 type Engine struct {
-	cache schedcache.Cache
-	vc    vcclientset.Interface
-	cfg   Config
+	schedulerCache schedcache.Cache
+	volcanoClient  vcclientset.Interface
+	config         Config
 
-	factory  vcinformers.SharedInformerFactory
-	lister   repacklisters.RepackRunLister
-	synced   cache.InformerSynced
-	queue    workqueue.TypedRateLimitingInterface[string]
-	recorder record.EventRecorder
-	now      func() time.Time
+	informerFactory         vcinformers.SharedInformerFactory
+	repackRunLister         repacklisters.RepackRunLister
+	repackRunInformerSynced cache.InformerSynced
+	workQueue               workqueue.TypedRateLimitingInterface[string]
+	recorder                record.EventRecorder
+	now                     func() time.Time
 
-	mu             sync.Mutex
-	tiers          []conf.Tier
-	configurations []conf.Configuration
-	// execActive is the name of the Execute run currently holding the K=1 slot
-	// ("" = none); lastExecFinish is when this engine last finished an Execute.
+	engineStateMutex sync.Mutex
+	tiers            []conf.Tier
+	configurations   []conf.Configuration
+	// activeExecuteRunName is the Execute run currently holding the K=1 slot
+	// ("" = none); lastExecuteFinishTime is when this engine last finished an Execute.
 	// Both are authoritative (do not depend on informer-cache freshness), so the
 	// gate is correct even before a status write propagates to the lister, and
-	// safe if Workers is ever > 1. Guarded by mu.
-	execActive     string
-	lastExecFinish time.Time
+	// safe if Workers is ever > 1. Guarded by engineStateMutex.
+	activeExecuteRunName  string
+	lastExecuteFinishTime time.Time
 }
 
 const (
@@ -138,16 +138,16 @@ func newEventRecorder(config *rest.Config) record.EventRecorder {
 		klog.ErrorS(err, "repack: event recorder disabled (client build failed)")
 		return nil
 	}
-	s := runtime.NewScheme()
-	utilruntime.Must(kubescheme.AddToScheme(s))
-	utilruntime.Must(repackv1alpha1.AddToScheme(s))
-	b := record.NewBroadcaster()
-	b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
-	return b.NewRecorder(s, v1.EventSource{Component: "volcano-repack-engine"})
+	scheme := runtime.NewScheme()
+	utilruntime.Must(kubescheme.AddToScheme(scheme))
+	utilruntime.Must(repackv1alpha1.AddToScheme(scheme))
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+	return broadcaster.NewRecorder(scheme, v1.EventSource{Component: "volcano-repack-engine"})
 }
 
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
-func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
+func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 	// The engine reuses scheduler machinery (cache, plugins, predicates) that reads
 	// the scheduler's global options.ServerOpts — several accesses are unguarded
 	// (e.g. volume-binding, predicate/sharding helpers). The scheduler binary fills
@@ -160,18 +160,18 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 		opt.RegisterOptions()
 	}
 
-	if cfg.Core == "" {
-		cfg.Core = engineframework.CoreDrain
+	if engineConfig.Core == "" {
+		engineConfig.Core = engineframework.CoreDrain
 	}
-	if len(cfg.Plugins) == 0 {
-		cfg.Plugins = []string{"base", "node", "gang"}
+	if len(engineConfig.Plugins) == 0 {
+		engineConfig.Plugins = []string{"base", "node", "gang"}
 	}
-	if cfg.NominationTTL <= 0 {
-		cfg.NominationTTL = defaultNominationTTL
+	if engineConfig.NominationTTL <= 0 {
+		engineConfig.NominationTTL = defaultNominationTTL
 	}
-	vc := vcclientset.NewForConfigOrDie(config)
-	factory := vcinformers.NewSharedInformerFactory(vc, cfg.ResyncPeriod)
-	informer := factory.Repack().V1alpha1().RepackRuns()
+	volcanoClient := vcclientset.NewForConfigOrDie(config)
+	informerFactory := vcinformers.NewSharedInformerFactory(volcanoClient, engineConfig.ResyncPeriod)
+	informer := informerFactory.Repack().V1alpha1().RepackRuns()
 	schedulerNames := schedoptions.ServerOpts.SchedulerNames
 	if len(schedulerNames) == 0 {
 		schedulerNames = []string{"volcano"}
@@ -185,16 +185,16 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 		// empty, so the engine would see a zero-node cluster.
 		// schedulerNames must match the pods the engine plans to move (volcano Jobs
 		// use schedulerName=volcano); an empty list skips Job/PodGroup indexing.
-		cache: schedcache.New(config, schedulerNames, schedoptions.ServerOpts.DefaultQueue,
+		schedulerCache: schedcache.New(config, schedulerNames, schedoptions.ServerOpts.DefaultQueue,
 			schedoptions.ServerOpts.NodeSelector, repackNodeWorkers,
 			schedoptions.ServerOpts.IgnoredCSIProvisioners, 0, 0),
-		vc:      vc,
-		cfg:     cfg,
-		factory: factory,
-		lister:  informer.Lister(),
-		synced:  informer.Informer().HasSynced,
-		queue:   workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		now:     time.Now,
+		volcanoClient:           volcanoClient,
+		config:                  engineConfig,
+		informerFactory:         informerFactory,
+		repackRunLister:         informer.Lister(),
+		repackRunInformerSynced: informer.Informer().HasSynced,
+		workQueue:               workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		now:                     time.Now,
 	}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: e.enqueue,
@@ -220,22 +220,22 @@ func NewEngine(config *rest.Config, cfg Config) (*Engine, error) {
 // RepackRun events with a single worker until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	defer utilruntime.HandleCrash()
-	defer e.queue.ShutDown()
+	defer e.workQueue.ShutDown()
 
 	if err := e.loadConf(); err != nil {
 		klog.ErrorS(err, "repack: load scheduler conf")
 		return // fail closed: never plan/evict without the scheduler's filter stack
 	}
-	e.factory.Start(ctx.Done())
-	e.cache.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), e.synced) {
+	e.informerFactory.Start(ctx.Done())
+	e.schedulerCache.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), e.repackRunInformerSynced) {
 		klog.Error("repack: RepackRun cache failed to sync")
 		return
 	}
 	e.recoverOrphans(ctx) // fail runs left Running by a crashed predecessor
 	klog.V(3).InfoS("repack-engine started (event-driven)",
-		"core", e.cfg.Core, "plugins", e.cfg.Plugins,
-		"defaultResource", e.cfg.DefaultResource, "cooldown", e.cfg.Cooldown, "resyncPeriod", e.cfg.ResyncPeriod)
+		"core", e.config.Core, "plugins", e.config.Plugins,
+		"defaultResource", e.config.DefaultResource, "cooldown", e.config.Cooldown, "resyncPeriod", e.config.ResyncPeriod)
 	// Single worker: Execute runs serialize naturally (one reconcile at a time).
 	go func() {
 		for e.processNext(ctx) {
@@ -246,10 +246,10 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) loadConf() error {
-	if e.cfg.SchedulerConf == "" {
+	if e.config.SchedulerConf == "" {
 		return fmt.Errorf("scheduler-conf is required")
 	}
-	raw, err := os.ReadFile(e.cfg.SchedulerConf)
+	raw, err := os.ReadFile(e.config.SchedulerConf)
 	if err != nil {
 		return err
 	}
@@ -257,9 +257,9 @@ func (e *Engine) loadConf() error {
 	if err != nil {
 		return err
 	}
-	e.mu.Lock()
+	e.engineStateMutex.Lock()
 	e.tiers, e.configurations = tiers, configurations
-	e.mu.Unlock()
+	e.engineStateMutex.Unlock()
 	return nil
 }
 
@@ -269,7 +269,7 @@ func (e *Engine) enqueue(obj interface{}) {
 	if !ok || !isCandidate(run) {
 		return
 	}
-	e.queue.Add(run.Name)
+	e.workQueue.Add(run.Name)
 }
 
 // isCandidate reports whether a run is ready for the engine. Running without a
@@ -288,26 +288,26 @@ func isCandidate(run *repackv1alpha1.RepackRun) bool {
 const maxReconcileRetries = 5
 
 func (e *Engine) processNext(ctx context.Context) bool {
-	key, shutdown := e.queue.Get()
+	key, shutdown := e.workQueue.Get()
 	if shutdown {
 		return false
 	}
-	defer e.queue.Done(key)
+	defer e.workQueue.Done(key)
 
 	if err := e.reconcileSafely(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("repack-engine reconcile %q: %w", key, err))
-		if e.queue.NumRequeues(key) < maxReconcileRetries {
-			klog.V(4).InfoS("requeueing RepackRun after error", "run", key, "retries", e.queue.NumRequeues(key)+1)
-			e.queue.AddRateLimited(key)
+		if e.workQueue.NumRequeues(key) < maxReconcileRetries {
+			klog.V(4).InfoS("requeueing RepackRun after error", "run", key, "retries", e.workQueue.NumRequeues(key)+1)
+			e.workQueue.AddRateLimited(key)
 			return true
 		}
 		// Poison pill: stop retrying and fail the run so it does not loop forever
 		// (and its Execute slot, if any, was already released by process's defer).
-		e.queue.Forget(key)
+		e.workQueue.Forget(key)
 		e.failByName(ctx, key, "ReconcileGaveUp", fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
 		return true
 	}
-	e.queue.Forget(key)
+	e.workQueue.Forget(key)
 	return true
 }
 
@@ -327,7 +327,7 @@ func (e *Engine) reconcileSafely(ctx context.Context, name string) (err error) {
 
 // failByName marks a run Failed by name (poison-pill path); best-effort.
 func (e *Engine) failByName(ctx context.Context, name, reason string, cause error) {
-	run, err := e.lister.Get(name)
+	run, err := e.repackRunLister.Get(name)
 	if err != nil {
 		return // gone or lister error; nothing to write
 	}
@@ -341,7 +341,7 @@ func (e *Engine) failByName(ctx context.Context, name, reason string, cause erro
 // Execute serialization gate (one-at-a-time + cooldown — it lives here, in the
 // worker that actually evicts), then plan/act.
 func (e *Engine) reconcile(ctx context.Context, name string) error {
-	run, err := e.lister.Get(name)
+	run, err := e.repackRunLister.Get(name)
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -368,7 +368,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		Mode:              work.Spec.Mode,
 		ExecuteActive:     active,
 		LastExecuteFinish: lastFinish,
-		Cooldown:          e.cfg.Cooldown,
+		Cooldown:          e.config.Cooldown,
 		Now:               e.now(),
 	})
 	if !gate.Admit {
@@ -382,7 +382,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 			return err
 		}
 		if gate.RequeueAfter > 0 {
-			e.queue.AddAfter(name, gate.RequeueAfter)
+			e.workQueue.AddAfter(name, gate.RequeueAfter)
 		}
 		return nil
 	}
@@ -399,7 +399,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 // Execute slot and let TTL GC collect it. Conservative on purpose — we do not
 // re-run, since a mid-eviction Execute must not be blindly repeated.
 func (e *Engine) recoverOrphans(ctx context.Context) {
-	runs, err := e.lister.List(labels.Everything())
+	runs, err := e.repackRunLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "repack: list for orphan recovery")
 		return

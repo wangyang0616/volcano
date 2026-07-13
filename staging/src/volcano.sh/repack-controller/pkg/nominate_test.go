@@ -35,8 +35,8 @@ func nominatorWith(runs ...*repackv1alpha1.RepackRun) *Nominator {
 		_ = idx.Add(r)
 	}
 	return &Nominator{
-		repackLister: repacklisters.NewRepackRunLister(idx),
-		now:          func() time.Time { return time.Unix(1000, 0) },
+		repackRunLister: repacklisters.NewRepackRunLister(idx),
+		now:             func() time.Time { return time.Unix(1000, 0) },
 	}
 }
 
@@ -50,7 +50,7 @@ func pendingPod(ns, name, pg string, labels map[string]string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name, Labels: labels,
-			Annotations: map[string]string{annPodGroup: pg},
+			Annotations: map[string]string{podGroupAnnotationKey: pg},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodPending},
 	}

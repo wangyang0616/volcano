@@ -76,8 +76,8 @@ type SessionConfig struct {
 // Session is one repack pass: a snapshot plus the callbacks plugins register,
 // consumed by the core and actions. Mirrors framework.Session in the scheduler.
 type Session struct {
-	cfg     SessionConfig
-	plugins []Plugin // opened plugins, for OnSessionClose
+	configuration SessionConfig
+	plugins       []Plugin // opened plugins, for OnSessionClose
 
 	movableFns    []MovableFn
 	domainFns     []DomainFn
@@ -85,15 +85,15 @@ type Session struct {
 	constraintFns []PlanConstraintFn
 
 	// results filled by the action, read by the driver
-	plan   *api.RepackPlan
-	report Report
-	commit *CommitResult // Execute-only; nil for DryRun or an empty plan
+	plan         *api.RepackPlan
+	report       Report
+	commitResult *CommitResult // Execute-only; nil for DryRun or an empty plan
 }
 
 // OpenSession builds a Session and runs each named plugin's OnSessionOpen (which
 // registers its callbacks). Unknown plugin names are ignored.
-func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
-	ssn := &Session{cfg: cfg}
+func OpenSession(configuration SessionConfig, pluginNames []string) *Session {
+	ssn := &Session{configuration: configuration}
 	ssn.registerBuiltinConstraints()
 	for _, name := range pluginNames {
 		p, ok := GetPlugin(name)
@@ -112,7 +112,7 @@ func OpenSession(cfg SessionConfig, pluginNames []string) *Session {
 // the same seam via AddConstraintFn.
 func (s *Session) registerBuiltinConstraints() {
 	// MinNodesFreed: a plan must free at least this many nodes (default 1).
-	minFreed := s.cfg.MinNodesFreed
+	minFreed := s.configuration.MinNodesFreed
 	if minFreed < 1 {
 		minFreed = 1
 	}
@@ -120,14 +120,14 @@ func (s *Session) registerBuiltinConstraints() {
 		return plan != nil && plan.Benefit() >= float64(minFreed)
 	})
 	// MinFragImprovementPercent: fragmentation must drop by at least this many
-	// percentage points. FragRateDelta is negative (fragmentation fell), so the
+	// percentage points. FragmentationRateDelta is negative (fragmentation fell), so the
 	// improvement is round(-delta*100). 0 = no gate.
-	if minImprove := s.cfg.MinFragImprovementPercent; minImprove > 0 {
+	if minImprove := s.configuration.MinFragImprovementPercent; minImprove > 0 {
 		s.AddConstraintFn(func(_ *api.PlanContext, plan *api.RepackPlan) bool {
 			if plan == nil {
 				return false
 			}
-			improvePct := int(-plan.FragRateDelta()*100 + 0.5)
+			improvePct := int(-plan.FragmentationRateDelta()*100 + 0.5)
 			return improvePct >= minImprove
 		})
 	}
@@ -181,23 +181,23 @@ func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
 
 // ---- config accessors ----
 
-func (s *Session) Snapshot() Snapshot              { return s.cfg.Snapshot }
-func (s *Session) Run() *repackv1alpha1.RepackRun  { return s.cfg.Run }
-func (s *Session) Resource() v1.ResourceName       { return s.cfg.Resource }
-func (s *Session) Mode() repackv1alpha1.RepackMode { return s.cfg.Mode }
-func (s *Session) CoreName() string                { return s.cfg.CoreName }
-func (s *Session) Hooks() CommitHooks              { return s.cfg.Hooks }
-func (s *Session) MinNodesFreed() int              { return s.cfg.MinNodesFreed }
-func (s *Session) MinFragImprovementPercent() int  { return s.cfg.MinFragImprovementPercent }
-func (s *Session) MaxPodGroups() int               { return s.cfg.MaxPodGroups }
-func (s *Session) MaxResource() int64              { return s.cfg.MaxResource }
-func (s *Session) LimitPodGroups() bool            { return s.cfg.LimitPodGroups }
-func (s *Session) LimitResource() bool             { return s.cfg.LimitResource }
+func (s *Session) Snapshot() Snapshot              { return s.configuration.Snapshot }
+func (s *Session) Run() *repackv1alpha1.RepackRun  { return s.configuration.Run }
+func (s *Session) Resource() v1.ResourceName       { return s.configuration.Resource }
+func (s *Session) Mode() repackv1alpha1.RepackMode { return s.configuration.Mode }
+func (s *Session) CoreName() string                { return s.configuration.CoreName }
+func (s *Session) Hooks() CommitHooks              { return s.configuration.Hooks }
+func (s *Session) MinNodesFreed() int              { return s.configuration.MinNodesFreed }
+func (s *Session) MinFragImprovementPercent() int  { return s.configuration.MinFragImprovementPercent }
+func (s *Session) MaxPodGroups() int               { return s.configuration.MaxPodGroups }
+func (s *Session) MaxResource() int64              { return s.configuration.MaxResource }
+func (s *Session) LimitPodGroups() bool            { return s.configuration.LimitPodGroups }
+func (s *Session) LimitResource() bool             { return s.configuration.LimitResource }
 
 // Free returns the node free-capacity basis (default NodeInfo.FutureIdle).
 func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
-	if s.cfg.Free != nil {
-		return s.cfg.Free
+	if s.configuration.Free != nil {
+		return s.configuration.Free
 	}
 	return func(n *schedapi.NodeInfo) *schedapi.Resource { return n.FutureIdle() }
 }
@@ -205,13 +205,13 @@ func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
 // ---- aggregate consumption (called by the core/actions) ----
 
 // Nodes returns the snapshot's candidate nodes.
-func (s *Session) Nodes() []*schedapi.NodeInfo { return s.cfg.Snapshot.Nodes() }
+func (s *Session) Nodes() []*schedapi.NodeInfo { return s.configuration.Snapshot.Nodes() }
 
 // FeasibleRelocation delegates to the snapshot's scheduler-faithful relocation
 // feasibility check: simulate evicting victims and greedily place them onto receivers with the
 // full scheduler filter stack. See Snapshot.FeasibleRelocation.
 func (s *Session) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
-	return s.cfg.Snapshot.FeasibleRelocation(committed, victims, receivers)
+	return s.configuration.Snapshot.FeasibleRelocation(committed, victims, receivers)
 }
 
 // Movable returns an api.Movable that is the AND of all registered MovableFns
@@ -237,22 +237,22 @@ func (s *Session) Movable() api.Movable {
 func (s *Session) FreeableUnits() []api.FreeableUnit {
 	var out []api.FreeableUnit
 	for _, fn := range s.domainFns {
-		out = append(out, fn(s.cfg.Snapshot)...)
+		out = append(out, fn(s.configuration.Snapshot)...)
 	}
 	return out
 }
 
 // PlanContext builds the scoring context from the snapshot and target resource.
 func (s *Session) PlanContext() *api.PlanContext {
-	return &api.PlanContext{GPU: s.cfg.Resource, Views: s.cfg.Snapshot}
+	return &api.PlanContext{TargetResource: s.configuration.Resource, PodGroupViews: s.configuration.Snapshot}
 }
 
-// CurrentFragRate is the target resource's fragmentation rate over the snapshot's
-// nodes, independent of any plan. Used to fill report.FragRateBefore when the core
+// CurrentFragmentationRate is the target resource's fragmentation rate over the snapshot's
+// nodes, independent of any plan. Used to fill report.FragmentationRateBefore when the core
 // returns no plan, so the driver can tell a clean cluster (NoFragmentation) apart
 // from a fragmented one with no worthwhile plan (BelowGoalThreshold).
-func (s *Session) CurrentFragRate() float64 {
-	return api.MeasureResource(s.Nodes(), s.cfg.Resource).FragRate()
+func (s *Session) CurrentFragmentationRate() float64 {
+	return api.MeasureResourceFragmentation(s.Nodes(), s.configuration.Resource).FragmentationRate()
 }
 
 // LeastDisruptive returns the index of the least-disruptive candidate, applying
@@ -301,9 +301,9 @@ func (s *Session) LeastDisruptive(cands []*api.CandidatePlan) int {
 
 // ---- result (set by the action, read by the driver) ----
 
-func (s *Session) SetPlan(p *api.RepackPlan) { s.plan = p }
-func (s *Session) Plan() *api.RepackPlan     { return s.plan }
-func (s *Session) SetReport(r Report)        { s.report = r }
-func (s *Session) Report() Report            { return s.report }
-func (s *Session) SetCommit(r *CommitResult) { s.commit = r }
-func (s *Session) Commit() *CommitResult     { return s.commit }
+func (s *Session) SetPlan(p *api.RepackPlan)            { s.plan = p }
+func (s *Session) Plan() *api.RepackPlan                { return s.plan }
+func (s *Session) SetReport(r Report)                   { s.report = r }
+func (s *Session) Report() Report                       { return s.report }
+func (s *Session) SetCommit(commitResult *CommitResult) { s.commitResult = commitResult }
+func (s *Session) Commit() *CommitResult                { return s.commitResult }

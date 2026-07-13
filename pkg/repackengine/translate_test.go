@@ -26,7 +26,7 @@ import (
 )
 
 func TestResolveResource(t *testing.T) {
-	e := &Engine{cfg: Config{DefaultResource: "nvidia.com/gpu"}}
+	e := &Engine{config: Config{DefaultResource: "nvidia.com/gpu"}}
 
 	// goals[0].resource wins when set.
 	run := &repackv1alpha1.RepackRun{}
@@ -41,7 +41,7 @@ func TestResolveResource(t *testing.T) {
 	}
 
 	// empty goals AND empty default -> "" (driver then fails NoTargetResource).
-	e0 := &Engine{cfg: Config{}}
+	e0 := &Engine{config: Config{}}
 	if got := e0.resolveResource(&repackv1alpha1.RepackRun{}); got != "" {
 		t.Errorf("no goals, no default -> '', got %q", got)
 	}

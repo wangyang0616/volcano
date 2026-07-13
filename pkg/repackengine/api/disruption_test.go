@@ -28,40 +28,40 @@ func gpuJobTask(name, gang string, g int64) *api.TaskInfo {
 	return &api.TaskInfo{Name: name, Job: api.JobID(gang), InitResreq: gpuRes(g)}
 }
 
-// Aggregate counts real relocations per gang; To==From is ignored.
+// MoveAggregate counts real relocations per gang; To==From is ignored.
 func TestAggregate(t *testing.T) {
-	ctx := &PlanContext{GPU: gpu}
+	ctx := &PlanContext{TargetResource: gpu}
 	cp := &CandidatePlan{Moves: []*Move{
 		{Task: gpuJobTask("a", "g1", 2), From: "n0", To: "n1"},
 		{Task: gpuJobTask("b", "g1", 3), From: "n0", To: "n1"},
 		{Task: gpuJobTask("c", "g2", 4), From: "n0", To: "n1"},
 		{Task: gpuJobTask("d", "g2", 1), From: "n0", To: "n0"}, // no-op
 	}}
-	a := cp.Aggregate(ctx)
-	if a.AffectedPGs != 2 {
-		t.Errorf("affectedPGs=%d, want 2", a.AffectedPGs)
+	a := cp.MoveAggregate(ctx)
+	if a.AffectedPodGroups != 2 {
+		t.Errorf("affectedPGs=%d, want 2", a.AffectedPodGroups)
 	}
 	if a.MovedPods != 3 {
 		t.Errorf("movedPods=%d, want 3", a.MovedPods)
 	}
-	if a.MovedGPU != 9 {
-		t.Errorf("movedGPU=%d, want 9", a.MovedGPU)
+	if a.MovedResource != 9 {
+		t.Errorf("movedResource=%d, want 9", a.MovedResource)
 	}
-	if g1 := a.ByPG["g1"]; g1 == nil || g1.MovedPods != 2 || g1.MovedGPU != 5 {
+	if g1 := a.ByPodGroup["g1"]; g1 == nil || g1.MovedPods != 2 || g1.MovedResource != 5 {
 		t.Errorf("g1=%+v, want {2 pods, 5 gpu}", g1)
 	}
-	if g2 := a.ByPG["g2"]; g2 == nil || g2.MovedPods != 1 || g2.MovedGPU != 4 {
+	if g2 := a.ByPodGroup["g2"]; g2 == nil || g2.MovedPods != 1 || g2.MovedResource != 4 {
 		t.Errorf("g2=%+v, want {1 pod, 4 gpu}", g2)
 	}
 }
 
-// CostOf summarizes a move set's default dimensions.
+// CalculateDisruptionCost summarizes a move set's default dimensions.
 func TestCostOf(t *testing.T) {
-	c := CostOf([]*Move{
+	c := CalculateDisruptionCost([]*Move{
 		{Task: gpuJobTask("a", "g1", 2), From: "n0", To: "n1"},
 		{Task: gpuJobTask("c", "g2", 4), From: "n0", To: "n1"},
 	}, gpu)
-	if c.AffectedPodGroups != 2 || c.MovedGPU != 6 || c.MovedPods != 2 {
+	if c.AffectedPodGroups != 2 || c.MovedResource != 6 || c.MovedPods != 2 {
 		t.Errorf("cost=%+v, want {2, 6, 2}", c)
 	}
 }

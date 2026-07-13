@@ -43,10 +43,10 @@ import (
 // deliberately two-phase: persist the complete plan and nomination intents
 // first, then issue evictions. This closes the replacement-pod race and ensures
 // a crash never performs an eviction whose intent was not durably recorded.
-func (e *Engine) process(ctx context.Context, work *repackv1alpha1.RepackRun) error {
-	start := time.Now()
-	defer func() { metrics.ObserveCycle(string(work.Spec.Mode), time.Since(start).Seconds()) }()
-	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) error {
+	processingStartTime := time.Now()
+	defer func() { metrics.ObserveCycle(string(run.Spec.Mode), time.Since(processingStartTime).Seconds()) }()
+	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		// Defers run LIFO: markExecuteDone (declared last) releases the K=1 slot
 		// first, then requeueGatedRuns (declared first) re-enqueues Execute runs
 		// that were blocked on it. Without the wake, a run gated with reason
@@ -55,140 +55,140 @@ func (e *Engine) process(ctx context.Context, work *repackv1alpha1.RepackRun) er
 		defer e.requeueGatedRuns()
 		// Release the K=1 slot and stamp the cooldown anchor when done, even on
 		// panic/early-return paths.
-		defer e.markExecuteDone(work.Name)
+		defer e.markExecuteDone(run.Name)
 	}
-	e.mu.Lock()
-	tiers, cfgs := e.tiers, e.configurations
-	e.mu.Unlock()
+	e.engineStateMutex.Lock()
+	schedulerTiers, schedulerConfigurations := e.tiers, e.configurations
+	e.engineStateMutex.Unlock()
 
-	sched := schedframework.OpenSession(e.cache, tiers, cfgs)
+	schedulerSession := schedframework.OpenSession(e.schedulerCache, schedulerTiers, schedulerConfigurations)
 	// Read-only close: the engine plans against the session but must NOT write back
 	// PodGroup/Queue status (gang Unschedulable conditions, JobUpdater, queue
 	// allocated) — that is the scheduler's job and a second writer would race it.
-	defer schedframework.CloseSessionReadOnly(sched)
+	defer schedframework.CloseSessionReadOnly(schedulerSession)
 
-	klog.V(4).InfoS("repack: processing run", "run", work.Name, "mode", work.Spec.Mode)
-	generation := work.Generation
-	res := e.resolveResource(work)
-	if res == "" {
+	klog.V(4).InfoS("repack: processing run", "run", run.Name, "mode", run.Spec.Mode)
+	generation := run.Generation
+	targetResource := e.resolveResource(run)
+	if targetResource == "" {
 		// No target accelerator resolvable: spec.goals is empty AND the engine's
 		// --repack-default-resource is unset. Measuring fragmentation on the empty
 		// resource would count every node as empty and silently report
 		// NoFragmentation, so fail fast with an actionable reason instead.
-		return e.fail(ctx, work, generation, "NoTargetResource",
+		return e.fail(ctx, run, generation, "NoTargetResource",
 			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
 	}
-	if !supportedTarget(res) {
+	if !supportedTarget(targetResource) {
 		// Only fully-qualified extended resources (nvidia.com/gpu, huawei.com/Ascend910)
 		// are supported — they live in Resource.ScalarResources. Core compute resources
 		// (cpu, memory, ephemeral-storage, ...) are stored in dedicated fields, so
 		// Scalar() reads 0 for them and the run would be a silent no-op reporting
 		// NoFragmentation. CEL rejects this on spec.goals, but the --repack-default-
 		// resource fallback bypasses CEL, so guard it here too.
-		return e.fail(ctx, work, generation, "UnsupportedResource",
-			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", res))
+		return e.fail(ctx, run, generation, "UnsupportedResource",
+			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", targetResource))
 	}
-	if _, ok := engineframework.GetCore(e.cfg.Core); !ok {
-		return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
-			fmt.Errorf("unknown repack core %q (registered: %v)", e.cfg.Core, engineframework.CoreNames()))
+	if _, ok := engineframework.GetCore(e.config.Core); !ok {
+		return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
+			fmt.Errorf("unknown repack core %q (registered: %v)", e.config.Core, engineframework.CoreNames()))
 	}
-	actions := e.cfg.Actions
+	actions := e.config.Actions
 	if len(actions) == 0 {
 		actions = engineframework.DefaultActions()
 	}
 	for _, name := range actions {
 		if _, ok := engineframework.GetAction(name); !ok {
-			return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
+			return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
 				fmt.Errorf("unknown repack action %q (registered: %v)", name, engineframework.ActionNames()))
 		}
 	}
-	for _, name := range e.cfg.Plugins {
+	for _, name := range e.config.Plugins {
 		if _, ok := engineframework.GetPlugin(name); !ok {
-			return e.fail(ctx, work, generation, "InvalidEngineConfiguration",
+			return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
 				fmt.Errorf("unknown repack plugin %q", name))
 		}
 	}
 
 	reason := state.ReasonSimulating
-	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		reason = state.ReasonEvicting
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", generation)
-	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", generation)
-	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-	if err := e.updateStatus(ctx, work); err != nil {
+	state.SetCondition(&run.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", generation)
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", generation)
+	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist Running status: %w", err)
 	}
 
-	scope, err := engineframework.NewScopeMatcher(work.Spec.Scope, adapter.SessionGangScopeLookup(sched))
+	scope, err := engineframework.NewScopeMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
 	if err != nil {
-		return e.fail(ctx, work, generation, "ScopeError", err)
+		return e.fail(ctx, run, generation, "ScopeError", err)
 	}
 
-	snapshot := adapter.NewSessionSnapshot(sched, res, scope)
-	maxPG, maxRes, limitPG, limitRes := maxPerRun(work, res)
-	klog.V(5).InfoS("repack: engine session opened", "run", work.Name, "resource", res,
-		"nodes", len(snapshot.Nodes()), "maxPodGroups", maxPG, "maxResource", maxRes)
-	engineSsn := engineframework.OpenSession(engineframework.SessionConfig{
+	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
+	maxPodGroups, maxResource, hasPodGroupLimit, hasResourceLimit := maxPerRun(run, targetResource)
+	klog.V(5).InfoS("repack: engine session opened", "run", run.Name, "resource", targetResource,
+		"nodes", len(snapshot.Nodes()), "maxPodGroups", maxPodGroups, "maxResource", maxResource)
+	engineSession := engineframework.OpenSession(engineframework.SessionConfig{
 		Snapshot:                  snapshot,
-		Run:                       work,
-		Resource:                  res,
-		Mode:                      work.Spec.Mode,
-		CoreName:                  e.cfg.Core,
-		MinNodesFreed:             e.cfg.MinNodesFreed,
-		MinFragImprovementPercent: minFragImprovement(work),
-		MaxPodGroups:              maxPG,
-		MaxResource:               maxRes,
-		LimitPodGroups:            limitPG,
-		LimitResource:             limitRes,
-		Hooks:                     hooksFor(work.Spec.Mode, e.cache.Client()),
+		Run:                       run,
+		Resource:                  targetResource,
+		Mode:                      run.Spec.Mode,
+		CoreName:                  e.config.Core,
+		MinNodesFreed:             e.config.MinNodesFreed,
+		MinFragImprovementPercent: minFragImprovement(run),
+		MaxPodGroups:              maxPodGroups,
+		MaxResource:               maxResource,
+		LimitPodGroups:            hasPodGroupLimit,
+		LimitResource:             hasResourceLimit,
+		Hooks:                     hooksFor(run.Spec.Mode, e.schedulerCache.Client()),
 		Free:                      adapter.NodeFreeCapacity,
-	}, e.cfg.Plugins)
-	engineSsn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
-	defer engineframework.CloseSession(engineSsn)
+	}, e.config.Plugins)
+	engineSession.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
+	defer engineframework.CloseSession(engineSession)
 
 	// Actions are planning-only. Execute is committed below, after applyPlan has
 	// been persisted successfully.
-	engineframework.RunActions(e.cfg.Actions, engineSsn)
+	engineframework.RunActions(e.config.Actions, engineSession)
 
-	report, plan := engineSsn.Report(), engineSsn.Plan()
-	klog.V(3).InfoS("plan computed", "run", work.Name, "mode", work.Spec.Mode, "resource", res,
-		"freedNodes", report.NodesFreed, "movedCards", report.MovedResource,
+	report, plan := engineSession.Report(), engineSession.Plan()
+	klog.V(3).InfoS("plan computed", "run", run.Name, "mode", run.Spec.Mode, "resource", targetResource,
+		"freedNodes", report.NodesFreed, "movedResource", report.MovedResource,
 		"affectedPodGroups", report.AffectedPodGroups,
-		"fragBeforePct", pct(report.FragRateBefore), "fragAfterPct", pct(report.FragRateAfter))
+		"fragBeforePct", percentagePoints(report.FragmentationRateBefore), "fragAfterPct", percentagePoints(report.FragmentationRateAfter))
 	// The Complete reason doubles as the "worth repacking?" verdict (§5.2.2);
 	// there is no summary.verdict. worthwhile = the plan freed nodes; an empty
 	// plan splits by whether fragmentation existed: none (clean) vs below the
 	// benefit gate (fragmented but not worth acting on).
 	worthwhile := report.NodesFreed > 0
-	execute := work.Spec.Mode == repackv1alpha1.RepackModeExecute
-	ttl := time.Duration(0)
+	execute := run.Spec.Mode == repackv1alpha1.RepackModeExecute
+	nominationTTL := time.Duration(0)
 	if execute {
-		ttl = e.cfg.NominationTTL
+		nominationTTL = e.config.NominationTTL
 	}
-	applyPlan(work, report, plan, res, execute, ttl)
+	applyPlan(run, report, plan, targetResource, execute, nominationTTL)
 	if execute && worthwhile {
 		// This is the prepare barrier. In particular, nominations must be visible
 		// before an eviction can cause a replacement pod to appear.
-		if err := e.updateStatus(ctx, work); err != nil {
+		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist prepared Execute plan: %w", err)
 		}
 	}
 
-	var commit *engineframework.CommitResult
+	var commitResult *engineframework.CommitResult
 	if execute && worthwhile {
-		result, err := engineframework.CommitPlan(plan, engineSsn.Hooks())
+		result, err := engineframework.CommitPlan(plan, engineSession.Hooks())
 		if err != nil {
-			return e.fail(ctx, work, generation, state.ReasonExecuteFailed, err)
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
-		commit = &result
-		engineSsn.SetCommit(commit)
+		commitResult = &result
+		engineSession.SetCommit(commitResult)
 	}
-	evicted, rejected := 0, 0
-	if commit != nil {
-		evicted, rejected = len(commit.Evicted), len(commit.Failed)
-		metrics.ObserveEvictions(evicted, rejected)
-		klog.V(3).InfoS("evictions issued", "run", work.Name, "evicted", evicted, "rejected", rejected)
+	evictedCount, rejectedCount := 0, 0
+	if commitResult != nil {
+		evictedCount, rejectedCount = len(commitResult.Evicted), len(commitResult.Failed)
+		metrics.ObserveEvictions(evictedCount, rejectedCount)
+		klog.V(3).InfoS("evictions issued", "run", run.Name, "evictedCount", evictedCount, "rejectedCount", rejectedCount)
 	}
 
 	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
@@ -196,55 +196,55 @@ func (e *Engine) process(ctx context.Context, work *repackv1alpha1.RepackRun) er
 	if execute && worthwhile {
 		// Replace the optimistic prepared plan with the realized subset. Failed
 		// evictions must not leave stale nominations or claim nodes were freed.
-		plan = realizedPlan(plan, commit)
+		plan = realizedPlan(plan, commitResult)
 		report = engineframework.RenderReport(plan)
-		applyPlan(work, report, plan, res, true, ttl)
+		applyPlan(run, report, plan, targetResource, true, nominationTTL)
 	}
-	if execute && worthwhile && evicted == 0 && rejected > 0 {
-		return e.fail(ctx, work, generation, state.ReasonExecuteFailed,
-			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejected))
+	if execute && worthwhile && evictedCount == 0 && rejectedCount > 0 {
+		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
 	}
 	if execute && worthwhile && report.NodesFreed == 0 {
-		return e.fail(ctx, work, generation, state.ReasonExecuteFailed,
-			fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evicted, rejected))
+		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+			fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evictedCount, rejectedCount))
 	}
 
 	var done, msg string
 	switch {
-	case !worthwhile && report.FragRateBefore > 0:
+	case !worthwhile && report.FragmentationRateBefore > 0:
 		done, msg = state.ReasonBelowGoalThreshold, "engine finished"
 	case !worthwhile:
 		done, msg = state.ReasonNoFragmentation, "engine finished"
 	case execute:
 		done, msg = state.ReasonExecuted, "engine finished"
 		// Partial success: some evictions were rejected but at least one succeeded.
-		if rejected > 0 {
-			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", evicted, rejected)
+		if rejectedCount > 0 {
+			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", evictedCount, rejectedCount)
 		}
 	default:
 		done, msg = state.ReasonRepackRecommended, "engine finished"
 	}
-	state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
-	state.SetCondition(&work.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
-	work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-	klog.V(3).InfoS("RepackRun finished", "run", work.Name, "mode", work.Spec.Mode, "outcome", done)
-	return e.updateStatusTerminal(ctx, work)
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
+	state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
+	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	klog.V(3).InfoS("RepackRun finished", "run", run.Name, "mode", run.Spec.Mode, "outcome", done)
+	return e.updateStatusTerminal(ctx, run)
 }
 
 // hooksFor returns the commit side effects. DryRun: none. Execute: evict each
 // victim via the Eviction API (PDB-respecting; the workload controller then
 // recreates the pod, steered by the nomination reconciler). No reservation/taint.
-func hooksFor(mode repackv1alpha1.RepackMode, kube kubernetes.Interface) engineframework.CommitHooks {
+func hooksFor(mode repackv1alpha1.RepackMode, kubernetesClient kubernetes.Interface) engineframework.CommitHooks {
 	if mode != repackv1alpha1.RepackModeExecute {
 		return engineframework.CommitHooks{}
 	}
 	return engineframework.CommitHooks{
-		Evict: func(m *engineapi.Move) error {
-			if m == nil || m.Task == nil || m.Task.Pod == nil {
+		Evict: func(move *engineapi.Move) error {
+			if move == nil || move.Task == nil || move.Task.Pod == nil {
 				return nil
 			}
-			pod := m.Task.Pod
-			return kube.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), &policyv1.Eviction{
+			pod := move.Task.Pod
+			return kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), &policyv1.Eviction{
 				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
 			})
 		},
@@ -255,33 +255,33 @@ func (e *Engine) resolveResource(run *repackv1alpha1.RepackRun) v1.ResourceName 
 	if len(run.Spec.Goals) > 0 && run.Spec.Goals[0].Resource != "" {
 		return run.Spec.Goals[0].Resource
 	}
-	return v1.ResourceName(e.cfg.DefaultResource)
+	return v1.ResourceName(e.config.DefaultResource)
 }
 
-// supportedTarget reports whether res is a defragmentable accelerator resource.
+// supportedTarget reports whether targetResource is a defragmentable accelerator resource.
 // Extended resources are fully qualified with a domain prefix (contain "/"), e.g.
 // nvidia.com/gpu; core resources (cpu, memory, ephemeral-storage, pods,
 // hugepages-*) are not and are unsupported. This mirrors the CEL rule on
 // spec.goals[0].resource and also guards the --repack-default-resource fallback.
-func supportedTarget(res v1.ResourceName) bool {
-	return strings.Contains(string(res), "/")
+func supportedTarget(targetResource v1.ResourceName) bool {
+	return strings.Contains(string(targetResource), "/")
 }
 
 // realizedPlan filters an optimistic plan through the actual eviction results.
 // A node is reported freed only when every planned move sourced from that node
 // was accepted. The returned plan retains the original fragmentation baseline so
 // RenderReport can describe the realized benefit without inventing a new metric.
-func realizedPlan(plan *engineapi.RepackPlan, commit *engineframework.CommitResult) *engineapi.RepackPlan {
-	if plan == nil || commit == nil {
+func realizedPlan(plan *engineapi.RepackPlan, commitResult *engineframework.CommitResult) *engineapi.RepackPlan {
+	if plan == nil || commitResult == nil {
 		return nil
 	}
-	succeeded := make(map[string]int, len(commit.Evicted))
-	failedSource := make(map[string]bool, len(commit.Failed))
-	for _, oc := range commit.Evicted {
-		succeeded[moveOutcomeKey(oc.Namespace, oc.Task, oc.From, oc.To)]++
+	succeeded := make(map[string]int, len(commitResult.Evicted))
+	failedSource := make(map[string]bool, len(commitResult.Failed))
+	for _, moveOutcome := range commitResult.Evicted {
+		succeeded[moveOutcomeKey(moveOutcome.Namespace, moveOutcome.Task, moveOutcome.From, moveOutcome.To)]++
 	}
-	for _, oc := range commit.Failed {
-		failedSource[oc.From] = true
+	for _, moveOutcome := range commitResult.Failed {
+		failedSource[moveOutcome.From] = true
 	}
 
 	realized := &engineapi.RepackPlan{Before: plan.Before}
@@ -313,7 +313,7 @@ func realizedPlan(plan *engineapi.RepackPlan, commit *engineframework.CommitResu
 			realized.FreedUnits = append(realized.FreedUnits, unit)
 		}
 	}
-	realized.Cost = engineapi.CostOf(realized.Moves, plan.Before.Resource)
+	realized.Cost = engineapi.CalculateDisruptionCost(realized.Moves, plan.Before.Resource)
 	return realized
 }
 

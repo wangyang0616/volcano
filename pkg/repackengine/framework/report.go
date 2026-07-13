@@ -23,15 +23,15 @@ import (
 // Report is the search outcome rendered from a RepackPlan — the engine-side,
 // CRD-independent shape the driver projects into RepackRun.status.plan (§4.6).
 type Report struct {
-	NodesFreed        int   // realized node-level benefit (whole nodes freed)
-	MovedResource     int64 // target-resource units relocated
-	AffectedPodGroups int64 // distinct gangs disrupted
-	FragRateDelta     float64
-	// FragRateBefore/After are the resource fragmentation rate (0-1) before/after
+	NodesFreed             int   // realized node-level benefit (whole nodes freed)
+	MovedResource          int64 // target-resource units relocated
+	AffectedPodGroups      int64 // distinct gangs disrupted
+	FragmentationRateDelta float64
+	// FragmentationRateBefore/After are the resource fragmentation rate (0-1) before/after
 	// the plan, feeding status.plan.summary.frag{Before,After}Percent. after =
-	// before + FragRateDelta (freeing a node drops B by 1: (B-A-freed)/M).
-	FragRateBefore float64
-	FragRateAfter  float64
+	// before + FragmentationRateDelta (freeing a node reduces the occupied-node count by one).
+	FragmentationRateBefore float64
+	FragmentationRateAfter  float64
 }
 
 // RenderReport turns a plan into the report. Nil plan → empty report.
@@ -40,11 +40,11 @@ func RenderReport(plan *api.RepackPlan) Report {
 		return Report{}
 	}
 	return Report{
-		NodesFreed:        plan.NodesFreed(),
-		MovedResource:     plan.Cost.MovedGPU,
-		AffectedPodGroups: plan.Cost.AffectedPodGroups,
-		FragRateDelta:     plan.FragRateDelta(),
-		FragRateBefore:    plan.Before.FragRate(),
-		FragRateAfter:     plan.Before.FragRate() + plan.FragRateDelta(),
+		NodesFreed:              plan.NodesFreed(),
+		MovedResource:           plan.Cost.MovedResource,
+		AffectedPodGroups:       plan.Cost.AffectedPodGroups,
+		FragmentationRateDelta:  plan.FragmentationRateDelta(),
+		FragmentationRateBefore: plan.Before.FragmentationRate(),
+		FragmentationRateAfter:  plan.Before.FragmentationRate() + plan.FragmentationRateDelta(),
 	}
 }

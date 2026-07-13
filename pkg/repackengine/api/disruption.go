@@ -42,89 +42,89 @@ type PodGroupViewer interface {
 // It is built by the engine Session and passed to the disruption score functions
 // that plugins register.
 type PlanContext struct {
-	GPU     v1.ResourceName // accelerator resource being defragmented
-	Views   PodGroupViewer  // per-PodGroup facts; nil-safe via View()
+	TargetResource v1.ResourceName // accelerator resource being defragmented
+	PodGroupViews  PodGroupViewer  // per-PodGroup facts; nil-safe via PodGroupView()
 }
 
-// View returns the PodGroup facts, zero-valued when unknown.
-func (c *PlanContext) View(id api.JobID) PodGroupView {
-	if c == nil || c.Views == nil {
+// PodGroupView returns the PodGroup facts, zero-valued when unknown.
+func (context *PlanContext) PodGroupView(podGroupID api.JobID) PodGroupView {
+	if context == nil || context.PodGroupViews == nil {
 		return PodGroupView{}
 	}
-	return c.Views.PodGroupView(id)
+	return context.PodGroupViews.PodGroupView(podGroupID)
 }
 
 // Resource returns the target accelerator, defaulting to nvidia.com/gpu.
-func (c *PlanContext) Resource() v1.ResourceName {
-	if c == nil || c.GPU == "" {
+func (context *PlanContext) Resource() v1.ResourceName {
+	if context == nil || context.TargetResource == "" {
 		return v1.ResourceName("nvidia.com/gpu")
 	}
-	return c.GPU
+	return context.TargetResource
 }
 
 // CandidatePlan is one rearrangement under comparison: the moves it implies.
 // Aggregates are computed once and cached.
 type CandidatePlan struct {
-	Moves []*Move
-	agg   *PlanAgg
+	Moves     []*Move
+	aggregate *PlanMoveAggregate
 }
 
-// PGAgg is the per-PodGroup move aggregate.
-type PGAgg struct {
-	MovedPods int64
-	MovedGPU  int64
+// PodGroupMoveAggregate is the per-PodGroup move aggregate.
+type PodGroupMoveAggregate struct {
+	MovedPods     int64
+	MovedResource int64
 }
 
-// PlanAgg is the whole-plan move aggregate, with a per-PodGroup breakdown.
-type PlanAgg struct {
-	AffectedPGs int64
-	MovedGPU    int64
-	MovedPods   int64
-	ByPG        map[api.JobID]*PGAgg
+// PlanMoveAggregate is the whole-plan move aggregate, with a per-PodGroup breakdown.
+type PlanMoveAggregate struct {
+	AffectedPodGroups int64
+	MovedResource     int64
+	MovedPods         int64
+	ByPodGroup        map[api.JobID]*PodGroupMoveAggregate
 }
 
-// Aggregate computes (and caches) the move aggregate for the given context.
+// MoveAggregate computes (and caches) the move aggregate for the given context.
 // Exported so disruption score functions in plugin packages can build on it.
-func (p *CandidatePlan) Aggregate(ctx *PlanContext) *PlanAgg {
-	if p.agg != nil {
-		return p.agg
+func (plan *CandidatePlan) MoveAggregate(context *PlanContext) *PlanMoveAggregate {
+	if plan.aggregate != nil {
+		return plan.aggregate
 	}
-	a := &PlanAgg{ByPG: map[api.JobID]*PGAgg{}}
-	for _, m := range p.Moves {
-		if m == nil || m.Task == nil || m.To == m.From {
+	moveAggregate := &PlanMoveAggregate{ByPodGroup: map[api.JobID]*PodGroupMoveAggregate{}}
+	for _, move := range plan.Moves {
+		if move == nil || move.Task == nil || move.To == move.From {
 			continue // not actually relocated
 		}
-		g := Scalar(m.Task.InitResreq, ctx.Resource())
-		a.MovedPods++
-		a.MovedGPU += g
-		pg := a.ByPG[m.Task.Job]
-		if pg == nil {
-			pg = &PGAgg{}
-			a.ByPG[m.Task.Job] = pg
+		requestedResource := Scalar(move.Task.InitResreq, context.Resource())
+		moveAggregate.MovedPods++
+		moveAggregate.MovedResource += requestedResource
+		podGroupAggregate := moveAggregate.ByPodGroup[move.Task.Job]
+		if podGroupAggregate == nil {
+			podGroupAggregate = &PodGroupMoveAggregate{}
+			moveAggregate.ByPodGroup[move.Task.Job] = podGroupAggregate
 		}
-		pg.MovedPods++
-		pg.MovedGPU += g
+		podGroupAggregate.MovedPods++
+		podGroupAggregate.MovedResource += requestedResource
 	}
-	a.AffectedPGs = int64(len(a.ByPG))
-	p.agg = a
-	return a
+	moveAggregate.AffectedPodGroups = int64(len(moveAggregate.ByPodGroup))
+	plan.aggregate = moveAggregate
+	return moveAggregate
 }
 
 // DisruptionCost is a flat summary of a plan's default dimensions, for
 // status/report output — not the comparison mechanism.
 type DisruptionCost struct {
 	AffectedPodGroups int64
-	MovedGPU          int64
+	MovedResource     int64
 	MovedPods         int64
 }
 
-// CostOf summarizes a move set's default dimensions for resource gpuRes.
-func CostOf(moves []*Move, gpuRes v1.ResourceName) DisruptionCost {
-	p := &CandidatePlan{Moves: moves}
-	a := p.Aggregate(&PlanContext{GPU: gpuRes})
+// CalculateDisruptionCost summarizes a move set's default dimensions for targetResource.
+func CalculateDisruptionCost(moves []*Move, targetResource v1.ResourceName) DisruptionCost {
+	plan := &CandidatePlan{Moves: moves}
+	moveAggregate := plan.MoveAggregate(&PlanContext{TargetResource: targetResource})
 	return DisruptionCost{
-		AffectedPodGroups: a.AffectedPGs,
-		MovedGPU:          a.MovedGPU,
-		MovedPods:         a.MovedPods,
+		AffectedPodGroups: moveAggregate.AffectedPodGroups,
+		MovedResource:     moveAggregate.MovedResource,
+		MovedPods:         moveAggregate.MovedPods,
 	}
 }

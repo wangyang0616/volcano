@@ -58,13 +58,13 @@ type Options struct {
 
 // Controller reconciles RepackRun objects.
 type Controller struct {
-	client vcclientset.Interface
-	lister repacklisters.RepackRunLister
-	synced cache.InformerSynced
-	queue  workqueue.TypedRateLimitingInterface[string]
+	volcanoClient           vcclientset.Interface
+	repackRunLister         repacklisters.RepackRunLister
+	repackRunInformerSynced cache.InformerSynced
+	workQueue               workqueue.TypedRateLimitingInterface[string]
 
-	factory vcinformers.SharedInformerFactory
-	opts    Options
+	informerFactory vcinformers.SharedInformerFactory
+	options         Options
 	// executeCooldown is the GC retention floor for finished Execute runs.
 	executeCooldown time.Duration
 	// now is injectable for tests; defaults to time.Now.
@@ -73,23 +73,23 @@ type Controller struct {
 
 // New builds a Controller wired to the given clientset and shared informer
 // factory. The caller owns starting the factory and the lifecycle context.
-func New(client vcclientset.Interface, factory vcinformers.SharedInformerFactory, opts Options) *Controller {
-	if opts.Workers < 1 {
-		opts.Workers = 1
+func New(volcanoClient vcclientset.Interface, informerFactory vcinformers.SharedInformerFactory, options Options) *Controller {
+	if options.Workers < 1 {
+		options.Workers = 1
 	}
-	if opts.ExecuteCooldown <= 0 {
-		opts.ExecuteCooldown = state.DefaultExecuteCooldown
+	if options.ExecuteCooldown <= 0 {
+		options.ExecuteCooldown = state.DefaultExecuteCooldown
 	}
-	informer := factory.Repack().V1alpha1().RepackRuns()
+	informer := informerFactory.Repack().V1alpha1().RepackRuns()
 	c := &Controller{
-		client:          client,
-		lister:          informer.Lister(),
-		synced:          informer.Informer().HasSynced,
-		queue:           workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		factory:         factory,
-		opts:            opts,
-		executeCooldown: opts.ExecuteCooldown,
-		now:             time.Now,
+		volcanoClient:           volcanoClient,
+		repackRunLister:         informer.Lister(),
+		repackRunInformerSynced: informer.Informer().HasSynced,
+		workQueue:               workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		informerFactory:         informerFactory,
+		options:                 options,
+		executeCooldown:         options.ExecuteCooldown,
+		now:                     time.Now,
 	}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.enqueue,
@@ -106,22 +106,22 @@ func (c *Controller) enqueue(obj interface{}) {
 		utilruntime.HandleError(fmt.Errorf("repackrun key: %w", err))
 		return
 	}
-	c.queue.Add(key)
+	c.workQueue.Add(key)
 }
 
 // Run starts the factory, waits for cache sync, and launches workers until ctx
 // is cancelled.
 func (c *Controller) Run(ctx context.Context) error {
 	defer utilruntime.HandleCrash()
-	defer c.queue.ShutDown()
+	defer c.workQueue.ShutDown()
 
-	c.factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), c.synced) {
+	c.informerFactory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), c.repackRunInformerSynced) {
 		return fmt.Errorf("repackrun controller: cache failed to sync")
 	}
-	klog.V(3).InfoS("Starting repackrun controller", "workers", c.opts.Workers, "executeCooldown", c.executeCooldown)
+	klog.V(3).InfoS("Starting repackrun controller", "workers", c.options.Workers, "executeCooldown", c.executeCooldown)
 
-	for i := 0; i < c.opts.Workers; i++ {
+	for i := 0; i < c.options.Workers; i++ {
 		go func() {
 			for c.processNext(ctx) {
 			}
@@ -133,18 +133,18 @@ func (c *Controller) Run(ctx context.Context) error {
 }
 
 func (c *Controller) processNext(ctx context.Context) bool {
-	key, shutdown := c.queue.Get()
+	key, shutdown := c.workQueue.Get()
 	if shutdown {
 		return false
 	}
-	defer c.queue.Done(key)
+	defer c.workQueue.Done(key)
 
 	if err := c.reconcile(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("reconcile repackrun %q: %w", key, err))
-		c.queue.AddRateLimited(key)
+		c.workQueue.AddRateLimited(key)
 		return true
 	}
-	c.queue.Forget(key)
+	c.workQueue.Forget(key)
 	return true
 }
 
@@ -153,7 +153,7 @@ func (c *Controller) processNext(ctx context.Context) bool {
 // apiserver; the engine owns all non-terminal lifecycle (phase/conditions); the
 // nomination reconciler (nominate.go) steers replacement pods.
 func (c *Controller) reconcile(ctx context.Context, name string) error {
-	run, err := c.lister.Get(name)
+	run, err := c.repackRunLister.Get(name)
 	if apierrors.IsNotFound(err) {
 		return nil // deleted; nothing to do
 	}
@@ -171,17 +171,17 @@ func (c *Controller) reconcile(ctx context.Context, name string) error {
 	if state.CooldownRetained(run, c.executeCooldown, now) {
 		if d := state.CooldownRemaining(run, c.executeCooldown, now); d > 0 {
 			klog.V(4).InfoS("GC: retaining finished Execute run as cooldown anchor", "name", name, "retainFor", d)
-			c.queue.AddAfter(name, d) // revisit right when the window lifts
+			c.workQueue.AddAfter(name, d) // revisit right when the window lifts
 		}
 		return nil
 	}
 	if state.TTLExpired(run, now) {
 		klog.V(3).InfoS("GC: deleting expired RepackRun", "name", name, "phase", run.Status.Phase)
-		return ignoreNotFound(c.client.RepackV1alpha1().RepackRuns().Delete(ctx, name, metav1.DeleteOptions{}))
+		return ignoreNotFound(c.volcanoClient.RepackV1alpha1().RepackRuns().Delete(ctx, name, metav1.DeleteOptions{}))
 	}
 	if d := ttlRemaining(run, now); d > 0 {
 		klog.V(5).InfoS("GC: run not yet expired, requeueing at TTL", "name", name, "ttlRemaining", d)
-		c.queue.AddAfter(name, d)
+		c.workQueue.AddAfter(name, d)
 	}
 	return nil
 }

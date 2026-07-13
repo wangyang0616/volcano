@@ -52,7 +52,7 @@ func (*drainCore) Name() string { return framework.CoreDrain }
 
 // Plan runs the incremental, gang-aware drain over the session's freeable units.
 func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
-	res := ssn.Resource()
+	targetResource := ssn.Resource()
 	nodes := ssn.Nodes()
 	movable := ssn.Movable()
 	units := ssn.FreeableUnits()
@@ -66,14 +66,15 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 		}
 	}
 
-	before := api.MeasureResource(nodes, res)
-	klog.V(4).InfoS("repack drain: starting pass", "resource", res,
+	before := api.MeasureResourceFragmentation(nodes, targetResource)
+	klog.V(4).InfoS("repack drain: starting pass", "resource", targetResource,
 		"nodes", len(nodes), "freeableUnits", len(units),
-		"occupiedNodes", before.B, "optimalNodes", before.A, "providingNodes", before.M)
+		"occupiedNodes", before.OccupiedNodeCount, "optimalNodes", before.OptimalOccupiedNodeCount,
+		"providingNodes", before.ProvidingNodeCount)
 
-	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, res)
+	plan := drainGreedy(nodes, nodesByName, units, ssn, movable, targetResource)
 	if plan == nil {
-		klog.V(4).InfoS("repack drain: no plan — nothing could be freed", "resource", res)
+		klog.V(4).InfoS("repack drain: no plan — nothing could be freed", "resource", targetResource)
 		return nil, false
 	}
 	plan.Before = before
@@ -82,11 +83,11 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 	// disruptionPolicy.maxDisruptionScore, added later). A rejected plan = NoRepackNeeded.
 	if !ssn.PlanAdmissible(plan) {
 		klog.V(3).InfoS("repack drain: plan rejected by benefit gate (below MinNodesFreed / MinFragImprovement)",
-			"resource", res, "freedNodes", len(plan.FreedNodes), "moves", len(plan.Moves))
+			"resource", targetResource, "freedNodes", len(plan.FreedNodes), "moves", len(plan.Moves))
 		return nil, false
 	}
-	plan.Cost = api.CostOf(plan.Moves, res)
-	klog.V(3).InfoS("repack drain: plan accepted", "resource", res,
+	plan.Cost = api.CalculateDisruptionCost(plan.Moves, targetResource)
+	klog.V(3).InfoS("repack drain: plan accepted", "resource", targetResource,
 		"freedNodes", plan.FreedNodes, "moves", len(plan.Moves))
 	return plan, true
 }
@@ -94,11 +95,11 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 // candidate is one unit that can be vacated this step, with the moves that vacate
 // it and the disruption-budget deltas those moves imply.
 type candidate struct {
-	unit         api.FreeableUnit
-	placed       []*api.Move
-	newPodGroups map[schedapi.JobID]bool
-	newCards     int64
-	key          string
+	unit               api.FreeableUnit
+	placed             []*api.Move
+	newPodGroups       map[schedapi.JobID]bool
+	additionalResource int64
+	key                string
 }
 
 // drainState is the running state of one drain pass. Feasibility (which victims
@@ -107,16 +108,16 @@ type candidate struct {
 // and the disruption budget.
 type drainState struct {
 	// Fixed for the whole pass.
-	ssn          *framework.Session
-	snapshot     framework.Snapshot
-	nodes        []*schedapi.NodeInfo
-	nodesByName  map[string]*schedapi.NodeInfo
-	movable      api.Movable
-	resource     v1.ResourceName
-	maxPodGroups int
-	maxResource  int64
-	limitPG      bool
-	limitRes     bool
+	ssn              *framework.Session
+	snapshot         framework.Snapshot
+	nodes            []*schedapi.NodeInfo
+	nodesByName      map[string]*schedapi.NodeInfo
+	movable          api.Movable
+	resource         v1.ResourceName
+	maxPodGroups     int
+	maxResource      int64
+	hasPodGroupLimit bool
+	hasResourceLimit bool
 
 	// Mutated as units are committed.
 	drained        map[string]bool // emptied — no longer a receiver
@@ -124,7 +125,7 @@ type drainState struct {
 	provenStuck    map[string]bool // proven un-vacatable this pass → prefer as receiver
 	stuckUnits     map[string]bool // monotonic infeasibility cache; never re-simulate
 	movedPodGroups map[schedapi.JobID]bool
-	movedCards     int64
+	movedResource  int64
 	moves          []*api.Move
 	freedNodes     []string
 	freedUnits     []api.FreeableUnit
@@ -140,9 +141,9 @@ func drainGreedy(
 	units []api.FreeableUnit,
 	ssn *framework.Session,
 	movable api.Movable,
-	res v1.ResourceName,
+	targetResource v1.ResourceName,
 ) *api.RepackPlan {
-	s := newDrainState(nodes, nodesByName, ssn, movable, res)
+	s := newDrainState(nodes, nodesByName, ssn, movable, targetResource)
 	for step := 1; ; step++ {
 		// 1. Evaluate every still-freeable unit against the committed moves so far.
 		var feasible []candidate
@@ -159,7 +160,7 @@ func drainGreedy(
 		// 2. Pick the least-disruptive one and 3. commit it.
 		chosen := s.chooseLeastDisruptive(feasible)
 		klog.V(4).InfoS("repack drain: committing unit", "step", step, "unit", chosen.key,
-			"freesNodes", chosen.unit.Nodes, "moves", len(chosen.placed), "cards", chosen.newCards)
+			"freesNodes", chosen.unit.Nodes, "moves", len(chosen.placed), "movedResource", chosen.additionalResource)
 		s.commit(chosen)
 	}
 	// 4. A pass that freed nothing yields no plan.
@@ -172,24 +173,24 @@ func newDrainState(
 	nodesByName map[string]*schedapi.NodeInfo,
 	ssn *framework.Session,
 	movable api.Movable,
-	res v1.ResourceName,
+	targetResource v1.ResourceName,
 ) *drainState {
 	return &drainState{
-		ssn:            ssn,
-		snapshot:       ssn.Snapshot(),
-		nodes:          nodes,
-		nodesByName:    nodesByName,
-		movable:        movable,
-		resource:       res,
-		maxPodGroups:   ssn.MaxPodGroups(),
-		maxResource:    ssn.MaxResource(),
-		limitPG:        ssn.LimitPodGroups(),
-		limitRes:       ssn.LimitResource(),
-		drained:        make(map[string]bool),
-		filled:         make(map[string]bool),
-		provenStuck:    make(map[string]bool),
-		stuckUnits:     make(map[string]bool),
-		movedPodGroups: make(map[schedapi.JobID]bool),
+		ssn:              ssn,
+		snapshot:         ssn.Snapshot(),
+		nodes:            nodes,
+		nodesByName:      nodesByName,
+		movable:          movable,
+		resource:         targetResource,
+		maxPodGroups:     ssn.MaxPodGroups(),
+		maxResource:      ssn.MaxResource(),
+		hasPodGroupLimit: ssn.LimitPodGroups(),
+		hasResourceLimit: ssn.LimitResource(),
+		drained:          make(map[string]bool),
+		filled:           make(map[string]bool),
+		provenStuck:      make(map[string]bool),
+		stuckUnits:       make(map[string]bool),
+		movedPodGroups:   make(map[schedapi.JobID]bool),
 	}
 }
 
@@ -249,21 +250,21 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	}
 	// Disruption budget (maxPerRun): prospective deltas.
 	newPodGroups := make(map[schedapi.JobID]bool)
-	var newCards int64
+	var additionalResource int64
 	for _, v := range victims {
 		if !s.movedPodGroups[v.Job] {
 			newPodGroups[v.Job] = true
 		}
-		newCards += api.Scalar(v.InitResreq, s.resource)
+		additionalResource += api.Scalar(v.InitResreq, s.resource)
 	}
-	if (s.limitPG || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
+	if (s.hasPodGroupLimit || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.podGroups", "unit", key,
 			"wouldBe", len(s.movedPodGroups)+len(newPodGroups), "max", s.maxPodGroups)
 		return candidate{}, false
 	}
-	if (s.limitRes || s.maxResource > 0) && s.movedCards+newCards > s.maxResource {
+	if (s.hasResourceLimit || s.maxResource > 0) && s.movedResource+additionalResource > s.maxResource {
 		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.resources", "unit", key,
-			"wouldBe", s.movedCards+newCards, "max", s.maxResource)
+			"wouldBe", s.movedResource+additionalResource, "max", s.maxResource)
 		return candidate{}, false
 	}
 	if klog.V(5).Enabled() {
@@ -272,8 +273,8 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 				"pod", m.Task.Name, "from", m.From, "to", m.To)
 		}
 	}
-	klog.V(5).InfoS("repack drain: unit FEASIBLE", "unit", key, "moves", len(placed), "cards", newCards)
-	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, newCards: newCards, key: key}, true
+	klog.V(5).InfoS("repack drain: unit FEASIBLE", "unit", key, "moves", len(placed), "movedResource", additionalResource)
+	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, additionalResource: additionalResource, key: key}, true
 }
 
 // receiversInPreferenceOrder returns the nodes that may receive relocated pods, in
@@ -307,12 +308,12 @@ func (s *drainState) receiversInPreferenceOrder(inUnit map[string]bool) []*sched
 // receiverSlack is the target-resource free capacity used to best-fit sort receivers.
 // Prefer FutureIdle (scheduler cache); fall back to Allocatable−Used for test nodes
 // that only set Used/Allocatable without initializing Idle.
-func receiverSlack(n *schedapi.NodeInfo, res v1.ResourceName) int64 {
+func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
 	if n == nil {
 		return 0
 	}
 	if n.Idle != nil {
-		return api.Scalar(n.FutureIdle(), res)
+		return api.Scalar(n.FutureIdle(), targetResource)
 	}
 	if n.Allocatable == nil {
 		return 0
@@ -321,7 +322,7 @@ func receiverSlack(n *schedapi.NodeInfo, res v1.ResourceName) int64 {
 	if n.Used != nil {
 		free.SubWithoutAssert(n.Used)
 	}
-	return api.Scalar(free, res)
+	return api.Scalar(free, targetResource)
 }
 
 // staying reports whether a node will remain occupied regardless of this pass — so
@@ -361,7 +362,7 @@ func (s *drainState) commit(chosen candidate) {
 	for pg := range chosen.newPodGroups {
 		s.movedPodGroups[pg] = true
 	}
-	s.movedCards += chosen.newCards
+	s.movedResource += chosen.additionalResource
 	for _, nodeName := range chosen.unit.Nodes {
 		s.drained[nodeName] = true
 		s.freedNodes = append(s.freedNodes, nodeName)
@@ -381,11 +382,11 @@ func (s *drainState) plan() *api.RepackPlan {
 // freeableNow reports whether every node of the unit can still be a drain target
 // (present, not already drained, not a receiver/filled, and freeable), returning
 // the unit's node set.
-func freeableNow(unit api.FreeableUnit, nodesByName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable, res v1.ResourceName) (map[string]bool, bool) {
+func freeableNow(unit api.FreeableUnit, nodesByName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable, targetResource v1.ResourceName) (map[string]bool, bool) {
 	inUnit := make(map[string]bool, len(unit.Nodes))
 	for _, nodeName := range unit.Nodes {
 		n := nodesByName[nodeName]
-		if n == nil || drained[nodeName] || filled[nodeName] || !api.NodeFreeable(n, movable, res) {
+		if n == nil || drained[nodeName] || filled[nodeName] || !api.NodeFreeable(n, movable, targetResource) {
 			return nil, false
 		}
 		inUnit[nodeName] = true
@@ -394,14 +395,14 @@ func freeableNow(unit api.FreeableUnit, nodesByName map[string]*schedapi.NodeInf
 }
 
 // occupiesAccelerator reports whether the node uses any of the target accelerator
-// resource — the SAME criterion MeasureResource uses to count a node as occupied
+// resource — the SAME criterion MeasureResourceFragmentation uses to count a node as occupied
 // (B), so "the drain treats this node as empty" ⟺ "the fragmentation metric does
 // not count it". A node with only CPU/memory pods is empty for defrag: its
 // accelerator capacity is idle, so filling it just lights up a fresh accelerator
 // node (net-zero), and freeing it is not a consolidation. Everything (empty/full/
 // fragmentation) is judged by the resource being defragmented (goals[0].resource).
-func occupiesAccelerator(n *schedapi.NodeInfo, res v1.ResourceName) bool {
-	return n != nil && n.Used != nil && api.Scalar(n.Used, res) > 0
+func occupiesAccelerator(n *schedapi.NodeInfo, targetResource v1.ResourceName) bool {
+	return n != nil && n.Used != nil && api.Scalar(n.Used, targetResource) > 0
 }
 
 // unitKey is a deterministic identifier for a unit (sorted member node names).

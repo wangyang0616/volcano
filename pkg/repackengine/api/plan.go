@@ -38,11 +38,11 @@ type FreeableUnit struct {
 // RepackPlan is the outcome of one core search pass — the algorithm-agnostic plan
 // every core (drain, concentration, ...) returns.
 type RepackPlan struct {
-	Moves      []*Move        // every gang relocation (from -> to)
-	FreedNodes []string       // nodes fully vacated by this plan
-	FreedUnits []FreeableUnit // freeable units fully realized (node and/or hypernode)
-	Before     ResourceFrag   // fragmentation measured before the plan
-	Cost       DisruptionCost // disruption summary of Moves
+	Moves      []*Move               // every gang relocation (from -> to)
+	FreedNodes []string              // nodes fully vacated by this plan
+	FreedUnits []FreeableUnit        // freeable units fully realized (node and/or hypernode)
+	Before     ResourceFragmentation // fragmentation measured before the plan
+	Cost       DisruptionCost        // disruption summary of Moves
 }
 
 // NodesFreed is the realized node-level benefit (whole nodes emptied).
@@ -65,12 +65,13 @@ func (p *RepackPlan) Benefit() float64 {
 	return b
 }
 
-// FragRateDelta is the change in fragmentation rate: -nodesFreed/M (design §4.12).
-func (p *RepackPlan) FragRateDelta() float64 {
-	if p == nil || p.Before.M == 0 {
+// FragmentationRateDelta is the change in fragmentation rate: freed nodes divided
+// by providing nodes (design §4.12).
+func (p *RepackPlan) FragmentationRateDelta() float64 {
+	if p == nil || p.Before.ProvidingNodeCount == 0 {
 		return 0
 	}
-	return -float64(len(p.FreedNodes)) / float64(p.Before.M)
+	return -float64(len(p.FreedNodes)) / float64(p.Before.ProvidingNodeCount)
 }
 
 // AffectedPodGroups returns the distinct PodGroups touched by this plan, sorted —

@@ -34,15 +34,15 @@ func TestBenefit_FallbackNodeCount(t *testing.T) {
 	}
 }
 
-// FragRateDelta = -nodesFreed / M.
+// FragmentationRateDelta = -nodesFreed / providingNodeCount.
 func TestFragRateDelta(t *testing.T) {
-	p := &RepackPlan{FreedNodes: []string{"n0"}, Before: ResourceFrag{M: 10}}
-	if got := p.FragRateDelta(); got != -0.1 {
+	p := &RepackPlan{FreedNodes: []string{"n0"}, Before: ResourceFragmentation{ProvidingNodeCount: 10}}
+	if got := p.FragmentationRateDelta(); got != -0.1 {
 		t.Errorf("delta=%v, want -0.1", got)
 	}
-	// M=0 must not divide by zero.
-	if got := (&RepackPlan{FreedNodes: []string{"n0"}}).FragRateDelta(); got != 0 {
-		t.Errorf("delta with M=0 = %v, want 0", got)
+	// A zero providing-node count must not divide by zero.
+	if got := (&RepackPlan{FreedNodes: []string{"n0"}}).FragmentationRateDelta(); got != 0 {
+		t.Errorf("delta with zero providing-node count = %v, want 0", got)
 	}
 }
 

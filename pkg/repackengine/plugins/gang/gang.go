@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package gang is the gang-awareness plugin: it registers the gang-semantics
 // disruption scores so the core prefers plans that don't shatter PodGroups —
-// gangBreaches (gangs pushed below minAvailable) and damagedGPU (a breached gang
+// gangBreaches (gangs pushed below minAvailable) and damagedResource (a breached gang
 // counts its WHOLE footprint as lost, capturing "突破 minAvailable 即整组受损").
 package gang
 
@@ -32,8 +32,8 @@ const Name = "gang"
 // below minAvailable (a breach) is weighted above merely churning a breached gang's
 // cards (disruptionPolicy overrides these later).
 const (
-	weightGangBreaches = 0.8
-	weightDamagedGPU   = 0.6
+	weightGangBreaches    = 0.8
+	weightDamagedResource = 0.6
 )
 
 func init() {
@@ -46,7 +46,7 @@ func (*gangPlugin) Name() string { return Name }
 
 func (*gangPlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddDisruptionScoreFn("gangBreaches", weightGangBreaches, scoreGangBreaches)
-	ssn.AddDisruptionScoreFn("damagedGPU", weightDamagedGPU, scoreDamagedGPU)
+	ssn.AddDisruptionScoreFn("damagedResource", weightDamagedResource, scoreDamagedResource)
 }
 
 func (*gangPlugin) OnSessionClose(*framework.Session) {}
@@ -55,8 +55,8 @@ func (*gangPlugin) OnSessionClose(*framework.Session) {}
 // the gang's slack = Running − MinAvailable), risking gang eviction mid-repack.
 func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 	var breachedGangs int64
-	for podGroupID, moved := range p.Aggregate(ctx).ByPG {
-		view := ctx.View(podGroupID)
+	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
+		view := ctx.PodGroupView(podGroupID)
 		slack := int64(view.Running) - int64(view.MinAvailable)
 		if slack < 0 {
 			slack = 0
@@ -68,22 +68,22 @@ func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 	return float64(breachedGangs)
 }
 
-// scoreDamagedGPU: gang-semantics "damaged cards". Within slack → only the moved
+// scoreDamagedResource: gang-semantics "damaged resource". Within slack → only the moved
 // cards count; breaching minAvailable → the whole gang Footprint counts (and
 // further pods of an already-breached gang add nothing).
-func scoreDamagedGPU(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-	var damagedCards int64
-	for podGroupID, moved := range p.Aggregate(ctx).ByPG {
-		view := ctx.View(podGroupID)
+func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+	var damagedResource int64
+	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
+		view := ctx.PodGroupView(podGroupID)
 		slack := int64(view.Running) - int64(view.MinAvailable)
 		if slack < 0 {
 			slack = 0
 		}
 		if moved.MovedPods > slack {
-			damagedCards += view.Footprint
+			damagedResource += view.Footprint
 		} else {
-			damagedCards += moved.MovedGPU
+			damagedResource += moved.MovedResource
 		}
 	}
-	return float64(damagedCards)
+	return float64(damagedResource)
 }

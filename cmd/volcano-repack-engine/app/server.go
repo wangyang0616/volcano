@@ -81,7 +81,7 @@ func Run(opt *options.ServerOption) error {
 
 	engine, err := repackengine.NewEngine(config, repackengine.Config{
 		SchedulerConf:   opt.SchedulerConf,
-		ResyncPeriod:    opt.SchedulePeriod,
+		ResyncPeriod:    opt.ResyncPeriod,
 		Cooldown:        opt.Cooldown,
 		Core:            opt.Algorithm,
 		Actions:         opt.Actions,
