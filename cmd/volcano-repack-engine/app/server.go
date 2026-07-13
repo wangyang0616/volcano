@@ -52,6 +52,15 @@ func Run(opt *options.ServerOption) error {
 		return err
 	}
 
+	// Reuse the scheduler cache against clusters of different Kubernetes
+	// versions. Its feature-gated informers (notably DRA) must match the API
+	// server before the cache is constructed, otherwise an older cluster can
+	// never complete cache sync for resources it does not serve.
+	if err := commonutil.SetupComponentGlobals(config); err != nil {
+		klog.Errorf("failed to set component globals: %v", err)
+		return err
+	}
+
 	// k8s scheduler framework plugins (interpodaffinity PreFilter, etc.) use
 	// k8smetrics.Goroutines via Parallelizer.Until; init before opening sessions.
 	schedmetrics.InitKubeSchedulerRelatedMetrics()
