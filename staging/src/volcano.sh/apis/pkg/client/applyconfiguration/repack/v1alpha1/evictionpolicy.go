@@ -21,7 +21,7 @@ package v1alpha1
 // with apply.
 //
 // EvictionPolicy configures the execution behavior of Kubernetes Eviction API
-// requests. Selection and scoring remain in DisruptionPolicy; this type owns
+// requests. Selection and scoring remain internal to the engine; this type owns
 // only the mechanics of submitting an accepted move.
 type EvictionPolicyApplyConfiguration struct {
 	// GracePeriodSeconds overrides the graceful-termination period requested for

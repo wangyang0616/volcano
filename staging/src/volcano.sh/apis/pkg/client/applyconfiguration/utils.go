@@ -163,10 +163,6 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationnodeinfov1alpha1.ResourceInfoApplyConfiguration{}
 
 		// Group=repack.volcano.sh, Version=v1alpha1
-	case repackv1alpha1.SchemeGroupVersion.WithKind("DisruptionHardFloors"):
-		return &applyconfigurationrepackv1alpha1.DisruptionHardFloorsApplyConfiguration{}
-	case repackv1alpha1.SchemeGroupVersion.WithKind("DisruptionPolicy"):
-		return &applyconfigurationrepackv1alpha1.DisruptionPolicyApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("EvictionPolicy"):
 		return &applyconfigurationrepackv1alpha1.EvictionPolicyApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("MaxPerRun"):
@@ -175,16 +171,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationrepackv1alpha1.PodMoveApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("PodNomination"):
 		return &applyconfigurationrepackv1alpha1.PodNominationApplyConfiguration{}
-	case repackv1alpha1.SchemeGroupVersion.WithKind("RelievedPodGroup"):
-		return &applyconfigurationrepackv1alpha1.RelievedPodGroupApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackGoal"):
 		return &applyconfigurationrepackv1alpha1.RepackGoalApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackMove"):
 		return &applyconfigurationrepackv1alpha1.RepackMoveApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackPlan"):
 		return &applyconfigurationrepackv1alpha1.RepackPlanApplyConfiguration{}
-	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRelief"):
-		return &applyconfigurationrepackv1alpha1.RepackReliefApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRun"):
 		return &applyconfigurationrepackv1alpha1.RepackRunApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRunSpec"):

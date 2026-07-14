@@ -74,7 +74,7 @@ Volcano 已有基于 [kubernetes-sigs/descheduler](https://github.com/kubernetes
 
 #### 故事 → RepackRun / RepackPolicy 映射
 
-两个 CRD 分工：**`RepackRun`** 是"一次性工单"（人手动发起，或由 Policy 自动创建）；**`RepackPolicy`** 只做"**按触发条件生成 RepackRun**"（内嵌 RepackRun 模板，CronJob→Job 式；**不做集群级护栏**——那是治理，另议）。下表把上面每条故事落到具体载体与字段，字段名均与最终 CRD 一致（完整多路径示例见 §5.5 RepackRun、§5.6 RepackPolicy/relief/disruptionPolicy）。
+两个 CRD 分工：**`RepackRun`** 是"一次性工单"（人手动发起，或由 Policy 自动创建）；**`RepackPolicy`** 只做"**按触发条件生成 RepackRun**"（内嵌 RepackRun 模板，CronJob→Job 式；**不做集群级护栏**——那是治理，另议）。P0 只以当前 CRD 为准；relief 与可配扰动策略留待 P1 重新讨论，当前不声明字段。
 
 | 故事（能力） | 载体 | 关键字段（与最终 CRD 一致） | 阶段 |
 |---|---|---|---|
@@ -91,9 +91,9 @@ Volcano 已有基于 [kubernetes-sigs/descheduler](https://github.com/kubernetes
 | 生成 Run（模板） | RepackPolicy | `runTemplate.spec`（其 `mode` 决定 DryRun/Execute）；串行由引擎 K=1+冷静期兜底 | P1 |
 | 排除受保护对象（单次） | RepackRun | `scope.podGroups.exclude`（按保护标签） | P0 |
 | 拓扑整域腾空 | RepackRun | 拓扑目标画像插件（NVLink/超节点） | P1 |
-| 解救排队 gang | RepackRun | `relief.podGroupRefs` / `relief.minRelieved` | P1 |
+| 解救排队 gang | 待 P1 设计 | API 与语义均未定稿 | P1 |
 | 驱逐执行参数 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `eviction.gracePeriodSeconds` | P0 |
-| 可配扰动策略 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `disruptionPolicy.minRunDuration` / `.maxDisruptionScore`；PDB 预检与阻塞策略后续放在 `eviction.pdb` | P1 |
+| 可配扰动策略 | 待 P1 设计 | API 与语义均未定稿；PDB 扩展一并讨论 | P1 |
 | 集群级默认 + 硬护栏 / 跨 Run 强制保护 | 治理机制（另议） | CEL `ValidatingAdmissionPolicy` 或后续单开 CRD，**不在 RepackPolicy 内** | 待定 |
 
 **示例 1 · 集群管理员：一键腾空 a100 节点池（P0，RepackRun）** — 对应故事"一键腾整机 / 统一标签圈定 / 限定节点排除保护 / 控爆炸半径 / 自动清理"
@@ -183,9 +183,6 @@ spec:
           nvidia.com/gpu: 64
       eviction:                     # P0：本次 Eviction 请求的执行参数
         gracePeriodSeconds: 30      # 可选：不填则使用 Pod.spec.terminationGracePeriodSeconds
-      disruptionPolicy:             # P1 扰动策略
-        minRunDuration: 30m
-        maxDisruptionScore: 80
 ```
 
 ## 3. 目标（Goals）
@@ -207,7 +204,7 @@ spec:
 **按整理语义与质量**
 
 - 支持 **Gang 感知的碎片整理**：以 PodGroup（gang）为动作与代价单位，按 gang 语义计"受损卡数"（**P0**）
-- 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；`eviction.gracePeriodSeconds` 可覆盖本次驱逐的优雅终止等待；可配 `disruptionPolicy`（`minRunDuration` / `maxDisruptionScore` / 权重）（**P1**）
+- 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；`eviction.gracePeriodSeconds` 可覆盖本次驱逐的优雅终止等待；可配置扰动策略留待 **P1** 讨论 API 与语义。
 - 支持**规划时可行性预检（尽力、非预留）**：驱逐前模拟"被驱逐 Pod 都有处可落"（INV-RESCHED），不过则不驱逐（**P0**）
 - 支持**落点引导**：驱逐后用 `pod.status.nominatedNodeName` 把重建 Pod 引导到目标节点；空间不保留、交还排队队列（**P0**）
 - 支持**复用调度器判断**：与 `volcano-scheduler` 同一份插件配置、同一 `framework`/`predicate`，判断同源、同演进（**P0**）
@@ -281,8 +278,6 @@ flowchart LR
 | `maxPerRun.podGroups` / `.resources` | 单轮最多动几个作业 / 几张卡 | 可选 | P0 |
 | `eviction.gracePeriodSeconds` | 本次 Eviction 请求的优雅终止等待秒数；不填沿用各 Pod 的 `terminationGracePeriodSeconds`，`0` 请求立即终止 | 可选，仅 Execute 生效 | P0 |
 | `ttlSecondsAfterFinished` | 终态后自动清理（对齐 Job，由控制器执行） | 可选 | P0 |
-| `relief` | 指定要"解救"的排队作业（反向整理出落点） | 可选 | **P1** |
-| `disruptionPolicy` | 扰动策略：搬迁单元 / 最小运行时长 / 中断分红线 / 权重 | 可选 | **P1** |
 
 #### Eviction 与 PDB 的职责边界
 
@@ -294,24 +289,8 @@ Pod 自己的 `spec.terminationGracePeriodSeconds`；显式 `0` 表示请求立�
 
 PDB 与优雅终止同属 Eviction API 的执行面，但解决的是不同问题：前者决定当前是否允许
 中断，后者决定已获准中断后可保留多久。每一次实际驱逐都必须使用 Kubernetes Eviction API，
-因此**始终受 PDB 约束，不能提供绕过 PDB 的开关**。现有
-`disruptionPolicy.respectPDB` 仅是未实现的 v1alpha1 兼容占位，不应据此推断可关闭 PDB。
-
-PDB 的后续 API 固定在 `eviction.pdb`，待完整行为确定后再暴露，而不是提前提供空字段：
-
-```yaml
-spec:
-  eviction:
-    gracePeriodSeconds: 30
-    pdb:                         # P1，尚未进入 CRD
-      preflight: Require          # None | Require：是否在规划阶段排除无 budget 的 victim
-      onBlocked: Retry            # Continue | Fail | Retry：Eviction 被 PDB 拒绝后的行为
-      retryTimeoutSeconds: 300    # 仅 Retry 时有效
-```
-
-`preflight` 只能减少“规划成功、提交时被 PDB 拒绝”的概率，因为 PDB 状态可在两者之间变化；
-最终 Eviction API 仍是唯一权威。默认行为保持当前开环语义：不做 PDB 预检，逐个尝试
-Eviction，继续其他 move；全部被拒绝时 Run 以 `ExecuteFailed` 结束。
+因此**始终受 PDB 约束，不能提供绕过 PDB 的开关**。PDB 预检和被阻塞后的处理属于未来
+P1 的整体扰动/执行策略设计；在行为和 API 一并定稿前，P0 不提供任何相关字段。
 
 > **万物皆 PodGroup：工作负载选择统一到 PodGroup 维度**
 > repack 的动作/代价单位是 PodGroup（gang），因此**选择也统一表达在 PodGroup 上**：`selector`（PG 标签）与 `names`（PG 的 `ns/name`）指向同一种对象，语义自洽。这对三类负载一视同仁——Volcano 原生（vcjob）、K8s 原生（Deployment/StatefulSet…）、用户自定义 CRD。
@@ -325,7 +304,7 @@ Eviction，继续其他 move；全部被拒绝时 Run 以 `ExecuteFailed` 结束
 **status 核心字段**
 
 - `phase`：`Pending` / `Running` / `Succeeded` / `Failed` / `Cancelled`（由 `conditions` 派生，`conditions` 为权威）。
-- `plan`（**DryRun 与 Execute 同一字段、同一结构**）：整理计划的三层渐进披露——一句话 `message` + 扁平 `summary`（碎片率前后、腾出节点数、搬走卡数）+ 明细 `moves[]`（**每个 PodGroup 一条**，`namespace` 提升到条顶层共享，除精确 `podGroupName` 外并列 `owner` 用户可见工作负载引用——PodGroup 是内部对象，用户按 Deployment/vcjob/StatefulSet 认领；条内 `pods[]` 给**逐 pod** 的 `fromNode → toNode` 计划落点，因一个 gang 的 pod 可散落多源节点、迁往多目标节点，**DryRun 也能看到每个 pod 迁往哪个节点**；`pods[]` 只列被迁移的 pod，没搬的不出现）+ `freedNodes[]`（计划腾空的节点名列表）。`moves` 是**纯计划**、DryRun 与 Execute 同构；Execute 的实际落点/绑定情况交由 `nominations[].phase` + 聚合 `summary`（`freedNodeCount`/`fragAfterPercent`）表达，不在 `pods[]` 逐 pod 记漂移（结果导向：漂移不纠正、成败看聚合腾空与 relief）。
+- `plan`（**DryRun 与 Execute 同一字段、同一结构**）：整理计划的三层渐进披露——一句话 `message` + 扁平 `summary`（碎片率前后、腾出节点数、搬走卡数）+ 明细 `moves[]`（**每个 PodGroup 一条**，`namespace` 提升到条顶层共享，除精确 `podGroupName` 外并列 `owner` 用户可见工作负载引用——PodGroup 是内部对象，用户按 Deployment/vcjob/StatefulSet 认领；条内 `pods[]` 给**逐 pod** 的 `fromNode → toNode` 计划落点，因一个 gang 的 pod 可散落多源节点、迁往多目标节点，**DryRun 也能看到每个 pod 迁往哪个节点**；`pods[]` 只列被迁移的 pod，没搬的不出现）+ `freedNodes[]`（计划腾空的节点名列表）。`moves` 是**纯计划**、DryRun 与 Execute 同构；Execute 的实际落点/绑定情况交由 `nominations[].phase` + 聚合 `summary`（`freedNodeCount`/`fragAfterPercent`）表达，不在 `pods[]` 逐 pod 记漂移。
 - `nominations`（**Execute 独有**）：durable 落点提名意图，交控制器的提名 reconciler 消费（引导重建 pod 落到 `toNode`）。
 
 **RepackRun 结构体定义（Go，与 `types.go` 一致）**
@@ -346,8 +325,6 @@ type RepackRunSpec struct {
     MaxPerRun               *MaxPerRun        `json:"maxPerRun,omitempty"`               // 单轮规模封顶
     Eviction                *EvictionPolicy   `json:"eviction,omitempty"`                // Execute 的 Eviction 请求参数
     TTLSecondsAfterFinished *int64            `json:"ttlSecondsAfterFinished,omitempty"` // 终态后自动删
-    Relief                  *RepackRelief     `json:"relief,omitempty"`                  // P1：解救式整理
-    DisruptionPolicy        *DisruptionPolicy `json:"disruptionPolicy,omitempty"`        // P1：可配扰动策略
 }
 
 // scope：万物皆 PodGroup，两轴（podGroups / nodes）同构
@@ -407,7 +384,6 @@ type RepackPlan struct {
     Summary    *RepackSummary     `json:"summary,omitempty"`    // 扁平看板层
     Moves      []RepackMove       `json:"moves,omitempty"`      // 每段搬迁：带 fromNode→toNode 计划落点
     FreedNodes []string           `json:"freedNodes,omitempty"` // 计划腾空的节点名（Execute 实际腾空数见 summary.freedNodeCount）
-    Relief     []RelievedPodGroup `json:"relief,omitempty"`     // P1：会被解救的排队 gang
 }
 // RepackMove：一个 PodGroup 的迁移信息。fromNode/toNode 本质逐 pod（一个 gang 的 pod
 // 可散落多源节点、迁往多目标节点），故内含 pods[] 明细，PodGroup 级只留身份与合计。
@@ -420,7 +396,7 @@ type RepackMove struct {
 }
 // PodMove：单个 pod 的迁移（纯计划：pods[] 只列被迁移的 pod，没搬的不出现）。
 // DryRun 与 Execute 同构；Execute 的实际落点/绑定交由 nominations[].phase + summary 表达，
-// 不在此逐 pod 记 outcome/actualNode（结果导向：漂移不纠正、成败看聚合腾空与 relief）。
+// 不在此逐 pod 记 outcome/actualNode（结果导向：漂移不纠正、成败看聚合腾空）。
 type PodMove struct {
     Name     string `json:"name,omitempty"`     // pod 名（确定性命名精确对应；随机名为计划时快照）
     FromNode string `json:"fromNode,omitempty"` // 该 pod 当前节点
@@ -452,20 +428,13 @@ type RepackSummary struct { // 扁平看板层（列表/告警读它）——纯
 // 已精简（对齐评审）：moves 删 role/moveKind/disruptionScore/outcome/actualNode（可读性/常量/
 // 内部打分/漂移不纠正；身份匹配的 role 只留在 nominations[]，Execute 落点看 nominations[].phase）；
 // 逐 pod 明细收进 pods[]PodMove（纯计划）；freedNodes 由 []FreedNode 塌缩为 []string
-// （actuallyFreed 可由 summary.freedNodeCount + nominations 表达，且「保持空」并非成功判据、成功判据是 relief）；
+// （actuallyFreed 可由 summary.freedNodeCount + nominations 表达，且「保持空」并非成功判据）；
 // summary 删 verdict（→ conditions.reason）/fragDeltaPercent（=before−after 派生）/
-// podGroupsToMove（=distinct moves 派生）/pendingRelieved（=len(relief)，且 relief 本身 P1）。
+// podGroupsToMove（=distinct moves 派生）。
 type ResolvedScope struct {
     PodGroupCount int32 `json:"podGroupCount,omitempty"`
     NodeCount     int32 `json:"nodeCount,omitempty"`
 }
-type RelievedPodGroup struct { // P1
-    Namespace    string `json:"namespace"`
-    PodGroupName string `json:"podGroupName"`
-    Relieved     bool   `json:"relieved,omitempty"`
-}
-// RepackRelief、DisruptionPolicy（均 P1，spec 子结构）完整字段见仓库
-// staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1。
 ```
 
 **status 示例**
@@ -678,22 +647,6 @@ spec:                                         # 必选；创建后整体不可�
   eviction:                                   # 可选：仅 Execute 生效，控制 Eviction 请求
     gracePeriodSeconds: 30                    # 不填=沿用每个 Pod 的 terminationGracePeriodSeconds；0=立即终止
   ttlSecondsAfterFinished: 3600               # 可选：终态后自动回收（秒）；不填=不自动删
-  relief:                                     # 可选（P1）：解救式整理
-    podGroupRefs:                             # 必选（若配 relief）：想让其可调度的 pending PodGroup（"ns/name"）
-      - ml/train-large
-    minRelieved: 1                            # 可选：至少解开几个才值得（默认 1）
-  disruptionPolicy:                           # 可选（P1）：可配扰动策略
-    bundlePolicy: SurplusPodsOnly             # 可选：SurplusPodsOnly | EntireJobPermitted
-    minRunDuration: 30m                       # 可选：运行不足此时长的作业不搬
-    maxDisruptionScore: 80                    # 可选：中断代价红线（超则不选为 victim）
-    lambda: 1                                 # 可选：收益 vs 扰动 总权重（整数，默认 1）
-    weights:                                  # 可选：各扰动项整数权重（键须匹配启用的评分插件）
-      priority: 3
-      movedCards: 1
-      gangBreaches: 5
-    hardFloors:                               # 可选：硬护栏
-      freezePriorityAbove: 100                # 可选：优先级 ≥ 此值的 gang 绝不搬
-      maxMovesPerJob: 4                       # 可选：单个 PodGroup 单轮最多搬几次
 ```
 
 **示例二：`status`（全字段，Execute 终态）** —— 全部由控制器/引擎写，用户只读
@@ -738,10 +691,6 @@ status:
             cards: 4
     freedNodes:                               # 可选：计划腾空的节点名（[]string）
       - node-3
-    relief:                                   # 可选（P1）：会被解救的排队 gang
-      - namespace: ml                         # 必选（relief 项内）
-        podGroupName: train-large             # 必选（relief 项内）
-        relieved: true                        # 可选
   nominations:                                # 可选（Execute 独有）：落点提名意图，reconciler 消费
     - namespace: ml                           # 必选（nomination 内）
       podGroupName: train-a                   # 可选：所属 PodGroup
@@ -1061,39 +1010,16 @@ spec:
 - **反应式条件的评估周期是控制器级配置**：由 RepackPolicy 控制器的启动 flag / 配置文件设定（如 `--repack-policy-eval-interval`，全局一份），与引擎的 `--repack-execute-cooldown` 同属运维调优项，不进 CRD。
 - **对 P0 引擎零改动**：引擎只认 `RepackRun.spec`；RepackPolicy 是纯粹的"Run 生产者"，全部逻辑在 Policy 控制器内。
 
-#### 5.6.2 解救式整理：`relief`
+#### 5.6.2 解救式整理（P1 待设计）
 
-P0 目标是"降碎片/腾空节点"（consolidation-driven）；relief 增加一种目标：**让指定排队 gang 能调度下来**（relief-driven）。
+P0 目标是"降碎片/腾空节点"（consolidation-driven）。以指定排队 gang 可调度为目标的
+解救式整理（relief-driven）留待 P1 讨论：当前不声明字段、状态输出或 YAML 形状。
 
-```yaml
-spec:
-  mode: Execute
-  relief:
-    podGroupRefs:                   # 想解救的 pending gang
-      - ns/train-large
-    minRelieved: 1                  # 至少解开几个才算值得
-```
+#### 5.6.3 后续扰动策略与 PDB
 
-引擎模拟时把"目标排队 gang 的落点"纳入装箱：反向选 victim、腾出该 gang 需要的连续空位，可行才提交。复用 P0 的 INV-RESCHED 与提名（此时目标 gang 的 Pod 是**已存在的 Pending Pod**，可直接提名，比重建 Pod 更干净）。
-
-#### 5.6.3 可配扰动策略与 PDB 兼容：`disruptionPolicy`
-
-P0 用引擎内置默认扰动评分；P1 开放为可配：
-
-```yaml
-spec:
-  disruptionPolicy:
-    bundlePolicy: SurplusPodsOnly    # 只动 gang 盈余 Pod / 或 EntireJobPermitted 整组搬
-    minRunDuration: 30m              # 运行不足此时长的作业不搬
-    maxDisruptionScore: 80           # 中断代价红线
-    lambda: 1                        # 收益 vs 扰动 总权重（整数）
-    weights:                         # 各扰动项整数权重（相对值）
-      damagedGPU: 6
-      priority: 8
-```
-
-- **PDB 兼容**：Execute 选 victim 时叠加 PDB 资格判断（`UnifiedEvictableFn`），绝不把某 PDB 选中的 Pod 集驱逐到低于其 `minAvailable`。
-- 权重/λ 走 `RepackRun.spec.disruptionPolicy`（每次 Run 维度），**不放插件 config**（config 只决定启用哪些评分插件）。
+P0 使用引擎内置扰动评分，并通过 `scope`、`maxPerRun` 和 INV-RESCHED 控制风险。解救
+排队 workload、可配置扰动策略以及 PDB 预检/阻塞处理均留待 P1 统一讨论；当前 CRD 和 Go
+API 不声明字段、类型或 YAML 形状。
 
 #### 5.6.4 AI 拓扑感知整理目标
 
@@ -1105,7 +1031,7 @@ spec:
 
 - **RepackRun** 完整结构体定义（spec + status）见 [§5.2](#52-repackrun-api)。
 - **RepackPolicy** 结构体定义（P1，触发 + 内嵌 RepackRun 模板）见 [§5.6.1](#561-自动触发repackpolicy模板生成cronjobjob-式)。
-- `RepackPlan` / `RepackMove` / `FreedNode` / `RepackSummary` / `RepackRelief` / `DisruptionPolicy` 等完整字段见仓库 `staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1`。
+- `RepackPlan` / `RepackMove` / `RepackSummary` 等完整字段见仓库 `staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1`。
 
 ### 碎片度量（Fragmentation Index）
 
@@ -1220,16 +1146,16 @@ flowchart TD
 - **破组后边际为 0**：阶跃在破组处是**平台**（定值 footprint，与"多搬了几个"无关）——即"破组后这些 pod 搬与不搬影响性无差"。drain core 据此做**增量破组感知贪心**：把"已破组 gang 的 pod"的搬动增量代价记 0，动态优先腾"搭便车"的节点，在同等 gang 损伤下多腾节点（见 §整理算法详解 A）。
 - **封顶**：`maxPerRun.podGroups` / `.resources` 限定单轮规模；长优雅期作业可在挑 victim 时规避。
 
-### 实现分期（设计已全部敲定，仅实现顺序不同）
+### 实现分期
 
-> **方案设计 P0 + P1 一并敲定**（见 §3、§5、§6）。下表是**编码落地顺序**：先实现并验证 P0，再推进 P1。
+> P0 API 与行为已经定稿；P1 项目仅保留能力方向，具体 API 需在后续单独讨论。
 
 | 能力 | 设计 | 实现 |
 |---|---|---|
 | `RepackRun`（DryRun/Execute）、单资源、节点腾空/集中度算法、INV-RESCHED、提名落点、K=1+冷静期、TTL | ✅ 敲定 | **P0** |
 | `RepackPolicy`（自动触发 + 集群级默认/护栏，§5.6.1） | ✅ 敲定 | **P1** |
-| `relief` 解救式整理（§5.6.2） | ✅ 敲定 | **P1** |
-| `disruptionPolicy`（含 PDB 兼容、评分权重，§5.6.3） | ✅ 敲定 | **P1** |
+| 解救式整理（§5.6.2） | API 待定 | **P1** |
+| 可配置扰动策略与 PDB（§5.6.3） | API 待定 | **P1** |
 | AI 拓扑感知整理目标（NVLink/超节点，§5.6.4）、提名 reconciler 软优先 | ✅ 敲定 | **P1** |
 | 跨资源**联合**整理（一个 Run 同时整理多种加速资源、跨资源合成收益） | 🔒 schema 预留 | **P2+** |
 
@@ -1251,7 +1177,7 @@ flowchart TD
 
 ### 未来考虑（Future considerations）
 
-> P1 能力（`RepackPolicy`/`relief`/`disruptionPolicy`/拓扑感知）已在 §5.6 设计敲定，不在此列。本节仅列**尚未设计、待后续**的方向：
+> 解救式整理和可配置扰动策略/PDB 的 API 均待 P1 单独设计，不在当前 CRD 中预留声明。
 
 - **跨资源联合整理**（P2+）：一个 `RepackRun` 同时整理 GPU+NPU 并跨资源合成收益；`goals[]` schema 已预留列表形状，放开 `maxItems` 即可。
 - **提名 reconciler 的调度侧软优先**：窗口内让调度器更偏好被提名 Pod 落到目标节点（不饿死、不预留），作为 P1 提名机制的命中率增强。

@@ -59,63 +59,6 @@ spec:
             description: Spec is immutable once set (one-shot job; recompute by creating
               a new Run).
             properties:
-              disruptionPolicy:
-                description: 'DisruptionPolicy (reserved): how/whether running jobs
-                  may be disturbed.'
-                properties:
-                  bundlePolicy:
-                    description: BundlePolicy controls the unit of relocation for
-                      a gang.
-                    enum:
-                    - SurplusPodsOnly
-                    - EntireJobPermitted
-                    type: string
-                  hardFloors:
-                    description: HardFloors are optional hard guardrails (frozen anchors
-                      / per-job caps).
-                    properties:
-                      freezePriorityAbove:
-                        description: 'FreezePriorityAbove: gangs with priority >=
-                          this never move.'
-                        format: int32
-                        type: integer
-                      maxMovesPerJob:
-                        description: MaxMovesPerJob caps relocations of any single
-                          PodGroup.
-                        format: int32
-                        minimum: 0
-                        type: integer
-                    type: object
-                  lambda:
-                    description: Lambda is the benefit-vs-friction trade-off as an
-                      integer weight (default 1).
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  maxDisruptionScore:
-                    description: MaxDisruptionScore is the disruption-cost red line.
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  minRunDuration:
-                    description: 'MinRunDuration: jobs running less than this are
-                      not moved.'
-                    type: string
-                  respectPDB:
-                    description: |-
-                      RespectPDB is retained as an unimplemented v1alpha1 compatibility field.
-                      Deprecated: Kubernetes Eviction API always respects PDBs; future planning
-                      and blocked-eviction controls live in spec.eviction.pdb.
-                    type: boolean
-                  weights:
-                    additionalProperties:
-                      format: int32
-                      type: integer
-                    description: |-
-                      Weights are per-disruption-term integer weights (relative; keys must match
-                      scoring plugins enabled in config).
-                    type: object
-                type: object
               eviction:
                 description: |-
                   Eviction configures how Execute issues Kubernetes Eviction requests. It is
@@ -187,24 +130,6 @@ spec:
                 - DryRun
                 - Execute
                 type: string
-              relief:
-                description: 'Relief (reserved): pending PodGroups this run aims to
-                  make schedulable.'
-                properties:
-                  minRelieved:
-                    description: 'MinRelieved: at least this many must become schedulable
-                      to be worthwhile.'
-                    format: int32
-                    minimum: 1
-                    type: integer
-                  podGroupRefs:
-                    description: PodGroupRefs are "namespace/name" of pending PodGroups
-                      to relieve.
-                    items:
-                      type: string
-                    maxItems: 256
-                    type: array
-                type: object
               scope:
                 description: Scope bounds which PodGroups may move and which nodes
                   participate.
@@ -707,25 +632,6 @@ spec:
                       - podGroupName
                       type: object
                     maxItems: 4096
-                    type: array
-                  relief:
-                    description: Relief reports which pending PodGroups would be unblocked
-                      (reserved).
-                    items:
-                      description: RelievedPodGroup reports a pending gang that would
-                        become schedulable (reserved).
-                      properties:
-                        namespace:
-                          type: string
-                        podGroupName:
-                          type: string
-                        relieved:
-                          type: boolean
-                      required:
-                      - namespace
-                      - podGroupName
-                      type: object
-                    maxItems: 256
                     type: array
                   summary:
                     description: Summary is the flat, at-a-glance layer (UI lists

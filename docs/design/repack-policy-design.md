@@ -102,18 +102,18 @@ Repack **不等于** gang 抢占：优化目标是 **降低碎片、解开 pendi
 
 > **能力分期（权威，覆盖全文）**：
 >
-> - **P0**：`mode`(DryRun/Execute) · `scope`(podGroups/nodes 两轴 include/exclude) · `goals` **恰一条**(单资源碎片门槛) · `maxPerRun`(规模上限) · `ttlSecondsAfterFinished`；**consolidation-driven**（为腾空节点而整理）；INV-RESCHED 硬约束 + 引擎内部扰动择优 + 整 gang 完整搬迁（默认）。
-> - **P1**：`RepackPolicy`（模板生成）；**`relief`（relief-driven，解开 pending gang）**；**`disruptionPolicy` 整块**（`bundlePolicy` / `minRunDuration` / `maxDisruptionScore`）；以及 `eviction.pdb` 的 PDB 规划预检和阻塞处理；多级拓扑 / 队列配额 / 成本整理 / 防饿死等。
+> - **P0**：`mode`(DryRun/Execute) · `scope`(podGroups/nodes 两轴 include/exclude) · `goals` **恰一条**(单资源碎片门槛) · `maxPerRun`(规模上限) · `eviction.gracePeriodSeconds` · `ttlSecondsAfterFinished`；**consolidation-driven**（为腾空节点而整理）；INV-RESCHED 硬约束 + 引擎内部扰动择优 + 整 gang 完整搬迁（默认）。
+> - **P1**：`RepackPolicy`（模板生成）；解救 pending gang、可配置扰动策略和 PDB 规划/阻塞处理；以及多级拓扑 / 队列配额 / 成本整理 / 防饿死等。上述 relief/disruption/PDB 的 API、类型与字段均待后续讨论，当前不在 `RepackRun` 中声明。
 > - **P2+**：单个 Run **多资源整理**（`goals` 多条 + 跨资源合成）。
 >
-> 即 **P0 = 单资源、consolidation-driven、无 relief、无可配 disruptionPolicy/PDB**；扰动控制在 P0 仅靠引擎内部评分 + `scope` 划片 + `maxPerRun` + INV-RESCHED 保底。
+> 即 **P0 = 单资源、consolidation-driven、无 relief、无可配扰动/PDB API**；扰动控制在 P0 仅靠引擎内部评分 + `scope` 划片 + `maxPerRun` + INV-RESCHED 保底。
 
 **关键设计前提：Policy 复用 Run 的 spec**——`RepackPolicy.runTemplate.spec` 就是一份 `RepackRunSpec`（单一事实来源、零 schema 漂移）。因此分期很自然：
 
 | 维度 | **P0（仅 RepackRun）** | **P1（引入 RepackPolicy）** |
 |------|------------------------|------------------------------|
 | **触发方式** | **仅手动** `kubectl create` Run（DryRun / Execute） | + Policy `trigger`（`cronSchedule`/`onPendingBlocked`/`onFragmentation`）自动生成 Run |
-| **spec 来源** | Run **完全自洽、手写全量**：`scope`（含 exclude）/`goals`(恰一条)/`maxPerRun`/`ttlSecondsAfterFinished`（**不含 `relief`/`disruptionPolicy`——P1**） | Policy 用 `runTemplate.spec` **生成** Run（模板即 RepackRunSpec）；**不做继承补全/护栏钳制**；模板里可带 `relief`/`disruptionPolicy` |
+| **spec 来源** | Run **完全自洽、手写全量**：`scope`（含 exclude）/`goals`(恰一条)/`maxPerRun`/`eviction`/`ttlSecondsAfterFinished` | Policy 用 `runTemplate.spec` **生成** Run（模板即 RepackRunSpec）；**不做继承补全/护栏钳制**。P1 增量 API 待后续设计 |
 | **归属** | **无** ownerReferences（无 Policy）；Run 独立对象 | 生成的 Run 经 `ownerReferences` 归属 Policy（随 Policy 级联删除） |
 | **护栏** | Run 自带 `scope.podGroups.exclude`（划片）+ `maxPerRun` + INV-RESCHED；**PDB 兼容 = P1**（随 disruptionPolicy） | 同 P0（护栏仍在 Run 上）；「集群级默认/跨 Run 强制」属治理机制，另议、不在 Policy 内 |
 | **并发** | 引擎内置 **Execute K=1**（+ 启动参数 cooldown） | 同上（Policy 不加并发字段；控制器默认「上个派生 Run 未结束不新建」） |
@@ -260,7 +260,7 @@ metadata:
 - **selector 匹配 PodGroup 标签**：`podGroupSelector` 作用在 `PodGroup.metadata.labels` 上。
 - 方案详单同口径：`plan.moves[].{namespace,podGroupName}`（§4.6）。
 
-**一条 RepackRun = 「这一次整理任务」的工单。** **P0 顶层 4 个功能块**（`mode`/`scope`/`goals`/`maxPerRun`）+ 1 个生命周期字段（`ttlSecondsAfterFinished`）；**常用的只有 `mode` 和 `scope`**，其余可选、有默认。（`relief`/`disruptionPolicy` 为 **P1**，见 §3.3。）
+**一条 RepackRun = 「这一次整理任务」的工单。** **P0 顶层 5 个功能块**（`mode`/`scope`/`goals`/`maxPerRun`/`eviction`）+ 1 个生命周期字段（`ttlSecondsAfterFinished`）；**常用的只有 `mode` 和 `scope`**，其余可选、有默认。
 
 | 顶层块 | 回答 | 必填? | 阶段 |
 |--------|------|-------|------|
@@ -268,16 +268,10 @@ metadata:
 | **`scope`** | **在哪儿整理**：哪些运行中作业可被搬走、限定在哪些节点 | 否（Execute 须指定） | P0 |
 | **`goals`** | **单资源碎片目标（P0/P1 至多一条）**：该类加速资源的碎片改善门槛；`resource` 必须是**扩展资源**（CEL `self.contains('/')`，如 `nvidia.com/gpu`；cpu/memory 等 native 资源被 apiserver 拒）；省略=回落引擎 `--repack-default-resource`，两者皆空即 `NoTargetResource` 失败、误配 native 即 `UnsupportedResource` 失败（§4.12.2b）。多条=多资源 **P2+** | 否（有默认） | P0 |
 | **`maxPerRun`** | **单轮规模封顶**：podGroups + resources(ResourceList，异构) | 否（有默认） | P0 |
-| **`relief`** | **想达成什么**：让哪些排队作业能被调度（`podGroupRefs`）、至少解开几个才值得（`minRelieved`）——relief-driven | — | **P1** |
 | **`eviction`** | **如何提交已选 move**：`gracePeriodSeconds` 覆盖本次 Eviction 的优雅终止时间 | 否 | **P0** |
-| **`disruptionPolicy`** | **怎么/能不能扰动在跑作业**：bundlePolicy/minRunDuration/maxDisruptionScore | — | **P1** |
 | `ttlSecondsAfterFinished` | 终态后多久自动清理（不设运行超时字段，卡 Running 由崩溃孤儿回收兜底） | 否 |
 
-> **最容易混的两个，务必分清**：
-> - **`scope.podGroups` = 可以被搬走的运行中作业**——腾地方的对象，会被**驱逐重排**。
-> - **`relief.podGroupRefs` = 想让它跑起来的排队中作业**——整理的**受益者，自身不动**。
-> - 一句话：**在排队、想被调度的 → `relief`；在运行、允许为腾地方而挪动的 → `scope`。**
-> - `scope` 圈的是「**候选范围**」不是「victim 名单」——引擎在范围内模拟、自己挑出真正要搬的。
+> **`scope.podGroups` = 可以被搬走的运行中作业**——腾地方的对象，会被**驱逐重排**。它圈的是「候选范围」不是「victim 名单」——引擎在范围内模拟、自己挑出真正要搬的。解救排队作业的目标语义不属于当前 P0 API，留待 P1 讨论。
 
 **`scope` 按两个维度组织，每维 `include`/`exclude` 同构**（都用 `selector`+`names` 这一种 matcher）：
 
@@ -321,12 +315,7 @@ kind: RepackRun
 metadata: { name: look-1 }
 spec: { mode: DryRun }
 ---
-# B. 想让某个排队作业能排上，看看怎么整理
-spec:
-  mode: DryRun
-  relief: { podGroupRefs: [ ml/train-large ] }           # 我想让它跑起来（受益者，自身不动）
----
-# C. 真正执行：允许动 a100 池里带 repack-eligible 标签的作业来腾地方
+# B. 真正执行：允许动 a100 池里带 repack-eligible 标签的作业来腾地方
 spec:
   mode: Execute
   scope:
@@ -362,47 +351,24 @@ spec:
         selector: { matchLabels: { repack.volcano.sh/repack-protected: "true" } }
         names:    [ node-guard-1 ]
 
-  # ② 目标（可选）：让这些排队 PodGroup 能被调度（受益者，自身不动）
-  relief:
-    podGroupRefs: [ ml/train-large ]        # 想缓解的 pending PodGroup（namespace/name）
-    minRelieved: 1                          # 至少解开几个才算值得（默认 1；pending 跨资源，故与逐资源 goals 分开）
-
-  # ③ 单资源碎片目标（P0/P1：至多一条，CEL maxItems:1；可选，省略=回落引擎 --repack-default-resource，见 §4.12.2b）
+  # ② 单资源碎片目标（P0/P1：至多一条，CEL maxItems:1；可选，省略=回落引擎 --repack-default-resource，见 §4.12.2b）
   goals:
     - resource: nvidia.com/gpu              # 这一个 Run 整理哪类资源（GPU/NPU…）
       minFragRateImprovement: "0.05"        # 该资源碎片率绝对改善≥此值
   # 多资源（goals 多条、一个 Run 同时整理 GPU+NPU）= P2+；列表形状已预留，P2 放开 maxItems
 
-  # ④ Execute 的 Eviction 请求参数（P0）；不填沿用每个 Pod 自己的终止宽限期
+  # ③ Execute 的 Eviction 请求参数（P0）；不填沿用每个 Pod 自己的终止宽限期
   eviction:
     gracePeriodSeconds: 30
 
-  # ⑤ 怎么/能不能扰动在跑作业（整块 P1；P0 不开放、用引擎默认评分，§3.3）
-  disruptionPolicy:
-    bundlePolicy: SurplusPodsOnly           # 搬迁单元：SurplusPodsOnly | EntireJobPermitted
-    minRunDuration: 30m                     # 运行不足此时长的作业不搬
-    maxDisruptionScore: 80                  # 中断代价分红线（§4.13.3）
-    # 扰动评分调参（P1 放开，本次 Run 维度；省略=引擎默认 DefaultWeightedDisruption）：
-    lambda: "0.5"                           # 收益 vs 扰动 总摩擦系数
-    weights:                                # 各扰动评分项权重（仅对 config 启用的项生效，§4.16.5）
-      affectedPodGroups: "1.0"
-      damagedGPU: "0.6"                     # gang 语义受损卡量
-      priority: "0.8"
-      movedGPU: "0.3"
-      movedPods: "0.1"
-      gangBreaches: "1.0"
-    hardFloors:                             # 可选硬护栏
-      freezePriorityAbove: 1000             # ≥此优先级永不搬
-      maxMovesPerJob: 2
-
-  # ⑤ 单轮规模封顶（可选，有默认；区别于 K8s 资源 limits）
+  # ④ 单轮规模封顶（可选，有默认；区别于 K8s 资源 limits）
   maxPerRun:
     podGroups: 10                           # 单轮最多搬几个 PodGroup（跨资源计数）
     resources:                              # 逐资源单轮上限（ResourceList，异构/可演进）
       nvidia.com/gpu: 64
       huawei.com/Ascend910: 32              # 长期可加 cpu: "2000" / memory: "4Ti"
 
-  # ⑥ 生命周期（不设运行超时字段；卡 Running 由崩溃孤儿回收兜底）
+  # ⑤ 生命周期（不设运行超时字段；卡 Running 由崩溃孤儿回收兜底）
   ttlSecondsAfterFinished: 86400            # 终态后 24h 自动 DELETE
 ```
 

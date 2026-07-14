@@ -32,8 +32,6 @@ type RepackPlanApplyConfiguration struct {
 	Moves []RepackMoveApplyConfiguration `json:"moves,omitempty"`
 	// FreedNodes are the names of nodes the plan empties.
 	FreedNodes []string `json:"freedNodes,omitempty"`
-	// Relief reports which pending PodGroups would be unblocked (reserved).
-	Relief []RelievedPodGroupApplyConfiguration `json:"relief,omitempty"`
 }
 
 // RepackPlanApplyConfiguration constructs a declarative configuration of the RepackPlan type for use with
@@ -69,19 +67,6 @@ func (b *RepackPlanApplyConfiguration) WithMoves(values ...*RepackMoveApplyConfi
 func (b *RepackPlanApplyConfiguration) WithFreedNodes(values ...string) *RepackPlanApplyConfiguration {
 	for i := range values {
 		b.FreedNodes = append(b.FreedNodes, values[i])
-	}
-	return b
-}
-
-// WithRelief adds the given value to the Relief field in the declarative configuration
-// and returns the receiver, so that objects can be build by chaining "With" function invocations.
-// If called multiple times, values provided by each call will be appended to the Relief field.
-func (b *RepackPlanApplyConfiguration) WithRelief(values ...*RelievedPodGroupApplyConfiguration) *RepackPlanApplyConfiguration {
-	for i := range values {
-		if values[i] == nil {
-			panic("nil value passed to WithRelief")
-		}
-		b.Relief = append(b.Relief, *values[i])
 	}
 	return b
 }

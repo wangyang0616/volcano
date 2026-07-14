@@ -26,9 +26,6 @@ import (
 //
 // ---------- spec ----------
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
-// The core spec is hand-written in full; the relief and disruptionPolicy fields
-// are reserved here so the schema is stable, but the engine currently honors its
-// own defaults for them.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
 // admission step): mode is an enum, goals is capped at one entry, and the spec is
@@ -40,13 +37,9 @@ type RepackRunSpecApplyConfiguration struct {
 	Mode *repackv1alpha1.RepackMode `json:"mode,omitempty"`
 	// Scope bounds which PodGroups may move and which nodes participate.
 	Scope *RepackScopeApplyConfiguration `json:"scope,omitempty"`
-	// Relief (reserved): pending PodGroups this run aims to make schedulable.
-	Relief *RepackReliefApplyConfiguration `json:"relief,omitempty"`
 	// Goals is the per-resource fragmentation target: exactly one entry
 	// (a run defragments a single accelerator resource); multi-resource is reserved.
 	Goals []RepackGoalApplyConfiguration `json:"goals,omitempty"`
-	// DisruptionPolicy (reserved): how/whether running jobs may be disturbed.
-	DisruptionPolicy *DisruptionPolicyApplyConfiguration `json:"disruptionPolicy,omitempty"`
 	// MaxPerRun caps the blast radius of a single run.
 	MaxPerRun *MaxPerRunApplyConfiguration `json:"maxPerRun,omitempty"`
 	// Eviction configures how Execute issues Kubernetes Eviction requests. It is
@@ -79,14 +72,6 @@ func (b *RepackRunSpecApplyConfiguration) WithScope(value *RepackScopeApplyConfi
 	return b
 }
 
-// WithRelief sets the Relief field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the Relief field is set to the value of the last call.
-func (b *RepackRunSpecApplyConfiguration) WithRelief(value *RepackReliefApplyConfiguration) *RepackRunSpecApplyConfiguration {
-	b.Relief = value
-	return b
-}
-
 // WithGoals adds the given value to the Goals field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
 // If called multiple times, values provided by each call will be appended to the Goals field.
@@ -97,14 +82,6 @@ func (b *RepackRunSpecApplyConfiguration) WithGoals(values ...*RepackGoalApplyCo
 		}
 		b.Goals = append(b.Goals, *values[i])
 	}
-	return b
-}
-
-// WithDisruptionPolicy sets the DisruptionPolicy field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the DisruptionPolicy field is set to the value of the last call.
-func (b *RepackRunSpecApplyConfiguration) WithDisruptionPolicy(value *DisruptionPolicyApplyConfiguration) *RepackRunSpecApplyConfiguration {
-	b.DisruptionPolicy = value
 	return b
 }
 

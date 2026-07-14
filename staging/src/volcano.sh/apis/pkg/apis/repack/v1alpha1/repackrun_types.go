@@ -32,17 +32,6 @@ const (
 	RepackModeExecute RepackMode = "Execute"
 )
 
-// BundlePolicy controls the unit of relocation for a gang.
-// +kubebuilder:validation:Enum=SurplusPodsOnly;EntireJobPermitted
-type BundlePolicy string
-
-const (
-	// BundleSurplusPodsOnly moves only pods above MinAvailable (never breaches gang).
-	BundleSurplusPodsOnly BundlePolicy = "SurplusPodsOnly"
-	// BundleEntireJobPermitted allows relocating a whole gang.
-	BundleEntireJobPermitted BundlePolicy = "EntireJobPermitted"
-)
-
 // RepackPhase is the coarse lifecycle phase. conditions are authoritative;
 // phase is a derived projection for kubectl wait / list views.
 // +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Cancelled
@@ -59,9 +48,6 @@ const (
 // ---------- spec ----------
 
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
-// The core spec is hand-written in full; the relief and disruptionPolicy fields
-// are reserved here so the schema is stable, but the engine currently honors its
-// own defaults for them.
 //
 // Admission is enforced entirely at the apiserver via CEL/markers (no controller
 // admission step): mode is an enum, goals is capped at one entry, and the spec is
@@ -77,19 +63,11 @@ type RepackRunSpec struct {
 	// +optional
 	Scope *RepackScope `json:"scope,omitempty"`
 
-	// Relief (reserved): pending PodGroups this run aims to make schedulable.
-	// +optional
-	Relief *RepackRelief `json:"relief,omitempty"`
-
 	// Goals is the per-resource fragmentation target: exactly one entry
 	// (a run defragments a single accelerator resource); multi-resource is reserved.
 	// +optional
 	// +kubebuilder:validation:MaxItems=1
 	Goals []RepackGoal `json:"goals,omitempty"`
-
-	// DisruptionPolicy (reserved): how/whether running jobs may be disturbed.
-	// +optional
-	DisruptionPolicy *DisruptionPolicy `json:"disruptionPolicy,omitempty"`
 
 	// MaxPerRun caps the blast radius of a single run.
 	// +optional
@@ -108,7 +86,7 @@ type RepackRunSpec struct {
 }
 
 // EvictionPolicy configures the execution behavior of Kubernetes Eviction API
-// requests. Selection and scoring remain in DisruptionPolicy; this type owns
+// requests. Selection and scoring remain internal to the engine; this type owns
 // only the mechanics of submitting an accepted move.
 type EvictionPolicy struct {
 	// GracePeriodSeconds overrides the graceful-termination period requested for
@@ -158,19 +136,6 @@ type RepackSelector struct {
 	Names []string `json:"names,omitempty"`
 }
 
-// RepackRelief (reserved) names pending PodGroups to unblock (beneficiaries; they
-// themselves are not moved).
-type RepackRelief struct {
-	// PodGroupRefs are "namespace/name" of pending PodGroups to relieve.
-	// +optional
-	// +kubebuilder:validation:MaxItems=256
-	PodGroupRefs []string `json:"podGroupRefs,omitempty"`
-	// MinRelieved: at least this many must become schedulable to be worthwhile.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MinRelieved *int32 `json:"minRelieved,omitempty"`
-}
-
 // RepackGoal is one resource's fragmentation target.
 type RepackGoal struct {
 	// Resource is the accelerator to defragment (e.g. nvidia.com/gpu). Only
@@ -186,48 +151,6 @@ type RepackGoal struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	MinFragImprovementPercent int32 `json:"minFragImprovementPercent,omitempty"`
-}
-
-// DisruptionPolicy (reserved) tunes how running jobs may be disturbed. Lives on the
-// Run (not in plugin config): plugin config only selects which scoring plugins
-// are enabled. The engine currently ignores these and uses its defaults.
-type DisruptionPolicy struct {
-	// +optional
-	BundlePolicy BundlePolicy `json:"bundlePolicy,omitempty"`
-	// MinRunDuration: jobs running less than this are not moved.
-	// +optional
-	MinRunDuration *metav1.Duration `json:"minRunDuration,omitempty"`
-	// MaxDisruptionScore is the disruption-cost red line.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MaxDisruptionScore *int32 `json:"maxDisruptionScore,omitempty"`
-	// RespectPDB is retained as an unimplemented v1alpha1 compatibility field.
-	// Deprecated: Kubernetes Eviction API always respects PDBs; future planning
-	// and blocked-eviction controls live in spec.eviction.pdb.
-	// +optional
-	RespectPDB *bool `json:"respectPDB,omitempty"`
-	// Lambda is the benefit-vs-friction trade-off as an integer weight (default 1).
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	Lambda int32 `json:"lambda,omitempty"`
-	// Weights are per-disruption-term integer weights (relative; keys must match
-	// scoring plugins enabled in config).
-	// +optional
-	Weights map[string]int32 `json:"weights,omitempty"`
-	// HardFloors are optional hard guardrails (frozen anchors / per-job caps).
-	// +optional
-	HardFloors *DisruptionHardFloors `json:"hardFloors,omitempty"`
-}
-
-// DisruptionHardFloors are optional hard guardrails.
-type DisruptionHardFloors struct {
-	// FreezePriorityAbove: gangs with priority >= this never move.
-	// +optional
-	FreezePriorityAbove *int32 `json:"freezePriorityAbove,omitempty"`
-	// MaxMovesPerJob caps relocations of any single PodGroup.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MaxMovesPerJob *int32 `json:"maxMovesPerJob,omitempty"`
 }
 
 // MaxPerRun caps a single run's blast radius (distinct from K8s resource limits).
@@ -344,10 +267,6 @@ type RepackPlan struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=2048
 	FreedNodes []string `json:"freedNodes,omitempty"`
-	// Relief reports which pending PodGroups would be unblocked (reserved).
-	// +optional
-	// +kubebuilder:validation:MaxItems=256
-	Relief []RelievedPodGroup `json:"relief,omitempty"`
 }
 
 // RepackSummary is the flat second layer of the plan. Single-resource per run
@@ -433,16 +352,6 @@ type WorkloadRef struct {
 	Kind string `json:"kind,omitempty"`
 	// +optional
 	Name string `json:"name,omitempty"`
-}
-
-// RelievedPodGroup reports a pending gang that would become schedulable (reserved).
-type RelievedPodGroup struct {
-	// +kubebuilder:validation:Required
-	Namespace string `json:"namespace"`
-	// +kubebuilder:validation:Required
-	PodGroupName string `json:"podGroupName"`
-	// +optional
-	Relieved bool `json:"relieved,omitempty"`
 }
 
 // ---------- root objects ----------
