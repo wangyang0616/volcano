@@ -21,6 +21,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	// PodIdentityLabel identifies a logical workload replica across Pod
+	// reconstruction. A value must be unique within its PodGroup and stable when
+	// the workload controller recreates the Pod. Repack records this label in a
+	// nomination to steer the replacement Pod to its planned landing node.
+	PodIdentityLabel = "repack.volcano.sh/pod-identity"
+)
+
 // RepackMode selects whether a RepackRun only simulates or actually evicts.
 // +kubebuilder:validation:Enum=DryRun;Execute
 type RepackMode string

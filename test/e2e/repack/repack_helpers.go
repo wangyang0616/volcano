@@ -30,6 +30,7 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,6 +50,10 @@ const (
 	npuPerNode    = 8
 	repackTimeout = 3 * time.Minute
 	repackPoll    = 2 * time.Second
+
+	nativeWorkloadLabel  = "repack-e2e-workload"
+	nativeScopeLabel     = "repack-e2e-scope"
+	nativeSchedulingGate = "repack-e2e-hold"
 )
 
 // ---- node fixtures -------------------------------------------------------
@@ -134,6 +139,95 @@ func occupy(ctx *e2eutil.TestContext, name, node string, cards int) *batchv1alph
 	job := e2eutil.CreateJob(ctx, spec)
 	Expect(e2eutil.WaitTasksReady(ctx, job, 1)).NotTo(HaveOccurred())
 	return job
+}
+
+// nativeWorkload is a scheduler-placed Deployment replica that starts at a
+// deterministic node only for fixture setup. Its PodGroup is created by the
+// generic pg-controller path (ReplicaSet owner); no workload-specific Repack
+// integration is involved.
+type nativeWorkload struct {
+	deployment *appsv1.Deployment
+	podName    string
+	podGroup   string
+}
+
+// occupyNativeDeployment creates one gated Deployment pod, binds it to node to
+// form a deterministic fragmented layout, then removes the gate from the
+// ReplicaSet template. A later Repack eviction therefore produces an ordinary
+// Volcano-scheduled replacement, which can consume a nomination.
+func occupyNativeDeployment(ctx *e2eutil.TestContext, name, node, scopeValue string, cards int) *nativeWorkload {
+	replicas := int32(1)
+	labels := map[string]string{
+		nativeWorkloadLabel: name,
+		nativeScopeLabel:    scopeValue,
+	}
+	quantity := resource.MustParse(fmt.Sprintf("%d", cards))
+	deployment, err := ctx.Kubeclient.AppsV1().Deployments(ctx.Namespace).Create(context.TODO(), &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ctx.Namespace},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{nativeWorkloadLabel: name}},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: v1.PodSpec{
+					SchedulerName:   e2eutil.SchedulerName,
+					RestartPolicy:   v1.RestartPolicyAlways,
+					SchedulingGates: []v1.PodSchedulingGate{{Name: nativeSchedulingGate}},
+					Containers: []v1.Container{{
+						Name:            name,
+						Image:           e2eutil.DefaultNginxImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Resources:       v1.ResourceRequirements{Requests: v1.ResourceList{npuResource: quantity}, Limits: v1.ResourceList{npuResource: quantity}},
+					}},
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "create native deployment")
+
+	var initialPod *v1.Pod
+	Eventually(func() bool {
+		pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: nativeWorkloadLabel + "=" + name,
+		})
+		if listErr != nil || len(pods.Items) != 1 {
+			return false
+		}
+		pod := &pods.Items[0]
+		if pod.Annotations["scheduling.k8s.io/group-name"] == "" {
+			return false
+		}
+		initialPod = pod.DeepCopy()
+		return true
+	}, repackTimeout, repackPoll).Should(BeTrue(), "automatic PodGroup must be associated with native pod")
+
+	err = ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Bind(context.TODO(), &v1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: initialPod.Name, Namespace: ctx.Namespace},
+		Target:     v1.ObjectReference{Kind: "Node", Name: node},
+	}, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "bind gated native pod")
+	Eventually(func() v1.PodPhase {
+		pod, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), initialPod.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return v1.PodUnknown
+		}
+		return pod.Status.Phase
+	}, repackTimeout, repackPoll).Should(Equal(v1.PodRunning), "manually bound native pod should run")
+
+	owner := metav1.GetControllerOf(initialPod)
+	Expect(owner).NotTo(BeNil(), "Deployment pod must have a ReplicaSet controller")
+	Expect(owner.Kind).To(Equal("ReplicaSet"))
+	replicaSet, err := ctx.Kubeclient.AppsV1().ReplicaSets(ctx.Namespace).Get(context.TODO(), owner.Name, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred(), "get native deployment ReplicaSet")
+	replicaSet.Spec.Template.Spec.SchedulingGates = nil
+	_, err = ctx.Kubeclient.AppsV1().ReplicaSets(ctx.Namespace).Update(context.TODO(), replicaSet, metav1.UpdateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "remove fixture scheduling gate from replacement template")
+
+	return &nativeWorkload{
+		deployment: deployment,
+		podName:    initialPod.Name,
+		podGroup:   initialPod.Annotations["scheduling.k8s.io/group-name"],
+	}
 }
 
 // ---- RepackRun helpers ---------------------------------------------------

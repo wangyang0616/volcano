@@ -25,6 +25,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -163,6 +164,64 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		for _, m := range got.Status.Plan.Moves {
 			Expect(ctx.Namespace + "/" + m.PodGroupName).To(Equal(pgs[0]))
 		}
+	})
+
+	// E14b/C6b: labels from a generic ReplicaSet-owned workload are projected to
+	// its automatic PodGroup, so a PodGroup selector can select it without Repack
+	// recognizing the workload kind. Execute then proves that the replacement
+	// consumes its fungible nomination and is scheduled at the planned target.
+	It("selects a native workload by PodGroup labels and lands its replacement on the nominated node", func() {
+		moving := occupyNativeDeployment(ctx, "native-moving", nodes[0], "move", 4)
+		staying := occupyNativeDeployment(ctx, "native-staying", nodes[1], "stay", 2)
+		defer func() {
+			_ = ctx.Kubeclient.AppsV1().Deployments(ctx.Namespace).Delete(context.TODO(), moving.deployment.Name, metav1.DeleteOptions{})
+			_ = ctx.Kubeclient.AppsV1().Deployments(ctx.Namespace).Delete(context.TODO(), staying.deployment.Name, metav1.DeleteOptions{})
+		}()
+
+		Eventually(func() map[string]string {
+			pg, getErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Get(context.TODO(), moving.podGroup, metav1.GetOptions{})
+			if getErr != nil {
+				return nil
+			}
+			return pg.Labels
+		}, repackTimeout, repackPoll).Should(HaveKeyWithValue(nativeScopeLabel, "move"), "automatic PodGroup must expose pod-template labels")
+
+		scope := &repackv1alpha1.RepackScope{PodGroups: &repackv1alpha1.RepackSelectorTerm{
+			Include: &repackv1alpha1.RepackSelector{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{nativeScopeLabel: "move"}}},
+		}}
+		run, err := newRun("native-selector", repackv1alpha1.RepackModeExecute).goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(got.Status.Plan.Moves).NotTo(BeEmpty())
+		for _, move := range got.Status.Plan.Moves {
+			Expect(move.PodGroupName).To(Equal(moving.podGroup), "only the selector-matched native PodGroup may move")
+		}
+		Expect(got.Status.Nominations).To(HaveLen(1), "one relocated native replica needs one nomination")
+		nomination := got.Status.Nominations[0]
+		Expect(nomination.PodGroupName).To(Equal(moving.podGroup))
+		Expect(nomination.IdentityLabels).To(BeEmpty(), "single-replica Deployment uses the fungible landing contract")
+		Eventually(func() string {
+			latest := getRun(ctx, run.Name)
+			if len(latest.Status.Nominations) != 1 {
+				return ""
+			}
+			return string(latest.Status.Nominations[0].Phase)
+		}, repackTimeout, repackPoll).Should(Equal("Bound"), "replacement must consume its pending nomination")
+
+		Eventually(func() string {
+			pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+				LabelSelector: labels.Set{nativeWorkloadLabel: moving.deployment.Name}.String(),
+			})
+			if listErr != nil || len(pods.Items) != 1 || pods.Items[0].Name == moving.podName || pods.Items[0].Spec.NodeName == "" {
+				return ""
+			}
+			return pods.Items[0].Spec.NodeName
+		}, repackTimeout, repackPoll).Should(Equal(nomination.NodeName),
+			"replacement must be scheduled to the node recorded by its nomination")
 	})
 
 	// F18: maxPerRun.podGroups caps the number of gangs a single run relocates.

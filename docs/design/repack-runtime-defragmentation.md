@@ -525,8 +525,6 @@ status:
     - namespace: ml
       podGroupName: train-a
       victimPodName: train-a-worker-0 # 旧 pod 名：审计 + 同名重建时精确快路径
-      identityLabels:                 # 匹配替身的身份标签（自解释：键=用哪个 label，值=其值）
-        repack.volcano.sh/pod-identity: worker-0   # vcjob：<task>-<index>，见 §5.2.2
       nodeName: node-a30
       expirationTime: "2026-07-02T11:16:12Z"
       phase: Bound                    # Pending/Bound/Expired：重建 pod 是否已按提名落定
@@ -580,9 +578,7 @@ Execute 驱逐 victim pod 后，工作负载控制器会重建一个替身 pod�
 
 身份**以 label 键值对的形式**记进 `nominations[].identityLabels`（自解释：一眼看到用哪个 label、值是什么），reconciler 按它对 pending pod 做 label 超集匹配。
 
-1. **Tier 1 — 声明式身份 label（主契约）**：pod 若带 `repack.volcano.sh/pod-identity`，则记 `identityLabels: {repack.volcano.sh/pod-identity: <值>}`。约束：该值须**在所属 PodGroup 内唯一、且跨重建稳定**。Volcano 自家与自定义负载走这条：
-   - vcjob → `<task>-<index>`（如 `worker-0`）；
-   - kthena → `<group>-<role>-<role-id>-<workerIndex>`（如 `sample-0-decode-0-0`，把当前是 env 的 workerIndex 也纳入）。
+1. **Tier 1 — 声明式身份 label（主契约）**：pod 若带 `repack.volcano.sh/pod-identity`，则记 `identityLabels: {repack.volcano.sh/pod-identity: <值>}`。约束：该值须**在所属 PodGroup 内唯一、且跨重建稳定**。名称可能变化的自定义负载走这条；例如 kthena 使用 `<group>-<role>-<role-id>-<workerIndex>`（如 `sample-0-decode-0-0`，把当前是 env 的 workerIndex 也纳入）。vcjob 的 Pod 名为稳定的 `<job>-<task>-<index>`，由 `victimPodName` 精确快路径覆盖，无需额外标签。
 2. **原生负载自动适配**：pod 未带上述 label 时，repack **直接读 pod 自身的标准索引 label**（K8s 官方既有约定，非猜测，无需查 ownerRef），命中即记入 `identityLabels`：
 
    | 原生负载 | 读取并记录的 label | 说明 |
@@ -596,9 +592,9 @@ Execute 驱逐 victim pod 后，工作负载控制器会重建一个替身 pod�
 
 **匹配策略（reconciler）**：对某条 nomination，先按 `namespace + victimPodName` 精确命中（同名重建的快路径）；不中则在 `namespace + podGroupName` 内命中 label 是 `identityLabels` 超集的 pending pod；`identityLabels` 为空（fungible）时命中该 PG 内任一未消费的 pending pod。**记的是哪个 label 就匹哪个，新增身份来源零改 reconciler 代码。** 全程 **soft nomination**：不预留、`expirationTime` 到期即弃，不追求逐一精确。
 
-**为何这样能统一管理**：repack **只认识 `repack.volcano.sh/pod-identity` + 两个标准索引 label（`apps.kubernetes.io/pod-index`、`batch.kubernetes.io/job-completion-index`）这几个固定 key**，且都直接读 pod 自身的 label、不查 ownerRef、不认识任何具体负载的私有 label scheme；Volcano 自家负载（vcjob/kthena）实现 Tier 1 拿精确引导，StatefulSet/Indexed Job 由标准 label 自动兜住，其余自定义负载想精确就打这一个 label——**契约由 Volcano 定、负载来对齐**，新增负载类型 repack 一行不用改。
+**为何这样能统一管理**：repack **只认识 `repack.volcano.sh/pod-identity` + 两个标准索引 label（`apps.kubernetes.io/pod-index`、`batch.kubernetes.io/job-completion-index`）这几个固定 key**，且都直接读 pod 自身的 label、不查 ownerRef、不认识任何具体负载的私有 label scheme；vcjob 走稳定名称的精确快路径，StatefulSet/Indexed Job 由标准 label 自动兜住，其余自定义负载想精确就打这一个 label——**契约由 Volcano 定、负载来对齐**，新增负载类型 repack 一行不用改。
 
-**配套 P0 待办**：kthena / vcjob 控制器给 pod 打 `repack.volcano.sh/pod-identity`（kthena 需把 workerIndex 纳入该值）——跨项目对齐项。
+**配套 P0 落地状态**：vcjob 使用稳定 Pod 名走 `victimPodName` 精确匹配，不需要额外 identity label。kthena 仍需在其独立控制器中写入 `repack.volcano.sh/pod-identity=<group>-<role>-<role-id>-<worker-index>`（其中 workerIndex 必须来自稳定的逻辑副本编号），这是跨项目对齐项。
 
 #### 5.2.3 全字段参考示例（必选 / 可选标注）
 
@@ -727,7 +723,7 @@ status:
 
 | 框架 | PG 由谁建 | 业务标签继承 | 角色/身份标签 | 接入建议 |
 |------|-----------|--------------|----------------|----------|
-| **vcjob** | vcjob 控制器 | ✓ `job.Labels` | `volcano.sh/task-spec` | 已完备 |
+| **vcjob** | vcjob 控制器 | ✓ `job.Labels` | `volcano.sh/task-spec`；稳定 Pod 名 `<job>-<task>-<index>` | 已完备（exact-name） |
 | **kthena** | ModelServing 控制器（自建） | 需补继承 ModelServing 标签 | `modelserving.volcano.sh/{role,role-id}`；打 `pod-identity`=`<group>-<role>-<roleId>-<workerIndex>` | 自建路径，补 ② ③ |
 | **kubeflow**（training-operator） | operator（自建 PG，已有 Volcano 集成） | 把 `training.kubeflow.org/*` 或用户业务标签拷到 PG | 角色 `training.kubeflow.org/replica-type`(chief/worker/ps)、`replica-index`；`pod-identity`=`<replica-type>-<replica-index>` | 自建路径，补 ② ③ |
 | **llm-d**（P/D 分离） | 多为按 role 分独立 Deployment → 走 pg-controller | 业务标签打 pod 模板（靠 §5.2.1）；或 operator 聚合成 gang PG 时自拷 | 角色 `llm-d.ai/role`(prefill/decode)；随机名 → **务必打 `pod-identity`**=`<role>-<ordinal>` | 单角色 Deployment 走 fungible 即可；多角色同 PG 建议自建 PG + 打身份标签 |

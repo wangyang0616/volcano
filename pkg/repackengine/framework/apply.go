@@ -31,6 +31,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -41,7 +42,7 @@ import (
 // is hardcoded.
 const (
 	// labelPodIdentity is the declarative Tier-1 identity (workload-provided).
-	labelPodIdentity = "repack.volcano.sh/pod-identity"
+	labelPodIdentity = repackv1alpha1.PodIdentityLabel
 	// labelStatefulSetPodIndex / labelJobCompletionIndex are the standard K8s
 	// per-pod index labels used as native-adapter identities.
 	labelStatefulSetPodIndex = "apps.kubernetes.io/pod-index"
