@@ -557,20 +557,20 @@ status:
 | PG 创建路径 | 谁创建 | 是否继承负载业务标签 | 结论 |
 |-------------|--------|----------------------|------|
 | **vcjob** | vcjob 控制器 | **✓ 全量继承** vcjob 自身 `metadata.labels`（代码 `pg.Labels = job.Labels`，`job_controller_actions.go`） | `scope.podGroups.selector` 按业务标签选 vcjob **已可用，无需改动** |
-| **kthena（ModelServing）** | kthena Model Serving 控制器（自建 PG，不走通用 pg-controller） | **✗ 仅打内部身份标签** `modelinfer.volcano.sh/name`，**不继承** ModelServing 的业务标签 | 只能按 `modelinfer.volcano.sh/name`（=ModelServing 名）选中；按业务标签选需 **kthena 侧改动**（跨项目，同 pod-identity label） |
-| **Deployment / RS / StatefulSet / 裸 Job / 自定义负载** | 通用 **pg-controller** 自动创建（`podgroup-<controller-owner-UID>`，如 Deployment 下即 ReplicaSet UID；一个 RS 的所有 pod 共用一个 PG） | **✗ 当前 PG 标签基本为空**（仅 pod 带 `preemptable`/`cooldown-time` 时拷这两个） | 需 **本增强（下述）** |
+| **kthena（ModelServing）** | kthena Model Serving 控制器（自建 PG，不走通用 pg-controller） | 由 kthena 项目负责将 ModelServing 业务标签同步到其自建 PG | 能力依赖部署相应 kthena 版本；不在本仓库实现或验证 |
+| **Deployment / RS / StatefulSet / 裸 Job / 自定义负载** | 通用 **pg-controller** 自动创建（`podgroup-<controller-owner-UID>`，如 Deployment 下即 ReplicaSet UID；一个 RS 的所有 pod 共用一个 PG） | **✓ 继承稳定业务标签**；过滤控制器/实例标签和 `batch.kubernetes.io/*` | `scope.podGroups.selector` 可按模板业务标签选中 |
 
-即：「按业务标签统一选中所有负载」需要 **本增强（通用 pg-controller）+ kthena 侧继承标签** 两处；vcjob 已完备。
+即：vcjob 与通用 pg-controller 路径均已支持按业务标签选择；kthena 作为自建 PodGroup 的独立控制器，由其自身负责标签继承。
 
-**增强点**：让 pg-controller 在创建/更新自动 PodGroup 时，把 pod 模板标签**继承**到 `PodGroup.Labels`，采用**全量继承 + 剔除系统标签**策略：
+**实现**：pg-controller 在创建和更新自动 PodGroup 时，把 pod 模板的稳定业务标签**继承**到 `PodGroup.Labels`，采用**全量继承 + 剔除系统标签**策略：
 
 - 继承 pod 上的业务标签（用户在负载模板里打的 `app` / `tier` / `tenant` 等）；
 - 剔除易变的系统/控制器注入标签：`pod-template-hash`、`controller-revision-hash`、`statefulset.kubernetes.io/pod-name`、`apps.kubernetes.io/pod-index`、`controller-uid`、`batch.kubernetes.io/*` 等（维护一个排除集/前缀规则），避免噪声与滚动升级抖动；
-- 防撞键：不覆盖 Volcano 自身或其他组件打在 PG 上、有语义的 label（保留既有 `preemptable`/`cooldown-time` 行为）；pod 模板标签变更时随 `createOrUpdateNormalPodPG` 同步。
+- 自动创建的 PG 由 pg-controller 管理其标签并随 pod 模板标签变更同步；显式关联到其他 PG 的 Pod 不会被该控制器改写。
 
-**收益**：一次改动让 PodGroup 成为一等可选对象，`scope.podGroups.selector` 从此对所有负载类型统一生效——不止 repack，队列统计、策略、看板等 PG 消费方都受益。
+**收益**：通用自动建 PG 的工作负载可通过 `scope.podGroups.selector` 统一选择；不止 repack，队列统计、策略、看板等 PG 消费方也能复用这些标签。
 
-**影响面与时序**：本增强是对**共享核心控制器**的改动，需单独社区评审与兼容性论证。因此 repack 的落地时序为：**vcjob 当天可用**（已全量继承）；**Deployment/自定义负载**的普适选择**依赖本增强合入**（存量集群需 pg-controller 升级 + pod 重新 reconcile 后 PG 才带上标签）；**kthena** 按业务标签选中需 **kthena 侧单独 PR**（在其 ModelServing 控制器建 PG 时继承 ModelServing 的业务标签，与 `repack.volcano.sh/pod-identity` label 同为跨项目对齐项）。三者可并行推进、互不阻塞。
+**兼容与时序**：这是共享 pg-controller 的元数据同步行为。升级后，Pod 在下一次 reconcile 时会更新其自动 PodGroup 的标签；kthena 等自建 PodGroup 的控制器仍需自行保持标签同步。
 
 #### 5.2.2 落点身份契约（landing-identity contract，P0）
 

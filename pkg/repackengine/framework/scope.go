@@ -29,10 +29,10 @@ import (
 // GangScopeLookup returns the information needed to match a gang against a
 // RepackScope: its PodGroup name in "namespace/name" form (for name selectors)
 // and its labels (for label selectors).
-// "Everything is a PodGroup": the labels are the PodGroup's own labels — for
-// non-vcjob workloads the pg-controller inherits pod template labels onto the
-// auto-created PodGroup (§5.2.1), so a PG label selector addresses every
-// workload type uniformly (no need to read pods).
+// "Everything is a PodGroup": the labels are the PodGroup's own labels. The
+// pg-controller inherits stable pod-template labels onto auto-created PodGroups;
+// workloads that create their own PodGroup must expose their labels there. This
+// keeps scope matching independent of workload-specific pod or owner lookups.
 // found=false means the JobID is unknown to the snapshot (treated as out of scope).
 // The live-Session implementation is adapter.SessionGangScopeLookup; tests use a func.
 type GangScopeLookup func(schedapi.JobID) (podGroupName string, gangLabels labels.Labels, found bool)

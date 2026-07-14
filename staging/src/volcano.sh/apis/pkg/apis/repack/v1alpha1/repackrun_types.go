@@ -104,11 +104,11 @@ type EvictionPolicy struct {
 // Everything is a PodGroup: selection is expressed uniformly against PodGroups
 // (the engine's action/cost unit is the gang), so both `selector` (PG labels)
 // and `names` (PG "namespace/name") address the SAME object. This works for
-// every workload type — Volcano-native (vcjob), K8s-native (Deployment /
-// StatefulSet / ...), and user-custom CRDs — because Volcano's pg-controller
-// inherits pod template labels onto the auto-created PodGroup (system/controller
-// labels such as pod-template-hash are filtered out), so a PG label selector
-// addresses all of them. Note `names` is only practical for deterministically
+// K8s-native workloads (Deployment / StatefulSet / ...) and custom workloads
+// that use the pg-controller inherit stable pod-template labels onto their
+// auto-created PodGroup; system/controller labels such as pod-template-hash are
+// filtered out. Workloads that create their own PodGroup must copy the labels
+// they want to expose. Note `names` is only practical for deterministically
 // named PodGroups (e.g. vcjob); auto-created PGs have UID-derived names, so those
 // are selected via `selector`.
 type RepackScope struct {
