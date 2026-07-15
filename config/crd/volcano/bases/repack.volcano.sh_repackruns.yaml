@@ -21,6 +21,10 @@ spec:
     - jsonPath: .spec.mode
       name: MODE
       type: string
+    - description: Target accelerator resource being defragmented
+      jsonPath: .spec.goals[0].resource
+      name: RESOURCE
+      type: string
     - jsonPath: .status.phase
       name: PHASE
       type: string
@@ -405,7 +409,7 @@ spec:
               rule: self == oldSelf
           status:
             description: |-
-              RepackRunStatus reports lifecycle and business output. conditions are
+              RepackRunStatus reports lifecycle and business output. Conditions are
               authoritative; phase is derived. "Worth repacking?" is folded into the
               terminal Complete condition's reason (RepackRecommended / Executed /
               NoFragmentation / BelowGoalThreshold), not a summary field.

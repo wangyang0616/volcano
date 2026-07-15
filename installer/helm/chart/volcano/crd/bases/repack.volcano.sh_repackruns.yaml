@@ -21,6 +21,10 @@ spec:
     - jsonPath: .spec.mode
       name: MODE
       type: string
+    - description: Target accelerator resource being defragmented
+      jsonPath: .spec.goals[0].resource
+      name: RESOURCE
+      type: string
     - jsonPath: .status.phase
       name: PHASE
       type: string

@@ -40,7 +40,7 @@ const (
 	RepackModeExecute RepackMode = "Execute"
 )
 
-// RepackPhase is the coarse lifecycle phase. conditions are authoritative;
+// RepackPhase is the coarse lifecycle phase. Conditions are authoritative;
 // phase is a derived projection for kubectl wait / list views.
 // +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Cancelled
 type RepackPhase string
@@ -174,7 +174,7 @@ type MaxPerRun struct {
 
 // ---------- status ----------
 
-// RepackRunStatus reports lifecycle and business output. conditions are
+// RepackRunStatus reports lifecycle and business output. Conditions are
 // authoritative; phase is derived. "Worth repacking?" is folded into the
 // terminal Complete condition's reason (RepackRecommended / Executed /
 // NoFragmentation / BelowGoalThreshold), not a summary field.
@@ -375,6 +375,7 @@ type WorkloadRef struct {
 // +kubebuilder:resource:path=repackruns,scope=Cluster,shortName=rpr;repackrun
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="MODE",type=string,JSONPath=`.spec.mode`
+// +kubebuilder:printcolumn:name="RESOURCE",type=string,JSONPath=`.spec.goals[0].resource`,description="Target accelerator resource being defragmented"
 // +kubebuilder:printcolumn:name="PHASE",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="FREED",type=integer,JSONPath=`.status.plan.summary.freedNodeCount`
 // +kubebuilder:printcolumn:name="AGE",type=date,JSONPath=`.metadata.creationTimestamp`
