@@ -22,8 +22,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -237,7 +239,40 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		defer deleteRun(ctx, run.Name)
 
 		got := waitTerminal(ctx, run.Name)
-		Expect(len(got.Status.Plan.Moves)).To(BeNumerically("<=", 1), "maxPerRun.podGroups=1 caps moves")
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("RepackRecommended"))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(1))
+		Expect(got.Status.Plan.Moves).To(HaveLen(1), "maxPerRun.podGroups=1 must allow exactly one gang move")
+	})
+
+	// F19: maxPerRun.resources is measured in user-facing whole accelerator
+	// cards. The only useful relocation here moves a 2-card gang.
+	It("maxPerRun.resources caps moved accelerator cards", func() {
+		occupy(ctx, "resource-cap-a", nodes[0], 4)
+		occupy(ctx, "resource-cap-b", nodes[1], 2)
+
+		blocked, err := newRun("resource-cap-blocked", repackv1alpha1.RepackModeDryRun).goal(npuResource).
+			maxPerRun(&repackv1alpha1.MaxPerRun{
+				Resources: v1.ResourceList{npuResource: resource.MustParse("1")},
+			}).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, blocked.Name)
+		blockedRun := waitTerminal(ctx, blocked.Name)
+		Expect(blockedRun.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(blockedRun)).To(Equal("BelowGoalThreshold"))
+		Expect(blockedRun.Status.Plan.Moves).To(BeEmpty())
+
+		admitted, err := newRun("resource-cap-admitted", repackv1alpha1.RepackModeDryRun).goal(npuResource).
+			maxPerRun(&repackv1alpha1.MaxPerRun{
+				Resources: v1.ResourceList{npuResource: resource.MustParse("2")},
+			}).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, admitted.Name)
+		admittedRun := waitTerminal(ctx, admitted.Name)
+		Expect(admittedRun.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(admittedRun)).To(Equal("RepackRecommended"))
+		Expect(admittedRun.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(1))
+		Expect(admittedRun.Status.Plan.Moves).To(HaveLen(1))
 	})
 
 	// G20: a finished run with a short TTL is GC-deleted by the controller.

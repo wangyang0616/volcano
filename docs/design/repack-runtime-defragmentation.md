@@ -741,7 +741,7 @@ repack-engine 复刻 scheduler 的扩展模型，分**三类扩展点**（在 `-
 
 | core | 思路 | 阶段 |
 |---|---|---|
-| **A · 节点腾空法**（`drain`，默认） | 增量破组感知贪心：按"当前增量腾空成本"挑单元（已破组 gang 的 pod 记 0）、负载搬进别处碎片、整空才提交，破组后"搭便车"节点免费腾 | **P0** |
+| **A · 节点腾空法**（`drain`，默认） | 动态贪心：每轮评估全部可腾空单元，对每个可行候选的**完整计划**做多策略扰动评分，选择最小扰动者后原子提交；负载优先填入已有占用的节点碎片 | **P0** |
 | **B · 集中度法**（`concentration`） | 逐 gang 往更满节点挪，沿集中度 Σused² 涨分爬山 | 接口预留、P0 不实现 |
 
 经 `repack.core` 选择；详见 [§6 整理算法](#整理算法详解)。
@@ -1061,16 +1061,39 @@ type Core interface {
 }
 ```
 
-core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.FeasibleRelocation()`（克隆式可调度性检查，见上"可调度性兜底"）、以及 gang/movecost 插件注册的扰动维度（见下方"增量代价"）。
+core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.FeasibleRelocation()`（克隆式可调度性检查，见上"可调度性兜底"）、以及 `base`/`gang` 插件注册的扰动评分维度。
 
-- **A（drain，P0）**：**增量破组感知的贪心，单趟动态、产出唯一 plan**。每步挑"当前**增量代价最小**"的可释放单元腾空，把其 victim 用 `ssn.FeasibleRelocation`（克隆式 feasibility check）重排进其余碎片，单元成员节点**全空才提交**（原子：放不下则跳过、已提交的 moves 不受影响）；提交后更新状态、**动态重选**下一个单元，遍历到无可腾为止，再校验 `MinNodesFreed`。可释放单元来自 `node` 插件（一节点一单元）；`hypernode` 启用则并入超节点单元（权重更高），core 优化二者**综合收益**。
+- **A（drain，P0）**：**单趟动态贪心、产出唯一 plan**。每一轮先评估全部仍可腾空的 unit；每个 unit 只有在 victim 可全部通过 `FeasibleRelocation` 重落、且不超过 `maxPerRun` 等硬约束时才成为可行候选。随后比较候选的**完整计划**（此前已提交的 moves + 该候选新增的 moves），选择扰动最小者并原子提交；提交后更新接收端容量和预算，再从头动态重选，直到没有可行候选。最后统一检查 `MinNodesFreed` 与 `goals[].minFragImprovementPercent` 收益门槛。当前内置 domain 为 `node`（一节点一 unit）；HyperNode 多节点 unit 是既有 `FreeableUnit` 扩展位，待后续插件接入。
 
-  **增量代价 = 字典序（关键）**：单元的腾空代价是一个**按维度排序的字典序键**，逐项比较、取最小：
-  1. **增量破组受损卡**（gang 阶跃）——core 维护"**已破组 gang 集合**"，随每次提交更新；victim 若属于**已破组** gang，该部分**记 0**（破组后再搬同一 gang 影响性不变，见 §扰动控制阶跃函数）；未破组内按搬走卡、这一搬会破组则按 footprint；
-  2. **搬走卡数**（movedGPU）；
-  3. **搬走 pod 数**（movedPods）。
+#### 当前 P0 多策略扰动评分（`LeastDisruptive`）
 
-  用字典序而非加权和：直观、无需调权重、天然"gang 损伤优先"。因为是单趟动态搜索，**只产出一个 plan**——**不需要跨候选归一化择优**（旧的"多起始排序 + pickBest + `LeastDisruptive` 加权归一"随之退役）。一旦某 gang 注定被破，"只压着该 gang pod 的其它节点"增量降为可忽略、**免费可腾**，从而在**同等 gang 损伤下多腾节点**。
+> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + Moves` 计算全计划扰动，并由 `Session.LeastDisruptive` 做**逐维 min-max 归一化的加权求和**。评分只在已经通过可行性与预算硬过滤的候选之间排序，不会放宽 INV-RESCHED 或 `maxPerRun`。
+
+默认启用 `base + node + gang`，其中 `node` 仅提供可腾空单元；实际评分由 `base` 与 `gang` 注册五个维度：
+
+| 评分维度 | 默认权重 | 原始值 | 目的 |
+|---|---:|---|---|
+| `affectedPodGroups` | 1.0 | 全计划中实际迁移到的 distinct PodGroup 数 | 尽量少影响作业 |
+| `gangBreaches` | 0.8 | `movedPods > max(Running-MinAvailable, 0)` 的 PodGroup 数 | 避免打破 gang 下限 |
+| `damagedResource` | 0.6 | 未破组时计该组已搬迁卡数；破组时计整个 PodGroup footprint | 避免低估打破大 gang 的代价 |
+| `movedResource` | 0.3 | 全计划搬迁的目标资源总量 | 控制 GPU/NPU 搬迁规模 |
+| `movedPods` | 0.1 | 全计划实际重落的 Pod 数 | 控制 Pod churn |
+
+对本轮第 `i` 个可行候选、每个维度 `k`，先在本轮候选集合内归一化：
+
+```text
+norm(i, k) = 0                                      if max(raw(*, k)) == min(raw(*, k))
+           = (raw(i, k) - min(raw(*, k))) / span    otherwise
+
+score(i) = Σ weight(k) × norm(i, k)
+```
+
+选择 `score(i)` 最小的候选。某维度在本轮所有候选都相同，说明它不能区分当前选择，归一化后贡献为 0；因此分数是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
+
+把已提交 moves 纳入每个候选有两个关键效果：一是新触及一个 PodGroup 会增加 `affectedPodGroups`；二是一个 gang 已被打破后，继续搬其 Pod 不再增加 `gangBreaches`，`damagedResource` 也仍是该 gang 的一次 footprint 计费，但 `movedResource` 与 `movedPods` 仍会增加。该机制会倾向复用已有扰动面，却不会把后续迁移误判为零代价。
+
+若总分相同，候选在进入评分前已按 `FreeableUnit.Weight` 降序、unit key 字典序升序排列，`LeastDisruptive` 保留第一个；这为未来 HyperNode 等更高 Weight 的 unit 留出确定性同分决策。Weight 不是硬优先级：低 Weight 候选若总扰动更低，仍可胜出。
+
 - **B（concentration，未实现）**：势函数 `Φ=Σusedᵢ²` 爬山（`ΔΦ=2g·(g+usedTo−usedFrom)` 最大步，整数严格涨分保证终止）；接口已留，P0 不构建。
 
 > 跨"整体 plan"的对比只在 **DryRun 同时启用两个 core（A/B，P1）** 时才需要——那属于"并排展示、人工/配置择一"，不是执行期的自动挑选。
@@ -1138,8 +1161,8 @@ flowchart TD
 ### 扰动控制
 
 - **动作/代价单位 = PodGroup（gang），软感知（非硬原子）**：破组代价以整 gang 评估，但**不要求整组 pod 一起搬**——只搬"腾节点所需"的那些 pod，破组与否由下面的阶跃函数计价，`node` 域 + 逐 task 装箱负责实际搬运。
-- **受损卡数按 gang 语义计（阶跃）**：搬走 Pod 未突破 `minAvailable` 时只计搬走的卡；一旦突破，整 gang 视为受损（按 footprint 计）。据此自动**优先只动盈余 Pod、避开大作业**。
-- **破组后边际为 0**：阶跃在破组处是**平台**（定值 footprint，与"多搬了几个"无关）——即"破组后这些 pod 搬与不搬影响性无差"。drain core 据此做**增量破组感知贪心**：把"已破组 gang 的 pod"的搬动增量代价记 0，动态优先腾"搭便车"的节点，在同等 gang 损伤下多腾节点（见 §整理算法详解 A）。
+- **受损卡数按 gang 语义计（阶跃）**：搬走 Pod 未突破 `minAvailable` 时计该组已搬走的卡；一旦突破，整 gang 视为受损（按 footprint 计）。因此首次打破大 gang 的成本显著更高，默认评分会倾向少触及作业、避开大作业。
+- **评分看全计划而非单步增量**：每轮把此前已提交的 moves 与当前候选 moves 合并评分。破组 gang 的 footprint 不会被重复累计、受影响 gang 数也不会重复增加；但后续搬迁仍会增加 `movedResource` 和 `movedPods`，并非"边际为 0"。详见上方“当前 P0 多策略扰动评分”。
 - **封顶**：`maxPerRun.podGroups` / `.resources` 限定单轮规模；长优雅期作业可在挑 victim 时规避。
 
 ### 实现分期

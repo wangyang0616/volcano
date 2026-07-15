@@ -46,10 +46,11 @@ import (
 // npuResource is a fake, fully-qualified extended resource (contains "/", so it
 // passes the goals.resource CEL rule). 8 units are advertised per worker node.
 const (
-	npuResource   = v1.ResourceName("volcano.sh/e2e-npu")
-	npuPerNode    = 8
-	repackTimeout = 3 * time.Minute
-	repackPoll    = 2 * time.Second
+	npuResource    = v1.ResourceName("volcano.sh/e2e-npu")
+	altNPUResource = v1.ResourceName("volcano.sh/e2e-alt-npu")
+	npuPerNode     = 8
+	repackTimeout  = 3 * time.Minute
+	repackPoll     = 2 * time.Second
 
 	nativeWorkloadLabel  = "repack-e2e-workload"
 	nativeScopeLabel     = "repack-e2e-scope"
@@ -91,20 +92,29 @@ func schedulableNodes(ctx *e2eutil.TestContext) []string {
 	return out
 }
 
-// advertiseNPU patches qty fake NPUs onto a node's capacity+allocatable.
-func advertiseNPU(ctx *e2eutil.TestContext, node string, qty int) {
+// advertiseResource patches an extended resource onto a node's
+// capacity+allocatable.
+func advertiseResource(ctx *e2eutil.TestContext, node string, res v1.ResourceName, qty int) {
 	patch := fmt.Sprintf(`{"status":{"capacity":{"%s":"%d"},"allocatable":{"%s":"%d"}}}`,
-		npuResource, qty, npuResource, qty)
+		res, qty, res, qty)
 	_, err := ctx.Kubeclient.CoreV1().Nodes().Patch(
 		context.TODO(), node, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{}, "status")
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// clearNPU removes the fake NPU resource from a node (JSON-merge null deletes it).
-func clearNPU(ctx *e2eutil.TestContext, node string) {
-	patch := fmt.Sprintf(`{"status":{"capacity":{"%s":null},"allocatable":{"%s":null}}}`, npuResource, npuResource)
+// clearResource removes an extended resource from a node (JSON-merge null deletes it).
+func clearResource(ctx *e2eutil.TestContext, node string, res v1.ResourceName) {
+	patch := fmt.Sprintf(`{"status":{"capacity":{"%s":null},"allocatable":{"%s":null}}}`, res, res)
 	_, _ = ctx.Kubeclient.CoreV1().Nodes().Patch(
 		context.TODO(), node, types.MergePatchType, []byte(patch), metav1.PatchOptions{}, "status")
+}
+
+func advertiseNPU(ctx *e2eutil.TestContext, node string, qty int) {
+	advertiseResource(ctx, node, npuResource, qty)
+}
+
+func clearNPU(ctx *e2eutil.TestContext, node string) {
+	clearResource(ctx, node, npuResource)
 }
 
 // npuFixture advertises fake NPUs on up to len(want) worker nodes and returns the
@@ -125,8 +135,15 @@ func npuFixture(ctx *e2eutil.TestContext, nodes int) []string {
 // task is pinned there (deterministic fragmented layout for DryRun); otherwise the
 // scheduler places it (used for Execute, so the replacement can move). Waits Ready.
 func occupy(ctx *e2eutil.TestContext, name, node string, cards int) *batchv1alpha1.Job {
+	return occupyResource(ctx, name, node, npuResource, cards)
+}
+
+// occupyResource creates a one-task vcjob requesting cards of res. It is used
+// to verify that spec.goals[0].resource selects a resource independently from
+// the engine's configured default resource.
+func occupyResource(ctx *e2eutil.TestContext, name, node string, res v1.ResourceName, cards int) *batchv1alpha1.Job {
 	npuQty := resource.MustParse(fmt.Sprintf("%d", cards))
-	npuList := v1.ResourceList{npuResource: npuQty}
+	npuList := v1.ResourceList{res: npuQty}
 	spec := &e2eutil.JobSpec{
 		Name:      name,
 		Namespace: ctx.Namespace,
@@ -241,7 +258,10 @@ func newRun(name string, mode repackv1alpha1.RepackMode) *runBuilder {
 	}}
 }
 func (b *runBuilder) goal(res v1.ResourceName) *runBuilder {
-	b.run.Spec.Goals = []repackv1alpha1.RepackGoal{{Resource: res}}
+	return b.goalWithMinFragImprovement(res, 0)
+}
+func (b *runBuilder) goalWithMinFragImprovement(res v1.ResourceName, percent int32) *runBuilder {
+	b.run.Spec.Goals = []repackv1alpha1.RepackGoal{{Resource: res, MinFragImprovementPercent: percent}}
 	return b
 }
 func (b *runBuilder) ttl(sec int64) *runBuilder { b.run.Spec.TTLSecondsAfterFinished = &sec; return b }

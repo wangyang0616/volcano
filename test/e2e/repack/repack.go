@@ -43,6 +43,7 @@ var _ = Describe("Repack DryRun & admission", func() {
 	AfterEach(func() {
 		for _, n := range nodes {
 			clearNPU(ctx, n)
+			clearResource(ctx, n, altNPUResource)
 		}
 		e2eutil.CleanupTestContext(ctx)
 	})
@@ -129,6 +130,52 @@ var _ = Describe("Repack DryRun & admission", func() {
 		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1))
 	})
 
+	// D10: an explicit goal must take precedence over --repack-default-resource.
+	// The e2e engine defaults to npuResource, so put the fragmented workload on a
+	// different resource. If the goal were ignored, this run would see an empty
+	// default resource and report NoFragmentation instead of a recommendation.
+	It("uses the explicitly requested goal resource ahead of the engine default", func() {
+		for _, n := range nodes {
+			advertiseResource(ctx, n, altNPUResource, npuPerNode)
+		}
+		occupyResource(ctx, "goal-a", nodes[0], altNPUResource, 4)
+		occupyResource(ctx, "goal-b", nodes[1], altNPUResource, 2)
+
+		run, err := newRun("explicit-goal", repackv1alpha1.RepackModeDryRun).goal(altNPUResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("RepackRecommended"))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1))
+	})
+
+	// The fixture has three providing nodes. Moving the 2-card gang alongside
+	// the 4-card gang reduces fragmentation by exactly 1/3, so a 33pp gate
+	// admits the plan whereas 34pp rejects it.
+	It("honors goals.minFragImprovementPercent as the plan benefit gate", func() {
+		occupy(ctx, "threshold-a", nodes[0], 4)
+		occupy(ctx, "threshold-b", nodes[1], 2)
+
+		admit, err := newRun("threshold-admit", repackv1alpha1.RepackModeDryRun).
+			goalWithMinFragImprovement(npuResource, 33).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, admit.Name)
+		admitted := waitTerminal(ctx, admit.Name)
+		Expect(completeReason(admitted)).To(Equal("RepackRecommended"))
+		Expect(admitted.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(1))
+
+		reject, err := newRun("threshold-reject", repackv1alpha1.RepackModeDryRun).
+			goalWithMinFragImprovement(npuResource, 34).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, reject.Name)
+		rejected := waitTerminal(ctx, reject.Name)
+		Expect(rejected.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(rejected)).To(Equal("BelowGoalThreshold"))
+		Expect(rejected.Status.Plan.Moves).To(BeEmpty())
+	})
+
 	// D12: CEL rejects a core resource target at apply time (no engine needed).
 	It("rejects a RepackRun whose goal targets a core resource (cpu)", func() {
 		run := &repackv1alpha1.RepackRun{
@@ -143,6 +190,25 @@ var _ = Describe("Repack DryRun & admission", func() {
 			deleteRun(ctx, created.Name)
 		}
 		Expect(err).To(HaveOccurred(), "cpu goal must be rejected by CEL")
+	})
+
+	// D13: P0 supports at most one goal (one accelerator resource per Run).
+	It("rejects a RepackRun with multiple goals", func() {
+		run := &repackv1alpha1.RepackRun{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "multiple-goals-"},
+			Spec: repackv1alpha1.RepackRunSpec{
+				Mode: repackv1alpha1.RepackModeDryRun,
+				Goals: []repackv1alpha1.RepackGoal{
+					{Resource: npuResource},
+					{Resource: altNPUResource},
+				},
+			},
+		}
+		created, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Create(context.TODO(), run, metav1.CreateOptions{})
+		if err == nil {
+			deleteRun(ctx, created.Name)
+		}
+		Expect(err).To(HaveOccurred(), "multiple goals must be rejected by the CRD maxItems validation")
 	})
 
 	// G22: spec is immutable once created (CEL self==oldSelf).
