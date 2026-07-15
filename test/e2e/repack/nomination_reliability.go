@@ -100,7 +100,7 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 			Expect(movePGs).To(HaveKey(nom.PodGroupName), "nomination must reference a moved PodGroup")
 			Expect(nom.ExpirationTime).NotTo(BeNil(), "nomination needs a TTL bound")
 			Expect(nom.ExpirationTime.Time.After(time.Now())).To(BeTrue(), "nomination expiration must be in the future")
-			Expect([]string{"Pending", "Bound", "Expired"}).To(ContainElement(nom.Phase), "nomination phase enum")
+			Expect([]repackv1alpha1.PodNominationPhase{repackv1alpha1.PodNominationPending, repackv1alpha1.PodNominationBound, repackv1alpha1.PodNominationExpired}).To(ContainElement(nom.Phase), "nomination phase enum")
 		}
 
 		// Exact linkage: one landing nomination per relocated pod.

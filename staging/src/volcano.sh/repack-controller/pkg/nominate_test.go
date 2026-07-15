@@ -135,7 +135,7 @@ func TestMatchNomination(t *testing.T) {
 	})
 
 	t.Run("no match: wrong PodGroup / namespace / expired / bound", func(t *testing.T) {
-		bound := repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", NodeName: "n1", Phase: nomBound, ExpirationTime: &future}
+		bound := repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", NodeName: "n1", Phase: repackv1alpha1.PodNominationBound, ExpirationTime: &future}
 		expired := repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", NodeName: "n1", ExpirationTime: &past}
 		wrongPG := repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "other", NodeName: "n1", ExpirationTime: &future}
 		wrongNS := repackv1alpha1.PodNomination{Namespace: "elsewhere", PodGroupName: "g", NodeName: "n1", ExpirationTime: &future}
@@ -173,7 +173,7 @@ func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
 func TestReconcilePatchesNominatedNodeAndMarksNominationBound(t *testing.T) {
 	pod := pendingPod("ns", "replacement", "group", nil)
 	run := runWithNoms("run", repackv1alpha1.PodNomination{
-		Namespace: "ns", PodGroupName: "group", VictimPodName: "replacement", NodeName: "n2", Phase: nomPending,
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "replacement", NodeName: "n2", Phase: repackv1alpha1.PodNominationPending,
 	})
 	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	if err := pods.Add(pod); err != nil {
@@ -215,15 +215,15 @@ func TestReconcilePatchesNominatedNodeAndMarksNominationBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get updated RepackRun: %v", err)
 	}
-	if updated.Status.Nominations[0].Phase != nomBound {
-		t.Errorf("nomination phase = %q, want %q", updated.Status.Nominations[0].Phase, nomBound)
+	if updated.Status.Nominations[0].Phase != repackv1alpha1.PodNominationBound {
+		t.Errorf("nomination phase = %q, want %q", updated.Status.Nominations[0].Phase, repackv1alpha1.PodNominationBound)
 	}
 }
 
 func TestBoundNominationsAreFlushedOncePerRun(t *testing.T) {
 	run := runWithNoms("run",
-		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p0", NodeName: "n1", Phase: nomPending},
-		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p1", NodeName: "n2", Phase: nomPending},
+		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p0", NodeName: "n1", Phase: repackv1alpha1.PodNominationPending},
+		repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "group", VictimPodName: "p1", NodeName: "n2", Phase: repackv1alpha1.PodNominationPending},
 	)
 	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
 	nominator := &Nominator{volcanoClient: volcanoClient}
@@ -247,8 +247,8 @@ func TestBoundNominationsAreFlushedOncePerRun(t *testing.T) {
 		t.Fatalf("get updated RepackRun: %v", err)
 	}
 	for _, nomination := range updated.Status.Nominations {
-		if nomination.Phase != nomBound {
-			t.Errorf("nomination %q phase = %q, want %q", nomination.VictimPodName, nomination.Phase, nomBound)
+		if nomination.Phase != repackv1alpha1.PodNominationBound {
+			t.Errorf("nomination %q phase = %q, want %q", nomination.VictimPodName, nomination.Phase, repackv1alpha1.PodNominationBound)
 		}
 	}
 }

@@ -53,6 +53,19 @@ const (
 	RepackCancelled RepackPhase = "Cancelled"
 )
 
+// PodNominationPhase reports the state of an Execute-mode landing nomination.
+// +kubebuilder:validation:Enum=Pending;Bound;Expired
+type PodNominationPhase string
+
+const (
+	// PodNominationPending has not yet matched a replacement pod.
+	PodNominationPending PodNominationPhase = "Pending"
+	// PodNominationBound has been applied to a replacement pod.
+	PodNominationBound PodNominationPhase = "Bound"
+	// PodNominationExpired elapsed without matching a replacement pod.
+	PodNominationExpired PodNominationPhase = "Expired"
+)
+
 // ---------- spec ----------
 
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
@@ -254,8 +267,7 @@ type PodNomination struct {
 	// Phase: Pending (not yet matched) / Bound (patched onto a replacement) /
 	// Expired (elapsed without a match).
 	// +optional
-	// +kubebuilder:validation:Enum=Pending;Bound;Expired
-	Phase string `json:"phase,omitempty"`
+	Phase PodNominationPhase `json:"phase,omitempty"`
 }
 
 // RepackPlan is the terminal output, populated in BOTH modes with the same

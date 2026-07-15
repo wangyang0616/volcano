@@ -43,12 +43,7 @@ import (
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 )
 
-// Nomination phases (mirror the CRD enum on PodNomination.Phase).
 const (
-	nomPending = "Pending"
-	nomBound   = "Bound"
-	nomExpired = "Expired"
-
 	podGroupIndexName         = "repack.volcano.sh/pod-group"
 	nominationVictimIndexName = "repack.volcano.sh/nomination-victim"
 	boundStatusFlushDelay     = 100 * time.Millisecond
@@ -172,7 +167,7 @@ func nominationVictimIndex(obj interface{}) ([]string, error) {
 	keys := make([]string, 0, len(run.Status.Nominations))
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		if nomination.Phase == nomBound || nomination.Phase == nomExpired || nomination.VictimPodName == "" {
+		if nomination.Phase == repackv1alpha1.PodNominationBound || nomination.Phase == repackv1alpha1.PodNominationExpired || nomination.VictimPodName == "" {
 			continue
 		}
 		keys = append(keys, nominationVictimIndexKey(nomination.Namespace, nomination.VictimPodName))
@@ -209,7 +204,7 @@ func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 	namespaces := map[string]bool{}
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		if nomination.Phase != nomBound && nomination.Phase != nomExpired {
+		if nomination.Phase != repackv1alpha1.PodNominationBound && nomination.Phase != repackv1alpha1.PodNominationExpired {
 			namespaces[nomination.Namespace] = true
 			if nomination.PodGroupName != "" {
 				podGroups[podGroupIndexKey(nomination.Namespace, nomination.PodGroupName)] = true
@@ -282,7 +277,7 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
 			if nomination.Namespace == pod.Namespace && nomination.VictimPodName == pod.Name &&
-				nomination.Phase != nomBound && nomination.Phase != nomExpired {
+				nomination.Phase != repackv1alpha1.PodNominationBound && nomination.Phase != repackv1alpha1.PodNominationExpired {
 				n.enqueuePendingForRun(run)
 				return
 			}
@@ -404,7 +399,7 @@ func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNominat
 	for _, run := range runs {
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
-			if nomination.Phase == nomBound || nomination.Phase == nomExpired {
+			if nomination.Phase == repackv1alpha1.PodNominationBound || nomination.Phase == repackv1alpha1.PodNominationExpired {
 				continue
 			}
 			if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
@@ -561,8 +556,8 @@ func (n *Nominator) flushBoundNominations(ctx context.Context, owningRunName str
 		for index := range updated.Status.Nominations {
 			nomination := &updated.Status.Nominations[index]
 			if _, queued := keys[nominationStatusKey(nomination)]; queued {
-				if nomination.Phase != nomBound {
-					nomination.Phase = nomBound
+				if nomination.Phase != repackv1alpha1.PodNominationBound {
+					nomination.Phase = repackv1alpha1.PodNominationBound
 					changed = true
 					boundCount++
 				}

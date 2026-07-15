@@ -27,7 +27,7 @@ import (
 // with apply.
 //
 // ---------- status ----------
-// RepackRunStatus reports lifecycle and business output. conditions are
+// RepackRunStatus reports lifecycle and business output. Conditions are
 // authoritative; phase is derived. "Worth repacking?" is folded into the
 // terminal Complete condition's reason (RepackRecommended / Executed /
 // NoFragmentation / BelowGoalThreshold), not a summary field.

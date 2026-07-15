@@ -19,6 +19,7 @@ package v1alpha1
 
 import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 )
 
 // PodNominationApplyConfiguration represents a declarative configuration of the PodNomination type for use
@@ -50,7 +51,7 @@ type PodNominationApplyConfiguration struct {
 	ExpirationTime *v1.Time `json:"expirationTime,omitempty"`
 	// Phase: Pending (not yet matched) / Bound (patched onto a replacement) /
 	// Expired (elapsed without a match).
-	Phase *string `json:"phase,omitempty"`
+	Phase *repackv1alpha1.PodNominationPhase `json:"phase,omitempty"`
 }
 
 // PodNominationApplyConfiguration constructs a declarative configuration of the PodNomination type for use with
@@ -116,7 +117,7 @@ func (b *PodNominationApplyConfiguration) WithExpirationTime(value v1.Time) *Pod
 // WithPhase sets the Phase field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Phase field is set to the value of the last call.
-func (b *PodNominationApplyConfiguration) WithPhase(value string) *PodNominationApplyConfiguration {
+func (b *PodNominationApplyConfiguration) WithPhase(value repackv1alpha1.PodNominationPhase) *PodNominationApplyConfiguration {
 	b.Phase = &value
 	return b
 }

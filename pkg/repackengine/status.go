@@ -74,10 +74,10 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 }
 
 func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
-	phases := make(map[string]string, len(latest))
+	phases := make(map[string]repackv1alpha1.PodNominationPhase, len(latest))
 	for i := range latest {
 		r := &latest[i]
-		if r.Phase == "Bound" || r.Phase == "Expired" {
+		if r.Phase == repackv1alpha1.PodNominationBound || r.Phase == repackv1alpha1.PodNominationExpired {
 			phases[nominationKey(r)] = r.Phase
 		}
 	}
@@ -300,7 +300,7 @@ func buildPodNominations(plan *engineapi.RepackPlan, nominationTTL time.Duration
 			VictimPodName:  intent.PodName,
 			IdentityLabels: intent.IdentityLabels,
 			NodeName:       intent.Node,
-			Phase:          "Pending",
+			Phase:          repackv1alpha1.PodNominationPending,
 			ExpirationTime: &expirationTime,
 		})
 	}

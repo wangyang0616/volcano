@@ -155,7 +155,7 @@ func TestNominationsOf(t *testing.T) {
 	if n.Namespace != "ns" || n.PodGroupName != "g" || n.VictimPodName != "w-0" || n.NodeName != "n2" {
 		t.Errorf("nomination=%+v", n)
 	}
-	if n.Phase != "Pending" {
+	if n.Phase != repackv1alpha1.PodNominationPending {
 		t.Errorf("phase=%q, want Pending", n.Phase)
 	}
 	if n.IdentityLabels["apps.kubernetes.io/pod-index"] != "0" {
@@ -242,10 +242,10 @@ func TestTerminalOutcome(t *testing.T) {
 }
 
 func TestMergeNominationPhasesPreservesControllerOwnedTerminalPhase(t *testing.T) {
-	desired := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: "Pending"}}
-	latest := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: "Bound"}}
+	desired := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodNominationPending}}
+	latest := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodNominationBound}}
 	mergeNominationPhases(desired, latest)
-	if desired[0].Phase != "Bound" {
+	if desired[0].Phase != repackv1alpha1.PodNominationBound {
 		t.Fatalf("phase=%q, want Bound", desired[0].Phase)
 	}
 }
@@ -255,7 +255,7 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "status-conflict"},
 		Status: repackv1alpha1.RepackRunStatus{
 			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1", Phase: "Bound",
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1", Phase: repackv1alpha1.PodNominationBound,
 			}},
 		},
 	}
@@ -275,7 +275,7 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	})
 
 	desired := run.Status.DeepCopy()
-	desired.Nominations[0].Phase = "Pending" // engine's stale view must not undo Bound.
+	desired.Nominations[0].Phase = repackv1alpha1.PodNominationPending // engine's stale view must not undo Bound.
 	desired.Phase = repackv1alpha1.RepackSucceeded
 	engine := &Engine{volcanoClient: volcanoClient}
 	if err := engine.writeStatus(context.Background(), run.Name, desired); err != nil {
@@ -291,7 +291,7 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	if updated.Status.Phase != repackv1alpha1.RepackSucceeded {
 		t.Errorf("phase = %q, want Succeeded", updated.Status.Phase)
 	}
-	if updated.Status.Nominations[0].Phase != "Bound" {
+	if updated.Status.Nominations[0].Phase != repackv1alpha1.PodNominationBound {
 		t.Errorf("nomination phase = %q, want controller-owned Bound", updated.Status.Nominations[0].Phase)
 	}
 }
