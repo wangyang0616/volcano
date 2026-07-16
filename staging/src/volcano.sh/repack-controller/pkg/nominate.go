@@ -20,7 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,19 +41,16 @@ import (
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	repackinformers "volcano.sh/apis/pkg/client/informers/externalversions/repack/v1alpha1"
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
+	"volcano.sh/repack-controller/pkg/placement"
 )
 
 const (
-	podGroupIndexName         = "repack.volcano.sh/pod-group"
-	nominationVictimIndexName = "repack.volcano.sh/nomination-victim"
-	boundStatusFlushDelay     = 100 * time.Millisecond
+	podGroupIndexName           = "repack.volcano.sh/pod-group"
+	placementGateOwnerIndexName = "repack.volcano.sh/placement-gate-owner"
+	nominationVictimIndexName   = "repack.volcano.sh/nomination-victim"
 )
 
-// podGroupAnnotationKey is the pod annotation carrying its PodGroup name; the reconciler
-// matches identityLabels generically, so it needs no per-workload identity key.
-const podGroupAnnotationKey = "scheduling.k8s.io/group-name"
-
-// Nominator is the landing-steering reconciler: it watches Pods and, for a not-
+// Nominator is the placement-steering reconciler: it watches Pods and, for a not-
 // yet-scheduled replacement pod, looks up a matching PodNomination in some
 // RepackRun.status.nominations[] and writes pod.status.nominatedNodeName so the
 // scheduler prefers the repack-recommended node. It is best-effort and soft — a
@@ -65,20 +62,18 @@ const podGroupAnnotationKey = "scheduling.k8s.io/group-name"
 // lifecycle, and is conceptually part of the repack control loop — so it lives
 // with the RepackRun controller, decoupled from any single workload controller.
 type Nominator struct {
-	kubernetesClient       kubernetes.Interface
-	volcanoClient          vcclientset.Interface
-	podLister              corelisters.PodLister
-	repackRunLister        repacklisters.RepackRunLister
-	podIndexer             cache.Indexer
-	repackRunIndexer       cache.Indexer
-	podGroupIndexAvailable bool
-	victimIndexAvailable   bool
-	informerSyncs          []cache.InformerSynced
-	workQueue              workqueue.TypedRateLimitingInterface[string]
-	boundStatusQueue       workqueue.TypedRateLimitingInterface[string]
-	boundMutex             sync.Mutex
-	pendingBounds          map[string]map[string]struct{} // RepackRun name -> nomination keys
-	now                    func() time.Time
+	kubernetesClient        kubernetes.Interface
+	volcanoClient           vcclientset.Interface
+	podLister               corelisters.PodLister
+	repackRunLister         repacklisters.RepackRunLister
+	podIndexer              cache.Indexer
+	repackRunIndexer        cache.Indexer
+	podGroupIndexAvailable  bool
+	gateOwnerIndexAvailable bool
+	victimIndexAvailable    bool
+	informerSyncs           []cache.InformerSynced
+	workQueue               workqueue.TypedRateLimitingInterface[string]
+	now                     func() time.Time
 }
 
 // NewNominator wires the reconciler to Pod and RepackRun informers. Watching
@@ -87,9 +82,14 @@ type Nominator struct {
 // RepackRun update must therefore wake the already-existing Pending Pod.
 func NewNominator(kubernetesClient kubernetes.Interface, volcanoClient vcclientset.Interface, podInformer coreinformers.PodInformer, repackRunInformer repackinformers.RepackRunInformer) *Nominator {
 	podGroupIndexAvailable := true
-	if err := podInformer.Informer().AddIndexers(cache.Indexers{podGroupIndexName: podGroupIndex}); err != nil {
-		klog.ErrorS(err, "repack nominator: add PodGroup index; falling back to namespace scan")
+	gateOwnerIndexAvailable := true
+	if err := podInformer.Informer().AddIndexers(cache.Indexers{
+		podGroupIndexName:           podGroupIndex,
+		placementGateOwnerIndexName: placementGateOwnerIndex,
+	}); err != nil {
+		klog.ErrorS(err, "repack nominator: add Pod indexes; falling back to namespace scan")
 		podGroupIndexAvailable = false
+		gateOwnerIndexAvailable = false
 	}
 	victimIndexAvailable := true
 	if err := repackRunInformer.Informer().AddIndexers(cache.Indexers{nominationVictimIndexName: nominationVictimIndex}); err != nil {
@@ -97,19 +97,18 @@ func NewNominator(kubernetesClient kubernetes.Interface, volcanoClient vcclients
 		victimIndexAvailable = false
 	}
 	n := &Nominator{
-		kubernetesClient:       kubernetesClient,
-		volcanoClient:          volcanoClient,
-		podLister:              podInformer.Lister(),
-		repackRunLister:        repackRunInformer.Lister(),
-		podIndexer:             podInformer.Informer().GetIndexer(),
-		repackRunIndexer:       repackRunInformer.Informer().GetIndexer(),
-		podGroupIndexAvailable: podGroupIndexAvailable,
-		victimIndexAvailable:   victimIndexAvailable,
-		informerSyncs:          []cache.InformerSynced{podInformer.Informer().HasSynced, repackRunInformer.Informer().HasSynced},
-		workQueue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		boundStatusQueue:       workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		pendingBounds:          make(map[string]map[string]struct{}),
-		now:                    time.Now,
+		kubernetesClient:        kubernetesClient,
+		volcanoClient:           volcanoClient,
+		podLister:               podInformer.Lister(),
+		repackRunLister:         repackRunInformer.Lister(),
+		podIndexer:              podInformer.Informer().GetIndexer(),
+		repackRunIndexer:        repackRunInformer.Informer().GetIndexer(),
+		podGroupIndexAvailable:  podGroupIndexAvailable,
+		gateOwnerIndexAvailable: gateOwnerIndexAvailable,
+		victimIndexAvailable:    victimIndexAvailable,
+		informerSyncs:           []cache.InformerSynced{podInformer.Informer().HasSynced, repackRunInformer.Informer().HasSynced},
+		workQueue:               workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		now:                     time.Now,
 	}
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueue,
@@ -119,6 +118,7 @@ func NewNominator(kubernetesClient kubernetes.Interface, volcanoClient vcclients
 	repackRunInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    n.enqueuePendingForRun,
 		UpdateFunc: func(_, newObj interface{}) { n.enqueuePendingForRun(newObj) },
+		DeleteFunc: n.enqueueGatedPodsForDeletedRun,
 	})
 	return n
 }
@@ -128,8 +128,17 @@ func (n *Nominator) enqueue(obj interface{}) {
 	if !ok {
 		return
 	}
+	if pod.Spec.NodeName != "" {
+		if pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "" {
+			key, err := cache.MetaNamespaceKeyFunc(pod)
+			if err == nil {
+				n.workQueue.Add(key)
+			}
+		}
+		return
+	}
 	if !needsNomination(pod) {
-		return // already scheduled or already nominated — skip cheaply
+		return // already nominated, terminating, or not Pending
 	}
 	key, err := cache.MetaNamespaceKeyFunc(pod)
 	if err != nil {
@@ -152,11 +161,23 @@ func podGroupIndex(obj interface{}) ([]string, error) {
 	if !ok {
 		return nil, nil
 	}
-	podGroupName := pod.Annotations[podGroupAnnotationKey]
+	podGroupName := placement.PodGroupName(pod)
 	if podGroupName == "" {
 		return nil, nil
 	}
 	return []string{podGroupIndexKey(pod.Namespace, podGroupName)}, nil
+}
+
+func placementGateOwnerIndex(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, nil
+	}
+	owner := pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]
+	if owner == "" {
+		return nil, nil
+	}
+	return []string{owner}, nil
 }
 
 func nominationVictimIndex(obj interface{}) ([]string, error) {
@@ -167,7 +188,7 @@ func nominationVictimIndex(obj interface{}) ([]string, error) {
 	keys := make([]string, 0, len(run.Status.Nominations))
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		if nomination.Phase == repackv1alpha1.PodNominationBound || nomination.Phase == repackv1alpha1.PodNominationExpired || nomination.VictimPodName == "" {
+		if placementConsumed(nomination) || nomination.Phase == repackv1alpha1.PodPlacementExpired || nomination.VictimPodName == "" {
 			continue
 		}
 		keys = append(keys, nominationVictimIndexKey(nomination.Namespace, nomination.VictimPodName))
@@ -200,11 +221,15 @@ func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 	if !ok {
 		return
 	}
+	n.enqueueGatedPodsForOwner(placement.OwnerValue(run.Name, run.UID))
+	if !placementRunActive(run) {
+		return
+	}
 	podGroups := map[string]bool{}
 	namespaces := map[string]bool{}
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		if nomination.Phase != repackv1alpha1.PodNominationBound && nomination.Phase != repackv1alpha1.PodNominationExpired {
+		if !placementConsumed(nomination) && nomination.Phase != repackv1alpha1.PodPlacementExpired {
 			namespaces[nomination.Namespace] = true
 			if nomination.PodGroupName != "" {
 				podGroups[podGroupIndexKey(nomination.Namespace, nomination.PodGroupName)] = true
@@ -238,6 +263,49 @@ func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 			for _, pod := range pods {
 				n.enqueue(pod)
 			}
+		}
+	}
+}
+
+func (n *Nominator) enqueueGatedPodsForDeletedRun(obj interface{}) {
+	run, ok := obj.(*repackv1alpha1.RepackRun)
+	if !ok {
+		if tombstone, tombstoneOK := obj.(cache.DeletedFinalStateUnknown); tombstoneOK {
+			run, ok = tombstone.Obj.(*repackv1alpha1.RepackRun)
+		}
+	}
+	if !ok || run == nil {
+		return
+	}
+	n.enqueueGatedPodsForOwner(placement.OwnerValue(run.Name, run.UID))
+}
+
+func (n *Nominator) enqueueGatedPodsForOwner(owner string) {
+	if owner == "" {
+		return
+	}
+	if n.gateOwnerIndexAvailable && n.podIndexer != nil {
+		objects, err := n.podIndexer.ByIndex(placementGateOwnerIndexName, owner)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+		for _, object := range objects {
+			n.enqueue(object)
+		}
+		return
+	}
+	if n.podLister == nil {
+		return
+	}
+	pods, err := n.podLister.List(labels.Everything())
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	for _, pod := range pods {
+		if pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == owner {
+			n.enqueue(pod)
 		}
 	}
 }
@@ -277,7 +345,7 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
 			if nomination.Namespace == pod.Namespace && nomination.VictimPodName == pod.Name &&
-				nomination.Phase != repackv1alpha1.PodNominationBound && nomination.Phase != repackv1alpha1.PodNominationExpired {
+				!placementConsumed(nomination) && nomination.Phase != repackv1alpha1.PodPlacementExpired {
 				n.enqueuePendingForRun(run)
 				return
 			}
@@ -290,7 +358,6 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 func (n *Nominator) Run(ctx context.Context, workers int) error {
 	defer utilruntime.HandleCrash()
 	defer n.workQueue.ShutDown()
-	defer n.boundStatusQueue.ShutDown()
 	if !cache.WaitForCacheSync(ctx.Done(), n.informerSyncs...) {
 		return fmt.Errorf("nominator: cache failed to sync")
 	}
@@ -298,18 +365,14 @@ func (n *Nominator) Run(ctx context.Context, workers int) error {
 		workers = 1
 	}
 	klog.V(3).InfoS("Starting repack nominator", "workers", workers,
-		"podGroupIndexEnabled", n.podGroupIndexAvailable, "victimIndexEnabled", n.victimIndexAvailable,
-		"boundStatusFlushDelay", boundStatusFlushDelay)
+		"podGroupIndexEnabled", n.podGroupIndexAvailable, "gateOwnerIndexEnabled", n.gateOwnerIndexAvailable,
+		"victimIndexEnabled", n.victimIndexAvailable)
 	for i := 0; i < workers; i++ {
 		go func() {
 			for n.processNext(ctx) {
 			}
 		}()
 	}
-	go func() {
-		for n.processNextBoundStatus(ctx) {
-		}
-	}()
 	<-ctx.Done()
 	return nil
 }
@@ -341,25 +404,88 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	if pod.Spec.NodeName != "" {
+		if err := n.observePlacement(ctx, pod); err != nil {
+			return err
+		}
+		return n.clearPlacementGate(ctx, pod)
+	}
 	if !needsNomination(pod) {
 		return nil
 	}
-
-	nomination, owningRunName := n.matchNomination(pod)
-	if nomination == nil {
-		klog.V(5).InfoS("no pending nomination matches this pod", "pod", key)
-		return nil // no pending nomination targets this pod
+	if !hasPlacementGate(pod) {
+		run, err := n.placementRunForPod(ctx, pod)
+		if err != nil {
+			return err
+		}
+		if placementAwaitingBinding(run, pod) {
+			return nil
+		}
+		return n.clearPlacementGate(ctx, pod)
 	}
 
-	if err := n.patchNominatedNode(ctx, pod, nomination.NodeName); err != nil {
+	run, err := n.placementRunForPod(ctx, pod)
+	if err != nil {
 		return err
 	}
-	klog.V(3).InfoS("nominated replacement pod", "pod", key, "node", nomination.NodeName, "repackRun", owningRunName)
-	// Bound is audit state, not part of the scheduling decision: the Pod status
-	// patch above is durable and needsNomination prevents duplicate patches. Batch
-	// run-status updates so N replacement pods do not produce N full-object writes.
-	n.queueBoundNomination(owningRunName, nomination)
+	if run == nil {
+		return n.clearPlacementGate(ctx, pod)
+	}
+	nomination, owningRunName := n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+	if nomination == nil {
+		if pendingPlacementForPodGroup(run, pod, n.now()) {
+			// Deployment/ReplicaSet can create its replacement while the victim
+			// remains Terminating. At this point it is indistinguishable from a
+			// concurrent scale-out Pod, so retain the owner-marked gate until
+			// victim deletion makes matching authoritative.
+			return nil
+		}
+		return n.clearPlacementGate(ctx, pod)
+	}
+	if hasPlacementGate(pod) && nomination.SelectedNodeName == "" {
+		// The admission webhook has stopped the scheduler. Hand the placement
+		// decision to the engine, which owns the scheduler session and can choose
+		// a current receiver without duplicating predicate logic here.
+		return n.markPlacementGated(ctx, owningRunName, pod)
+	}
+
+	selectedNode := nomination.SelectedNodeName
+	if selectedNode == "" {
+		selectedNode = nomination.NodeName
+	}
+	if err := n.patchNominatedNode(ctx, pod, selectedNode); err != nil {
+		return err
+	}
+	if err := n.markPlacementNominated(ctx, owningRunName, nomination, pod, selectedNode); err != nil {
+		return err
+	}
+	if err := n.openPlacementGate(ctx, pod); err != nil {
+		return err
+	}
+	klog.V(3).InfoS("repack placement nominated replacement pod", "pod", key, "node", selectedNode, "repackRun", owningRunName)
 	return nil
+}
+
+func pendingPlacementForPodGroup(run *repackv1alpha1.RepackRun, pod *corev1.Pod, now time.Time) bool {
+	if !placementRunActive(run) || pod == nil {
+		return false
+	}
+	podGroupName := placement.PodGroupName(pod)
+	for i := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[i]
+		if nomination.Namespace != pod.Namespace || nomination.PodGroupName != podGroupName || placementConsumed(nomination) || nomination.Phase == repackv1alpha1.PodPlacementExpired {
+			continue
+		}
+		if nomination.ExpirationTime == nil || !now.After(nomination.ExpirationTime.Time) {
+			return true
+		}
+	}
+	return false
+}
+
+func placementRunActive(run *repackv1alpha1.RepackRun) bool {
+	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
+		run.Status.Phase == repackv1alpha1.RepackRunning
 }
 
 // needsNomination is true for a pod that is unscheduled, not yet nominated, and
@@ -371,10 +497,7 @@ func needsNomination(pod *corev1.Pod) bool {
 		pod.DeletionTimestamp == nil
 }
 
-// matchNomination scans every RepackRun's pending, unexpired nominations for one
-// that targets this pod, returning the record and the owning run's name.
-//
-// Match precedence — the landing-identity contract (§5.2.2):
+// Match precedence — the placement identity contract (§5.2.2):
 //  1. victimPodName exact: nomination.VictimPodName equals the pod's name (same-name
 //     rebuild — vcjob/StatefulSet/kthena ordinals);
 //  2. identityLabels: same namespace+PodGroup and the pod's labels are a superset
@@ -382,24 +505,25 @@ func needsNomination(pod *corev1.Pod) bool {
 //     say exactly how to match — e.g. repack.volcano.sh/pod-identity=worker-3);
 //  3. fungible: nomination.IdentityLabels empty — any pending pod in the same PodGroup
 //     (single-role Deployment/ReplicaSet/Job).
-//
-// TODO(#46): when a native-kind pod exposes its identity only via env / ordinal
-// name (not a label), have the engine record the equivalent label key here so the
-// generic superset match still applies.
-func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNomination, string) {
-	runs, err := n.repackRunLister.List(labels.Everything())
-	if err != nil {
-		utilruntime.HandleError(err)
+func (n *Nominator) matchNominationInRuns(pod *corev1.Pod, runs []*repackv1alpha1.RepackRun) (*repackv1alpha1.PodNomination, string) {
+	if pod == nil {
 		return nil, ""
 	}
 	now := n.now()
-	podGroupName := pod.Annotations[podGroupAnnotationKey]
+	podGroupName := placement.PodGroupName(pod)
 	var fungibleNomination *repackv1alpha1.PodNomination
 	var fungibleRunName string
 	for _, run := range runs {
+		if !placementRunActive(run) {
+			continue
+		}
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
-			if nomination.Phase == repackv1alpha1.PodNominationBound || nomination.Phase == repackv1alpha1.PodNominationExpired {
+			if placementConsumed(nomination) || nomination.Phase == repackv1alpha1.PodPlacementExpired {
+				continue
+			}
+			if nomination.ReplacementPodName != "" &&
+				(nomination.ReplacementPodName != pod.Name || nomination.ReplacementPodUID != pod.UID) {
 				continue
 			}
 			if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
@@ -435,6 +559,45 @@ func (n *Nominator) matchNomination(pod *corev1.Pod) (*repackv1alpha1.PodNominat
 	return fungibleNomination, fungibleRunName
 }
 
+// placementRunForPod reads only the Run recorded by the gate owner annotation.
+// The direct read closes informer ordering windows without scanning or matching
+// unrelated Runs.
+func (n *Nominator) placementRunForPod(ctx context.Context, pod *corev1.Pod) (*repackv1alpha1.RepackRun, error) {
+	if n.volcanoClient == nil || pod == nil {
+		return nil, nil
+	}
+	runName, runUID, ok := placement.ParseOwner(
+		pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation])
+	if !ok {
+		return nil, nil
+	}
+	run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if run.UID != runUID {
+		return nil, nil
+	}
+	return run, nil
+}
+
+func placementAwaitingBinding(run *repackv1alpha1.RepackRun, pod *corev1.Pod) bool {
+	if run == nil || pod == nil {
+		return false
+	}
+	for i := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[i]
+		if nomination.Namespace == pod.Namespace && nomination.ReplacementPodName == pod.Name &&
+			nomination.ReplacementPodUID == pod.UID && nomination.Phase == repackv1alpha1.PodPlacementNominated {
+			return true
+		}
+	}
+	return false
+}
+
 func (n *Nominator) victimGone(nomination *repackv1alpha1.PodNomination) bool {
 	if nomination == nil || nomination.VictimPodName == "" || n.podLister == nil {
 		return true
@@ -467,116 +630,185 @@ func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, nod
 	return ignoreNotFound(err)
 }
 
+// openPlacementGate removes only Repack's scheduling gate after the selected
+// receiver is durable. The owner marker remains until actual binding is
+// observed, so scheduled Pod updates can find their Run without global scans.
+func (n *Nominator) openPlacementGate(ctx context.Context, pod *corev1.Pod) error {
+	return n.patchPlacementGate(ctx, pod, false)
+}
+
+// clearPlacementGate removes both Repack's gate and owner marker on terminal,
+// stale, unrelated, or already-observed paths.
+func (n *Nominator) clearPlacementGate(ctx context.Context, pod *corev1.Pod) error {
+	return n.patchPlacementGate(ctx, pod, true)
+}
+
+func (n *Nominator) patchPlacementGate(ctx context.Context, pod *corev1.Pod, removeOwner bool) error {
+	if pod == nil || (!hasPlacementGate(pod) &&
+		(!removeOwner || pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == "")) {
+		return nil
+	}
+	expectedOwner := pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := n.kubernetesClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if latest.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != expectedOwner {
+			return nil
+		}
+		operations := make([]string, 0, 2)
+		for index := range latest.Spec.SchedulingGates {
+			if latest.Spec.SchedulingGates[index].Name != repackv1alpha1.PlacementGateName {
+				continue
+			}
+			operations = append(operations, fmt.Sprintf(`{"op":"remove","path":"/spec/schedulingGates/%d"}`, index))
+			break
+		}
+		if removeOwner && latest.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "" {
+			operations = append(operations, `{"op":"remove","path":"/metadata/annotations/repack.volcano.sh~1placement-gate-owner"}`)
+		}
+		if len(operations) == 0 {
+			return nil
+		}
+		body := []byte("[" + strings.Join(operations, ",") + "]")
+		_, err = n.kubernetesClient.CoreV1().Pods(latest.Namespace).Patch(ctx, latest.Name, types.JSONPatchType, body, metav1.PatchOptions{})
+		return ignoreNotFound(err)
+	})
+}
+
+func hasPlacementGate(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == repackv1alpha1.PlacementGateName {
+			return true
+		}
+	}
+	return false
+}
+
+// markPlacementNominated records the concrete replacement before opening its
+// gate. This makes the later bound-node observation unambiguous even for
+// fungible native workloads.
+func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, nomination *repackv1alpha1.PodNomination, pod *corev1.Pod, selectedNode string) error {
+	if runName == "" || nomination == nil || pod == nil {
+		return nil
+	}
+	key := nominationStatusKey(nomination)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
+		if err != nil {
+			return ignoreNotFound(err)
+		}
+		for index := range run.Status.Nominations {
+			current := &run.Status.Nominations[index]
+			if nominationStatusKey(current) != key {
+				continue
+			}
+			if placementConsumed(current) {
+				return nil
+			}
+			current.SelectedNodeName = selectedNode
+			current.ReplacementPodName = pod.Name
+			current.ReplacementPodUID = pod.UID
+			current.Phase = repackv1alpha1.PodPlacementNominated
+			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+			return err
+		}
+		return nil
+	})
+}
+
+func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod *corev1.Pod) error {
+	if runName == "" || pod == nil {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
+		if err != nil {
+			return ignoreNotFound(err)
+		}
+		current, _ := n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+		if current == nil {
+			return nil
+		}
+		current.ReplacementPodName = pod.Name
+		current.ReplacementPodUID = pod.UID
+		current.Phase = repackv1alpha1.PodPlacementGated
+		_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+		return err
+	})
+}
+
+// observePlacement records the scheduler's actual binding. A selected node is a
+// soft preference by design; if the scheduler has to choose elsewhere the run
+// remains live and the drift is surfaced as Degraded rather than pinning the Pod.
+func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error {
+	if pod == nil || pod.Spec.NodeName == "" {
+		return nil
+	}
+	cachedRun, err := n.placementRunForPod(ctx, pod)
+	if err != nil {
+		return err
+	}
+	if cachedRun == nil {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, cachedRun.Name, metav1.GetOptions{})
+		if err != nil {
+			return ignoreNotFound(err)
+		}
+		for index := range run.Status.Nominations {
+			nomination := &run.Status.Nominations[index]
+			if nomination.Namespace != pod.Namespace || nomination.ReplacementPodName != pod.Name || nomination.ReplacementPodUID != pod.UID {
+				continue
+			}
+			nomination.ActualNodeName = pod.Spec.NodeName
+			switch nomination.Phase {
+			case repackv1alpha1.PodPlacementNominated:
+				if nomination.SelectedNodeName == pod.Spec.NodeName {
+					nomination.Phase = repackv1alpha1.PodPlacementPlaced
+				} else {
+					nomination.Phase = repackv1alpha1.PodPlacementDegraded
+				}
+			case repackv1alpha1.PodPlacementGated, repackv1alpha1.PodPlacementAwaitingCapacity:
+				// Another actor bypassed the gate before the engine selected a
+				// receiver. Record the actual node but never claim controlled
+				// placement success.
+				nomination.Phase = repackv1alpha1.PodPlacementDegraded
+			default:
+				return nil
+			}
+			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+			return err
+		}
+		return nil
+	})
+}
+
+func placementConsumed(nomination *repackv1alpha1.PodNomination) bool {
+	if nomination == nil {
+		return true
+	}
+	switch nomination.Phase {
+	case repackv1alpha1.PodPlacementNominated, repackv1alpha1.PodPlacementPlaced,
+		repackv1alpha1.PodPlacementDegraded, repackv1alpha1.PodPlacementExpired,
+		repackv1alpha1.PodNominationBound:
+		return true
+	default:
+		return false
+	}
+}
+
 func nominationStatusKey(nomination *repackv1alpha1.PodNomination) string {
 	if nomination == nil {
 		return ""
 	}
 	return nomination.Namespace + "\x00" + nomination.PodGroupName + "\x00" + nomination.VictimPodName + "\x00" + nomination.NodeName
-}
-
-// queueBoundNomination coalesces Bound transitions for a RepackRun. The pod's
-// nominatedNodeName is written first and is the scheduling authority; this
-// status update is asynchronous audit/lifecycle state.
-func (n *Nominator) queueBoundNomination(owningRunName string, nomination *repackv1alpha1.PodNomination) {
-	key := nominationStatusKey(nomination)
-	if owningRunName == "" || key == "" {
-		return
-	}
-	n.boundMutex.Lock()
-	if n.pendingBounds == nil {
-		n.pendingBounds = make(map[string]map[string]struct{})
-	}
-	if n.pendingBounds[owningRunName] == nil {
-		n.pendingBounds[owningRunName] = make(map[string]struct{})
-	}
-	n.pendingBounds[owningRunName][key] = struct{}{}
-	pendingCount := len(n.pendingBounds[owningRunName])
-	n.boundMutex.Unlock()
-	klog.V(5).InfoS("repack nominator: queued Bound status transition", "run", owningRunName,
-		"pendingBoundCount", pendingCount)
-	if n.boundStatusQueue != nil {
-		n.boundStatusQueue.AddAfter(owningRunName, boundStatusFlushDelay)
-	}
-}
-
-func (n *Nominator) processNextBoundStatus(ctx context.Context) bool {
-	name, shutdown := n.boundStatusQueue.Get()
-	if shutdown {
-		return false
-	}
-	defer n.boundStatusQueue.Done(name)
-	if err := n.flushBoundNominations(ctx, name); err != nil {
-		utilruntime.HandleError(fmt.Errorf("mark nominations Bound for RepackRun %q: %w", name, err))
-		n.boundStatusQueue.AddRateLimited(name)
-		return true
-	}
-	n.boundStatusQueue.Forget(name)
-	return true
-}
-
-func (n *Nominator) boundNominationKeys(owningRunName string) map[string]struct{} {
-	n.boundMutex.Lock()
-	defer n.boundMutex.Unlock()
-	pending := n.pendingBounds[owningRunName]
-	keys := make(map[string]struct{}, len(pending))
-	for key := range pending {
-		keys[key] = struct{}{}
-	}
-	return keys
-}
-
-func (n *Nominator) clearBoundNominationKeys(owningRunName string, keys map[string]struct{}) {
-	n.boundMutex.Lock()
-	defer n.boundMutex.Unlock()
-	for key := range keys {
-		delete(n.pendingBounds[owningRunName], key)
-	}
-	if len(n.pendingBounds[owningRunName]) == 0 {
-		delete(n.pendingBounds, owningRunName)
-	}
-}
-
-// flushBoundNominations flips all queued records to Bound in one status update.
-// Re-reading the run avoids clobbering a concurrent engine terminal write.
-func (n *Nominator) flushBoundNominations(ctx context.Context, owningRunName string) error {
-	keys := n.boundNominationKeys(owningRunName)
-	if len(keys) == 0 {
-		return nil
-	}
-	updatedCount := 0
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Use an API read, not the informer lister: a stale cached status could
-		// otherwise overwrite the engine's just-written terminal result.
-		updated, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, owningRunName, metav1.GetOptions{})
-		if err != nil {
-			return ignoreNotFound(err)
-		}
-		changed := false
-		boundCount := 0
-		for index := range updated.Status.Nominations {
-			nomination := &updated.Status.Nominations[index]
-			if _, queued := keys[nominationStatusKey(nomination)]; queued {
-				if nomination.Phase != repackv1alpha1.PodNominationBound {
-					nomination.Phase = repackv1alpha1.PodNominationBound
-					changed = true
-					boundCount++
-				}
-			}
-		}
-		if changed {
-			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-			if err != nil {
-				return ignoreNotFound(err)
-			}
-		}
-		updatedCount = boundCount
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	n.clearBoundNominationKeys(owningRunName, keys)
-	klog.V(3).InfoS("repack nominator: Bound nominations flushed", "run", owningRunName,
-		"queuedCount", len(keys), "updatedCount", updatedCount)
-	return nil
 }

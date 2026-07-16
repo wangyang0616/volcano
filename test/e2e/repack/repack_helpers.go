@@ -51,10 +51,11 @@ const (
 	npuPerNode     = 8
 	repackTimeout  = 3 * time.Minute
 	repackPoll     = 2 * time.Second
+	fixtureTimeout = 45 * time.Second
 
 	nativeWorkloadLabel  = "repack-e2e-workload"
 	nativeScopeLabel     = "repack-e2e-scope"
-	nativeSchedulingGate = "repack-e2e-hold"
+	nativePlacementTaint = "repack.volcano.sh/e2e-initial-placement"
 )
 
 // ---- node fixtures -------------------------------------------------------
@@ -158,21 +159,26 @@ func occupyResource(ctx *e2eutil.TestContext, name, node string, res v1.Resource
 	return job
 }
 
-// nativeWorkload is a scheduler-placed Deployment replica that starts at a
+// nativeWorkload is a scheduler-placed controller-owned Pod that starts at a
 // deterministic node only for fixture setup. Its PodGroup is created by the
-// generic pg-controller path (ReplicaSet owner); no workload-specific Repack
-// integration is involved.
+// generic pg-controller path; no workload-specific Repack integration is
+// involved.
 type nativeWorkload struct {
-	deployment *appsv1.Deployment
-	podName    string
-	podGroup   string
+	deployment  *appsv1.Deployment
+	statefulSet *appsv1.StatefulSet
+	podName     string
+	podUID      types.UID
+	podGroup    string
 }
 
-// occupyNativeDeployment creates one gated Deployment pod, binds it to node to
-// form a deterministic fragmented layout, then removes the gate from the
-// ReplicaSet template. A later Repack eviction therefore produces an ordinary
-// Volcano-scheduled replacement, which can consume a nomination.
+// occupyNativeDeployment creates a Deployment replica on a deterministic node
+// without changing its template: other workers are temporarily tainted during
+// the initial scheduling decision. A replacement therefore remains owned by
+// the same ReplicaSet and retains the same controller-derived PodGroup name.
 func occupyNativeDeployment(ctx *e2eutil.TestContext, name, node, scopeValue string, cards int) *nativeWorkload {
+	releaseNodes := holdNonTargetNodes(ctx, node)
+	defer releaseNodes()
+
 	replicas := int32(1)
 	labels := map[string]string{
 		nativeWorkloadLabel: name,
@@ -187,9 +193,8 @@ func occupyNativeDeployment(ctx *e2eutil.TestContext, name, node, scopeValue str
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: v1.PodSpec{
-					SchedulerName:   e2eutil.SchedulerName,
-					RestartPolicy:   v1.RestartPolicyAlways,
-					SchedulingGates: []v1.PodSchedulingGate{{Name: nativeSchedulingGate}},
+					SchedulerName: e2eutil.SchedulerName,
+					RestartPolicy: v1.RestartPolicyAlways,
 					Containers: []v1.Container{{
 						Name:            name,
 						Image:           e2eutil.DefaultNginxImage,
@@ -211,39 +216,124 @@ func occupyNativeDeployment(ctx *e2eutil.TestContext, name, node, scopeValue str
 			return false
 		}
 		pod := &pods.Items[0]
-		if pod.Annotations["scheduling.k8s.io/group-name"] == "" {
+		if pod.Annotations["scheduling.k8s.io/group-name"] == "" || pod.Spec.NodeName != node || pod.Status.Phase != v1.PodRunning {
 			return false
 		}
 		initialPod = pod.DeepCopy()
 		return true
-	}, repackTimeout, repackPoll).Should(BeTrue(), "automatic PodGroup must be associated with native pod")
-
-	err = ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Bind(context.TODO(), &v1.Binding{
-		ObjectMeta: metav1.ObjectMeta{Name: initialPod.Name, Namespace: ctx.Namespace},
-		Target:     v1.ObjectReference{Kind: "Node", Name: node},
-	}, metav1.CreateOptions{})
-	Expect(err).NotTo(HaveOccurred(), "bind gated native pod")
-	Eventually(func() v1.PodPhase {
-		pod, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), initialPod.Name, metav1.GetOptions{})
-		if getErr != nil {
-			return v1.PodUnknown
-		}
-		return pod.Status.Phase
-	}, repackTimeout, repackPoll).Should(Equal(v1.PodRunning), "manually bound native pod should run")
-
-	owner := metav1.GetControllerOf(initialPod)
-	Expect(owner).NotTo(BeNil(), "Deployment pod must have a ReplicaSet controller")
-	Expect(owner.Kind).To(Equal("ReplicaSet"))
-	replicaSet, err := ctx.Kubeclient.AppsV1().ReplicaSets(ctx.Namespace).Get(context.TODO(), owner.Name, metav1.GetOptions{})
-	Expect(err).NotTo(HaveOccurred(), "get native deployment ReplicaSet")
-	replicaSet.Spec.Template.Spec.SchedulingGates = nil
-	_, err = ctx.Kubeclient.AppsV1().ReplicaSets(ctx.Namespace).Update(context.TODO(), replicaSet, metav1.UpdateOptions{})
-	Expect(err).NotTo(HaveOccurred(), "remove fixture scheduling gate from replacement template")
+	}, fixtureTimeout, repackPoll).Should(BeTrue(), "native pod must run on the deterministic fixture node with an automatic PodGroup")
 
 	return &nativeWorkload{
 		deployment: deployment,
 		podName:    initialPod.Name,
+		podUID:     initialPod.UID,
 		podGroup:   initialPod.Annotations["scheduling.k8s.io/group-name"],
+	}
+}
+
+// occupyNativeStatefulSet creates a StatefulSet replica on a deterministic
+// node. Its replacement keeps both the stable ordinal name and the
+// StatefulSet-derived automatic PodGroup.
+func occupyNativeStatefulSet(ctx *e2eutil.TestContext, name, node, scopeValue string, cards int) *nativeWorkload {
+	releaseNodes := holdNonTargetNodes(ctx, node)
+	defer releaseNodes()
+
+	replicas := int32(1)
+	labels := map[string]string{
+		nativeWorkloadLabel: name,
+		nativeScopeLabel:    scopeValue,
+	}
+	quantity := resource.MustParse(fmt.Sprintf("%d", cards))
+	statefulSet, err := ctx.Kubeclient.AppsV1().StatefulSets(ctx.Namespace).Create(context.TODO(), &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ctx.Namespace},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: name,
+			Replicas:    &replicas,
+			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{nativeWorkloadLabel: name}},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: v1.PodSpec{
+					SchedulerName: e2eutil.SchedulerName,
+					RestartPolicy: v1.RestartPolicyAlways,
+					Containers: []v1.Container{{
+						Name:            name,
+						Image:           e2eutil.DefaultNginxImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Resources:       v1.ResourceRequirements{Requests: v1.ResourceList{npuResource: quantity}, Limits: v1.ResourceList{npuResource: quantity}},
+					}},
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "create native StatefulSet")
+
+	var initialPod *v1.Pod
+	Eventually(func() bool {
+		pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: nativeWorkloadLabel + "=" + name,
+		})
+		if listErr != nil || len(pods.Items) != 1 {
+			return false
+		}
+		pod := &pods.Items[0]
+		if pod.Annotations["scheduling.k8s.io/group-name"] == "" || pod.Spec.NodeName != node || pod.Status.Phase != v1.PodRunning {
+			return false
+		}
+		initialPod = pod.DeepCopy()
+		return true
+	}, fixtureTimeout, repackPoll).Should(BeTrue(), "StatefulSet pod must run on the deterministic fixture node with an automatic PodGroup")
+
+	return &nativeWorkload{
+		statefulSet: statefulSet,
+		podName:     initialPod.Name,
+		podUID:      initialPod.UID,
+		podGroup:    initialPod.Annotations["scheduling.k8s.io/group-name"],
+	}
+}
+
+func holdNonTargetNodes(ctx *e2eutil.TestContext, target string) func() {
+	taint := v1.Taint{Key: nativePlacementTaint, Value: "true", Effect: v1.TaintEffectNoSchedule}
+	var added []string
+	for _, nodeName := range schedulableNodes(ctx) {
+		if nodeName == target {
+			continue
+		}
+		node, err := ctx.Kubeclient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		node = node.DeepCopy()
+		alreadyHeld := false
+		for _, existing := range node.Spec.Taints {
+			if existing.Key == taint.Key && existing.Value == taint.Value && existing.Effect == taint.Effect {
+				alreadyHeld = true
+				break
+			}
+		}
+		if alreadyHeld {
+			continue
+		}
+		node.Spec.Taints = append(node.Spec.Taints, taint)
+		_, err = ctx.Kubeclient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred(), "hold non-target fixture node")
+		added = append(added, nodeName)
+	}
+	return func() {
+		for _, nodeName := range added {
+			node, err := ctx.Kubeclient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+			node = node.DeepCopy()
+			filtered := node.Spec.Taints[:0]
+			for _, existing := range node.Spec.Taints {
+				if existing.Key == taint.Key && existing.Value == taint.Value && existing.Effect == taint.Effect {
+					continue
+				}
+				filtered = append(filtered, existing)
+			}
+			node.Spec.Taints = filtered
+			_, err = ctx.Kubeclient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "release non-target fixture node")
+		}
 	}
 }
 

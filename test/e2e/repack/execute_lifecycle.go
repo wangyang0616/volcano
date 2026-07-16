@@ -27,7 +27,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -54,8 +53,9 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 
 	// C6: Execute actually commits — it evicts and writes durable nominations.
 	It("Execute evicts and records nominations", func() {
-		occupy(ctx, "exec-a", nodes[0], 4)
-		occupy(ctx, "exec-b", nodes[1], 2)
+		moving := occupyNativeDeployment(ctx, "exec-moving", nodes[0], "move", 4)
+		staying := occupyNativeDeployment(ctx, "exec-staying", nodes[1], "stay", 2)
+		defer deleteNativeWorkloads(ctx, moving, staying)
 
 		run, err := newRun("execute", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
@@ -64,15 +64,16 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
 		Expect(completeReason(got)).To(Equal("Executed"))
-		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record landing nominations")
+		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")
 	})
 
 	// C8: after an Execute finishes, a second Execute within the cooldown window is
 	// gated (Queued/ExecuteCoolingDown). (K=1 concurrent AnotherRunActive is timing-
 	// racy in e2e — the gate logic itself is unit-tested in state.EvaluateGate.)
 	It("gates a second Execute during the cooldown window", func() {
-		occupy(ctx, "cd-a", nodes[0], 4)
-		occupy(ctx, "cd-b", nodes[1], 2)
+		moving := occupyNativeDeployment(ctx, "cooldown-moving", nodes[0], "move", 4)
+		staying := occupyNativeDeployment(ctx, "cooldown-staying", nodes[1], "stay", 2)
+		defer deleteNativeWorkloads(ctx, moving, staying)
 
 		first, err := newRun("cooldown-1", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
@@ -169,10 +170,9 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 	})
 
 	// E14b/C6b: labels from a generic ReplicaSet-owned workload are projected to
-	// its automatic PodGroup, so a PodGroup selector can select it without Repack
-	// recognizing the workload kind. Execute then proves that the replacement
-	// consumes its fungible nomination and is scheduled at the planned target.
-	It("selects a native workload by PodGroup labels and lands its replacement on the nominated node", func() {
+	// its automatic PodGroup, and its replacement retains that PodGroup because
+	// it is created by the same ReplicaSet.
+	It("selects a native workload by PodGroup labels and places its replacement", func() {
 		moving := occupyNativeDeployment(ctx, "native-moving", nodes[0], "move", 4)
 		staying := occupyNativeDeployment(ctx, "native-staying", nodes[1], "stay", 2)
 		defer func() {
@@ -205,25 +205,21 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		Expect(got.Status.Nominations).To(HaveLen(1), "one relocated native replica needs one nomination")
 		nomination := got.Status.Nominations[0]
 		Expect(nomination.PodGroupName).To(Equal(moving.podGroup))
-		Expect(nomination.IdentityLabels).To(BeEmpty(), "single-replica Deployment uses the fungible landing contract")
-		Eventually(func() string {
-			latest := getRun(ctx, run.Name)
-			if len(latest.Status.Nominations) != 1 {
-				return ""
-			}
-			return string(latest.Status.Nominations[0].Phase)
-		}, repackTimeout, repackPoll).Should(Equal("Bound"), "replacement must consume its pending nomination")
-
-		Eventually(func() string {
+		Expect(nomination.SelectedNodeName).NotTo(BeEmpty(), "engine must persist its live receiver selection")
+		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.SelectedNodeName), "engine must not select a node this run frees")
+		Expect(nomination.ActualNodeName).To(Equal(nomination.SelectedNodeName), "controller must record the actual placement")
+		Eventually(func() bool {
 			pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
-				LabelSelector: labels.Set{nativeWorkloadLabel: moving.deployment.Name}.String(),
+				LabelSelector: nativeWorkloadLabel + "=" + moving.deployment.Name,
 			})
-			if listErr != nil || len(pods.Items) != 1 || pods.Items[0].Name == moving.podName || pods.Items[0].Spec.NodeName == "" {
-				return ""
+			if listErr != nil || len(pods.Items) != 1 {
+				return false
 			}
-			return pods.Items[0].Spec.NodeName
-		}, repackTimeout, repackPoll).Should(Equal(nomination.NodeName),
-			"replacement must be scheduled to the node recorded by its nomination")
+			replacement := pods.Items[0]
+			return replacement.Name != moving.podName &&
+				replacement.Annotations["scheduling.k8s.io/group-name"] == moving.podGroup &&
+				replacement.Spec.NodeName == nomination.SelectedNodeName
+		}, repackTimeout, repackPoll).Should(BeTrue(), "Deployment replacement must retain its ReplicaSet-derived PodGroup")
 	})
 
 	// F18: maxPerRun.podGroups caps the number of gangs a single run relocates.
@@ -295,12 +291,23 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 	})
 })
 
+func deleteNativeWorkloads(ctx *e2eutil.TestContext, workloads ...*nativeWorkload) {
+	for _, workload := range workloads {
+		if workload == nil {
+			continue
+		}
+		if workload.deployment != nil {
+			_ = ctx.Kubeclient.AppsV1().Deployments(ctx.Namespace).Delete(context.TODO(), workload.deployment.Name, metav1.DeleteOptions{})
+		}
+		if workload.statefulSet != nil {
+			_ = ctx.Kubeclient.AppsV1().StatefulSets(ctx.Namespace).Delete(context.TODO(), workload.statefulSet.Name, metav1.DeleteOptions{})
+		}
+	}
+}
+
 // Note on coverage gaps that are intentionally NOT e2e-tested here:
 //   - K=1 concurrent (AnotherRunActive): the window is too small to observe
 //     reliably (Execute is open-loop-fast); covered by state.EvaluateGate UT and
 //     the engine's TestRequeueGatedRuns / gate concurrency UT.
-//   - recoverOrphans (engine restart mid-run): requires restarting the engine
-//     deployment at a precise moment; covered by design and hard to trigger
-//     deterministically in CI.
 //   - /metrics and /healthz endpoints: the engine has no Service, so scraping its
 //     pod requires port-forward; covered by the cmd wiring + UT.

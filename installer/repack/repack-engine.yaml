@@ -56,7 +56,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
     resources: ["queues", "podgroups"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update"] # write/remove the RepackRun placement lease
   - apiGroups: ["nodeinfo.volcano.sh"]
     resources: ["numatopologies"]
     verbs: ["get", "list", "watch"]

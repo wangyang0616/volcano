@@ -204,11 +204,11 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 			if !oldOK || !newOK {
 				return
 			}
-			// Spec is immutable, so a real update is one of our own status writes
-			// (which must not dirty the workqueue while the key is processing).
-			// A same-RV update is an informer resync safety-net and may recover a
-			// dropped Add event.
-			if oldRun.ResourceVersion == newRun.ResourceVersion {
+			// A placement Run is deliberately driven by status transitions from the
+			// controller (Gated -> Nominated -> Placed), so it must be requeued on
+			// a real update as well. Initial planning still ignores its own status
+			// writes; a same-RV update remains the informer-resync safety net.
+			if oldRun.ResourceVersion == newRun.ResourceVersion || isPlacementCandidate(newRun) || isPlacementCleanupCandidate(newRun) {
 				e.enqueue(newRun)
 			}
 		},
@@ -261,23 +261,46 @@ func (e *Engine) loadConf() error {
 	return nil
 }
 
-// enqueue adds a candidate RepackRun (Admitted + Pending) to the workqueue.
+// enqueue adds a planning or in-flight placement RepackRun to the workqueue.
 func (e *Engine) enqueue(obj interface{}) {
 	run, ok := obj.(*repackv1alpha1.RepackRun)
-	if !ok || !isCandidate(run) {
+	if !ok || (!isCandidate(run) && !isPlacementCleanupCandidate(run)) {
 		return
 	}
 	e.workQueue.Add(run.Name)
 }
 
-// isCandidate reports whether a run is ready for the engine. Running without a
-// persisted plan is safe to retry: no Execute side effect can happen before the
-// prepare barrier writes status.plan. Running with a plan is deliberately not
-// retried, because it may have been interrupted mid-commit.
+// isCandidate reports whether a run is ready for initial planning or for the
+// post-eviction placement protocol. A Running Execute with a persisted plan is
+// revisited only while it has durable placement records; it never repeats the
+// eviction commit.
 func isCandidate(run *repackv1alpha1.RepackRun) bool {
+	if isPlacementCandidate(run) {
+		return true
+	}
 	p := run.Status.Phase
 	return p == "" || p == repackv1alpha1.RepackPending ||
 		(p == repackv1alpha1.RepackRunning && run.Status.Plan == nil)
+}
+
+func isPlacementCandidate(run *repackv1alpha1.RepackRun) bool {
+	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
+		run.Status.Phase == repackv1alpha1.RepackRunning && run.Status.Plan != nil && len(run.Status.Nominations) > 0
+}
+
+// isPlacementCleanupCandidate admits an already-terminal Execute Run only to
+// retry idempotent removal of its gate-owner markers and PodGroup leases. It
+// never re-enters planning or eviction.
+func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
+	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute || len(run.Status.Nominations) == 0 {
+		return false
+	}
+	switch run.Status.Phase {
+	case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 // maxReconcileRetries caps how many times a failing RepackRun is retried before
@@ -346,8 +369,14 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	if isPlacementCleanupCandidate(run) {
+		return e.cleanupPlacement(ctx, run.DeepCopy())
+	}
 	if !isCandidate(run) {
 		return nil // already picked up / terminal
+	}
+	if isPlacementCandidate(run) {
+		return e.reconcilePlacement(ctx, run.DeepCopy())
 	}
 	klog.V(4).InfoS("reconciling RepackRun", "run", name, "mode", run.Spec.Mode)
 	work := run.DeepCopy()
@@ -390,11 +419,10 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 	return e.process(ctx, work)
 }
 
-// recoverOrphans fails any run left in Running by a crashed predecessor. With a
-// single leader-elected engine, a Running run at startup cannot be in progress
-// (this instance just started), so it is orphaned: mark it Failed to release the
-// Execute slot and let TTL GC collect it. Conservative on purpose — we do not
-// re-run, since a mid-eviction Execute must not be blindly repeated.
+// recoverOrphans fails an interrupted planning/eviction run. Placement runs are
+// intentionally recoverable: their durable lease, replacement identity, and
+// deadline let a new engine instance safely resume receiver selection without
+// repeating any eviction.
 func (e *Engine) recoverOrphans(ctx context.Context) {
 	runs, err := e.repackRunLister.List(labels.Everything())
 	if err != nil {
@@ -403,6 +431,11 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 	}
 	for _, r := range runs {
 		if r.Status.Phase != repackv1alpha1.RepackRunning {
+			continue
+		}
+		if isPlacementCandidate(r) {
+			e.workQueue.Add(r.Name)
+			klog.V(3).InfoS("recovered in-progress placement run", "run", r.Name)
 			continue
 		}
 		work := r.DeepCopy()

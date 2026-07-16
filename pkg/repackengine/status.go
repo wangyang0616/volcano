@@ -43,7 +43,22 @@ func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, genera
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), generation)
 	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
-	return e.updateStatusTerminal(ctx, run)
+	if err := e.updateStatusTerminal(ctx, run); err != nil {
+		return err
+	}
+	if run.Spec.Mode != repackv1alpha1.RepackModeExecute {
+		return nil
+	}
+	// A failure after the prepare barrier must release its PodGroup lease.
+	// Pod-level gate cleanup is driven by the nomination controller from this
+	// terminal status. Return lease cleanup failures so the terminal-only
+	// reconcile path can retry without replaying an eviction.
+	e.markExecuteDone(run.Name)
+	e.requeueGatedRuns()
+	if err := e.cleanupPlacement(ctx, run); err != nil {
+		return fmt.Errorf("cleanup placement after failure: %w", err)
+	}
+	return nil
 }
 
 func (e *Engine) updateStatus(ctx context.Context, run *repackv1alpha1.RepackRun) error {
@@ -62,9 +77,9 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 		if err != nil {
 			return err
 		}
-		// Re-apply the intended status onto the freshest object. Nomination phase is
-		// controller-owned; preserve a concurrently observed Bound/Expired phase
-		// instead of resetting it to Pending during the engine's terminal write.
+		// Re-apply the intended status onto the freshest object. Placement progress is
+		// controller-owned; preserve a concurrently observed replacement association or
+		// terminal placement result instead of resetting it during an engine write.
 		merged := desired.DeepCopy()
 		mergeNominationPhases(merged.Nominations, latest.Status.Nominations)
 		merged.DeepCopyInto(&latest.Status)
@@ -74,16 +89,23 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 }
 
 func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
-	phases := make(map[string]repackv1alpha1.PodNominationPhase, len(latest))
+	placements := make(map[string]repackv1alpha1.PodNomination, len(latest))
 	for i := range latest {
 		r := &latest[i]
-		if r.Phase == repackv1alpha1.PodNominationBound || r.Phase == repackv1alpha1.PodNominationExpired {
-			phases[nominationKey(r)] = r.Phase
+		if r.Phase == repackv1alpha1.PodPlacementGated || r.Phase == repackv1alpha1.PodPlacementAwaitingCapacity ||
+			r.Phase == repackv1alpha1.PodPlacementNominated || r.Phase == repackv1alpha1.PodPlacementPlaced ||
+			r.Phase == repackv1alpha1.PodPlacementDegraded || r.Phase == repackv1alpha1.PodPlacementExpired ||
+			r.Phase == repackv1alpha1.PodNominationBound || r.Phase == repackv1alpha1.PodNominationExpired {
+			placements[nominationKey(r)] = *r
 		}
 	}
 	for i := range desired {
-		if phase := phases[nominationKey(&desired[i])]; phase != "" {
-			desired[i].Phase = phase
+		if placement, found := placements[nominationKey(&desired[i])]; found {
+			desired[i].Phase = placement.Phase
+			desired[i].SelectedNodeName = placement.SelectedNodeName
+			desired[i].ReplacementPodName = placement.ReplacementPodName
+			desired[i].ReplacementPodUID = placement.ReplacementPodUID
+			desired[i].ActualNodeName = placement.ActualNodeName
 		}
 	}
 }
@@ -161,7 +183,7 @@ func stampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 // modes: DryRun = predicted plan, Execute = executed plan. Each move carries the
 // planned target node (fromNode -> toNode), visible in DryRun too. Execute also
 // writes the durable status.nominations[] (consumed by the controller's nomination
-// reconciler) and marks freed nodes as actuallyFreed. Per-move actual-landing /
+// reconciler) and marks freed nodes as actuallyFreed. Per-move actual placement /
 // drift (outcome/actualNode) is filled later by the reconciler as replacement pods
 // land; the engine's initial write leaves it empty.
 func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, targetResource v1.ResourceName, owners map[string]*repackv1alpha1.WorkloadRef, execute bool, nominationTTL time.Duration) {
@@ -319,8 +341,8 @@ func percentagePoints(fraction float64) int32 {
 	return percentage
 }
 
-// buildPodNominations renders per-pod landing-steering intents (Execute-only). Claiming
-// follows the landing-identity contract (proposal §5.2.2): victimPodName exact
+// buildPodNominations renders per-pod placement-steering intents (Execute-only). Claiming
+// follows the placement identity contract (proposal §5.2.2): victimPodName exact
 // match, then identityLabels (label-superset match), then fungible. IdentityLabels
 // are resolved from the victim pod's own well-known labels by the framework.
 func buildPodNominations(plan *engineapi.RepackPlan, nominationTTL time.Duration) []repackv1alpha1.PodNomination {
@@ -338,7 +360,7 @@ func buildPodNominations(plan *engineapi.RepackPlan, nominationTTL time.Duration
 			VictimPodName:  intent.PodName,
 			IdentityLabels: intent.IdentityLabels,
 			NodeName:       intent.Node,
-			Phase:          repackv1alpha1.PodNominationPending,
+			Phase:          repackv1alpha1.PodPlacementPrepared,
 			ExpirationTime: &expirationTime,
 		})
 	}

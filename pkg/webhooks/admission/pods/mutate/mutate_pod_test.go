@@ -23,7 +23,12 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	"volcano.sh/repack-controller/pkg/placement"
 	webconfig "volcano.sh/volcano/pkg/webhooks/config"
 )
 
@@ -215,4 +220,184 @@ func TestMutatePods(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPatchRepackPlacementGate(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "pg", NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pg", Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	previousClient, previousSchedulers := config.VolcanoClient, config.SchedulerNames
+	defer func() {
+		config.VolcanoClient = previousClient
+		config.SchedulerNames = previousSchedulers
+	}()
+	config.VolcanoClient = vcfake.NewSimpleClientset(run, podGroup)
+	config.SchedulerNames = []string{"volcano"}
+
+	patches, err := patchRepackPlacementGate(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "replacement", Annotations: map[string]string{"scheduling.k8s.io/group-name": "pg"},
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 2 || patches[0].Path != "/spec/schedulingGates" {
+		t.Fatalf("placement gate patches = %#v", patches)
+	}
+	gates, ok := patches[0].Value.([]v1.PodSchedulingGate)
+	if !ok || len(gates) != 1 || gates[0].Name != repackv1alpha1.PlacementGateName {
+		t.Fatalf("placement gates = %#v", patches[0].Value)
+	}
+	if patches[1].Path != "/metadata/annotations/repack.volcano.sh~1placement-gate-owner" || patches[1].Value != "run/run-uid" {
+		t.Fatalf("placement owner patch = %#v", patches[1])
+	}
+}
+
+func TestRepackPlacementPodGroupName(t *testing.T) {
+	controller := true
+	deploymentReplicaSetOwner := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "workload-7f8d9c", UID: types.UID("replicaset-uid"), Controller: &controller,
+	}
+	tests := []struct {
+		name string
+		pod  *v1.Pod
+		want string
+	}{
+		{
+			name: "explicit PodGroup wins over automatic name",
+			pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Annotations:     map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: "explicit-pg"},
+				OwnerReferences: []metav1.OwnerReference{deploymentReplicaSetOwner},
+			}},
+			want: "explicit-pg",
+		},
+		{
+			name: "Deployment Pod derives its ReplicaSet PodGroup",
+			pod:  &v1.Pod{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{deploymentReplicaSetOwner}}},
+			want: "podgroup-replicaset-uid",
+		},
+		{
+			name: "ownerless Pod is not associated by its Pod UID fallback",
+			pod:  &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-uid")}},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := placement.PodGroupName(tt.pod); got != tt.want {
+				t.Fatalf("repack placement PodGroup = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPatchRepackPlacementGateDerivesNormalPodGroup(t *testing.T) {
+	controller := true
+	podGroupName := "podgroup-replicaset-uid"
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: podGroupName, NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: podGroupName, Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	previousClient, previousSchedulers := config.VolcanoClient, config.SchedulerNames
+	defer func() {
+		config.VolcanoClient = previousClient
+		config.SchedulerNames = previousSchedulers
+	}()
+	config.VolcanoClient = vcfake.NewSimpleClientset(run, podGroup)
+	config.SchedulerNames = []string{"volcano"}
+
+	patches, err := patchRepackPlacementGate(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "deployment-replacement", OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "workload-7f8d9c", UID: types.UID("replicaset-uid"), Controller: &controller,
+			}},
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 2 || patches[0].Path != "/spec/schedulingGates" {
+		t.Fatalf("derived placement gate patches = %#v", patches)
+	}
+}
+
+func TestPatchRepackPlacementGateSafetyBoundaries(t *testing.T) {
+	activeRun := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "pg", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pg", Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	previousClient, previousSchedulers := config.VolcanoClient, config.SchedulerNames
+	defer func() {
+		config.VolcanoClient = previousClient
+		config.SchedulerNames = previousSchedulers
+	}()
+	config.SchedulerNames = []string{"volcano"}
+
+	t.Run("non Volcano scheduler is never intercepted", func(t *testing.T) {
+		config.VolcanoClient = vcfake.NewSimpleClientset(activeRun, podGroup)
+		patches, err := patchRepackPlacementGate(&v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: "pg"}},
+			Spec:       v1.PodSpec{SchedulerName: "default-scheduler"},
+		})
+		if err != nil || len(patches) != 0 {
+			t.Fatalf("patches = %#v, err = %v", patches, err)
+		}
+	})
+
+	t.Run("terminal owner does not gate", func(t *testing.T) {
+		terminal := activeRun.DeepCopy()
+		terminal.Status.Phase = repackv1alpha1.RepackFailed
+		config.VolcanoClient = vcfake.NewSimpleClientset(terminal, podGroup)
+		patches, err := patchRepackPlacementGate(&v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: "pg"}},
+			Spec:       v1.PodSpec{SchedulerName: "volcano"},
+		})
+		if err != nil || len(patches) != 0 {
+			t.Fatalf("patches = %#v, err = %v", patches, err)
+		}
+	})
+
+	t.Run("malformed lease fails open", func(t *testing.T) {
+		malformed := podGroup.DeepCopy()
+		malformed.Annotations[repackv1alpha1.PlacementLeaseAnnotation] = "malformed"
+		config.VolcanoClient = vcfake.NewSimpleClientset(malformed)
+		patches, err := patchRepackPlacementGate(&v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: "pg"}},
+			Spec:       v1.PodSpec{SchedulerName: "volcano"},
+		})
+		if err != nil || len(patches) != 0 {
+			t.Fatalf("patches = %#v, err = %v", patches, err)
+		}
+	})
 }

@@ -47,16 +47,12 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 	// Execute records well-formed nominations wired to the plan. All assertions read
 	// the terminal status object, so this is fully deterministic and stable.
 	//
-	// NOTE: we deliberately do NOT assert the replacement physically lands on the
-	// nominated node. The fixture pins pods via the Job template's spec.nodeName, so
-	// an evicted pod is recreated back onto its original node (kubelet runs it
-	// directly, bypassing the scheduler and the nominatedNodeName hint). Real
-	// scheduler-placed workloads honor the nomination; that landing path is covered
-	// by the nominate reconciler unit tests. Here we prove the engine produced
-	// correct, plan-linked nominations.
+	// The fixture uses scheduler-placed native workloads, so the terminal status
+	// covers the full replacement protocol rather than a Pod pinned by spec.nodeName.
 	It("records well-formed nominations wired to the plan", func() {
-		occupy(ctx, "nom-a", nodes[0], 4)
-		occupy(ctx, "nom-b", nodes[1], 2)
+		moving := occupyNativeDeployment(ctx, "nom-moving", nodes[0], "move", 4)
+		staying := occupyNativeDeployment(ctx, "nom-staying", nodes[1], "stay", 2)
+		defer deleteNativeWorkloads(ctx, moving, staying)
 
 		run, err := newRun("nominations", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
@@ -66,7 +62,7 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
 		Expect(completeReason(got)).To(Equal("Executed"))
 		Expect(got.Status.Plan).NotTo(BeNil())
-		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record landing nominations")
+		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")
 
 		// Lookup sets built entirely from the plan (all from status -> stable).
 		freed := map[string]bool{}
@@ -100,10 +96,12 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 			Expect(movePGs).To(HaveKey(nom.PodGroupName), "nomination must reference a moved PodGroup")
 			Expect(nom.ExpirationTime).NotTo(BeNil(), "nomination needs a TTL bound")
 			Expect(nom.ExpirationTime.Time.After(time.Now())).To(BeTrue(), "nomination expiration must be in the future")
-			Expect([]repackv1alpha1.PodNominationPhase{repackv1alpha1.PodNominationPending, repackv1alpha1.PodNominationBound, repackv1alpha1.PodNominationExpired}).To(ContainElement(nom.Phase), "nomination phase enum")
+			Expect(nom.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced), "terminal success requires verified placement")
+			Expect(nom.SelectedNodeName).NotTo(BeEmpty(), "live receiver selection must be recorded")
+			Expect(nom.ActualNodeName).To(Equal(nom.SelectedNodeName), "actual node must match the selected receiver")
 		}
 
-		// Exact linkage: one landing nomination per relocated pod.
+		// Exact linkage: one placement nomination per relocated pod.
 		Expect(len(got.Status.Nominations)).To(Equal(totalMovedPods), "one nomination per relocated pod")
 	})
 

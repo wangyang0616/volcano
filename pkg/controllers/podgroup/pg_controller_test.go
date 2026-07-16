@@ -1108,6 +1108,28 @@ func TestPodGroupLabelSynchronization(t *testing.T) {
 	assert.Equal(t, map[string]string{"app": "training", "tenant": "production"}, podGroup.Labels)
 }
 
+func TestMergePodGroupAnnotationsPreservesRuntimeLease(t *testing.T) {
+	existing := map[string]string{
+		"volcano.sh/custom-key":                      "old",
+		"repack.volcano.sh/placement-lease":          "run-a/uid-a",
+		"example.com/controller-owned-runtime-state": "keep",
+	}
+	desired := map[string]string{
+		"volcano.sh/custom-key":                      "new",
+		"scheduling.volcano.sh/group-min-member":     "3",
+		"example.com/controller-owned-runtime-state": "must-not-overwrite",
+	}
+
+	got := mergePodGroupAnnotations(existing, desired)
+	assert.Equal(t, "new", got["volcano.sh/custom-key"])
+	assert.Equal(t, "3", got["scheduling.volcano.sh/group-min-member"])
+	assert.Equal(t, "run-a/uid-a", got["repack.volcano.sh/placement-lease"])
+	assert.Equal(t, "keep", got["example.com/controller-owned-runtime-state"])
+	// Omission intentionally retains the last Volcano-derived value: pg-controller
+	// must not use a rollout update as an implicit delete for runtime state.
+	assert.Equal(t, "old", mergePodGroupAnnotations(existing, nil)["volcano.sh/custom-key"])
+}
+
 func TestPodLabelUpdateEnqueuesOnlyLabelChanges(t *testing.T) {
 	c := newFakeController()
 	oldPod := &v1.Pod{

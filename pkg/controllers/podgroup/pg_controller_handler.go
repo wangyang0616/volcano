@@ -559,12 +559,36 @@ func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGro
 		isUpdated = true
 	}
 
-	if !reflect.DeepEqual(newPodGroup.Annotations, podGroup.Annotations) {
-		podGroup.Annotations = newPodGroup.Annotations
+	mergedAnnotations := mergePodGroupAnnotations(podGroup.Annotations, newPodGroup.Annotations)
+	if !reflect.DeepEqual(mergedAnnotations, podGroup.Annotations) {
+		podGroup.Annotations = mergedAnnotations
 		isUpdated = true
 	}
 
 	return isUpdated
+}
+
+// mergePodGroupAnnotations preserves runtime annotations already attached to an
+// automatic PodGroup. The controller owns only Volcano annotation domains; a
+// newer value derived from the Pod or its owner wins, while an omitted value is
+// retained. In particular, Repack's placement lease must survive a native
+// workload's rollout until the Repack engine explicitly releases it.
+func mergePodGroupAnnotations(existing, desired map[string]string) map[string]string {
+	merged := make(map[string]string, len(existing)+len(desired))
+	for key, value := range existing {
+		merged[key] = value
+	}
+	for key, value := range desired {
+		if isVolcanoAnnotation(key) {
+			merged[key] = value
+		}
+	}
+	return merged
+}
+
+func isVolcanoAnnotation(key string) bool {
+	domain, _, found := strings.Cut(key, "/")
+	return found && (domain == "volcano.sh" || strings.HasSuffix(domain, ".volcano.sh"))
 }
 
 func newPGOwnerReferences(pod *v1.Pod) []metav1.OwnerReference {

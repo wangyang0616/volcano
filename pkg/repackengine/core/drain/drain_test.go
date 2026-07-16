@@ -28,6 +28,8 @@ import (
 
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/base"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/gang"
 )
 
 const gpu = v1.ResourceName("nvidia.com/gpu")
@@ -136,6 +138,10 @@ func nodeUnits(snap framework.Snapshot) []api.FreeableUnit {
 }
 
 func drainSession(snap framework.Snapshot, movable framework.MovableFn, minFreed int, maxPG int, maxRes int64) *framework.Session {
+	return drainSessionWithPlugins(snap, movable, minFreed, maxPG, maxRes, nil)
+}
+
+func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableFn, minFreed int, maxPG int, maxRes int64, plugins []string) *framework.Session {
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Snapshot:      snap,
 		Resource:      gpu,
@@ -145,7 +151,7 @@ func drainSession(snap framework.Snapshot, movable framework.MovableFn, minFreed
 		MaxPodGroups:  maxPG,
 		MaxResource:   maxRes,
 		Free:          freeByCapMinusUsed,
-	}, nil)
+	}, plugins)
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(movable)
 	return ssn
@@ -183,6 +189,41 @@ func TestDrain_FreesOneNode(t *testing.T) {
 	}
 	if plan.Benefit() != 1 {
 		t.Errorf("benefit=%v, want 1", plan.Benefit())
+	}
+}
+
+// When both nodes are feasible drain targets, the production disruption scores
+// must choose the smaller blast radius. This mirrors three independent two-pod
+// Deployments (one 2-card pod from each on node-a) and a one-pod Deployment on
+// node-b. Every PodGroup has minAvailable=1: moving b-0 breaches its one-pod
+// gang, whereas moving any a pod leaves its two-pod gang at minAvailable. Even
+// with that gang cost, moving b-0 (one PodGroup / two cards) must beat the
+// reverse direction (three PodGroups / six cards).
+func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
+	a0 := gpuTask("a-0", "pg-a0", 2)
+	a1 := gpuTask("a-1", "pg-a1", 2)
+	a2 := gpuTask("a-2", "pg-a2", 2)
+	b0 := gpuTask("b-0", "pg-b0", 2)
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("node-a", 8, a0, a1, a2),
+		capNode("node-b", 8, b0),
+	}, views: map[schedapi.JobID]api.PodGroupView{
+		"pg-a0": {Running: 2, MinAvailable: 1, Footprint: 4},
+		"pg-a1": {Running: 2, MinAvailable: 1, Footprint: 4},
+		"pg-a2": {Running: 2, MinAvailable: 1, Footprint: 4},
+		"pg-b0": {Running: 1, MinAvailable: 1, Footprint: 2},
+	}}
+
+	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"}))
+	if !ok || plan == nil {
+		t.Fatal("expected both drain directions to be feasible")
+	}
+	if len(plan.FreedNodes) != 1 || plan.FreedNodes[0] != "node-b" {
+		t.Fatalf("freed=%v, want [node-b]: lower-disruption B->A plan must win", plan.FreedNodes)
+	}
+	moves := realMoves(plan)
+	if len(moves) != 1 || moves[0].Task.Name != "b-0" || moves[0].From != "node-b" || moves[0].To != "node-a" {
+		t.Fatalf("moves=%+v, want b-0:node-b->node-a", moves)
 	}
 }
 

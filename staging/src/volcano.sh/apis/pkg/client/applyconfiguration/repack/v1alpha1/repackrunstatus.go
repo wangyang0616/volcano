@@ -47,11 +47,11 @@ type RepackRunStatusApplyConfiguration struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Plan is the migration plan, populated in BOTH modes with the SAME shape:
 	// DryRun = predicted plan; Execute = executed plan. moves is a pure plan;
-	// Execute's realized landing is reported via nominations[].phase + summary.
+	// Execute's realized placement is reported via nominations[].phase + summary.
 	Plan *RepackPlanApplyConfiguration `json:"plan,omitempty"`
-	// Nominations are the durable landing-steering intents produced by Execute:
+	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
-	// landing-identity contract (victimPodName exact match -> identityLabels ->
+	// placement identity contract (victimPodName exact match -> identityLabels ->
 	// fungible). See the design proposal §5.2.2.
 	Nominations []PodNominationApplyConfiguration `json:"nominations,omitempty"`
 }

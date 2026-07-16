@@ -30,6 +30,7 @@ type PodSpec struct {
 	Name            string
 	Node            string
 	Req             v1.ResourceList
+	Limit           v1.ResourceList
 	Tolerations     []v1.Toleration
 	Annotations     map[string]string
 	Labels          map[string]string
@@ -62,6 +63,7 @@ func CreatePod(ctx *TestContext, spec PodSpec) *v1.Pod {
 					ImagePullPolicy: v1.PullIfNotPresent,
 					Resources: v1.ResourceRequirements{
 						Requests: spec.Req,
+						Limits:   spec.Limit,
 					},
 				},
 			},

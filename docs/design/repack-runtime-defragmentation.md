@@ -206,7 +206,7 @@ spec:
 - 支持 **Gang 感知的碎片整理**：以 PodGroup（gang）为动作与代价单位，按 gang 语义计"受损卡数"（**P0**）
 - 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；`eviction.gracePeriodSeconds` 可覆盖本次驱逐的优雅终止等待；可配置扰动策略留待 **P1** 讨论 API 与语义。
 - 支持**规划时可行性预检（尽力、非预留）**：驱逐前模拟"被驱逐 Pod 都有处可落"（INV-RESCHED），不过则不驱逐（**P0**）
-- 支持**落点引导**：驱逐后用 `pod.status.nominatedNodeName` 把重建 Pod 引导到目标节点；空间不保留、交还排队队列（**P0**）
+- 支持**动态 placement**：驱逐前写 PodGroup placement lease；替身 Pod 创建时由 webhook 注入 scheduling gate 并记录 Run UID owner，Engine 基于最新 Session 重算并持久化 receiver，controller 独占 gate 生命周期，写 `pod.status.nominatedNodeName` 后解除 gate、绑定观察后清理 owner；无稳定 identity 的原生负载扩容 Pod 在与替身不可区分的窗口内保持 gate，nomination 被认领或 Run 终态后放行；无可行 receiver 至 deadline 则解除本 gate 并显式降级（**P0**）
 - 支持**复用调度器判断**：与 `volcano-scheduler` 同一份插件配置、同一 `framework`/`predicate`，判断同源、同演进（**P0**）
 
 ## 4. 非目标（Non-Goals）

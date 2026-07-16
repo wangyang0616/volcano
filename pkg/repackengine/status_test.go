@@ -192,8 +192,8 @@ func TestNominationsOf(t *testing.T) {
 	if n.Namespace != "ns" || n.PodGroupName != "g" || n.VictimPodName != "w-0" || n.NodeName != "n2" {
 		t.Errorf("nomination=%+v", n)
 	}
-	if n.Phase != repackv1alpha1.PodNominationPending {
-		t.Errorf("phase=%q, want Pending", n.Phase)
+	if n.Phase != repackv1alpha1.PodPlacementPrepared {
+		t.Errorf("phase=%q, want Prepared", n.Phase)
 	}
 	if n.IdentityLabels["apps.kubernetes.io/pod-index"] != "0" {
 		t.Errorf("identityLabels=%v, want pod-index=0", n.IdentityLabels)
@@ -278,12 +278,18 @@ func TestTerminalOutcome(t *testing.T) {
 	}
 }
 
-func TestMergeNominationPhasesPreservesControllerOwnedTerminalPhase(t *testing.T) {
+func TestMergeNominationPhasesPreservesControllerOwnedPlacementPhase(t *testing.T) {
 	desired := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodNominationPending}}
-	latest := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodNominationBound}}
+	latest := []repackv1alpha1.PodNomination{{
+		Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodPlacementGated,
+		ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
+	}}
 	mergeNominationPhases(desired, latest)
-	if desired[0].Phase != repackv1alpha1.PodNominationBound {
-		t.Fatalf("phase=%q, want Bound", desired[0].Phase)
+	if desired[0].Phase != repackv1alpha1.PodPlacementGated {
+		t.Fatalf("phase=%q, want Gated", desired[0].Phase)
+	}
+	if desired[0].ReplacementPodName != "replacement" || desired[0].ReplacementPodUID != "replacement-uid" {
+		t.Fatalf("replacement identity=%q/%q, want replacement/replacement-uid", desired[0].ReplacementPodName, desired[0].ReplacementPodUID)
 	}
 }
 

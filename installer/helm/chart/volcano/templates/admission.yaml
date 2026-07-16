@@ -63,6 +63,9 @@ rules:
   - apiGroups: ["scheduling.incubator.k8s.io", "scheduling.volcano.sh"]
     resources: ["podgroups"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["repack.volcano.sh"]
+    resources: ["repackruns"]
+    verbs: ["get"]
   {{- if .Values.custom.enabled_admissions | regexMatch "/podgroups/mutate" }}
   - apiGroups: [""]
     resources: ["namespaces"]

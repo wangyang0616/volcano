@@ -48,12 +48,15 @@ const (
 	// ReasonSlotAcquired clears Queued once the K=1/cooldown gate admits the run.
 	ReasonSlotAcquired = "SlotAcquired"
 	// Queued reasons — only Execute is gated; DryRun never queues.
-	ReasonAnotherRunActive   = "AnotherRunActive"  // K=1 occupied
+	ReasonAnotherRunActive   = "AnotherRunActive"   // K=1 occupied
 	ReasonExecuteCoolingDown = "ExecuteCoolingDown" // cooldown not elapsed
 	ReasonWaitingForLeader   = "WaitingForLeader"
 	// Progressing sub-reasons.
 	ReasonSimulating = "Simulating" // DryRun
 	ReasonEvicting   = "Evicting"   // Execute
+	// ReasonAwaitingPlacement means eviction succeeded and replacement Pods are
+	// held by placement gates until their actual bindings are observed.
+	ReasonAwaitingPlacement = "AwaitingPlacement"
 	// Terminal Complete reasons. These double as the "worth repacking?" verdict
 	// (proposal §5.2.2), so there is no separate status.plan.summary.verdict.
 	ReasonRepackRecommended  = "RepackRecommended"  // DryRun found a worthwhile plan
@@ -64,6 +67,9 @@ const (
 	// ReasonExecuteFailed is terminal-Failed: a worthwhile plan was found but every
 	// eviction was rejected (e.g. by PDBs), so the repack achieved nothing.
 	ReasonExecuteFailed = "ExecuteFailed"
+	// ReasonPlacementDegraded reports that normal scheduling was allowed to
+	// restore a replacement Pod but the selected defragmentation placement drifted.
+	ReasonPlacementDegraded = "PlacementDegraded"
 )
 
 // DerivePhase projects conditions onto the coarse phase (§4.6.1). Precedence:

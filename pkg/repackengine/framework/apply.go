@@ -37,7 +37,7 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/api"
 )
 
-// Landing-identity contract well-known label keys (§5.2.2). resolveIdentityLabels
+// Placement identity contract well-known label keys (§5.2.2). resolveIdentityLabels
 // reads only these standard keys off the pod itself — no per-workload label scheme
 // is hardcoded.
 const (
@@ -49,7 +49,7 @@ const (
 	labelJobCompletionIndex  = "batch.kubernetes.io/job-completion-index"
 )
 
-// Nomination is a landing hint written on a concrete pending pod
+// Nomination is a placement hint written on a concrete pending pod
 // (pod.status.NominatedNodeName). The steering primitive, written by the
 // nomination reconciler on each *replacement* pod, not on the dying victim.
 type Nomination struct {
@@ -59,7 +59,7 @@ type Nomination struct {
 
 // NominationIntent is the durable steering record for ONE relocated pod: after
 // the victim is evicted, its replacement should be nominated to Node. Carries the
-// keys the reconciler matches the replacement by, per the landing-identity
+// keys the reconciler matches the replacement by, per the placement identity
 // contract (§5.2.2): exact PodName (same-name rebuild), else IdentityLabels
 // (label-superset match), else fungible (any pod in the gang). Role is retained
 // for audit/debug only.
@@ -107,7 +107,7 @@ func NominationIntents(plan *api.RepackPlan) []NominationIntent {
 }
 
 // resolveIdentityLabels returns the labels that identify a pod's replacement
-// across reconstruction, per the landing-identity contract (§5.2.2), reading only
+// across reconstruction, per the placement identity contract (§5.2.2), reading only
 // the pod's own well-known labels in priority order:
 //  1. Tier 1: the declarative repack.volcano.sh/pod-identity label (workloads opt in);
 //  2. native adapters: the standard StatefulSet pod-index / Indexed Job
@@ -207,7 +207,7 @@ func orderedMoves(plan *api.RepackPlan) []*api.Move {
 	return ms
 }
 
-// pendingNominations: landing hints for pods Pending at commit time (relief, added later).
+// pendingNominations: placement hints for pods Pending at commit time (relief, added later).
 // Empty for consolidation (replacement pods don't exist yet → steered async by
 // the nomination reconciler over NominationIntents).
 func pendingNominations(_ *api.RepackPlan) []Nomination { return nil }

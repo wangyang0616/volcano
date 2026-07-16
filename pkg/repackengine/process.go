@@ -46,16 +46,15 @@ import (
 func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) error {
 	processingStartTime := time.Now()
 	defer func() { metrics.ObserveCycle(string(run.Spec.Mode), time.Since(processingStartTime).Seconds()) }()
+	releaseExecuteSlot := run.Spec.Mode == repackv1alpha1.RepackModeExecute
 	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
-		// Defers run LIFO: markExecuteDone (declared last) releases the K=1 slot
-		// first, then requeueGatedRuns (declared first) re-enqueues Execute runs
-		// that were blocked on it. Without the wake, a run gated with reason
-		// AnotherRunActive — which carries no RequeueAfter — would never be
-		// revisited under the event-driven (resync=0) model and would be starved.
-		defer e.requeueGatedRuns()
-		// Release the K=1 slot and stamp the cooldown anchor when done, even on
-		// panic/early-return paths.
-		defer e.markExecuteDone(run.Name)
+		defer func() {
+			if !releaseExecuteSlot {
+				return
+			}
+			e.markExecuteDone(run.Name)
+			e.requeueGatedRuns()
+		}()
 	}
 	schedulerTiers, schedulerConfigurations := e.tiers, e.configurations
 
@@ -172,53 +171,89 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	applyPlan(run, report, plan, targetResource, moveOwners, execute, nominationTTL)
 	if execute && worthwhile {
 		// This is the prepare barrier. In particular, nominations must be visible
-		// before an eviction can cause a replacement pod to appear.
+		// before an eviction can cause a replacement pod to appear. PodGroup
+		// placement leases are the second half of that barrier: the admission
+		// webhook can then gate every replacement before the scheduler observes it.
 		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist prepared Execute plan: %w", err)
+		}
+		preparedPlacementGroups := placementPodGroups(run)
+		if err := e.preparePlacementLeases(ctx, run); err != nil {
+			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, fmt.Errorf("prepare placement leases: %w", err))
 		}
 		klog.V(3).InfoS("repack: Execute plan prepared before eviction",
 			"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
 			"nominationCount", len(run.Status.Nominations), "nominationTTL", nominationTTL)
-	}
 
-	var commitResult *engineframework.CommitResult
-	if execute && worthwhile {
+		var commitResult *engineframework.CommitResult
 		result, err := engineframework.CommitPlan(plan, engineSession.Hooks())
 		if err != nil {
+			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
 		commitResult = &result
 		engineSession.SetCommit(commitResult)
-	}
-	evictedCount, rejectedCount := 0, 0
-	if commitResult != nil {
-		evictedCount, rejectedCount = len(commitResult.Evicted), len(commitResult.Failed)
+
+		evictedCount, rejectedCount := len(commitResult.Evicted), len(commitResult.Failed)
 		metrics.ObserveEvictions(evictedCount, rejectedCount)
 		klog.V(3).InfoS("evictions issued", "run", run.Name, "evictedCount", evictedCount, "rejectedCount", rejectedCount)
-	}
 
-	// Execute with a worthwhile plan: if every eviction was rejected (e.g. by PDBs)
-	// the repack achieved nothing — fail rather than falsely reporting Executed.
-	if execute && worthwhile {
-		// Replace the optimistic prepared plan with the realized subset. Failed
-		// evictions must not leave stale nominations or claim nodes were freed.
+		// Replace the optimistic prepared plan with the realized subset. Release a
+		// lease as soon as none of its moves were accepted; otherwise a rejected
+		// eviction could leave future Pods in that PodGroup gated indefinitely.
 		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
 		plan = realizedPlan(plan, commitResult)
 		report = engineframework.RenderReport(plan)
 		applyPlan(run, report, plan, targetResource, moveOwners, true, nominationTTL)
+		groupsToRelease := placementGroupsDifference(preparedPlacementGroups, placementPodGroups(run))
+		if len(groupsToRelease) > 0 {
+			// Persist the realized nomination set before relinquishing any lease. A
+			// retry after an API interruption must never see a prepared nomination
+			// with no corresponding gate protection.
+			if err := e.updateStatus(ctx, run); err != nil {
+				return fmt.Errorf("persist realized Execute plan before lease cleanup: %w", err)
+			}
+		}
+		if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
+		}
 		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
 			"run", run.Name, "plannedMoveCount", plannedMoveCount, "realizedMoveCount", len(plan.Moves),
 			"plannedFreedNodeCount", plannedFreedNodeCount, "realizedFreedNodeCount", len(plan.FreedNodes),
 			"remainingNominationCount", len(run.Status.Nominations))
+
+		if evictedCount == 0 && rejectedCount > 0 {
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+				fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
+		}
+		if report.NodesFreed == 0 {
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+				fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evictedCount, rejectedCount))
+		}
+		if evictedCount > 0 {
+			// An accepted eviction only begins the replacement placement protocol. Keep
+			// the Execute slot until the placement controller observes every actual
+			// binding (or degrades it on expiry), so another Run cannot overlap the same
+			// PodGroup lease.
+			state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
+				state.ReasonAwaitingPlacement, "waiting for replacement pod placement", generation)
+			run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+			if err := e.updateStatus(ctx, run); err != nil {
+				return fmt.Errorf("persist awaiting placement status: %w", err)
+			}
+			releaseExecuteSlot = false
+			klog.V(3).InfoS("repack: evictions accepted; awaiting replacement placement", "run", run.Name,
+				"evictedCount", evictedCount, "nominationCount", len(run.Status.Nominations))
+			// The replacement Pod is created asynchronously by its workload controller.
+			// A status update is not a reliable queue wake-up (the informer may already
+			// have observed this object), so guarantee a later placement reconciliation.
+			e.workQueue.AddAfter(run.Name, placementRetryInterval)
+			return nil
+		}
 	}
-	if execute && worthwhile && evictedCount == 0 && rejectedCount > 0 {
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-			fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
-	}
-	if execute && worthwhile && report.NodesFreed == 0 {
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-			fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evictedCount, rejectedCount))
-	}
+
+	evictedCount, rejectedCount := 0, 0
 
 	var done, msg string
 	switch {

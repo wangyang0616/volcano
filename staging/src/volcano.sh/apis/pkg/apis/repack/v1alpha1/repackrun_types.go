@@ -19,14 +19,25 @@ package v1alpha1
 import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
 	// PodIdentityLabel identifies a logical workload replica across Pod
 	// reconstruction. A value must be unique within its PodGroup and stable when
 	// the workload controller recreates the Pod. Repack records this label in a
-	// nomination to steer the replacement Pod to its planned landing node.
+	// nomination to steer the replacement Pod to its planned placement node.
 	PodIdentityLabel = "repack.volcano.sh/pod-identity"
+	// PlacementGateName is injected only into replacement Pods belonging to an
+	// active RepackRun placement lease.
+	PlacementGateName = "repack.volcano.sh/placement"
+	// PlacementLeaseAnnotation is written onto an affected PodGroup before its
+	// victim Pods are evicted. Its value is the owning RepackRun name and UID.
+	PlacementLeaseAnnotation = "repack.volcano.sh/placement-lease"
+	// PlacementGateOwnerAnnotation is written beside a placement scheduling gate.
+	// It records the exact Run name and UID that owns the gate, allowing terminal
+	// cleanup to release unrelated scale-out Pods without touching another Run.
+	PlacementGateOwnerAnnotation = "repack.volcano.sh/placement-gate-owner"
 )
 
 // RepackMode selects whether a RepackRun only simulates or actually evicts.
@@ -53,16 +64,29 @@ const (
 	RepackCancelled RepackPhase = "Cancelled"
 )
 
-// PodNominationPhase reports the state of an Execute-mode landing nomination.
-// +kubebuilder:validation:Enum=Pending;Bound;Expired
+// PodNominationPhase reports the state of an Execute-mode replacement placement.
+// +kubebuilder:validation:Enum=Prepared;Gated;AwaitingCapacity;Nominated;Placed;Degraded;Expired;Pending;Bound
 type PodNominationPhase string
 
 const (
-	// PodNominationPending has not yet matched a replacement pod.
+	// PodPlacementPrepared is persisted before eviction, before a replacement exists.
+	PodPlacementPrepared PodNominationPhase = "Prepared"
+	// PodPlacementGated identifies a concrete replacement held by the placement gate.
+	PodPlacementGated PodNominationPhase = "Gated"
+	// PodPlacementAwaitingCapacity is waiting for an immediately schedulable receiver.
+	PodPlacementAwaitingCapacity PodNominationPhase = "AwaitingCapacity"
+	// PodPlacementNominated has had its selected node written to nominatedNodeName.
+	PodPlacementNominated PodNominationPhase = "Nominated"
+	// PodPlacementPlaced means the replacement was bound to its selected node.
+	PodPlacementPlaced PodNominationPhase = "Placed"
+	// PodPlacementDegraded releases the gate so normal scheduling can restore service.
+	PodPlacementDegraded PodNominationPhase = "Degraded"
+	// PodPlacementExpired elapsed without completing placement.
+	PodPlacementExpired PodNominationPhase = "Expired"
+
+	// Deprecated aliases retain v1alpha1 status compatibility for existing runs.
 	PodNominationPending PodNominationPhase = "Pending"
-	// PodNominationBound has been applied to a replacement pod.
-	PodNominationBound PodNominationPhase = "Bound"
-	// PodNominationExpired elapsed without matching a replacement pod.
+	PodNominationBound   PodNominationPhase = "Bound"
 	PodNominationExpired PodNominationPhase = "Expired"
 )
 
@@ -221,22 +245,22 @@ type RepackRunStatus struct {
 
 	// Plan is the migration plan, populated in BOTH modes with the SAME shape:
 	// DryRun = predicted plan; Execute = executed plan. moves is a pure plan;
-	// Execute's realized landing is reported via nominations[].phase + summary.
+	// Execute's realized placement is reported via nominations[].phase + summary.
 	// +optional
 	Plan *RepackPlan `json:"plan,omitempty"`
 
-	// Nominations are the durable landing-steering intents produced by Execute:
+	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
-	// landing-identity contract (victimPodName exact match -> identityLabels ->
+	// placement identity contract (victimPodName exact match -> identityLabels ->
 	// fungible). See the design proposal §5.2.2.
 	// +optional
 	// +kubebuilder:validation:MaxItems=4096
 	Nominations []PodNomination `json:"nominations,omitempty"`
 }
 
-// PodNomination steers one relocated pod's replacement onto a target node
-// (Execute-only). The reconciler patches pod.status.nominatedNodeName, claiming
-// the replacement per the landing-identity contract (proposal §5.2.2):
+// PodNomination records one relocated pod's replacement placement
+// (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
+// the replacement per the placement identity contract (proposal §5.2.2):
 // victimPodName exact match -> identityLabels (label match) -> fungible (any
 // pending pod in the PodGroup).
 type PodNomination struct {
@@ -258,14 +282,28 @@ type PodNomination struct {
 	// PodGroup). Self-describing: which label + value is visible in status.
 	// +optional
 	IdentityLabels map[string]string `json:"identityLabels,omitempty"`
-	// NodeName is the target node to nominate the replacement onto.
+	// NodeName is the immutable plan-time target node. It is retained for audit even
+	// if a later placement reconciliation selects another receiver.
 	// +kubebuilder:validation:Required
 	NodeName string `json:"nodeName"`
+	// SelectedNodeName is the current receiver selected from the live scheduler
+	// snapshot. It is written before the placement gate is removed.
+	// +optional
+	SelectedNodeName string `json:"selectedNodeName,omitempty"`
+	// ReplacementPodName and ReplacementPodUID identify the concrete Pod held by
+	// the placement gate. They are controller-owned status fields.
+	// +optional
+	ReplacementPodName string `json:"replacementPodName,omitempty"`
+	// +optional
+	ReplacementPodUID types.UID `json:"replacementPodUID,omitempty"`
+	// ActualNodeName is populated after the replacement is bound. It makes drift
+	// visible without overwriting the plan-time or selected target.
+	// +optional
+	ActualNodeName string `json:"actualNodeName,omitempty"`
 	// ExpirationTime bounds re-assertion; after it the nomination is Expired.
 	// +optional
 	ExpirationTime *metav1.Time `json:"expirationTime,omitempty"`
-	// Phase: Pending (not yet matched) / Bound (patched onto a replacement) /
-	// Expired (elapsed without a match).
+	// Phase is the controller-owned placement lifecycle.
 	// +optional
 	Phase PodNominationPhase `json:"phase,omitempty"`
 }
