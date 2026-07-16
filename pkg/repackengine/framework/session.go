@@ -247,10 +247,11 @@ func (s *Session) PlanContext() *api.PlanContext {
 	return &api.PlanContext{TargetResource: s.configuration.Resource, PodGroupViews: s.configuration.Snapshot}
 }
 
-// CurrentFragmentationRate is the target resource's fragmentation rate over the snapshot's
-// nodes, independent of any plan. Used to fill report.FragmentationRateBefore when the core
-// returns no plan, so the driver can tell a clean cluster (NoFragmentation) apart
-// from a fragmented one with no worthwhile plan (BelowGoalThreshold).
+// CurrentFragmentationRate is the target resource's cluster-wide fragmentation
+// rate over all snapshot nodes, independent of action scope and any plan. Used
+// to fill report.FragmentationRateBefore when the core returns no plan, so the
+// driver can tell a clean cluster (NoFragmentation) apart from a fragmented one
+// with no worthwhile in-scope plan (BelowGoalThreshold).
 func (s *Session) CurrentFragmentationRate() float64 {
 	return api.MeasureResourceFragmentation(s.Nodes(), s.configuration.Resource).FragmentationRate()
 }

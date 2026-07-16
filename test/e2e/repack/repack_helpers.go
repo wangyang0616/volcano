@@ -396,6 +396,24 @@ func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackR
 			return false, nil
 		})
 	Expect(err).NotTo(HaveOccurred(), "run %s did not reach a terminal phase (is the repack engine running?)", name)
+	Expect(last.Status.Message).NotTo(BeEmpty(), "terminal RepackRun must provide an operator-readable status.message")
+	Expect(last.Status.CompletionTime).NotTo(BeNil(), "terminal RepackRun must provide completionTime")
+	if last.Status.StartTime != nil {
+		Expect(last.Status.CompletionTime.Time.Before(last.Status.StartTime.Time)).To(BeFalse(),
+			"completionTime must not precede startTime")
+	}
+	var terminalCondition *metav1.Condition
+	for index := range last.Status.Conditions {
+		condition := &last.Status.Conditions[index]
+		if condition.Status == metav1.ConditionTrue &&
+			(condition.Type == "Complete" || condition.Type == "Failed" || condition.Type == "Cancelled") {
+			terminalCondition = condition
+			break
+		}
+	}
+	Expect(terminalCondition).NotTo(BeNil(), "terminal RepackRun must have a True terminal condition")
+	Expect(terminalCondition.Message).NotTo(BeEmpty(), "terminal condition must provide an operator-readable message")
+	Expect(terminalCondition.Message).NotTo(Equal("engine finished"), "terminal condition message must contain the actual result")
 	return last
 }
 

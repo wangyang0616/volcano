@@ -25,13 +25,14 @@ package v1alpha1
 // resource (goals[0].resource) — no per-resource breakdown. Multi-resource is
 // Reserved for multi-resource (would add a per-resource layer then).
 type RepackSummaryApplyConfiguration struct {
-	// Fragmentation before/after for the run's resource, in percentage points
-	// (0-100). Improvement = before - after (derive client-side).
+	// Cluster-wide fragmentation before the run and predicted after the complete
+	// plan, in percentage points (0-100). Only nodes providing the target resource
+	// participate; scope limits actions, not this cluster health metric.
 	FragBeforePercent *int32 `json:"fragBeforePercent,omitempty"`
 	FragAfterPercent  *int32 `json:"fragAfterPercent,omitempty"`
-	// FreedNodeCount is the number of nodes freed (headline; printer column).
+	// FreedNodeCount is the number of nodes the complete plan predicts it will free.
 	FreedNodeCount *int32 `json:"freedNodeCount,omitempty"`
-	// MovedCardCount is the total accelerator cards relocated (the run's resource).
+	// MovedCardCount is the total accelerator cards the complete plan would move.
 	MovedCardCount *int64                           `json:"movedCardCount,omitempty"`
 	ResolvedScope  *ResolvedScopeApplyConfiguration `json:"resolvedScope,omitempty"`
 }

@@ -243,11 +243,16 @@ type RepackRunStatus struct {
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 
-	// Plan is the migration plan, populated in BOTH modes with the SAME shape:
-	// DryRun = predicted plan; Execute = executed plan. moves is a pure plan;
-	// Execute's realized placement is reported via nominations[].phase + summary.
+	// Plan is the immutable plan-time decision in both modes. DryRun reports what
+	// would be done; Execute preserves the complete pre-eviction plan so rejected
+	// or degraded actions remain auditable. Actual Execute metrics live in Result.
 	// +optional
 	Plan *RepackPlan `json:"plan,omitempty"`
+
+	// Result is the Execute-only observed outcome. It is absent for DryRun and
+	// when Execute failed before any eviction was attempted.
+	// +optional
+	Result *RepackResult `json:"result,omitempty"`
 
 	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
@@ -308,10 +313,9 @@ type PodNomination struct {
 	Phase PodNominationPhase `json:"phase,omitempty"`
 }
 
-// RepackPlan is the terminal output, populated in BOTH modes with the same
-// shape: DryRun = predicted plan; Execute = executed plan. Three progressive
-// layers (summary + moves + freedNodes), capped by maxItems. Schema evolves with
-// the CRD apiVersion (no internal formatVersion).
+// RepackPlan is the immutable plan-time output in both modes. Three progressive
+// layers (summary + moves + freedNodes), capped by maxItems. Execute never
+// rewrites it with the accepted subset or actual placement result.
 type RepackPlan struct {
 	// Summary is the flat, at-a-glance layer (UI lists / alerts / printers read this).
 	// +optional
@@ -332,32 +336,52 @@ type RepackPlan struct {
 // resource (goals[0].resource) — no per-resource breakdown. Multi-resource is
 // Reserved for multi-resource (would add a per-resource layer then).
 type RepackSummary struct {
-	// Fragmentation before/after for the run's resource, in percentage points
-	// (0-100). Improvement = before - after (derive client-side).
-	// +optional
+	// Cluster-wide fragmentation before the run and predicted after the complete
+	// plan, in percentage points (0-100). Only nodes providing the target resource
+	// participate; scope limits actions, not this cluster health metric.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
-	FragBeforePercent int32 `json:"fragBeforePercent,omitempty"`
-	// +optional
+	FragBeforePercent int32 `json:"fragBeforePercent"`
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
-	FragAfterPercent int32 `json:"fragAfterPercent,omitempty"`
-	// FreedNodeCount is the number of nodes freed (headline; printer column).
-	// +optional
-	FreedNodeCount int32 `json:"freedNodeCount,omitempty"`
-	// MovedCardCount is the total accelerator cards relocated (the run's resource).
-	// +optional
-	MovedCardCount int64 `json:"movedCardCount,omitempty"`
+	FragAfterPercent int32 `json:"fragAfterPercent"`
+	// FreedNodeCount is the number of nodes the complete plan predicts it will free.
+	FreedNodeCount int32 `json:"freedNodeCount"`
+	// MovedCardCount is the total accelerator cards the complete plan would move.
+	MovedCardCount int64 `json:"movedCardCount"`
 	// +optional
 	ResolvedScope *ResolvedScope `json:"resolvedScope,omitempty"`
 }
 
-// ResolvedScope reports the effective scope after selector resolution.
+// RepackResult is the Execute-only observed outcome. Plan remains the immutable
+// audit record; Result reports what was accepted and what the cluster looked like
+// after replacement placement completed.
+type RepackResult struct {
+	// FragAfterPercent is the observed cluster-wide fragmentation after Execute.
+	// When MetricsVerified is false, it conservatively equals plan.fragBeforePercent.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	FragAfterPercent int32 `json:"fragAfterPercent"`
+	// FreedNodeCount is the number of plan.freedNodes actually free of the target
+	// resource in the verified terminal snapshot.
+	FreedNodeCount int32 `json:"freedNodeCount"`
+	// MovedCardCount is the accelerator-card total for accepted Pod evictions.
+	MovedCardCount int64 `json:"movedCardCount"`
+	// MetricsVerified reports whether FragAfterPercent and FreedNodeCount came
+	// from a coherent scheduler snapshot after replacement binding.
+	MetricsVerified bool `json:"metricsVerified"`
+}
+
+// ResolvedScope reports the effective action scope after selector resolution.
+// It does not change the cluster-wide fragmentation metric's denominator.
 type ResolvedScope struct {
-	// +optional
-	PodGroupCount int32 `json:"podGroupCount,omitempty"`
-	// +optional
-	NodeCount int32 `json:"nodeCount,omitempty"`
+	// PodGroupCount is the number of PodGroups selected by podGroup scope that
+	// currently consume the target resource. Later feasibility and disruption
+	// checks may still prevent them from moving.
+	PodGroupCount int32 `json:"podGroupCount"`
+	// NodeCount is the number of in-scope nodes providing the target resource and
+	// eligible to be selected as drain targets.
+	NodeCount int32 `json:"nodeCount"`
 }
 
 // RepackMove is one PodGroup's relocation. fromNode/toNode are per-pod (a gang's
@@ -427,7 +451,8 @@ type WorkloadRef struct {
 // +kubebuilder:printcolumn:name="MODE",type=string,JSONPath=`.spec.mode`
 // +kubebuilder:printcolumn:name="RESOURCE",type=string,JSONPath=`.spec.goals[0].resource`,description="Target accelerator resource being defragmented"
 // +kubebuilder:printcolumn:name="PHASE",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="FREED",type=integer,JSONPath=`.status.plan.summary.freedNodeCount`
+// +kubebuilder:printcolumn:name="PLAN-FREED",type=integer,JSONPath=`.status.plan.summary.freedNodeCount`
+// +kubebuilder:printcolumn:name="ACTUAL-FREED",type=integer,JSONPath=`.status.result.freedNodeCount`
 // +kubebuilder:printcolumn:name="AGE",type=date,JSONPath=`.metadata.creationTimestamp`
 type RepackRun struct {
 	metav1.TypeMeta   `json:",inline"`

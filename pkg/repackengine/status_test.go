@@ -18,13 +18,16 @@ package repackengine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
@@ -171,6 +174,155 @@ func TestSummaryOf(t *testing.T) {
 	}
 }
 
+func TestRepackSummarySerializesZeroValues(t *testing.T) {
+	data, err := json.Marshal(repackv1alpha1.RepackSummary{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		`"fragBeforePercent":0`,
+		`"fragAfterPercent":0`,
+		`"freedNodeCount":0`,
+		`"movedCardCount":0`,
+	} {
+		if !strings.Contains(string(data), field) {
+			t.Errorf("serialized summary %s does not contain %s", data, field)
+		}
+	}
+}
+
+func TestRepackResultSerializesZeroValues(t *testing.T) {
+	data, err := json.Marshal(repackv1alpha1.RepackResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		`"fragAfterPercent":0`,
+		`"freedNodeCount":0`,
+		`"movedCardCount":0`,
+		`"metricsVerified":false`,
+	} {
+		if !strings.Contains(string(data), field) {
+			t.Errorf("serialized result %s does not contain %s", data, field)
+		}
+	}
+}
+
+func TestBuildResolvedScope(t *testing.T) {
+	resource := func(cards int64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpuResource: float64(cards * 1000)}}
+	}
+	nodes := []*schedapi.NodeInfo{
+		{
+			Name:        "n0",
+			Node:        &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"pool": "selected"}}},
+			Allocatable: resource(8),
+			Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+				"a": {Job: "ns/a", Resreq: resource(2)},
+				"b": {Job: "ns/b", Resreq: resource(2)},
+			},
+		},
+		{
+			Name:        "n1",
+			Node:        &v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"pool": "excluded"}}},
+			Allocatable: resource(8),
+			Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+				"a2": {Job: "ns/a", Resreq: resource(2)},
+			},
+		},
+		{Name: "cpu-only", Allocatable: schedapi.EmptyResource()},
+	}
+	scope, err := engineframework.NewScopeMatcher(
+		&repackv1alpha1.RepackScope{
+			PodGroups: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{Names: []string{"ns/a"}},
+			},
+			Nodes: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "selected"}},
+				},
+			},
+		},
+		func(id schedapi.JobID) (string, labels.Labels, bool) {
+			return string(id), labels.Set{}, id == "ns/a" || id == "ns/b"
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := buildResolvedScope(nodes, scope, gpuResource)
+	if resolved.NodeCount != 1 || resolved.PodGroupCount != 1 {
+		t.Fatalf("resolvedScope = %+v, want nodeCount=1 podGroupCount=1", resolved)
+	}
+}
+
+func TestStampLifecycleIsIdempotent(t *testing.T) {
+	start := time.Unix(100, 0)
+	later := start.Add(time.Minute)
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{Phase: repackv1alpha1.RepackRunning}}
+	stampLifecycle(run, start)
+	if run.Status.StartTime == nil || !run.Status.StartTime.Time.Equal(start) || run.Status.CompletionTime != nil {
+		t.Fatalf("running lifecycle = %+v", run.Status)
+	}
+	run.Status.Phase = repackv1alpha1.RepackSucceeded
+	stampLifecycle(run, later)
+	if run.Status.CompletionTime == nil || !run.Status.CompletionTime.Time.Equal(later) {
+		t.Fatalf("completionTime = %v, want %v", run.Status.CompletionTime, later)
+	}
+	stampLifecycle(run, later.Add(time.Minute))
+	if !run.Status.StartTime.Time.Equal(start) || !run.Status.CompletionTime.Time.Equal(later) {
+		t.Fatalf("lifecycle timestamps were overwritten: %+v", run.Status)
+	}
+}
+
+func TestCompletionStatusMessageIncludesOperationalResult(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		Status: repackv1alpha1.RepackRunStatus{Plan: &repackv1alpha1.RepackPlan{
+			Summary: &repackv1alpha1.RepackSummary{
+				FragBeforePercent: 42,
+				FragAfterPercent:  28,
+				FreedNodeCount:    2,
+				MovedCardCount:    12,
+			},
+			Moves: []repackv1alpha1.RepackMove{{}, {}, {}},
+		}},
+	}
+	message := completionStatusMessage(run, gpuResource, state.ReasonRepackRecommended)
+	for _, want := range []string{"nvidia.com/gpu", "3 PodGroups", "12 cards", "2 nodes", "42% to 28%"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message %q does not contain %q", message, want)
+		}
+	}
+}
+
+func TestMarkExecuteNotPerformedPreservesPlanAndClearsExecutionState(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary: &repackv1alpha1.RepackSummary{
+				FragBeforePercent: 40,
+				FragAfterPercent:  20,
+				FreedNodeCount:    2,
+				MovedCardCount:    8,
+			},
+			Moves:      []repackv1alpha1.RepackMove{{PodGroupName: "pg"}},
+			FreedNodes: []string{"n0"},
+		},
+		Result:      &repackv1alpha1.RepackResult{FragAfterPercent: 30, FreedNodeCount: 1, MovedCardCount: 4},
+		Nominations: []repackv1alpha1.PodNomination{{VictimPodName: "pod"}},
+	}}
+	markExecuteNotPerformed(run)
+	summary := run.Status.Plan.Summary
+	if summary.FragAfterPercent != 20 || summary.FreedNodeCount != 2 || summary.MovedCardCount != 8 {
+		t.Fatalf("plan summary was modified: %+v", summary)
+	}
+	if len(run.Status.Plan.Moves) != 1 || len(run.Status.Plan.FreedNodes) != 1 {
+		t.Fatalf("complete plan was not preserved: %+v", run.Status.Plan)
+	}
+	if run.Status.Result != nil || len(run.Status.Nominations) != 0 {
+		t.Fatalf("execution state was not cleared: %+v", run.Status)
+	}
+}
+
 func TestNominationsOf(t *testing.T) {
 	if buildPodNominations(nil, time.Minute) != nil {
 		t.Error("nil plan -> nil")
@@ -212,7 +364,8 @@ func TestApplyPlan(t *testing.T) {
 
 	// DryRun: plan populated, no nominations.
 	dry := &repackv1alpha1.RepackRun{}
-	applyPlan(dry, report, plan, gpuResource, nil, false, time.Minute)
+	resolved := &repackv1alpha1.ResolvedScope{NodeCount: 3, PodGroupCount: 1}
+	applyPlan(dry, report, plan, gpuResource, nil, resolved)
 	if dry.Status.Plan == nil || dry.Status.Plan.Summary == nil {
 		t.Fatal("plan/summary not set")
 	}
@@ -222,12 +375,86 @@ func TestApplyPlan(t *testing.T) {
 	if len(dry.Status.Plan.FreedNodes) != 1 || dry.Status.Nominations != nil {
 		t.Errorf("DryRun should have freedNodes and no nominations")
 	}
+	if dry.Status.Plan.Summary.ResolvedScope == nil ||
+		dry.Status.Plan.Summary.ResolvedScope.NodeCount != 3 ||
+		dry.Status.Plan.Summary.ResolvedScope.PodGroupCount != 1 {
+		t.Errorf("resolvedScope=%+v, want 3 nodes/1 PodGroup", dry.Status.Plan.Summary.ResolvedScope)
+	}
 
-	// Execute: nominations populated.
+	// Execute preparation is explicit and does not alter the plan.
 	exec := &repackv1alpha1.RepackRun{}
-	applyPlan(exec, report, plan, gpuResource, nil, true, time.Minute)
+	applyPlan(exec, report, plan, gpuResource, nil, resolved)
+	prepareExecuteNominations(exec, plan, time.Minute)
 	if len(exec.Status.Nominations) != 1 {
 		t.Errorf("Execute should populate nominations, got %d", len(exec.Status.Nominations))
+	}
+}
+
+func TestRetainAcceptedNominationsPreservesDeadlineAndFiltersRejected(t *testing.T) {
+	acceptedMove := mkMove("accepted", "ns/g", 2, "n0", "n2")
+	acceptedMove.Task.Namespace = "ns"
+	rejectedMove := mkMove("rejected", "ns/g", 2, "n1", "n2")
+	rejectedMove.Task.Namespace = "ns"
+	fullPlan := &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove, rejectedMove}}
+	existing := buildPodNominations(fullPlan, time.Hour)
+	deadline := existing[0].ExpirationTime.DeepCopy()
+
+	got := retainAcceptedNominations(existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}}, time.Minute)
+	if len(got) != 1 || got[0].VictimPodName != "accepted" {
+		t.Fatalf("accepted nominations = %+v, want accepted only", got)
+	}
+	if got[0].ExpirationTime == nil || !got[0].ExpirationTime.Equal(deadline) {
+		t.Fatalf("expirationTime = %v, want preserved %v", got[0].ExpirationTime, deadline)
+	}
+}
+
+func TestAcceptedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			FreedNodes: []string{"n0", "n1"},
+			Moves: []repackv1alpha1.RepackMove{
+				{Namespace: "ns", PodGroupName: "a", Pods: []repackv1alpha1.PodMove{
+					{Name: "a-0", FromNode: "n0", ToNode: "n2"},
+					{Name: "a-1", FromNode: "n0", ToNode: "n2"},
+				}},
+				{Namespace: "ns", PodGroupName: "b", Pods: []repackv1alpha1.PodMove{
+					{Name: "b-0", FromNode: "n1", ToNode: "n2"},
+				}},
+			},
+		},
+		Nominations: []repackv1alpha1.PodNomination{
+			{Namespace: "ns", PodGroupName: "a", VictimPodName: "a-0", NodeName: "n2"},
+			{Namespace: "ns", PodGroupName: "b", VictimPodName: "b-0", NodeName: "n2"},
+		},
+	}}
+	got := acceptedFreedNodeNames(run)
+	if len(got) != 1 || got[0] != "n1" {
+		t.Fatalf("accepted freed nodes = %v, want [n1]", got)
+	}
+}
+
+func TestInitializeExecuteResultKeepsPlanBenefitAndRecordsAcceptedCards(t *testing.T) {
+	accepted := mkMove("accepted", "ns/g", 3, "n0", "n2")
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{Summary: &repackv1alpha1.RepackSummary{
+			FragBeforePercent: 50,
+			FragAfterPercent:  25,
+			FreedNodeCount:    2,
+			MovedCardCount:    8,
+		}},
+	}}
+	initializeExecuteResult(run, &engineapi.RepackPlan{Moves: []*engineapi.Move{accepted}}, gpuResource)
+	if run.Status.Result == nil ||
+		run.Status.Result.FragAfterPercent != 50 ||
+		run.Status.Result.FreedNodeCount != 0 ||
+		run.Status.Result.MovedCardCount != 3 ||
+		run.Status.Result.MetricsVerified {
+		t.Fatalf("initial result = %+v, want conservative actual metrics and 3 accepted cards", run.Status.Result)
+	}
+	if run.Status.Plan.Summary.FragAfterPercent != 25 ||
+		run.Status.Plan.Summary.FreedNodeCount != 2 ||
+		run.Status.Plan.Summary.MovedCardCount != 8 {
+		t.Fatalf("plan benefit was overwritten: %+v", run.Status.Plan.Summary)
 	}
 }
 
@@ -336,5 +563,39 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	}
 	if updated.Status.Nominations[0].Phase != repackv1alpha1.PodNominationBound {
 		t.Errorf("nomination phase = %q, want controller-owned Bound", updated.Status.Nominations[0].Phase)
+	}
+}
+
+func TestUpdateStatusTerminalPersistsMessageAndCompletionTime(t *testing.T) {
+	startTime := metav1.NewTime(time.Now().Add(-time.Minute))
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "terminal-status"},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeDryRun},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase:     repackv1alpha1.RepackSucceeded,
+			Message:   "operator-readable result",
+			StartTime: &startTime,
+			Conditions: []metav1.Condition{{
+				Type: state.CondComplete, Status: metav1.ConditionTrue, Reason: state.ReasonNoFragmentation,
+			}},
+		},
+	}
+	client := vcfake.NewSimpleClientset(run.DeepCopy())
+	engine := &Engine{volcanoClient: client}
+	if err := engine.updateStatusTerminal(context.Background(), run); err != nil {
+		t.Fatalf("updateStatusTerminal() error = %v", err)
+	}
+	updated, err := client.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Message != "operator-readable result" {
+		t.Errorf("message=%q, want operator-readable result", updated.Status.Message)
+	}
+	if updated.Status.CompletionTime == nil {
+		t.Fatal("completionTime was not persisted")
+	}
+	if updated.Status.CompletionTime.Time.Before(startTime.Time) {
+		t.Errorf("completionTime=%v precedes startTime=%v", updated.Status.CompletionTime, startTime)
 	}
 }

@@ -402,8 +402,14 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		metrics.ObserveGateRejection(gate.Reason)
 		klog.V(3).InfoS("RepackRun deferred by execute gate",
 			"run", name, "reason", gate.Reason, "requeueAfter", gate.RequeueAfter)
+		message := "Waiting to execute: another Execute RepackRun is active; this run will be retried when the active run finishes."
+		if gate.Reason == state.ReasonExecuteCoolingDown {
+			message = fmt.Sprintf(
+				"Waiting to execute: the previous Execute RepackRun is cooling down; retrying after %s.",
+				gate.RequeueAfter.Round(time.Second))
+		}
 		state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
-			gate.Reason, "waiting for an execute slot", work.Generation)
+			gate.Reason, message, work.Generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 		if err := e.updateStatus(ctx, work); err != nil {
 			return err
@@ -441,7 +447,9 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 		work := r.DeepCopy()
 		generation := work.Generation
 		const reason = "Interrupted"
-		msg := "engine restarted while this run was in progress"
+		cause := fmt.Errorf("engine restarted while this run was in progress")
+		msg := failureStatusMessage(e.resolveResource(work), reason, cause)
+		work.Status.Message = msg
 		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, generation)
 		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)

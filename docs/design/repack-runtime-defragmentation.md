@@ -304,8 +304,9 @@ P1 的整体扰动/执行策略设计；在行为和 API 一并定稿前，P0 �
 **status 核心字段**
 
 - `phase`：`Pending` / `Running` / `Succeeded` / `Failed` / `Cancelled`（由 `conditions` 派生，`conditions` 为权威）。
-- `plan`（**DryRun 与 Execute 同一字段、同一结构**）：整理计划的三层渐进披露——一句话 `message` + 扁平 `summary`（碎片率前后、腾出节点数、搬走卡数）+ 明细 `moves[]`（**每个 PodGroup 一条**，`namespace` 提升到条顶层共享，除精确 `podGroupName` 外并列 `owner` 用户可见工作负载引用——PodGroup 是内部对象，用户按 Deployment/vcjob/StatefulSet 认领；条内 `pods[]` 给**逐 pod** 的 `fromNode → toNode` 计划落点，因一个 gang 的 pod 可散落多源节点、迁往多目标节点，**DryRun 也能看到每个 pod 迁往哪个节点**；`pods[]` 只列被迁移的 pod，没搬的不出现）+ `freedNodes[]`（计划腾空的节点名列表）。`moves` 是**纯计划**、DryRun 与 Execute 同构；Execute 的实际落点/绑定情况交由 `nominations[].phase` + 聚合 `summary`（`freedNodeCount`/`fragAfterPercent`）表达，不在 `pods[]` 逐 pod 记漂移。
-- `nominations`（**Execute 独有**）：durable 落点提名意图，交控制器的提名 reconciler 消费（引导重建 pod 落到 `toNode`）。
+- `plan`（**DryRun 与 Execute 同一字段、同一结构**）：不可变的计划时快照。`summary` 始终记录完整计划的预期收益（目标资源的**全集群**碎片率 before/预测 after、预计腾出节点数、计划搬卡数、动作 scope 解析计数）；`moves[]` 与 `freedNodes[]` 始终保留驱逐前的完整方案。Execute 即使部分驱逐被拒绝或最终落点降级，也不得覆盖这份审计基线。
+- `result`（**Execute 独有**）：实际执行结果。`movedCardCount` 是被 Eviction API 接受的 Pod 所对应卡数；`fragAfterPercent` / `freedNodeCount` 来自替身绑定后的全集群一致快照；`metricsVerified=false` 表示未能可靠复测，此时碎片率保守回退为 plan before、实际腾空数为 0。若 Execute 在任何驱逐被接受前失败，`result` 不出现。
+- `nominations`（**Execute 独有**）：只保留驱逐已被接受的 durable 落点意图，交控制器的提名 reconciler 消费；计划与实际落点差异由 `nodeName` / `selectedNodeName` / `actualNodeName` 及 `phase` 表达。
 
 **RepackRun 结构体定义（Go，与 `types.go` 一致）**
 
@@ -359,7 +360,8 @@ type RepackRunStatus struct {
     Message        string             `json:"message,omitempty"`        // 终态一句话结论
     StartTime      *metav1.Time       `json:"startTime,omitempty"`
     CompletionTime *metav1.Time       `json:"completionTime,omitempty"` // TTL 锚点
-    Plan           *RepackPlan        `json:"plan,omitempty"`           // 整理计划（两种 mode 同一字段：DryRun=预测 / Execute=已执行）
+    Plan           *RepackPlan        `json:"plan,omitempty"`           // 不可变完整计划（两种 mode 同构，均为计划时快照）
+    Result         *RepackResult      `json:"result,omitempty"`         // Execute 独有：实际接受量与替身绑定后的观测结果
     Nominations    []PodNomination    `json:"nominations,omitempty"`    // Execute 独有：落点提名意图（每搬一个 pod 一条）
 }
 // 已精简（对齐 status 定义评审）：删除 mode（spec 不可变、恒可读，printer 用 spec.mode）、
@@ -379,11 +381,11 @@ type PodNomination struct {
     Phase          string       `json:"phase,omitempty"`          // Pending | Bound | Expired（重建 pod 是否已按提名落定）
 }
 // ---- status 子结构 ----
-// RepackPlan：DryRun 与 Execute 同一结构。DryRun=预测计划；Execute=已执行计划。
+// RepackPlan：DryRun 与 Execute 同一结构，始终是完整、不可变的计划时快照。
 type RepackPlan struct {
     Summary    *RepackSummary     `json:"summary,omitempty"`    // 扁平看板层
     Moves      []RepackMove       `json:"moves,omitempty"`      // 每段搬迁：带 fromNode→toNode 计划落点
-    FreedNodes []string           `json:"freedNodes,omitempty"` // 计划腾空的节点名（Execute 实际腾空数见 summary.freedNodeCount）
+    FreedNodes []string           `json:"freedNodes,omitempty"` // 计划腾空的节点名（Execute 实际腾空数见 status.result）
 }
 // RepackMove：一个 PodGroup 的迁移信息。fromNode/toNode 本质逐 pod（一个 gang 的 pod
 // 可散落多源节点、迁往多目标节点），故内含 pods[] 明细，PodGroup 级只留身份与合计。
@@ -395,7 +397,7 @@ type RepackMove struct {
     Pods         []PodMove    `json:"pods,omitempty"`   // 逐 pod 迁移明细（各自 fromNode→toNode）
 }
 // PodMove：单个 pod 的迁移（纯计划：pods[] 只列被迁移的 pod，没搬的不出现）。
-// DryRun 与 Execute 同构；Execute 的实际落点/绑定交由 nominations[].phase + summary 表达，
+// DryRun 与 Execute 同构；Execute 的实际落点/绑定交由 nominations[].phase + result 表达，
 // 不在此逐 pod 记 outcome/actualNode（结果导向：漂移不纠正、成败看聚合腾空）。
 type PodMove struct {
     Name     string `json:"name,omitempty"`     // pod 名（确定性命名精确对应；随机名为计划时快照）
@@ -414,17 +416,23 @@ type WorkloadRef struct {
 }
 // 单资源/Run（goals maxItems=1）：碎片率就是该资源的，无需按资源分列（多资源=P2+）
 type RepackSummary struct { // 扁平看板层（列表/告警读它）——纯度量，无 verdict
-    FragBeforePercent int32          `json:"fragBeforePercent,omitempty"` // 该资源碎片率（百分点 0–100）
-    FragAfterPercent  int32          `json:"fragAfterPercent,omitempty"`  // 改善 = before − after（自行相减）
-    FreedNodeCount    int32          `json:"freedNodeCount,omitempty"`    // 头条指标；printcolumn 数据源（对齐 resolvedScope.nodeCount 的 Count 家族）
-    MovedCardCount    int64          `json:"movedCardCount,omitempty"`    // 搬走的卡数总量（反范式计数，省一次聚合）
+    FragBeforePercent int32          `json:"fragBeforePercent"`           // 目标资源的全集群计划前碎片率（百分点 0–100）
+    FragAfterPercent  int32          `json:"fragAfterPercent"`            // 完整计划预测的碎片率
+    FreedNodeCount    int32          `json:"freedNodeCount"`              // 完整计划预计腾空数
+    MovedCardCount    int64          `json:"movedCardCount"`              // 完整计划搬卡数
     ResolvedScope     *ResolvedScope `json:"resolvedScope,omitempty"`     // 解析后的有效范围计数
+}
+type RepackResult struct { // Execute-only；与 plan 分离，避免实际结果覆盖原始收益基线
+    FragAfterPercent int32 `json:"fragAfterPercent"` // 实际复测值；未验证时等于 plan.fragBeforePercent
+    FreedNodeCount   int32 `json:"freedNodeCount"`   // plan.freedNodes 中实际空闲的节点数
+    MovedCardCount   int64 `json:"movedCardCount"`   // Eviction API 接受的 Pod 对应卡数
+    MetricsVerified  bool  `json:"metricsVerified"`  // fragAfter/freedNodeCount 是否来自一致快照
 }
 // 「值不值得整理」不放 summary，改由 conditions[Complete].reason 收口（conditions 权威、机器可读）：
 //   RepackRecommended  —— DryRun 找到划算方案（moves 非空）
 //   Executed           —— Execute 已执行搬迁
-//   NoFragmentation    —— scope 内无明显碎片，无需整理
-//   BelowGoalThreshold —— 有碎片但最优方案低于目标门控，未执行（fragBeforePercent 仍照填，暴露「有碎片整不动」）
+//   NoFragmentation    —— 目标资源的全集群碎片率为 0，无需整理
+//   BelowGoalThreshold —— 全集群有碎片，但当前 scope 内没有达到目标门控的可行方案
 // 已精简（对齐评审）：moves 删 role/moveKind/disruptionScore/outcome/actualNode（可读性/常量/
 // 内部打分/漂移不纠正；身份匹配的 role 只留在 nominations[]，Execute 落点看 nominations[].phase）；
 // 逐 pod 明细收进 pods[]PodMove（纯计划）；freedNodes 由 []FreedNode 塌缩为 []string
@@ -432,8 +440,8 @@ type RepackSummary struct { // 扁平看板层（列表/告警读它）——纯
 // summary 删 verdict（→ conditions.reason）/fragDeltaPercent（=before−after 派生）/
 // podGroupsToMove（=distinct moves 派生）。
 type ResolvedScope struct {
-    PodGroupCount int32 `json:"podGroupCount,omitempty"`
-    NodeCount     int32 `json:"nodeCount,omitempty"`
+    PodGroupCount int32 `json:"podGroupCount"` // podGroup scope 选中且正在消费目标资源的 PodGroup 数；后续约束仍可能否决迁移
+    NodeCount     int32 `json:"nodeCount"`     // scope 内、提供目标资源且可作 drain target 的节点数
 }
 ```
 
@@ -444,14 +452,14 @@ DryRun 终态（`status.plan` = 预测计划，`moves[].toNode` 让你看到计�
 ```yaml
 status:
   phase: Succeeded
-  message: "可整理：迁移 3 个 PodGroup(35 GPU)，腾出 2 台整机；GPU 碎片率 42→28"
+  message: "Repack recommended for nvidia.com/gpu: move 3 PodGroups and 35 cards to free 2 nodes; cluster fragmentation is expected to improve from 42% to 28%."
   startTime: "2026-07-02T10:00:00Z"
   completionTime: "2026-07-02T10:00:07Z"
   conditions:
     - type: Complete
       status: "True"
       reason: RepackRecommended       # ★「值不值得整理」的收口：找到划算方案
-      message: "plan generated"
+      message: "Repack recommended for nvidia.com/gpu: move 3 PodGroups and 35 cards to free 2 nodes; cluster fragmentation is expected to improve from 42% to 28%."
   plan:
     summary:                          # 扁平看板层（纯度量）
       fragBeforePercent: 42
@@ -486,12 +494,12 @@ status:
       - node-a23
 ```
 
-Execute 终态（`status.plan` = 已执行计划，`moves` 同构纯计划，落点绑定看 `nominations[].phase`）：
+Execute 终态（`status.plan` 保留完整原始计划与预期收益；`status.result` 呈现实际结果）：
 
 ```yaml
 status:
   phase: Succeeded
-  message: "已整理：搬迁 3 个 PodGroup，腾空 2 台整机"
+  message: "Repack completed for nvidia.com/gpu: moved 3 PodGroups and 35 cards, actually freed 2 nodes; cluster fragmentation changed from 42% to 29%."
   startTime: "2026-07-02T11:05:00Z"
   completionTime: "2026-07-02T11:06:12Z"
   conditions:
@@ -501,9 +509,9 @@ status:
   plan:
     summary:
       fragBeforePercent: 42
-      fragAfterPercent: 29           # 实际略逊于 DryRun 预估（运行期状态变化）
-      freedNodeCount: 2             # Execute 下即实际腾空数
-      movedCardCount: 35
+      fragAfterPercent: 28           # 完整计划的预测值，不被实际结果覆盖
+      freedNodeCount: 2              # 预计腾空数
+      movedCardCount: 35             # 完整计划搬卡数
     moves:                            # 与 DryRun 同构（纯计划）；实际落点/绑定看 nominations[].phase
       - namespace: ml
         podGroupName: train-a
@@ -518,9 +526,14 @@ status:
         cards: 4
         pods:
           - { name: infer-b-7d9f-abcde, fromNode: node-a23, toNode: node-a05, cards: 4 }
-    freedNodes:                       # 计划腾空节点名；实际腾空数看 summary.freedNodeCount，
+    freedNodes:                       # 计划腾空节点名；实际腾空数看 status.result，
       - node-a17                      # 落点绑定情况看 nominations[].phase
       - node-a23
+  result:                             # Execute-only 实际结果
+    fragAfterPercent: 29              # 替身绑定后的全集群复测
+    freedNodeCount: 2
+    movedCardCount: 35                # 实际被接受的驱逐所对应卡数
+    metricsVerified: true
   nominations:                        # 每搬一个 pod 一条，引导重建 pod 落到 nodeName
     - namespace: ml
       podGroupName: train-a
@@ -535,7 +548,7 @@ status:
 ```yaml
 status:
   phase: Succeeded                    # 计算跑完、结论是「不值得动」，仍是成功
-  message: "碎片率 42%，最优方案仅腾 1 台/改善 5%，低于目标 minFragImprovementPercent=10%，未执行"
+  message: "No repack performed for nvidia.com/gpu: cluster fragmentation is 42%, but no feasible plan within the resolved scope met the required 10 percentage-point improvement."
   conditions:
     - type: Complete
       status: "True"
@@ -659,12 +672,12 @@ status:
       reason: Executed                        # 可选：兼「值不值得」收口（RepackRecommended/Executed/NoFragmentation/BelowGoalThreshold）
       message: "executed"                     # 可选
       lastTransitionTime: "2026-07-04T10:08:42Z"  # 必选（condition 内）
-  plan:                                       # 可选整体：DryRun/Execute 同一字段（此处 Execute=已执行）
+  plan:                                       # 可选整体：DryRun/Execute 同一不可变完整计划
     summary:                                  # 可选：扁平看板（纯度量）
       fragBeforePercent: 42                   # 可选：碎片率整数百分点 0-100
-      fragAfterPercent: 31                    # 可选
-      freedNodeCount: 1                       # 可选：腾出整机数（printer 列取此）
-      movedCardCount: 35                      # 可选：搬走卡数合计
+      fragAfterPercent: 28                    # 可选：完整计划预测值
+      freedNodeCount: 2                       # 可选：完整计划预计腾出数
+      movedCardCount: 35                      # 可选：完整计划搬卡数
       resolvedScope:                          # 可选：解析后有效范围
         podGroupCount: 2                      # 可选
         nodeCount: 2                          # 可选
@@ -687,6 +700,11 @@ status:
             cards: 4
     freedNodes:                               # 可选：计划腾空的节点名（[]string）
       - node-3
+  result:                                     # 可选（Execute 独有）：实际接受量与复测结果
+    fragAfterPercent: 31
+    freedNodeCount: 1
+    movedCardCount: 27
+    metricsVerified: true
   nominations:                                # 可选（Execute 独有）：落点提名意图，reconciler 消费
     - namespace: ml                           # 必选（nomination 内）
       podGroupName: train-a                   # 可选：所属 PodGroup
@@ -698,7 +716,7 @@ status:
       phase: Bound                            # 可选：Pending | Bound | Expired
 ```
 
-> **DryRun 与 Execute 的差异**：DryRun 的 `plan` 结构完全相同（预测计划），但 **无 `nominations`**、`conditions[Complete].reason` 为 `RepackRecommended`/`NoFragmentation`/`BelowGoalThreshold`。
+> **DryRun 与 Execute 的差异**：两者 `plan` 都是完整预测计划；DryRun **无 `result` / `nominations`**。Execute 的 `result` 记录实际接受量和复测收益，`nominations` 只保留已接受驱逐。
 
 #### 5.2.4 外部负载接入指导（llm-d / kubeflow 等自定义 operator 的推荐做法）
 

@@ -75,7 +75,8 @@ func TestClearNodeBinding_AddTask(t *testing.T) {
 	}
 }
 
-// Nodes returns every in-scope session node (nil filter = all).
+// Nodes returns every session node. Scope gates drain targets separately so the
+// planning report can retain a cluster-wide target-resource fragmentation rate.
 func TestSessionSnapshot_Nodes(t *testing.T) {
 	ssn := &schedframework.Session{Nodes: map[string]*schedapi.NodeInfo{
 		"n0": capNode("n0", 8), "n1": capNode("n1", 8),

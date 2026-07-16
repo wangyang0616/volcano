@@ -45,10 +45,13 @@ type RepackRunStatusApplyConfiguration struct {
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 	// CompletionTime is when the run first reached a terminal phase (TTL anchor).
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
-	// Plan is the migration plan, populated in BOTH modes with the SAME shape:
-	// DryRun = predicted plan; Execute = executed plan. moves is a pure plan;
-	// Execute's realized placement is reported via nominations[].phase + summary.
+	// Plan is the immutable plan-time decision in both modes. DryRun reports what
+	// would be done; Execute preserves the complete pre-eviction plan so rejected
+	// or degraded actions remain auditable. Actual Execute metrics live in Result.
 	Plan *RepackPlanApplyConfiguration `json:"plan,omitempty"`
+	// Result is the Execute-only observed outcome. It is absent for DryRun and
+	// when Execute failed before any eviction was attempted.
+	Result *RepackResultApplyConfiguration `json:"result,omitempty"`
 	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
 	// placement identity contract (victimPodName exact match -> identityLabels ->
@@ -112,6 +115,14 @@ func (b *RepackRunStatusApplyConfiguration) WithCompletionTime(value metav1.Time
 // If called multiple times, the Plan field is set to the value of the last call.
 func (b *RepackRunStatusApplyConfiguration) WithPlan(value *RepackPlanApplyConfiguration) *RepackRunStatusApplyConfiguration {
 	b.Plan = value
+	return b
+}
+
+// WithResult sets the Result field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Result field is set to the value of the last call.
+func (b *RepackRunStatusApplyConfiguration) WithResult(value *RepackResultApplyConfiguration) *RepackRunStatusApplyConfiguration {
+	b.Result = value
 	return b
 }
 

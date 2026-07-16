@@ -113,8 +113,12 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		reason = state.ReasonEvicting
 	}
-	state.SetCondition(&run.Status.Conditions, state.CondQueued, metav1.ConditionFalse, state.ReasonSlotAcquired, "slot acquired", generation)
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, "engine started", generation)
+	progressMessage := fmt.Sprintf(
+		"Planning cluster-wide fragmentation for %s in %s mode.",
+		displayResource(targetResource), run.Spec.Mode)
+	state.SetCondition(&run.Status.Conditions, state.CondQueued, metav1.ConditionFalse,
+		state.ReasonSlotAcquired, "Execution slot acquired; planning has started.", generation)
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, progressMessage, generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist Running status: %w", err)
@@ -127,9 +131,12 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	}
 
 	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
+	resolvedScope := buildResolvedScope(snapshot.Nodes(), scope, targetResource)
 	maxPodGroups, maxResource, hasPodGroupLimit, hasResourceLimit := maxPerRun(run, targetResource)
 	klog.V(5).InfoS("repack: engine session opened", "run", run.Name, "resource", targetResource,
-		"nodes", len(snapshot.Nodes()), "maxPodGroups", maxPodGroups, "maxResource", maxResource)
+		"nodes", len(snapshot.Nodes()), "resolvedNodeCount", resolvedScope.NodeCount,
+		"resolvedPodGroupCount", resolvedScope.PodGroupCount,
+		"maxPodGroups", maxPodGroups, "maxResource", maxResource)
 	engineSession := engineframework.OpenSession(engineframework.SessionConfig{
 		Snapshot:                  snapshot,
 		Run:                       run,
@@ -168,18 +175,26 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		nominationTTL = e.config.NominationTTL
 	}
 	moveOwners := e.resolveMoveOwners(ctx, plan)
-	applyPlan(run, report, plan, targetResource, moveOwners, execute, nominationTTL)
+	applyPlan(run, report, plan, targetResource, moveOwners, resolvedScope)
 	if execute && worthwhile {
+		prepareExecuteNominations(run, plan, nominationTTL)
 		// This is the prepare barrier. In particular, nominations must be visible
 		// before an eviction can cause a replacement pod to appear. PodGroup
 		// placement leases are the second half of that barrier: the admission
 		// webhook can then gate every replacement before the scheduler observes it.
+		executionMessage := fmt.Sprintf(
+			"Executing repack for %s: evicting %d Pods from %d PodGroups and moving %d cards to free %d nodes.",
+			displayResource(targetResource), len(run.Status.Nominations), len(run.Status.Plan.Moves),
+			run.Status.Plan.Summary.MovedCardCount, run.Status.Plan.Summary.FreedNodeCount)
+		state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
+			state.ReasonEvicting, executionMessage, generation)
 		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist prepared Execute plan: %w", err)
 		}
 		preparedPlacementGroups := placementPodGroups(run)
 		if err := e.preparePlacementLeases(ctx, run); err != nil {
 			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
+			markExecuteNotPerformed(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, fmt.Errorf("prepare placement leases: %w", err))
 		}
 		klog.V(3).InfoS("repack: Execute plan prepared before eviction",
@@ -190,6 +205,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		result, err := engineframework.CommitPlan(plan, engineSession.Hooks())
 		if err != nil {
 			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
+			markExecuteNotPerformed(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
 		commitResult = &result
@@ -199,13 +215,15 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		metrics.ObserveEvictions(evictedCount, rejectedCount)
 		klog.V(3).InfoS("evictions issued", "run", run.Name, "evictedCount", evictedCount, "rejectedCount", rejectedCount)
 
-		// Replace the optimistic prepared plan with the realized subset. Release a
-		// lease as soon as none of its moves were accepted; otherwise a rejected
-		// eviction could leave future Pods in that PodGroup gated indefinitely.
+		// Preserve the complete pre-eviction status.plan, and report the accepted
+		// subset through nominations/result. Release a lease as soon as none of its
+		// moves were accepted; otherwise a rejected eviction could leave future Pods
+		// in that PodGroup gated indefinitely.
 		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
-		plan = realizedPlan(plan, commitResult)
-		report = engineframework.RenderReport(plan)
-		applyPlan(run, report, plan, targetResource, moveOwners, true, nominationTTL)
+		acceptedPlan := realizedPlan(plan, commitResult)
+		acceptedReport := engineframework.RenderReport(acceptedPlan)
+		run.Status.Nominations = retainAcceptedNominations(run.Status.Nominations, acceptedPlan, nominationTTL)
+		initializeExecuteResult(run, acceptedPlan, targetResource)
 		groupsToRelease := placementGroupsDifference(preparedPlacementGroups, placementPodGroups(run))
 		if len(groupsToRelease) > 0 {
 			// Persist the realized nomination set before relinquishing any lease. A
@@ -216,18 +234,20 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			}
 		}
 		if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
+			markExecuteBenefitUnverified(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
 		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
-			"run", run.Name, "plannedMoveCount", plannedMoveCount, "realizedMoveCount", len(plan.Moves),
-			"plannedFreedNodeCount", plannedFreedNodeCount, "realizedFreedNodeCount", len(plan.FreedNodes),
+			"run", run.Name, "plannedMoveCount", plannedMoveCount, "acceptedMoveCount", len(acceptedPlan.Moves),
+			"plannedFreedNodeCount", plannedFreedNodeCount, "acceptedFreedNodeCount", len(acceptedPlan.FreedNodes),
+			"acceptedMovedCardCount", run.Status.Result.MovedCardCount,
 			"remainingNominationCount", len(run.Status.Nominations))
 
 		if evictedCount == 0 && rejectedCount > 0 {
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
 				fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
 		}
-		if report.NodesFreed == 0 {
+		if acceptedReport.NodesFreed == 0 {
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
 				fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evictedCount, rejectedCount))
 		}
@@ -237,7 +257,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			// binding (or degrades it on expiry), so another Run cannot overlap the same
 			// PodGroup lease.
 			state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
-				state.ReasonAwaitingPlacement, "waiting for replacement pod placement", generation)
+				state.ReasonAwaitingPlacement, placementProgressMessage(run, targetResource), generation)
 			run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 			if err := e.updateStatus(ctx, run); err != nil {
 				return fmt.Errorf("persist awaiting placement status: %w", err)
@@ -252,24 +272,25 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			return nil
 		}
 	}
+	if execute && !worthwhile {
+		initializeNoopExecuteResult(run)
+	}
 
 	evictedCount, rejectedCount := 0, 0
 
-	var done, msg string
+	var done string
 	switch {
 	case !worthwhile && report.FragmentationRateBefore > 0:
-		done, msg = state.ReasonBelowGoalThreshold, "engine finished"
+		done = state.ReasonBelowGoalThreshold
 	case !worthwhile:
-		done, msg = state.ReasonNoFragmentation, "engine finished"
+		done = state.ReasonNoFragmentation
 	case execute:
-		done, msg = state.ReasonExecuted, "engine finished"
-		// Partial success: some evictions were rejected but at least one succeeded.
-		if rejectedCount > 0 {
-			msg = fmt.Sprintf("evicted %d pods; %d evictions were rejected", evictedCount, rejectedCount)
-		}
+		done = state.ReasonExecuted
 	default:
-		done, msg = state.ReasonRepackRecommended, "engine finished"
+		done = state.ReasonRepackRecommended
 	}
+	msg := completionStatusMessage(run, targetResource, done)
+	run.Status.Message = msg
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
 	state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)

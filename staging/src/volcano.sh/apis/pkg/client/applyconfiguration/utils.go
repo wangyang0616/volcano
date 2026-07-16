@@ -177,6 +177,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationrepackv1alpha1.RepackMoveApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackPlan"):
 		return &applyconfigurationrepackv1alpha1.RepackPlanApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackResult"):
+		return &applyconfigurationrepackv1alpha1.RepackResultApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRun"):
 		return &applyconfigurationrepackv1alpha1.RepackRunApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRunSpec"):

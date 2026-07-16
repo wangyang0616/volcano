@@ -28,7 +28,10 @@ spec:
       name: PHASE
       type: string
     - jsonPath: .status.plan.summary.freedNodeCount
-      name: FREED
+      name: PLAN-FREED
+      type: integer
+    - jsonPath: .status.result.freedNodeCount
+      name: ACTUAL-FREED
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: AGE
@@ -584,9 +587,9 @@ spec:
                 type: string
               plan:
                 description: |-
-                  Plan is the migration plan, populated in BOTH modes with the SAME shape:
-                  DryRun = predicted plan; Execute = executed plan. moves is a pure plan;
-                  Execute's realized placement is reported via nominations[].phase + summary.
+                  Plan is the immutable plan-time decision in both modes. DryRun reports what
+                  would be done; Execute preserves the complete pre-eviction plan so rejected
+                  or degraded actions remain auditable. Actual Execute metrics live in Result.
                 properties:
                   freedNodes:
                     description: FreedNodes are the names of nodes the plan empties.
@@ -667,40 +670,94 @@ spec:
                       / alerts / printers read this).
                     properties:
                       fragAfterPercent:
+                        description: Predicted cluster-wide fragmentation after
+                          the complete plan.
                         format: int32
                         maximum: 100
                         minimum: 0
                         type: integer
                       fragBeforePercent:
                         description: |-
-                          Fragmentation before/after for the run's resource, in percentage points
-                          (0-100). Improvement = before - after (derive client-side).
+                          Cluster-wide fragmentation before the run for the target resource, in
+                          percentage points (0-100). Only nodes providing that resource participate;
+                          scope limits actions, not this cluster health metric.
                         format: int32
                         maximum: 100
                         minimum: 0
                         type: integer
                       freedNodeCount:
-                        description: FreedNodeCount is the number of nodes freed (headline;
-                          printer column).
+                        description: FreedNodeCount is the number of nodes the complete
+                          plan predicts it will free.
                         format: int32
                         type: integer
                       movedCardCount:
                         description: MovedCardCount is the total accelerator cards
-                          relocated (the run's resource).
+                          the complete plan would move.
                         format: int64
                         type: integer
                       resolvedScope:
-                        description: ResolvedScope reports the effective scope after
-                          selector resolution.
+                        description: |-
+                          ResolvedScope reports the effective action scope after selector resolution.
+                          It does not change the cluster-wide fragmentation metric's denominator.
                         properties:
                           nodeCount:
+                            description: NodeCount is the number of in-scope nodes
+                              providing the target resource and eligible to be selected
+                              as drain targets.
                             format: int32
                             type: integer
                           podGroupCount:
+                            description: PodGroupCount is the number of PodGroups
+                              selected by podGroup scope that currently consume the
+                              target resource. Later feasibility and disruption checks
+                              may still prevent them from moving.
                             format: int32
                             type: integer
+                        required:
+                        - nodeCount
+                        - podGroupCount
                         type: object
+                    required:
+                    - fragAfterPercent
+                    - fragBeforePercent
+                    - freedNodeCount
+                    - movedCardCount
                     type: object
+                type: object
+              result:
+                description: |-
+                  Result is the Execute-only observed outcome. It is absent for DryRun and
+                  when Execute failed before any eviction was attempted.
+                properties:
+                  fragAfterPercent:
+                    description: |-
+                      FragAfterPercent is the observed cluster-wide fragmentation after Execute.
+                      When MetricsVerified is false, it conservatively equals plan.fragBeforePercent.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  freedNodeCount:
+                    description: |-
+                      FreedNodeCount is the number of plan.freedNodes actually free of the target
+                      resource in the verified terminal snapshot.
+                    format: int32
+                    type: integer
+                  metricsVerified:
+                    description: |-
+                      MetricsVerified reports whether FragAfterPercent and FreedNodeCount came
+                      from a coherent scheduler snapshot after replacement binding.
+                    type: boolean
+                  movedCardCount:
+                    description: MovedCardCount is the accelerator-card total for
+                      accepted Pod evictions.
+                    format: int64
+                    type: integer
+                required:
+                - fragAfterPercent
+                - freedNodeCount
+                - metricsVerified
+                - movedCardCount
                 type: object
               startTime:
                 description: StartTime is when the run first entered Running.

@@ -65,6 +65,9 @@ var _ = Describe("Repack DryRun & admission", func() {
 		Expect(got.Status.Plan).NotTo(BeNil())
 		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1))
 		Expect(got.Status.Plan.Summary.FragAfterPercent).To(BeNumerically("<", got.Status.Plan.Summary.FragBeforePercent))
+		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.ResolvedScope.NodeCount).To(BeEquivalentTo(3))
+		Expect(got.Status.Plan.Summary.ResolvedScope.PodGroupCount).To(BeNumerically(">=", 2))
 		Expect(len(got.Status.Plan.Moves)).To(BeNumerically(">=", 1))
 		// DryRun must not evict or nominate.
 		Expect(got.Status.Nominations).To(BeEmpty())
@@ -88,6 +91,9 @@ var _ = Describe("Repack DryRun & admission", func() {
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
 		Expect(completeReason(got)).To(Equal("NoFragmentation"))
 		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(0))
+		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.ResolvedScope.NodeCount).To(BeEquivalentTo(3))
+		Expect(got.Status.Plan.Summary.ResolvedScope.PodGroupCount).To(BeEquivalentTo(1))
 		Expect(got.Status.Plan.Moves).To(BeEmpty())
 	})
 
@@ -112,6 +118,9 @@ var _ = Describe("Repack DryRun & admission", func() {
 		Expect(completeReason(got)).To(Equal("BelowGoalThreshold"))
 		Expect(got.Status.Plan.Summary.FragBeforePercent).To(BeNumerically(">", 0))
 		Expect(got.Status.Plan.Summary.FragAfterPercent).To(Equal(got.Status.Plan.Summary.FragBeforePercent))
+		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.ResolvedScope.NodeCount).To(BeEquivalentTo(3))
+		Expect(got.Status.Plan.Summary.ResolvedScope.PodGroupCount).To(BeEquivalentTo(0))
 		Expect(got.Status.Plan.Moves).To(BeEmpty())
 	})
 

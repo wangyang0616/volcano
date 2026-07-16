@@ -22,6 +22,7 @@ import (
 	"sort"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -227,7 +228,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		// scheduler TaskInfo from it preserves its current resource requests and
 		// scheduling constraints for the full predicate simulation below.
 		task := schedapi.NewTaskInfo(pod)
-		receivers := placementReceivers(snapshot.Nodes(), run.Status.Plan.FreedNodes, nomination.NodeName, task)
+		receivers := placementReceivers(snapshot.Nodes(), acceptedFreedNodeNames(run), nomination.NodeName, task)
 		placements, fit := snapshot.FeasibleRelocation(committed, []*schedapi.TaskInfo{task}, receivers)
 		if !fit || len(placements) != 1 {
 			return e.markAwaitingPlacement(ctx, run.Name, pending)
@@ -332,6 +333,16 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 				changed = true
 			}
 		}
+		if state.SetCondition(
+			&run.Status.Conditions,
+			state.CondProgressing,
+			metav1.ConditionTrue,
+			state.ReasonAwaitingPlacement,
+			placementProgressMessage(run, e.resolveResource(run)),
+			run.Generation,
+		) {
+			changed = true
+		}
 		if !changed {
 			return nil
 		}
@@ -360,16 +371,50 @@ func placementsComplete(run *repackv1alpha1.RepackRun) bool {
 
 func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
 	degraded := false
+	expired := false
+	metricsUnverified := false
 	for index := range run.Status.Nominations {
 		if run.Status.Nominations[index].Phase != repackv1alpha1.PodPlacementPlaced {
 			degraded = true
-			break
+		}
+		if run.Status.Nominations[index].Phase == repackv1alpha1.PodPlacementExpired {
+			expired = true
 		}
 	}
-	reason, message := state.ReasonExecuted, "all replacement pods placed"
-	if degraded {
-		reason, message = state.ReasonPlacementDegraded, "one or more replacement pods did not reach the selected placement"
+	targetResource := e.resolveResource(run)
+	if expired {
+		// An expired replacement has been released to normal scheduling but has
+		// not produced a trustworthy terminal binding. Do not claim the optimistic
+		// plan benefit while workload demand may be temporarily absent.
+		markExecuteBenefitUnverified(run)
+	} else {
+		schedulerSession := schedframework.OpenSession(e.schedulerCache, e.tiers, e.configurations)
+		nodes := adapter.NewSessionSnapshot(schedulerSession, targetResource, nil).Nodes()
+		visible := placementBindingsVisible(nodes, run.Status.Nominations)
+		if !visible {
+			schedframework.CloseSessionReadOnly(schedulerSession)
+			// The nomination controller may observe Pod binding just before the
+			// scheduler cache applies the same Pod update. Wait for one coherent
+			// snapshot before publishing cluster-wide actual metrics.
+			if !placementObservationDeadlinePassed(run, e.now()) {
+				e.workQueue.AddAfter(run.Name, placementRetryInterval)
+				return nil
+			}
+			degraded = true
+			metricsUnverified = true
+			markExecuteBenefitUnverified(run)
+		} else {
+			updateActualExecuteResult(run, nodes, targetResource)
+			schedframework.CloseSessionReadOnly(schedulerSession)
+		}
 	}
+
+	reason := state.ReasonExecuted
+	if degraded {
+		reason = state.ReasonPlacementDegraded
+	}
+	message := placementStatusMessage(run, targetResource, degraded, metricsUnverified)
+	run.Status.Message = message
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, message, run.Generation)
 	if degraded {
 		state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, message, run.Generation)
@@ -390,6 +435,92 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		return fmt.Errorf("cleanup placement after terminal result: %w", err)
 	}
 	return nil
+}
+
+func placementObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.Time) bool {
+	if run == nil || len(run.Status.Nominations) == 0 {
+		return false
+	}
+	var latest time.Time
+	for index := range run.Status.Nominations {
+		expirationTime := run.Status.Nominations[index].ExpirationTime
+		if expirationTime == nil {
+			return false
+		}
+		if expirationTime.Time.After(latest) {
+			latest = expirationTime.Time
+		}
+	}
+	return !latest.IsZero() && !now.Before(latest)
+}
+
+func placementBindingsVisible(nodes []*schedapi.NodeInfo, nominations []repackv1alpha1.PodNomination) bool {
+	expected := make(map[string]string)
+	for index := range nominations {
+		nomination := &nominations[index]
+		switch nomination.Phase {
+		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementDegraded:
+			if nomination.ReplacementPodUID == "" || nomination.ActualNodeName == "" {
+				return false
+			}
+			expected[string(nomination.ReplacementPodUID)] = nomination.ActualNodeName
+		}
+	}
+	if len(expected) == 0 {
+		return true
+	}
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		for _, task := range node.Tasks {
+			if task == nil {
+				continue
+			}
+			expectedNode, found := expected[string(task.UID)]
+			if found && expectedNode == node.Name {
+				delete(expected, string(task.UID))
+			}
+		}
+	}
+	return len(expected) == 0
+}
+
+func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.NodeInfo, targetResource v1.ResourceName) {
+	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil || run.Status.Result == nil {
+		return
+	}
+	run.Status.Result.FragAfterPercent = percentagePoints(engineapi.MeasureResourceFragmentation(nodes, targetResource).FragmentationRate())
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(nodes))
+	for _, node := range nodes {
+		if node != nil {
+			nodesByName[node.Name] = node
+		}
+	}
+	var actuallyFreed int32
+	for _, nodeName := range acceptedFreedNodeNames(run) {
+		node := nodesByName[nodeName]
+		if node == nil || engineapi.Scalar(node.Allocatable, targetResource) <= 0 {
+			continue
+		}
+		if engineapi.Scalar(node.Used, targetResource) == 0 {
+			actuallyFreed++
+		}
+	}
+	run.Status.Result.FreedNodeCount = actuallyFreed
+	run.Status.Result.MetricsVerified = true
+}
+
+func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
+	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
+		return
+	}
+	if run.Status.Result == nil {
+		run.Status.Result = &repackv1alpha1.RepackResult{}
+	}
+	run.Status.Result.FragAfterPercent = run.Status.Plan.Summary.FragBeforePercent
+	run.Status.Result.FreedNodeCount = 0
+	run.Status.Result.MetricsVerified = false
 }
 
 func placementStatusKey(nomination *repackv1alpha1.PodNomination) string {

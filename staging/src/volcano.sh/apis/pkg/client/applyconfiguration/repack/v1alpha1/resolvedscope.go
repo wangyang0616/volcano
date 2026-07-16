@@ -20,10 +20,16 @@ package v1alpha1
 // ResolvedScopeApplyConfiguration represents a declarative configuration of the ResolvedScope type for use
 // with apply.
 //
-// ResolvedScope reports the effective scope after selector resolution.
+// ResolvedScope reports the effective action scope after selector resolution.
+// It does not change the cluster-wide fragmentation metric's denominator.
 type ResolvedScopeApplyConfiguration struct {
+	// PodGroupCount is the number of PodGroups selected by podGroup scope that
+	// currently consume the target resource. Later feasibility and disruption
+	// checks may still prevent them from moving.
 	PodGroupCount *int32 `json:"podGroupCount,omitempty"`
-	NodeCount     *int32 `json:"nodeCount,omitempty"`
+	// NodeCount is the number of in-scope nodes providing the target resource and
+	// eligible to be selected as drain targets.
+	NodeCount *int32 `json:"nodeCount,omitempty"`
 }
 
 // ResolvedScopeApplyConfiguration constructs a declarative configuration of the ResolvedScope type for use with

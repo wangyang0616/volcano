@@ -36,12 +36,15 @@ import (
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
+	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
 func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, generation int64, reason string, err error) error {
 	klog.ErrorS(err, "repack: run failed", "run", run.Name, "reason", reason)
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, err.Error(), generation)
-	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, err.Error(), generation)
+	message := failureStatusMessage(e.resolveResource(run), reason, err)
+	run.Status.Message = message
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, message, generation)
+	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, message, generation)
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
 		return err
@@ -179,14 +182,19 @@ func stampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 	}
 }
 
-// applyPlan maps the search outcome onto status.plan — the SAME shape for both
-// modes: DryRun = predicted plan, Execute = executed plan. Each move carries the
-// planned target node (fromNode -> toNode), visible in DryRun too. Execute also
-// writes the durable status.nominations[] (consumed by the controller's nomination
-// reconciler) and marks freed nodes as actuallyFreed. Per-move actual placement /
-// drift (outcome/actualNode) is filled later by the reconciler as replacement pods
-// land; the engine's initial write leaves it empty.
-func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, targetResource v1.ResourceName, owners map[string]*repackv1alpha1.WorkloadRef, execute bool, nominationTTL time.Duration) {
+// applyPlan maps the search outcome onto the immutable status.plan. DryRun and
+// Execute expose the same complete pre-eviction decision, including predicted
+// benefit. Execute acceptance and observed cluster metrics are deliberately
+// reported through status.nominations and status.result instead of rewriting
+// this audit record.
+func applyPlan(
+	run *repackv1alpha1.RepackRun,
+	report engineframework.Report,
+	plan *engineapi.RepackPlan,
+	targetResource v1.ResourceName,
+	owners map[string]*repackv1alpha1.WorkloadRef,
+	resolvedScope *repackv1alpha1.ResolvedScope,
+) {
 	moves := buildStatusMoves(plan, targetResource, owners)
 	summary := buildRepackSummary(report)
 	if summary != nil {
@@ -195,15 +203,156 @@ func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, pla
 			cards += m.Cards
 		}
 		summary.MovedCardCount = cards
+		if resolvedScope != nil {
+			summary.ResolvedScope = resolvedScope.DeepCopy()
+		}
 	}
 	run.Status.Plan = &repackv1alpha1.RepackPlan{
 		Summary:    summary,
 		Moves:      moves,
 		FreedNodes: sortedFreedNodeNames(plan),
 	}
-	if execute {
-		run.Status.Nominations = buildPodNominations(plan, nominationTTL)
+}
+
+// buildResolvedScope summarizes the two independent action-scope axes. The
+// fragmentation report remains cluster-wide: node scope limits drain targets,
+// while PodGroup scope limits which accelerator consumers may be moved.
+func buildResolvedScope(nodes []*schedapi.NodeInfo, scope *engineframework.ScopeMatcher, targetResource v1.ResourceName) *repackv1alpha1.ResolvedScope {
+	resolved := &repackv1alpha1.ResolvedScope{}
+	podGroups := make(map[schedapi.JobID]struct{})
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if engineapi.Scalar(node.Allocatable, targetResource) > 0 &&
+			(scope == nil || scope.NodeInScope(node)) {
+			resolved.NodeCount++
+		}
+		for _, task := range node.Tasks {
+			if task == nil || task.Job == "" || engineapi.Scalar(task.Resreq, targetResource) <= 0 {
+				continue
+			}
+			if scope == nil || scope.InScope(task.Job) {
+				podGroups[task.Job] = struct{}{}
+			}
+		}
 	}
+	resolved.PodGroupCount = int32(len(podGroups))
+	return resolved
+}
+
+func markExecuteNotPerformed(run *repackv1alpha1.RepackRun) {
+	if run == nil {
+		return
+	}
+	run.Status.Result = nil
+	run.Status.Nominations = nil
+}
+
+// prepareExecuteNominations records the complete set of placement intents before
+// the eviction barrier. A later commit filters this set to accepted evictions.
+func prepareExecuteNominations(run *repackv1alpha1.RepackRun, plan *engineapi.RepackPlan, nominationTTL time.Duration) {
+	if run == nil {
+		return
+	}
+	run.Status.Nominations = buildPodNominations(plan, nominationTTL)
+}
+
+// retainAcceptedNominations keeps only intents whose evictions were accepted.
+// Existing records are retained verbatim so their durable expiration deadline
+// and any concurrently observed replacement association are never reset.
+func retainAcceptedNominations(
+	existing []repackv1alpha1.PodNomination,
+	acceptedPlan *engineapi.RepackPlan,
+	nominationTTL time.Duration,
+) []repackv1alpha1.PodNomination {
+	accepted := buildPodNominations(acceptedPlan, nominationTTL)
+	if len(accepted) == 0 {
+		return nil
+	}
+	existingByKey := make(map[string]repackv1alpha1.PodNomination, len(existing))
+	for index := range existing {
+		existingByKey[nominationKey(&existing[index])] = existing[index]
+	}
+	for index := range accepted {
+		if record, found := existingByKey[nominationKey(&accepted[index])]; found {
+			accepted[index] = record
+		}
+	}
+	return accepted
+}
+
+// initializeExecuteResult publishes the accepted disruption amount immediately
+// after CommitPlan. Cluster-wide benefit remains conservative until replacement
+// bindings are visible in one coherent scheduler snapshot.
+func initializeExecuteResult(run *repackv1alpha1.RepackRun, acceptedPlan *engineapi.RepackPlan, targetResource v1.ResourceName) {
+	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
+		return
+	}
+	run.Status.Result = &repackv1alpha1.RepackResult{
+		FragAfterPercent: run.Status.Plan.Summary.FragBeforePercent,
+		MovedCardCount:   movedCardCount(acceptedPlan, targetResource),
+		MetricsVerified:  false,
+	}
+}
+
+func initializeNoopExecuteResult(run *repackv1alpha1.RepackRun) {
+	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
+		return
+	}
+	run.Status.Result = &repackv1alpha1.RepackResult{
+		FragAfterPercent: run.Status.Plan.Summary.FragBeforePercent,
+		MetricsVerified:  true,
+	}
+}
+
+func movedCardCount(plan *engineapi.RepackPlan, targetResource v1.ResourceName) int64 {
+	var cards int64
+	for _, move := range buildStatusMoves(plan, targetResource, nil) {
+		cards += move.Cards
+	}
+	return cards
+}
+
+// acceptedFreedNodeNames derives the source nodes whose complete planned victim
+// set was accepted. status.plan remains the complete proposal, so placement must
+// not exclude a source node whose eviction set was only partially accepted.
+func acceptedFreedNodeNames(run *repackv1alpha1.RepackRun) []string {
+	if run == nil || run.Status.Plan == nil {
+		return nil
+	}
+	accepted := make(map[string]struct{}, len(run.Status.Nominations))
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		accepted[nomination.Namespace+"\x00"+nomination.PodGroupName+"\x00"+nomination.VictimPodName+"\x00"+nomination.NodeName] = struct{}{}
+	}
+	var result []string
+	for _, nodeName := range run.Status.Plan.FreedNodes {
+		hasPlannedVictim := false
+		complete := true
+		for moveIndex := range run.Status.Plan.Moves {
+			move := &run.Status.Plan.Moves[moveIndex]
+			for podIndex := range move.Pods {
+				pod := &move.Pods[podIndex]
+				if pod.FromNode != nodeName {
+					continue
+				}
+				hasPlannedVictim = true
+				key := move.Namespace + "\x00" + move.PodGroupName + "\x00" + pod.Name + "\x00" + pod.ToNode
+				if _, found := accepted[key]; !found {
+					complete = false
+					break
+				}
+			}
+			if !complete {
+				break
+			}
+		}
+		if hasPlannedVictim && complete {
+			result = append(result, nodeName)
+		}
+	}
+	return result
 }
 
 // buildStatusMoves groups the plan's per-task relocations into per-PodGroup status moves;
@@ -318,9 +467,10 @@ func sortedFreedNodeNames(plan *engineapi.RepackPlan) []string {
 	return freedNodeNames
 }
 
-// buildRepackSummary renders the flat metrics layer. "Worth repacking?" is not here — it
-// is folded into the terminal condition's reason. MovedCardCount is filled by
-// applyPlan from moves; FragBefore/After come from the report (absolute rate).
+// buildRepackSummary renders the flat metrics layer. "Worth repacking?" is not
+// here — it is folded into the terminal condition's reason. MovedCardCount is
+// filled by applyPlan from moves; FragBefore/After are the target resource's
+// cluster-wide rates and do not use resolved scope as their denominator.
 func buildRepackSummary(report engineframework.Report) *repackv1alpha1.RepackSummary {
 	return &repackv1alpha1.RepackSummary{
 		FragBeforePercent: percentagePoints(report.FragmentationRateBefore),

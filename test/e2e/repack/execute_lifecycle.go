@@ -64,6 +64,17 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
 		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(got.Status.Plan).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.ResolvedScope.NodeCount).To(BeEquivalentTo(3))
+		Expect(got.Status.Plan.Summary.ResolvedScope.PodGroupCount).To(BeNumerically(">=", 2))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1), "Execute must preserve the predicted node-freeing benefit")
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Result.FreedNodeCount).To(BeNumerically(">=", 1), "Execute must report nodes actually free after replacement binding")
+		Expect(got.Status.Result.FragAfterPercent).To(BeNumerically("<=", got.Status.Plan.Summary.FragBeforePercent),
+			"Execute terminal status must report the remeasured cluster fragmentation")
 		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")
 	})
 
@@ -121,6 +132,14 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		got := waitTerminal(ctx, run.Name)
 		Expect(completeReason(got)).To(Equal("ExecuteFailed"))
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
+		Expect(got.Status.Plan).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary).NotTo(BeNil())
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeNumerically(">=", 1),
+			"the complete pre-eviction plan must remain visible after rejection")
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MovedCardCount).To(BeEquivalentTo(0))
+		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
+		Expect(got.Status.Nominations).To(BeEmpty(), "rejected evictions must not retain placement intents")
 	})
 
 	// E16: scope.nodes.exclude — an excluded node is never a drain target, so it is

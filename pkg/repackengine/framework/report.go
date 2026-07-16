@@ -27,9 +27,11 @@ type Report struct {
 	MovedResource          int64 // target-resource units relocated
 	AffectedPodGroups      int64 // distinct gangs disrupted
 	FragmentationRateDelta float64
-	// FragmentationRateBefore/After are the resource fragmentation rate (0-1) before/after
-	// the plan, feeding status.plan.summary.frag{Before,After}Percent. after =
-	// before + FragmentationRateDelta (freeing a node reduces the occupied-node count by one).
+	// FragmentationRateBefore/After are the cluster-wide fragmentation rate (0-1)
+	// for the target resource before/after the plan, feeding
+	// status.plan.summary.frag{Before,After}Percent. Scope limits eligible actions,
+	// not this cluster health metric. after = before + FragmentationRateDelta
+	// (freeing a node reduces the occupied-node count by one).
 	FragmentationRateBefore float64
 	FragmentationRateAfter  float64
 }
