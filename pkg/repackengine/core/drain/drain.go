@@ -229,9 +229,9 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 		s.recordPruned("cached_infeasible")
 		return candidate{}, false
 	}
-	inUnit, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
+	inUnit, diagnostics, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
 	if !ok {
-		klog.V(5).InfoS("repack drain: unit not freeable now (drained/filled/has-immovable-pod)", "unit", key, "nodes", unit.Nodes)
+		logNonFreeableNodes(key, diagnostics, s.resource)
 		return candidate{}, false
 	}
 	// Skip accelerator-empty units: freeing a node that runs no accelerator pod
@@ -401,7 +401,7 @@ func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
 // (not freeable), is receiver-only (excluded from draining by scope.nodes), or was
 // already proven un-vacatable this pass.
 func (s *drainState) staying(n *schedapi.NodeInfo) bool {
-	return !api.NodeFreeable(n, s.movable, s.resource) || !s.snapshot.NodeInScope(n) || s.provenStuck[n.Name]
+	return !api.EvaluateNodeFreeability(n, api.NodeFreeabilityState{}, s.movable, s.resource).Freeable || !s.snapshot.NodeInScope(n) || s.provenStuck[n.Name]
 }
 
 // chooseLeastDisruptive orders the feasible candidates deterministically (higher
@@ -450,19 +450,50 @@ func (s *drainState) plan() *api.RepackPlan {
 	return &api.RepackPlan{Moves: s.moves, FreedNodes: s.freedNodes, FreedUnits: s.freedUnits}
 }
 
-// freeableNow reports whether every node of the unit can still be a drain target
-// (present, not already drained, not a receiver/filled, and freeable), returning
-// the unit's node set.
-func freeableNow(unit api.FreeableUnit, nodesByName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable, targetResource v1.ResourceName) (map[string]bool, bool) {
+type nodeFreeability struct {
+	nodeName string
+	result   api.NodeFreeability
+}
+
+// freeableNow evaluates every node in a unit exactly once. It returns the
+// blocking diagnostics alongside the eligibility result, so logging cannot
+// diverge from the decision or require a second task scan.
+func freeableNow(unit api.FreeableUnit, nodesByName map[string]*schedapi.NodeInfo, drained, filled map[string]bool, movable api.Movable, targetResource v1.ResourceName) (map[string]bool, []nodeFreeability, bool) {
 	inUnit := make(map[string]bool, len(unit.Nodes))
+	var diagnostics []nodeFreeability
 	for _, nodeName := range unit.Nodes {
-		n := nodesByName[nodeName]
-		if n == nil || drained[nodeName] || filled[nodeName] || !api.NodeFreeable(n, movable, targetResource) {
-			return nil, false
+		result := api.EvaluateNodeFreeability(nodesByName[nodeName], api.NodeFreeabilityState{
+			Drained: drained[nodeName],
+			Filled:  filled[nodeName],
+		}, movable, targetResource)
+		if !result.Freeable {
+			diagnostics = append(diagnostics, nodeFreeability{nodeName: nodeName, result: result})
+			continue
 		}
 		inUnit[nodeName] = true
 	}
-	return inUnit, len(inUnit) > 0
+	return inUnit, diagnostics, len(diagnostics) == 0 && len(inUnit) > 0
+}
+
+// logNonFreeableNodes writes one V(4) record for every node that prevents a
+// freeable unit from being drained. The diagnostics are produced by the same
+// EvaluateNodeFreeability call that rejected the unit.
+func logNonFreeableNodes(unitKey string, diagnostics []nodeFreeability, targetResource v1.ResourceName) {
+	for _, diagnostic := range diagnostics {
+		immovablePods := make([]string, 0, len(diagnostic.result.ImmovableTasks))
+		for _, task := range diagnostic.result.ImmovableTasks {
+			pod := task.Namespace + "/" + task.Name
+			if task.Job != "" {
+				pod += " (podGroup=" + string(task.Job) + ")"
+			} else {
+				pod += " (podGroup=<none>)"
+			}
+			immovablePods = append(immovablePods, pod)
+		}
+		sort.Strings(immovablePods)
+		klog.V(4).InfoS("repack drain: node cannot be freed", "unit", unitKey, "node", diagnostic.nodeName,
+			"targetResource", targetResource, "reason", diagnostic.result.Reason, "immovablePods", immovablePods)
+	}
 }
 
 // occupiesAccelerator reports whether the node uses any of the target accelerator

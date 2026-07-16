@@ -108,14 +108,14 @@ type Engine struct {
 	recorder                record.EventRecorder
 	now                     func() time.Time
 
-	engineStateMutex sync.Mutex
-	tiers            []conf.Tier
-	configurations   []conf.Configuration
+	tiers          []conf.Tier
+	configurations []conf.Configuration
 	// activeExecuteRunName is the Execute run currently holding the K=1 slot
 	// ("" = none); lastExecuteFinishTime is when this engine last finished an Execute.
-	// Both are authoritative (do not depend on informer-cache freshness), so the
-	// gate is correct even before a status write propagates to the lister, and
-	// safe if Workers is ever > 1. Guarded by engineStateMutex.
+	// These values bridge informer-cache propagation and are protected by
+	// executeStateMutex. The check and claim are performed in one critical section
+	// so K=1 remains correct if the worker count is increased later.
+	executeStateMutex     sync.Mutex
 	activeExecuteRunName  string
 	lastExecuteFinishTime time.Time
 }
@@ -257,9 +257,7 @@ func (e *Engine) loadConf() error {
 	if err != nil {
 		return err
 	}
-	e.engineStateMutex.Lock()
 	e.tiers, e.configurations = tiers, configurations
-	e.engineStateMutex.Unlock()
 	return nil
 }
 
@@ -363,14 +361,11 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		}
 	}
 
-	active, lastFinish := e.executeGateState(work.Name)
-	gate := state.EvaluateGate(state.GateInputs{
-		Mode:              work.Spec.Mode,
-		ExecuteActive:     active,
-		LastExecuteFinish: lastFinish,
-		Cooldown:          e.config.Cooldown,
-		Now:               e.now(),
-	})
+	active, lastFinish := false, time.Time{}
+	gate := state.GateDecision{Admit: true} // DryRun is never serialized by Execute.
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+		gate, active, lastFinish = e.tryAcquireExecute(work.Name, e.now())
+	}
 	klog.V(4).InfoS("repack: execute gate evaluated", "run", work.Name, "mode", work.Spec.Mode,
 		"executeActive", active, "lastExecuteFinish", lastFinish, "cooldown", e.config.Cooldown,
 		"admit", gate.Admit, "reason", gate.Reason, "requeueAfter", gate.RequeueAfter)
@@ -390,7 +385,6 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		return nil
 	}
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
-		e.markExecuteActive(work.Name) // hold the K=1 slot across this synchronous process
 		klog.V(3).InfoS("repack: Execute slot acquired", "run", work.Name, "cooldown", e.config.Cooldown)
 	}
 	return e.process(ctx, work)

@@ -30,6 +30,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	state "volcano.sh/repack-controller/pkg/state"
 
@@ -94,7 +95,7 @@ func TestFreedNodesOf(t *testing.T) {
 
 func TestMovesOf(t *testing.T) {
 	// nil plan / no moves.
-	if buildStatusMoves(nil, gpuResource) != nil {
+	if buildStatusMoves(nil, gpuResource, nil) != nil {
 		t.Error("nil plan -> nil")
 	}
 
@@ -106,7 +107,10 @@ func TestMovesOf(t *testing.T) {
 		mkMove("a0", "ns/ga", 4, "n0", "n3"),
 		mkMove("noop", "ns/ga", 1, "n5", "n5"), // To==From: filtered
 	}}
-	moves := buildStatusMoves(plan, gpuResource)
+	owners := map[string]*repackv1alpha1.WorkloadRef{
+		"ns/ga": {APIVersion: "apps/v1", Kind: "Deployment", Name: "trainer"},
+	}
+	moves := buildStatusMoves(plan, gpuResource, owners)
 	if len(moves) != 2 {
 		t.Fatalf("got %d podgroup moves, want 2", len(moves))
 	}
@@ -118,12 +122,45 @@ func TestMovesOf(t *testing.T) {
 	if ga.Namespace != "ns" || ga.Cards != 4 || len(ga.Pods) != 1 {
 		t.Errorf("ga=%+v", ga)
 	}
+	if ga.Owner == nil || ga.Owner.APIVersion != "apps/v1" || ga.Owner.Kind != "Deployment" || ga.Owner.Name != "trainer" {
+		t.Errorf("ga owner=%+v, want apps/v1 Deployment trainer", ga.Owner)
+	}
+	if gb.Owner != nil {
+		t.Errorf("gb owner=%+v, want nil", gb.Owner)
+	}
 	if gb.Cards != 4 || len(gb.Pods) != 2 { // 2+2, two pods from two source nodes
 		t.Errorf("gb cards=%d pods=%d, want 4/2", gb.Cards, len(gb.Pods))
 	}
 	// gb pods are name-sorted: w0 then w1.
 	if gb.Pods[0].Name != "w0" || gb.Pods[0].FromNode != "n1" || gb.Pods[1].Name != "w1" {
 		t.Errorf("gb pods not sorted: %+v", gb.Pods)
+	}
+}
+
+func TestResolveMoveOwners(t *testing.T) {
+	controller := true
+	client := vcfake.NewSimpleClientset(
+		&schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "owned",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "worker", Controller: &controller}},
+		}},
+		&schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "non-controller",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "helper"}},
+		}},
+	)
+	plan := &engineapi.RepackPlan{Moves: []*engineapi.Move{
+		mkMove("owned-0", "ns/owned", 1, "n0", "n1"),
+		mkMove("plain-0", "ns/non-controller", 1, "n0", "n1"),
+		mkMove("missing-0", "ns/missing", 1, "n0", "n1"),
+	}}
+	owners := (&Engine{volcanoClient: client}).resolveMoveOwners(context.Background(), plan)
+	if len(owners) != 1 {
+		t.Fatalf("resolved owners=%v, want one controller owner", owners)
+	}
+	got := owners["ns/owned"]
+	if got == nil || got.APIVersion != "apps/v1" || got.Kind != "StatefulSet" || got.Name != "worker" {
+		t.Errorf("owner=%+v, want apps/v1 StatefulSet worker", got)
 	}
 }
 
@@ -175,7 +212,7 @@ func TestApplyPlan(t *testing.T) {
 
 	// DryRun: plan populated, no nominations.
 	dry := &repackv1alpha1.RepackRun{}
-	applyPlan(dry, report, plan, gpuResource, false, time.Minute)
+	applyPlan(dry, report, plan, gpuResource, nil, false, time.Minute)
 	if dry.Status.Plan == nil || dry.Status.Plan.Summary == nil {
 		t.Fatal("plan/summary not set")
 	}
@@ -188,7 +225,7 @@ func TestApplyPlan(t *testing.T) {
 
 	// Execute: nominations populated.
 	exec := &repackv1alpha1.RepackRun{}
-	applyPlan(exec, report, plan, gpuResource, true, time.Minute)
+	applyPlan(exec, report, plan, gpuResource, nil, true, time.Minute)
 	if len(exec.Status.Nominations) != 1 {
 		t.Errorf("Execute should populate nominations, got %d", len(exec.Status.Nominations))
 	}

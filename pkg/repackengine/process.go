@@ -57,9 +57,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		// panic/early-return paths.
 		defer e.markExecuteDone(run.Name)
 	}
-	e.engineStateMutex.Lock()
 	schedulerTiers, schedulerConfigurations := e.tiers, e.configurations
-	e.engineStateMutex.Unlock()
 
 	schedulerSession := schedframework.OpenSession(e.schedulerCache, schedulerTiers, schedulerConfigurations)
 	// Read-only close: the engine plans against the session but must NOT write back
@@ -170,7 +168,8 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	if execute {
 		nominationTTL = e.config.NominationTTL
 	}
-	applyPlan(run, report, plan, targetResource, execute, nominationTTL)
+	moveOwners := e.resolveMoveOwners(ctx, plan)
+	applyPlan(run, report, plan, targetResource, moveOwners, execute, nominationTTL)
 	if execute && worthwhile {
 		// This is the prepare barrier. In particular, nominations must be visible
 		// before an eviction can cause a replacement pod to appear.
@@ -206,7 +205,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
 		plan = realizedPlan(plan, commitResult)
 		report = engineframework.RenderReport(plan)
-		applyPlan(run, report, plan, targetResource, true, nominationTTL)
+		applyPlan(run, report, plan, targetResource, moveOwners, true, nominationTTL)
 		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
 			"run", run.Name, "plannedMoveCount", plannedMoveCount, "realizedMoveCount", len(plan.Moves),
 			"plannedFreedNodeCount", plannedFreedNodeCount, "realizedFreedNodeCount", len(plan.FreedNodes),

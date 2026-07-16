@@ -27,38 +27,47 @@ import (
 	repacklisters "volcano.sh/apis/pkg/client/listers/repack/v1alpha1"
 )
 
-// The K=1 in-memory gate state (activeExecuteRunName/lastExecuteFinishTime,
-// guarded by engineStateMutex) is
-// designed to be safe even if Workers > 1. Hammer markExecuteActive/Done and
-// executeGateState from many goroutines; run with -race to catch data races.
-func TestExecuteGateState_ConcurrentAccess(t *testing.T) {
+// K=1 admission must be an atomic check-and-claim: concurrent workers may not
+// both observe a free slot and start Execute.
+func TestTryAcquireExecute_ConcurrentK1(t *testing.T) {
 	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	now := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
 	e := &Engine{
 		repackRunLister: repacklisters.NewRepackRunLister(idx),
-		now:             time.Now,
+		now:             func() time.Time { return now },
 	}
 
-	const goroutines, iters = 16, 500
+	const goroutines = 16
 	var wg sync.WaitGroup
+	start := make(chan struct{})
+	admitted := make(chan string, goroutines)
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			<-start
 			name := fmt.Sprintf("run-%d", id)
-			for j := 0; j < iters; j++ {
-				e.markExecuteActive(name)
-				active, last := e.executeGateState(name)
-				_ = active
-				_ = last
-				e.markExecuteDone(name)
+			if gate, _, _ := e.tryAcquireExecute(name, now); gate.Admit {
+				admitted <- name
 			}
 		}(i)
 	}
+	close(start)
 	wg.Wait()
+	close(admitted)
 
-	// Every goroutine finished with markExecuteDone, which stamps the cooldown
-	// anchor, so lastExecuteFinishTime must be set (and reads must not have raced).
-	if _, last := e.executeGateState("x"); last.IsZero() {
-		t.Error("lastExecuteFinishTime should be stamped after Execute completions")
+	var winner string
+	for name := range admitted {
+		if winner != "" {
+			t.Fatalf("multiple Execute runs admitted: %q and %q", winner, name)
+		}
+		winner = name
+	}
+	if winner == "" {
+		t.Fatal("no Execute run admitted")
+	}
+	e.markExecuteDone(winner)
+	if gate, _, last := e.tryAcquireExecute("next", now); !gate.Admit || last.IsZero() {
+		t.Errorf("slot should be reusable after release, gate=%+v last=%v", gate, last)
 	}
 }

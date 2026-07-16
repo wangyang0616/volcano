@@ -164,8 +164,8 @@ func stampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 // reconciler) and marks freed nodes as actuallyFreed. Per-move actual-landing /
 // drift (outcome/actualNode) is filled later by the reconciler as replacement pods
 // land; the engine's initial write leaves it empty.
-func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, targetResource v1.ResourceName, execute bool, nominationTTL time.Duration) {
-	moves := buildStatusMoves(plan, targetResource)
+func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, plan *engineapi.RepackPlan, targetResource v1.ResourceName, owners map[string]*repackv1alpha1.WorkloadRef, execute bool, nominationTTL time.Duration) {
+	moves := buildStatusMoves(plan, targetResource, owners)
 	summary := buildRepackSummary(report)
 	if summary != nil {
 		var cards int64
@@ -187,7 +187,7 @@ func applyPlan(run *repackv1alpha1.RepackRun, report engineframework.Report, pla
 // buildStatusMoves groups the plan's per-task relocations into per-PodGroup status moves;
 // fromNode/toNode live per-pod in pods[] (a gang's pods may spread across nodes).
 // moves is a pure plan (identical in DryRun/Execute). Deterministic order.
-func buildStatusMoves(plan *engineapi.RepackPlan, targetResource v1.ResourceName) []repackv1alpha1.RepackMove {
+func buildStatusMoves(plan *engineapi.RepackPlan, targetResource v1.ResourceName, owners map[string]*repackv1alpha1.WorkloadRef) []repackv1alpha1.RepackMove {
 	if plan == nil {
 		return nil
 	}
@@ -203,7 +203,11 @@ func buildStatusMoves(plan *engineapi.RepackPlan, targetResource v1.ResourceName
 			moveIndex = len(statusMoves)
 			moveIndexByPodGroup[podGroupID] = moveIndex
 			namespace, podGroupName := splitPodGroupID(podGroupID)
-			statusMoves = append(statusMoves, repackv1alpha1.RepackMove{Namespace: namespace, PodGroupName: podGroupName})
+			statusMoves = append(statusMoves, repackv1alpha1.RepackMove{
+				Namespace:    namespace,
+				PodGroupName: podGroupName,
+				Owner:        owners[podGroupID],
+			})
 		}
 		var cards int64
 		if move.Task.Resreq != nil {
@@ -238,6 +242,40 @@ func buildStatusMoves(plan *engineapi.RepackPlan, targetResource v1.ResourceName
 		})
 	}
 	return statusMoves
+}
+
+// resolveMoveOwners returns the direct controller owner for every PodGroup
+// affected by plan. Owner display is best-effort status enrichment: a deleted
+// PodGroup or a transient read failure must not prevent an otherwise valid
+// RepackRun from completing.
+func (e *Engine) resolveMoveOwners(ctx context.Context, plan *engineapi.RepackPlan) map[string]*repackv1alpha1.WorkloadRef {
+	if plan == nil || e.volcanoClient == nil {
+		return nil
+	}
+	owners := make(map[string]*repackv1alpha1.WorkloadRef)
+	for _, podGroupID := range plan.AffectedPodGroups() {
+		namespace, name := splitPodGroupID(string(podGroupID))
+		if namespace == "" || name == "" {
+			continue
+		}
+		podGroup, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				klog.V(4).InfoS("repack: cannot resolve PodGroup owner for status move", "podGroup", podGroupID, "err", err)
+			}
+			continue
+		}
+		owner := metav1.GetControllerOf(podGroup)
+		if owner == nil {
+			continue
+		}
+		owners[string(podGroupID)] = &repackv1alpha1.WorkloadRef{
+			APIVersion: owner.APIVersion,
+			Kind:       owner.Kind,
+			Name:       owner.Name,
+		}
+	}
+	return owners
 }
 
 // splitPodGroupID splits a "namespace/name" JobID; missing "/" -> ("", id).

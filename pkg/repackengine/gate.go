@@ -26,40 +26,42 @@ import (
 	state "volcano.sh/repack-controller/pkg/state"
 )
 
-// executeGateState is the authoritative K=1 gate view: it combines this engine's
-// in-memory state (which does not lag the informer cache) with the cache scan
-// (which covers history across restarts / other leaders). active OR-s both; the
-// cooldown anchor takes the latest of the two, so a just-finished Execute's
-// cooldown is enforced even before its status write reaches the lister.
-func (e *Engine) executeGateState(currentRunName string) (executeActive bool, latestExecuteFinishTime time.Time) {
-	e.engineStateMutex.Lock()
-	inMemoryExecuteActive := e.activeExecuteRunName != "" && e.activeExecuteRunName != currentRunName
-	latestExecuteFinishTime = e.lastExecuteFinishTime
-	e.engineStateMutex.Unlock()
-
+// tryAcquireExecute evaluates the K=1/cooldown gate and claims the local Execute
+// slot as one atomic operation. The persisted scan is intentionally outside the
+// short critical section; the in-memory slot closes the local TOCTOU window
+// between that scan and the claim.
+func (e *Engine) tryAcquireExecute(currentRunName string, now time.Time) (gate state.GateDecision, executeActive bool, latestExecuteFinishTime time.Time) {
 	persistedExecuteActive, persistedExecuteFinishTime := e.persistedExecuteState(currentRunName)
-	executeActive = inMemoryExecuteActive || persistedExecuteActive
+
+	e.executeStateMutex.Lock()
+	defer e.executeStateMutex.Unlock()
+
+	executeActive = persistedExecuteActive || (e.activeExecuteRunName != "" && e.activeExecuteRunName != currentRunName)
+	latestExecuteFinishTime = e.lastExecuteFinishTime
 	if persistedExecuteFinishTime.After(latestExecuteFinishTime) {
 		latestExecuteFinishTime = persistedExecuteFinishTime
 	}
-	return executeActive, latestExecuteFinishTime
-}
-
-// markExecuteActive claims the in-memory K=1 slot for an Execute run.
-func (e *Engine) markExecuteActive(name string) {
-	e.engineStateMutex.Lock()
-	e.activeExecuteRunName = name
-	e.engineStateMutex.Unlock()
+	gate = state.EvaluateGate(state.GateInputs{
+		Mode:              repackv1alpha1.RepackModeExecute,
+		ExecuteActive:     executeActive,
+		LastExecuteFinish: latestExecuteFinishTime,
+		Cooldown:          e.config.Cooldown,
+		Now:               now,
+	})
+	if gate.Admit {
+		e.activeExecuteRunName = currentRunName
+	}
+	return gate, executeActive, latestExecuteFinishTime
 }
 
 // markExecuteDone releases the slot and stamps the cooldown anchor.
 func (e *Engine) markExecuteDone(name string) {
-	e.engineStateMutex.Lock()
+	e.executeStateMutex.Lock()
 	if e.activeExecuteRunName == name {
 		e.activeExecuteRunName = ""
 	}
 	e.lastExecuteFinishTime = e.now()
-	e.engineStateMutex.Unlock()
+	e.executeStateMutex.Unlock()
 }
 
 // persistedExecuteState scans the lister for the Execute gate: whether another Execute is
