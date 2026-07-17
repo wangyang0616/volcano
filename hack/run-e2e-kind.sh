@@ -31,7 +31,11 @@ CLUSTER_NAME=${CLUSTER_NAME:-integration}
 
 export CLUSTER_CONTEXT=("--name" "${CLUSTER_NAME}")
 
-export KIND_OPT=${KIND_OPT:="--config ${VK_ROOT}/hack/e2e-kind-config.yaml"}
+default_kind_config="${VK_ROOT}/hack/e2e-kind-config.yaml"
+if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+  default_kind_config="${VK_ROOT}/hack/e2e-kind-config-repack.yaml"
+fi
+export KIND_OPT=${KIND_OPT:="--config ${default_kind_config}"}
 
 # kwok node config
 export KWOK_NODE_CPU=${KWOK_NODE_CPU:-8}      # 8 cores
@@ -81,6 +85,75 @@ function install-kwok-nodes() {
   for i in $(seq 0 $((node_count-1))); do
     create-kwok-node $i
   done
+}
+
+# helm-install-volcano installs Volcano with the v1.14.1 chart defaults plus
+# optional case-specific custom values. Repack uses this helper to keep its
+# E2E-only settings isolated from the other suites.
+function helm-install-volcano {
+  local extra_custom_values="${1:-}"
+  local extra_values_flag=""
+  local tmpfile=""
+  if [[ -n "${extra_custom_values}" ]]; then
+    tmpfile=$(mktemp /tmp/volcano-extra-values-XXXXXX.yaml)
+    cat > "${tmpfile}" <<EXTRA
+custom:
+${extra_custom_values}
+EXTRA
+    extra_values_flag="--values ${tmpfile}"
+  fi
+
+  cat <<EOF | helm install ${CLUSTER_NAME} installer/helm/chart/volcano \
+  --namespace ${NAMESPACE} \
+  --kubeconfig ${KUBECONFIG} \
+  --values - \
+  ${extra_values_flag} \
+  --wait --timeout 10m
+basic:
+  image_pull_policy: IfNotPresent
+  image_tag_version: ${TAG}
+  scheduler_config_file: config/volcano-scheduler-ci.conf
+  crd_version: ${crd_version}
+
+custom:
+  scheduler_log_level: 5
+  admission_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  controller_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  scheduler_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  default_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  default_ns:
+    node-role.kubernetes.io/control-plane: ""
+  scheduler_feature_gates: ${FEATURE_GATES}
+  enabled_admissions: "/pods/mutate,/queues/mutate,/podgroups/mutate,/jobs/mutate,/jobs/validate,/jobflows/validate,/pods/validate,/queues/validate,/podgroups/validate,/hypernodes/validate,/cronjobs/validate"
+  ignored_provisioners: ${IGNORED_PROVISIONERS:-""}
+EOF
+  local helm_status=${PIPESTATUS[1]}
+  [[ -n "${tmpfile}" ]] && rm -f "${tmpfile}"
+  return "${helm_status}"
 }
 
 function install-volcano {
@@ -191,13 +264,26 @@ custom:
   ignored_provisioners: ${IGNORED_PROVISIONERS:-""}
 EOF
   ;;
+"REPACK")
+  echo "Install volcano chart with crd version $crd_version and repack engine enabled"
+  # The e2e advertises a fake extended resource volcano.sh/e2e-npu on nodes, so the
+  # engine's default target resource is set to it (covers empty-goals runs too).
+  # A short execute-cooldown keeps the Execute e2e cases independent: a gated run is
+  # only delayed (not failed), so the 10m default would push later Execute cases past
+  # their wait timeout. 30s is long enough to still observe the cooldown gate case.
+  helm-install-volcano "  controller_log_level: 5
+  repack_enable: true
+  repack_default_resource: volcano.sh/e2e-npu
+  repack_execute_cooldown: 30s
+  repack_log_level: 5"
+  ;;
 *)
   echo "Install volcano chart with crd version $crd_version"
   cat <<EOF | helm install ${CLUSTER_NAME} installer/helm/chart/volcano \
   --namespace ${NAMESPACE} \
   --kubeconfig ${KUBECONFIG} \
   --values - \
-  --wait
+  --wait --timeout 10m
 basic:
   image_pull_policy: IfNotPresent
   image_tag_version: ${TAG}
@@ -221,6 +307,13 @@ custom:
       operator: "Exists"
       effect: "NoSchedule"
   scheduler_tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  default_tolerations:
     - key: "node-role.kubernetes.io/control-plane"
       operator: "Exists"
       effect: "NoSchedule"
@@ -347,9 +440,13 @@ case ${E2E_TYPE} in
     echo "Running hypernode e2e suite..."
     KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -r --slow-spec-threshold='30s' --progress ./test/e2e/hypernode/
     ;;
-"CRONJOB")  
-    echo "Running cronjob e2e suite..."  
-    KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/cronjob/  
+"CRONJOB")
+    echo "Running cronjob e2e suite..."
+    KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/cronjob/
+    ;;
+"REPACK")
+    echo "Running repack e2e suite..."
+    KUBECONFIG=${KUBECONFIG} GOOS=${OS} ginkgo -v -r --slow-spec-threshold='30s' --progress ./test/e2e/repack/
     ;;
 esac
 

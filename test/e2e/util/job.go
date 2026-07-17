@@ -56,6 +56,9 @@ type TaskSpec struct {
 	MaxRetry              int32
 	SchGates              []v1.PodSchedulingGate
 	PartitionPolicy       *batchv1alpha1.PartitionPolicySpec
+	// MinAvailable overrides the per-task minimum, allowing E2E cases to model
+	// surplus replicas without changing the Job-wide gang minimum.
+	MinAvailable *int32
 }
 
 type JobSpec struct {
@@ -125,6 +128,7 @@ func CreateJobWithPodGroup(ctx *TestContext, jobSpec *JobSpec,
 		ts := batchv1alpha1.TaskSpec{
 			Name:            name,
 			Replicas:        task.Rep,
+			MinAvailable:    task.MinAvailable,
 			Policies:        task.Policies,
 			MaxRetry:        task.MaxRetry,
 			PartitionPolicy: task.PartitionPolicy,
@@ -233,6 +237,7 @@ func CreateJobInner(ctx *TestContext, jobSpec *JobSpec) (*batchv1alpha1.Job, err
 		ts := batchv1alpha1.TaskSpec{
 			Name:            name,
 			Replicas:        task.Rep,
+			MinAvailable:    task.MinAvailable,
 			Policies:        task.Policies,
 			MaxRetry:        maxRetry,
 			PartitionPolicy: task.PartitionPolicy,

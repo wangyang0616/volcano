@@ -30,6 +30,31 @@ function kind-up-cluster {
   kind load docker-image ${IMAGE_PREFIX}/vc-controller-manager:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   kind load docker-image ${IMAGE_PREFIX}/vc-scheduler:${TAG}          "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
   kind load docker-image ${IMAGE_PREFIX}/vc-webhook-manager:${TAG}    "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+  if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+    kind load docker-image ${IMAGE_PREFIX}/vc-repack-engine:${TAG} "${CLUSTER_CONTEXT[@]}" --nodes ${CLUSTER_CONTEXT[1]}-control-plane
+    ensure-repack-test-images
+  fi
+}
+
+function ensure-repack-test-images {
+  local repack_images=(
+    "nginx:1.29.3-alpine"
+  )
+
+  echo
+  echo "Ensuring repack test images are available locally"
+  for image in "${repack_images[@]}"; do
+    if ! docker image inspect "${image}" >/dev/null 2>&1; then
+      echo "Pulling image ${image} ..."
+      docker pull "${image}" >/dev/null || exit 1
+    fi
+  done
+
+  echo
+  echo "Loading repack test images into kind cluster"
+  for image in "${repack_images[@]}"; do
+    kind load docker-image "${image}" "${CLUSTER_CONTEXT[@]}" || exit 1
+  done
 }
 
 # check if the required images exist
@@ -50,6 +75,13 @@ function check-images {
     echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-webhook-manager:${TAG} does not exist"
     exit 1
   fi
+  if [[ "${E2E_TYPE}" == "REPACK" ]]; then
+    docker image inspect "${IMAGE_PREFIX}/vc-repack-engine:${TAG}" > /dev/null
+    if [[ $? -ne 0 ]]; then
+      echo -e "\033[31mERROR\033[0m: ${IMAGE_PREFIX}/vc-repack-engine:${TAG} does not exist"
+      exit 1
+    fi
+  fi
 }
 
 # check if kubectl installed
@@ -67,12 +99,41 @@ function check-prerequisites {
 # check if kind installed
 function check-kind {
   echo "Checking kind"
+  local required_kind_version="0.31.0"
+  local bin_path
+  bin_path=$(go env GOBIN)
+  if [[ -z "${bin_path}" ]]; then
+    bin_path="$(go env GOPATH)/bin"
+  fi
+  export PATH="${bin_path}:${PATH}"
+
   which kind >/dev/null 2>&1
   if [[ $? -ne 0 ]]; then
-    echo "Installing kind ..."
-    GOOS=${OS} go install sigs.k8s.io/kind@v0.30.0
-  else
-    echo -n "Found kind, version: " && kind version
+    echo "Installing kind ${required_kind_version} ..."
+    GOOS=${OS} go install sigs.k8s.io/kind@v${required_kind_version}
+    if ! command -v kind >/dev/null 2>&1; then
+      echo -e "\033[31mERROR\033[0m: kind installation completed but the binary is still not available on PATH"
+      exit 1
+    fi
+    echo -n "Using kind, version: " && kind version
+    return
+  fi
+
+  local found_version
+  found_version=$(kind version 2>/dev/null | awk '{print $2}' | tr -d 'v')
+  echo -n "Found kind, version: " && kind version
+  if [[ -z "${found_version}" ]]; then
+    echo -e "\033[33mWARNING\033[0m: unable to parse kind version; expected v${required_kind_version}+ for Repack E2E"
+    return
+  fi
+
+  # Repack E2E uses a recent Kubernetes node image and a multi-worker Kind
+  # configuration. Keep Kind new enough to support that cluster definition.
+  if [[ "${found_version}" < "${required_kind_version}" ]]; then
+    echo -e "\033[33mWARNING\033[0m: kind v${found_version} is older than v${required_kind_version}; upgrading..."
+    GOOS=${OS} go install sigs.k8s.io/kind@v${required_kind_version}
+    export PATH="${bin_path}:${PATH}"
+    echo -n "Using kind, version: " && kind version
   fi
 }
 

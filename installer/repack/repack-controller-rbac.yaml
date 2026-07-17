@@ -1,0 +1,37 @@
+# Additive RBAC for the RepackRun controller + nomination reconciler when run as
+# the DEFAULT built-in inside volcano-controller-manager (pkg/controllers/repack
+# shim). It grants the controller-manager's ServiceAccount the repack-specific
+# verbs on top of its existing role. Apply alongside repack-engine.yaml.
+#
+# (For the STANDALONE controller deployment instead, see
+# repack-controller-standalone.yaml, which carries its own SA + role.)
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: volcano-repack-controller
+rules:
+  - apiGroups: ["repack.volcano.sh"]
+    resources: ["repackruns"]
+    verbs: ["get", "list", "watch", "update", "delete"] # delete = TTL GC
+  - apiGroups: ["repack.volcano.sh"]
+    resources: ["repackruns/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"] # remove the placement gate after nomination
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch"] # nomination reconciler writes pod.status.nominatedNodeName
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: volcano-repack-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: volcano-controllers # the controller-manager's SA
+    namespace: volcano-system
+roleRef:
+  kind: ClusterRole
+  name: volcano-repack-controller
+  apiGroup: rbac.authorization.k8s.io

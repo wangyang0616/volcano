@@ -27,17 +27,26 @@ import (
 )
 
 type PodSpec struct {
-	Name        string
-	Node        string
-	Req         v1.ResourceList
-	Tolerations []v1.Toleration
+	Name            string
+	Node            string
+	Req             v1.ResourceList
+	Limit           v1.ResourceList
+	Tolerations     []v1.Toleration
+	Annotations     map[string]string
+	Labels          map[string]string
+	SchedulerName   string
+	RestartPolicy   v1.RestartPolicy
+	NodeSelector    map[string]string
+	SchedulingGates []v1.PodSchedulingGate
 }
 
 func CreatePod(ctx *TestContext, spec PodSpec) *v1.Pod {
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      spec.Name,
-			Namespace: ctx.Namespace,
+			Name:        spec.Name,
+			Namespace:   ctx.Namespace,
+			Annotations: spec.Annotations,
+			Labels:      spec.Labels,
 		},
 		Spec: v1.PodSpec{
 			NodeName: spec.Node,
@@ -48,10 +57,15 @@ func CreatePod(ctx *TestContext, spec PodSpec) *v1.Pod {
 					ImagePullPolicy: v1.PullIfNotPresent,
 					Resources: v1.ResourceRequirements{
 						Requests: spec.Req,
+						Limits:   spec.Limit,
 					},
 				},
 			},
-			Tolerations: spec.Tolerations,
+			Tolerations:     spec.Tolerations,
+			SchedulerName:   spec.SchedulerName,
+			RestartPolicy:   spec.RestartPolicy,
+			NodeSelector:    spec.NodeSelector,
+			SchedulingGates: spec.SchedulingGates,
 		},
 	}
 

@@ -66,7 +66,7 @@ include Makefile.def
 
 .EXPORT_ALL_VARIABLES:
 
-all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-webhook-manager vc-agent vcctl command-lines
+all: vc-scheduler vc-agent-scheduler vc-controller-manager vc-webhook-manager vc-agent vc-repack-engine vcctl command-lines
 
 init:
 	mkdir -p ${BIN_DIR}
@@ -92,6 +92,13 @@ vc-controller-manager: init
 vc-webhook-manager: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-webhook-manager ./cmd/webhook-manager
 
+vc-repack-engine: init
+	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-repack-engine ./cmd/volcano-repack-engine
+
+# Standalone RepackRun controller — built from its own module under staging.
+vc-repack-controller: init
+	cd staging/src/volcano.sh/repack-controller && CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o $(abspath ${BIN_DIR})/vc-repack-controller ./cmd/repack-controller
+
 vc-agent: init
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/vc-agent ./cmd/agent
 	CC=${CC} CGO_ENABLED=0 go build -ldflags ${LD_FLAGS} -o ${BIN_DIR}/network-qos ./cmd/network-qos
@@ -113,6 +120,19 @@ define build_component_image
 		--build-arg OPEN_EULER_IMAGE_TAG=${OPEN_EULER_IMAGE_TAG}
 endef
 
+# Package a pre-built linux binary into a minimal alpine image (no golang builder stage).
+define build_e2e_image_from_binary
+	@if [ ! -f ${BIN_DIR}/vc-$(1) ]; then \
+		echo "Missing ${BIN_DIR}/vc-$(1); run 'make vc-$(1)' first"; \
+		exit 1; \
+	fi
+	@echo "Building image ${IMAGE_PREFIX}/vc-$(1):$(TAG) from local binary..."
+	docker build -t "${IMAGE_PREFIX}/vc-$(1):$(TAG)" \
+		-f ./hack/Dockerfile.e2e-binary \
+		--build-arg BINARY=vc-$(1) \
+		.
+endef
+
 vc-controller-manager-image:
 	$(call build_component_image,controller-manager)
 
@@ -128,6 +148,25 @@ vc-webhook-manager-image:
 vc-agent-image:
 	$(call build_component_image,agent)
 
+vc-repack-engine-image:
+	$(call build_component_image,repack-engine)
+
+vc-repack-controller-image:
+	$(call build_component_image,repack-controller)
+
+# Images required by repack E2E (scheduler stack + repack-engine only).
+repack-e2e-images: vc-scheduler-image vc-controller-manager-image vc-webhook-manager-image vc-repack-engine-image
+
+# Fast local path: build linux binaries on the host, then wrap them in alpine images.
+repack-e2e-images-from-bin: vc-scheduler vc-controller-manager vc-webhook-manager vc-repack-engine
+	$(call build_e2e_image_from_binary,scheduler)
+	$(call build_e2e_image_from_binary,controller-manager)
+	@echo "Building image ${IMAGE_PREFIX}/vc-webhook-manager:$(TAG) from local binary..."
+	docker build -t "${IMAGE_PREFIX}/vc-webhook-manager:$(TAG)" \
+		-f ./hack/Dockerfile.e2e-webhook-binary \
+		--platform linux/${GOARCH} \
+		.
+	$(call build_e2e_image_from_binary,repack-engine)
 generate-code:
 	./hack/update-gencode.sh
 
@@ -136,6 +175,7 @@ manifests: controller-gen
 	# volcano crd base
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) \
 		paths="./staging/src/volcano.sh/apis/pkg/apis/scheduling/v1beta1; \
+		./staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/batch/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/bus/v1alpha1; \
 		./staging/src/volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1; \
@@ -186,8 +226,15 @@ e2e-test-vcctl: vcctl images
 e2e-test-stress: images
 	E2E_TYPE=STRESS ./hack/run-e2e-kind.sh
 
-e2e-test-cronjob: images  
+e2e-test-cronjob: images
 	E2E_TYPE=CRONJOB ./hack/run-e2e-kind.sh
+
+e2e-test-repack: repack-e2e-images
+	E2E_TYPE=REPACK ./hack/run-e2e-kind.sh
+
+# Local dev: skip multi-stage golang docker builds (avoids pulling golang:1.25.x).
+e2e-test-repack-local: repack-e2e-images-from-bin
+	E2E_TYPE=REPACK FORCE_REBUILD=false ./hack/run-e2e-kind.sh
 
 e2e-test-dra: images
 	E2E_TYPE=DRA FEATURE_GATES="DynamicResourceAllocation=true" ./hack/run-e2e-kind.sh

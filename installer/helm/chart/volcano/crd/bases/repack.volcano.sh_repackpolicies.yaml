@@ -1,0 +1,3 @@
+# RepackPolicy CRD is deferred to a later iteration; the first stage ships only
+# RepackRun. This file is intentionally emptied — delete it with `git rm` and
+# regenerate via `make manifests` (the build sandbox cannot remove files).
