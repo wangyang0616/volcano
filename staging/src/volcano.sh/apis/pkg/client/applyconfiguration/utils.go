@@ -27,6 +27,7 @@ import (
 	datadependencyv1alpha1 "volcano.sh/apis/pkg/apis/datadependency/v1alpha1"
 	flowv1alpha1 "volcano.sh/apis/pkg/apis/flow/v1alpha1"
 	nodeinfov1alpha1 "volcano.sh/apis/pkg/apis/nodeinfo/v1alpha1"
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	v1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	shardv1alpha1 "volcano.sh/apis/pkg/apis/shard/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
@@ -38,6 +39,7 @@ import (
 	applyconfigurationflowv1alpha1 "volcano.sh/apis/pkg/client/applyconfiguration/flow/v1alpha1"
 	internal "volcano.sh/apis/pkg/client/applyconfiguration/internal"
 	applyconfigurationnodeinfov1alpha1 "volcano.sh/apis/pkg/client/applyconfiguration/nodeinfo/v1alpha1"
+	applyconfigurationrepackv1alpha1 "volcano.sh/apis/pkg/client/applyconfiguration/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/client/applyconfiguration/scheduling/v1beta1"
 	applyconfigurationshardv1alpha1 "volcano.sh/apis/pkg/client/applyconfiguration/shard/v1alpha1"
 	applyconfigurationtopologyv1alpha1 "volcano.sh/apis/pkg/client/applyconfiguration/topology/v1alpha1"
@@ -159,6 +161,42 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationnodeinfov1alpha1.NumatopoSpecApplyConfiguration{}
 	case nodeinfov1alpha1.SchemeGroupVersion.WithKind("ResourceInfo"):
 		return &applyconfigurationnodeinfov1alpha1.ResourceInfoApplyConfiguration{}
+
+		// Group=repack.volcano.sh, Version=v1alpha1
+	case repackv1alpha1.SchemeGroupVersion.WithKind("EvictionPolicy"):
+		return &applyconfigurationrepackv1alpha1.EvictionPolicyApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("MaxPerRun"):
+		return &applyconfigurationrepackv1alpha1.MaxPerRunApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("PodMove"):
+		return &applyconfigurationrepackv1alpha1.PodMoveApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("PodNomination"):
+		return &applyconfigurationrepackv1alpha1.PodNominationApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackGoal"):
+		return &applyconfigurationrepackv1alpha1.RepackGoalApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackMove"):
+		return &applyconfigurationrepackv1alpha1.RepackMoveApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackPlan"):
+		return &applyconfigurationrepackv1alpha1.RepackPlanApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackResult"):
+		return &applyconfigurationrepackv1alpha1.RepackResultApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRun"):
+		return &applyconfigurationrepackv1alpha1.RepackRunApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRunSpec"):
+		return &applyconfigurationrepackv1alpha1.RepackRunSpecApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackRunStatus"):
+		return &applyconfigurationrepackv1alpha1.RepackRunStatusApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackScope"):
+		return &applyconfigurationrepackv1alpha1.RepackScopeApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackSelector"):
+		return &applyconfigurationrepackv1alpha1.RepackSelectorApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackSelectorTerm"):
+		return &applyconfigurationrepackv1alpha1.RepackSelectorTermApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackSummary"):
+		return &applyconfigurationrepackv1alpha1.RepackSummaryApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("ResolvedScope"):
+		return &applyconfigurationrepackv1alpha1.ResolvedScopeApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("WorkloadRef"):
+		return &applyconfigurationrepackv1alpha1.WorkloadRefApplyConfiguration{}
 
 		// Group=scheduling.volcano.sh, Version=v1beta1
 	case v1beta1.SchemeGroupVersion.WithKind("Affinity"):

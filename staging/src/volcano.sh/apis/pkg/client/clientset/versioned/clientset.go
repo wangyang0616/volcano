@@ -30,6 +30,7 @@ import (
 	datadependencyv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/datadependency/v1alpha1"
 	flowv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/flow/v1alpha1"
 	nodeinfov1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/nodeinfo/v1alpha1"
+	repackv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/scheduling/v1beta1"
 	shardv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/shard/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/client/clientset/versioned/typed/topology/v1alpha1"
@@ -44,6 +45,7 @@ type Interface interface {
 	DatadependencyV1alpha1() datadependencyv1alpha1.DatadependencyV1alpha1Interface
 	FlowV1alpha1() flowv1alpha1.FlowV1alpha1Interface
 	NodeinfoV1alpha1() nodeinfov1alpha1.NodeinfoV1alpha1Interface
+	RepackV1alpha1() repackv1alpha1.RepackV1alpha1Interface
 	SchedulingV1beta1() schedulingv1beta1.SchedulingV1beta1Interface
 	ShardV1alpha1() shardv1alpha1.ShardV1alpha1Interface
 	TopologyV1alpha1() topologyv1alpha1.TopologyV1alpha1Interface
@@ -59,6 +61,7 @@ type Clientset struct {
 	datadependencyV1alpha1 *datadependencyv1alpha1.DatadependencyV1alpha1Client
 	flowV1alpha1           *flowv1alpha1.FlowV1alpha1Client
 	nodeinfoV1alpha1       *nodeinfov1alpha1.NodeinfoV1alpha1Client
+	repackV1alpha1         *repackv1alpha1.RepackV1alpha1Client
 	schedulingV1beta1      *schedulingv1beta1.SchedulingV1beta1Client
 	shardV1alpha1          *shardv1alpha1.ShardV1alpha1Client
 	topologyV1alpha1       *topologyv1alpha1.TopologyV1alpha1Client
@@ -93,6 +96,11 @@ func (c *Clientset) FlowV1alpha1() flowv1alpha1.FlowV1alpha1Interface {
 // NodeinfoV1alpha1 retrieves the NodeinfoV1alpha1Client
 func (c *Clientset) NodeinfoV1alpha1() nodeinfov1alpha1.NodeinfoV1alpha1Interface {
 	return c.nodeinfoV1alpha1
+}
+
+// RepackV1alpha1 retrieves the RepackV1alpha1Client
+func (c *Clientset) RepackV1alpha1() repackv1alpha1.RepackV1alpha1Interface {
+	return c.repackV1alpha1
 }
 
 // SchedulingV1beta1 retrieves the SchedulingV1beta1Client
@@ -183,6 +191,10 @@ func NewForConfigAndClient(c *rest.Config, httpClient *http.Client) (*Clientset,
 	if err != nil {
 		return nil, err
 	}
+	cs.repackV1alpha1, err = repackv1alpha1.NewForConfigAndClient(&configShallowCopy, httpClient)
+	if err != nil {
+		return nil, err
+	}
 	cs.schedulingV1beta1, err = schedulingv1beta1.NewForConfigAndClient(&configShallowCopy, httpClient)
 	if err != nil {
 		return nil, err
@@ -226,6 +238,7 @@ func New(c rest.Interface) *Clientset {
 	cs.datadependencyV1alpha1 = datadependencyv1alpha1.New(c)
 	cs.flowV1alpha1 = flowv1alpha1.New(c)
 	cs.nodeinfoV1alpha1 = nodeinfov1alpha1.New(c)
+	cs.repackV1alpha1 = repackv1alpha1.New(c)
 	cs.schedulingV1beta1 = schedulingv1beta1.New(c)
 	cs.shardV1alpha1 = shardv1alpha1.New(c)
 	cs.topologyV1alpha1 = topologyv1alpha1.New(c)
