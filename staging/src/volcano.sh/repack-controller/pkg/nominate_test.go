@@ -31,6 +31,7 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
@@ -73,6 +74,21 @@ func pendingPod(ns, name, pg string, labels map[string]string) *corev1.Pod {
 			Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: pg},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+}
+
+func expectRecorderEvent(t *testing.T, recorder *record.FakeRecorder, reason string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.Contains(event, reason) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("did not observe event reason %q", reason)
+		}
 	}
 }
 
@@ -188,7 +204,8 @@ func TestRemovePlacementGateRemovesOwnerMarker(t *testing.T) {
 	pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
 	pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/uid"
 	client := k8sfake.NewSimpleClientset(pod)
-	n := &Nominator{kubernetesClient: client}
+	recorder := record.NewFakeRecorder(10)
+	n := &Nominator{kubernetesClient: client, recorder: recorder}
 
 	if err := n.clearPlacementGate(context.Background(), pod); err != nil {
 		t.Fatalf("remove placement gate: %v", err)
@@ -202,6 +219,7 @@ func TestRemovePlacementGateRemovesOwnerMarker(t *testing.T) {
 		if !strings.Contains(body, "/spec/schedulingGates/0") || !strings.Contains(body, "placement-gate-owner") {
 			t.Fatalf("patch must remove gate and owner marker, got %s", body)
 		}
+		expectRecorderEvent(t, recorder, eventReasonPlacementReleased)
 		return
 	}
 	t.Fatal("expected Pod patch")
@@ -257,6 +275,7 @@ func TestReconcilePatchesNominatedNodeAndRecordsPlacementNominated(t *testing.T)
 		volcanoClient:    volcanoClient,
 		podLister:        corelisters.NewPodLister(pods),
 		repackRunLister:  repacklisters.NewRepackRunLister(runs),
+		recorder:         record.NewFakeRecorder(10),
 		now:              time.Now,
 	}
 
@@ -286,6 +305,7 @@ func TestReconcilePatchesNominatedNodeAndRecordsPlacementNominated(t *testing.T)
 	if opened.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "run/run-uid" {
 		t.Fatal("gate owner must remain until actual binding is observed")
 	}
+	expectRecorderEvent(t, nominator.recorder.(*record.FakeRecorder), eventReasonPlacementNominated)
 }
 
 func TestReconcileGatedReplacementReportsIdentityWithoutOpeningGate(t *testing.T) {
@@ -311,6 +331,7 @@ func TestReconcileGatedReplacementReportsIdentityWithoutOpeningGate(t *testing.T
 		volcanoClient:    volcanoClient,
 		podLister:        corelisters.NewPodLister(pods),
 		repackRunLister:  repacklisters.NewRepackRunLister(runs),
+		recorder:         record.NewFakeRecorder(10),
 		now:              time.Now,
 	}
 
@@ -332,6 +353,50 @@ func TestReconcileGatedReplacementReportsIdentityWithoutOpeningGate(t *testing.T
 		if action.GetVerb() == "patch" {
 			t.Errorf("gated replacement must not be nominated or opened before engine selection: %#v", action)
 		}
+	}
+	expectRecorderEvent(t, nominator.recorder.(*record.FakeRecorder), eventReasonReplacementGated)
+}
+
+func TestObservePlacementRecordsSuccessAndDrift(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		actualNode     string
+		expectedPhase  repackv1alpha1.PodNominationPhase
+		expectedReason string
+	}{
+		{name: "selected node", actualNode: "n2", expectedPhase: repackv1alpha1.PodPlacementPlaced, expectedReason: eventReasonPlacementSucceeded},
+		{name: "different node", actualNode: "n3", expectedPhase: repackv1alpha1.PodPlacementDegraded, expectedReason: eventReasonPlacementDrifted},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			pod := pendingPod("ns", "replacement", "group", nil)
+			pod.UID = "replacement-uid"
+			pod.Spec.NodeName = testCase.actualNode
+			pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+			run := runWithNoms("run", repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim",
+				NodeName: "n2", SelectedNodeName: "n2",
+				ReplacementPodName: pod.Name, ReplacementPodUID: pod.UID,
+				Phase: repackv1alpha1.PodPlacementNominated,
+			})
+			recorder := record.NewFakeRecorder(10)
+			volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+			nominator := &Nominator{
+				volcanoClient: volcanoClient,
+				recorder:      recorder,
+			}
+
+			if err := nominator.observePlacement(context.Background(), pod); err != nil {
+				t.Fatal(err)
+			}
+			updated, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := updated.Status.Nominations[0]; got.Phase != testCase.expectedPhase || got.ActualNodeName != testCase.actualNode {
+				t.Fatalf("observed nomination = %+v, want phase %s on %s", got, testCase.expectedPhase, testCase.actualNode)
+			}
+			expectRecorderEvent(t, recorder, testCase.expectedReason)
+		})
 	}
 }
 

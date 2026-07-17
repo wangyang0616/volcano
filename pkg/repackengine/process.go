@@ -176,6 +176,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	}
 	moveOwners := e.resolveMoveOwners(ctx, plan)
 	applyPlan(run, report, plan, targetResource, moveOwners, resolvedScope)
+	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonPlanComputed, plannedBenefitEventMessage(run))
 	if execute && worthwhile {
 		prepareExecuteNominations(run, plan, nominationTTL)
 		// This is the prepare barrier. In particular, nominations must be visible
@@ -197,6 +198,9 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			markExecuteNotPerformed(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, fmt.Errorf("prepare placement leases: %w", err))
 		}
+		e.recordRunEvent(run, v1.EventTypeNormal, eventReasonExecutePrepared,
+			fmt.Sprintf("Prepared %d replacement placement intents across %d PodGroups before eviction.",
+				len(run.Status.Nominations), len(preparedPlacementGroups)))
 		klog.V(3).InfoS("repack: Execute plan prepared before eviction",
 			"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
 			"nominationCount", len(run.Status.Nominations), "nominationTTL", nominationTTL)
@@ -214,6 +218,21 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		evictedCount, rejectedCount := len(commitResult.Evicted), len(commitResult.Failed)
 		metrics.ObserveEvictions(evictedCount, rejectedCount)
 		klog.V(3).InfoS("evictions issued", "run", run.Name, "evictedCount", evictedCount, "rejectedCount", rejectedCount)
+		for _, outcome := range commitResult.Evicted {
+			klog.V(4).InfoS("repack: eviction accepted", "run", run.Name,
+				"pod", outcome.Namespace+"/"+outcome.Task, "fromNode", outcome.From, "plannedNode", outcome.To)
+		}
+		for _, outcome := range commitResult.Failed {
+			klog.V(4).InfoS("repack: eviction rejected", "run", run.Name,
+				"pod", outcome.Namespace+"/"+outcome.Task, "fromNode", outcome.From,
+				"plannedNode", outcome.To, "error", outcome.Err)
+		}
+		evictionEventType := v1.EventTypeNormal
+		if rejectedCount > 0 {
+			evictionEventType = v1.EventTypeWarning
+		}
+		e.recordRunEvent(run, evictionEventType, eventReasonEvictionsIssued,
+			fmt.Sprintf("Eviction API accepted %d Pods and rejected %d Pods.", evictedCount, rejectedCount))
 
 		// Preserve the complete pre-eviction status.plan, and report the accepted
 		// subset through nominations/result. Release a lease as soon as none of its
@@ -262,6 +281,8 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			if err := e.updateStatus(ctx, run); err != nil {
 				return fmt.Errorf("persist awaiting placement status: %w", err)
 			}
+			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonAwaitingPlacement,
+				placementProgressMessage(run, targetResource))
 			releaseExecuteSlot = false
 			klog.V(3).InfoS("repack: evictions accepted; awaiting replacement placement", "run", run.Name,
 				"evictedCount", evictedCount, "nominationCount", len(run.Status.Nominations))

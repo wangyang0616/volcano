@@ -31,8 +31,11 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -73,7 +76,42 @@ type Nominator struct {
 	victimIndexAvailable    bool
 	informerSyncs           []cache.InformerSynced
 	workQueue               workqueue.TypedRateLimitingInterface[string]
+	recorder                record.EventRecorder
 	now                     func() time.Time
+}
+
+const (
+	eventReasonReplacementGated    = "RepackReplacementGated"
+	eventReasonPlacementNominated  = "RepackPlacementNominated"
+	eventReasonPlacementSucceeded  = "RepackPlacementSucceeded"
+	eventReasonPlacementDrifted    = "RepackPlacementDrifted"
+	eventReasonPlacementGateOpened = "RepackPlacementGateOpened"
+	eventReasonPlacementReleased   = "RepackPlacementReleased"
+)
+
+// NewEventRecorder creates a Pod event recorder for the placement protocol.
+// Pod events complement RepackRun events: operators can diagnose why a concrete
+// replacement Pod is gated, nominated, drifted, or released from kubectl describe.
+func NewEventRecorder(kubernetesClient kubernetes.Interface, component string) record.EventRecorder {
+	if kubernetesClient == nil {
+		return nil
+	}
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubernetesClient.CoreV1().Events("")})
+	return broadcaster.NewRecorder(kubescheme.Scheme, corev1.EventSource{Component: component})
+}
+
+// SetEventRecorder enables Kubernetes events. It is optional so unit tests and
+// embedders that do not need events retain a lightweight constructor.
+func (n *Nominator) SetEventRecorder(recorder record.EventRecorder) {
+	n.recorder = recorder
+}
+
+func (n *Nominator) recordPodEvent(pod *corev1.Pod, eventType, reason, message string) {
+	if n == nil || n.recorder == nil || pod == nil {
+		return
+	}
+	n.recorder.Event(pod, eventType, reason, message)
 }
 
 // NewNominator wires the reconciler to Pod and RepackRun informers. Watching
@@ -385,6 +423,8 @@ func (n *Nominator) processNext(ctx context.Context) bool {
 	defer n.workQueue.Done(key)
 	if err := n.reconcile(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("nominate pod %q: %w", key, err))
+		klog.V(4).InfoS("repack nominator: reconcile failed; requeueing with rate limit",
+			"pod", key, "retryCount", n.workQueue.NumRequeues(key)+1, "error", err)
 		n.workQueue.AddRateLimited(key)
 		return true
 	}
@@ -404,6 +444,12 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	klog.V(4).InfoS("repack nominator: reconciling Pod",
+		"pod", key, "phase", pod.Status.Phase, "nodeName", pod.Spec.NodeName,
+		"nominatedNodeName", pod.Status.NominatedNodeName,
+		"podGroup", placement.PodGroupName(pod),
+		"placementGate", hasPlacementGate(pod),
+		"gateOwner", pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation])
 	if pod.Spec.NodeName != "" {
 		if err := n.observePlacement(ctx, pod); err != nil {
 			return err
@@ -429,6 +475,8 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		return err
 	}
 	if run == nil {
+		klog.V(4).InfoS("repack nominator: releasing stale placement gate because owning Run is absent",
+			"pod", key, "gateOwner", pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation])
 		return n.clearPlacementGate(ctx, pod)
 	}
 	nomination, owningRunName := n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
@@ -438,10 +486,18 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 			// remains Terminating. At this point it is indistinguishable from a
 			// concurrent scale-out Pod, so retain the owner-marked gate until
 			// victim deletion makes matching authoritative.
+			klog.V(4).InfoS("repack nominator: retaining ambiguous PodGroup gate until victim deletion",
+				"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod))
 			return nil
 		}
+		klog.V(4).InfoS("repack nominator: no active nomination matches Pod; releasing placement gate",
+			"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod))
 		return n.clearPlacementGate(ctx, pod)
 	}
+	klog.V(4).InfoS("repack nominator: matched replacement Pod to placement intent",
+		"pod", key, "run", owningRunName, "podGroup", nomination.PodGroupName,
+		"victimPod", nomination.VictimPodName, "plannedNode", nomination.NodeName,
+		"selectedNode", nomination.SelectedNodeName, "identityLabels", nomination.IdentityLabels)
 	if hasPlacementGate(pod) && nomination.SelectedNodeName == "" {
 		// The admission webhook has stopped the scheduler. Hand the placement
 		// decision to the engine, which owns the scheduler session and can choose
@@ -463,6 +519,8 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		return err
 	}
 	klog.V(3).InfoS("repack placement nominated replacement pod", "pod", key, "node", selectedNode, "repackRun", owningRunName)
+	n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementNominated,
+		fmt.Sprintf("RepackRun %s selected node %s for this replacement Pod.", owningRunName, selectedNode))
 	return nil
 }
 
@@ -649,7 +707,8 @@ func (n *Nominator) patchPlacementGate(ctx context.Context, pod *corev1.Pod, rem
 		return nil
 	}
 	expectedOwner := pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	patched := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest, err := n.kubernetesClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -676,8 +735,24 @@ func (n *Nominator) patchPlacementGate(ctx context.Context, pod *corev1.Pod, rem
 		}
 		body := []byte("[" + strings.Join(operations, ",") + "]")
 		_, err = n.kubernetesClient.CoreV1().Pods(latest.Namespace).Patch(ctx, latest.Name, types.JSONPatchType, body, metav1.PatchOptions{})
+		patched = err == nil
 		return ignoreNotFound(err)
 	})
+	if err != nil || !patched {
+		return err
+	}
+	if removeOwner {
+		klog.V(3).InfoS("repack nominator: released placement gate and owner marker",
+			"pod", pod.Namespace+"/"+pod.Name, "gateOwner", expectedOwner)
+		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementReleased,
+			fmt.Sprintf("Released the Repack placement gate owned by %s.", expectedOwner))
+	} else {
+		klog.V(4).InfoS("repack nominator: opened placement gate after nomination became durable",
+			"pod", pod.Namespace+"/"+pod.Name, "gateOwner", expectedOwner)
+		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementGateOpened,
+			"Opened the Repack placement gate after persisting the selected receiver.")
+	}
+	return nil
 }
 
 func hasPlacementGate(pod *corev1.Pod) bool {
@@ -728,7 +803,8 @@ func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod 
 	if runName == "" || pod == nil {
 		return nil
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	updated := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)
@@ -741,8 +817,18 @@ func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod 
 		current.ReplacementPodUID = pod.UID
 		current.Phase = repackv1alpha1.PodPlacementGated
 		_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+		updated = err == nil
 		return err
 	})
+	if err != nil || !updated {
+		return err
+	}
+	klog.V(3).InfoS("repack nominator: replacement Pod associated with placement intent and held by gate",
+		"run", runName, "pod", pod.Namespace+"/"+pod.Name,
+		"podGroup", placement.PodGroupName(pod), "podUID", pod.UID)
+	n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonReplacementGated,
+		fmt.Sprintf("RepackRun %s is holding this replacement Pod while selecting live receiver capacity.", runName))
+	return nil
 }
 
 // observePlacement records the scheduler's actual binding. A selected node is a
@@ -759,7 +845,9 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 	if cachedRun == nil {
 		return nil
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	observedPhase := repackv1alpha1.PodNominationPhase("")
+	selectedNode := ""
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, cachedRun.Name, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)
@@ -770,6 +858,7 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 				continue
 			}
 			nomination.ActualNodeName = pod.Spec.NodeName
+			selectedNode = nomination.SelectedNodeName
 			switch nomination.Phase {
 			case repackv1alpha1.PodPlacementNominated:
 				if nomination.SelectedNodeName == pod.Spec.NodeName {
@@ -785,11 +874,28 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 			default:
 				return nil
 			}
+			observedPhase = nomination.Phase
 			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 			return err
 		}
 		return nil
 	})
+	if err != nil || observedPhase == "" {
+		return err
+	}
+	if observedPhase == repackv1alpha1.PodPlacementPlaced {
+		klog.V(3).InfoS("repack nominator: replacement Pod reached selected receiver",
+			"run", cachedRun.Name, "pod", pod.Namespace+"/"+pod.Name, "node", pod.Spec.NodeName)
+		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementSucceeded,
+			fmt.Sprintf("Replacement Pod reached Repack-selected node %s.", pod.Spec.NodeName))
+	} else {
+		klog.V(3).InfoS("repack nominator: replacement Pod placement drift detected",
+			"run", cachedRun.Name, "pod", pod.Namespace+"/"+pod.Name,
+			"selectedNode", selectedNode, "actualNode", pod.Spec.NodeName, "phase", observedPhase)
+		n.recordPodEvent(pod, corev1.EventTypeWarning, eventReasonPlacementDrifted,
+			fmt.Sprintf("Replacement Pod bound to %s instead of Repack-selected node %s.", pod.Spec.NodeName, selectedNode))
+	}
+	return nil
 }
 
 func placementConsumed(nomination *repackv1alpha1.PodNomination) bool {

@@ -150,7 +150,11 @@ func (e *Engine) updateStatusTerminal(ctx context.Context, run *repackv1alpha1.R
 		if run.Status.Phase == repackv1alpha1.RepackFailed {
 			etype = v1.EventTypeWarning
 		}
-		e.recorder.Event(run, etype, outcome, "repack run reached a terminal state")
+		message := run.Status.Message
+		if message == "" {
+			message = "RepackRun reached a terminal state."
+		}
+		e.recorder.Event(run, etype, outcome, message)
 	}
 	return nil
 }

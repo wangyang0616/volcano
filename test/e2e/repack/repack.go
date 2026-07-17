@@ -32,7 +32,7 @@ import (
 // These tests require the repack CRDs and the volcano-repack-engine running
 // (helm custom.repack_enable=true, run via E2E_TYPE=REPACK).
 
-var _ = Describe("Repack DryRun & admission", func() {
+var _ = Describe("Repack DryRun & admission", Serial, func() {
 	var ctx *e2eutil.TestContext
 	var nodes []string
 
@@ -41,11 +41,12 @@ var _ = Describe("Repack DryRun & admission", func() {
 		nodes = npuFixture(ctx, 3) // advertise fake NPUs on 3 worker nodes
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
+		e2eutil.CleanupTestContext(ctx)
 		for _, n := range nodes {
 			clearNPU(ctx, n)
 			clearResource(ctx, n, altNPUResource)
 		}
-		e2eutil.CleanupTestContext(ctx)
 	})
 
 	// B1/B2/B3: fragmented cluster -> DryRun recommends consolidation, reports a

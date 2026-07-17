@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -581,7 +582,8 @@ func TestUpdateStatusTerminalPersistsMessageAndCompletionTime(t *testing.T) {
 		},
 	}
 	client := vcfake.NewSimpleClientset(run.DeepCopy())
-	engine := &Engine{volcanoClient: client}
+	recorder := record.NewFakeRecorder(10)
+	engine := &Engine{volcanoClient: client, recorder: recorder}
 	if err := engine.updateStatusTerminal(context.Background(), run); err != nil {
 		t.Fatalf("updateStatusTerminal() error = %v", err)
 	}
@@ -597,5 +599,14 @@ func TestUpdateStatusTerminalPersistsMessageAndCompletionTime(t *testing.T) {
 	}
 	if updated.Status.CompletionTime.Time.Before(startTime.Time) {
 		t.Errorf("completionTime=%v precedes startTime=%v", updated.Status.CompletionTime, startTime)
+	}
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, state.ReasonNoFragmentation) ||
+			!strings.Contains(event, "operator-readable result") {
+			t.Fatalf("terminal event = %q, want reason and operator-readable message", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal RepackRun event was not recorded")
 	}
 }

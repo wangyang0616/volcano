@@ -36,7 +36,7 @@ import (
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
 
-var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
+var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() {
 	var ctx *e2eutil.TestContext
 	var nodes []string
 
@@ -45,10 +45,11 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		nodes = npuFixture(ctx, 3)
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
+		e2eutil.CleanupTestContext(ctx)
 		for _, n := range nodes {
 			clearNPU(ctx, n)
 		}
-		e2eutil.CleanupTestContext(ctx)
 	})
 
 	// C6: Execute actually commits — it evicts and writes durable nominations.
@@ -76,6 +77,49 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		Expect(got.Status.Result.FragAfterPercent).To(BeNumerically("<=", got.Status.Plan.Summary.FragBeforePercent),
 			"Execute terminal status must report the remeasured cluster fragmentation")
 		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")
+		waitRunEventReasons(ctx, got,
+			"PlanComputed", "ExecutePrepared", "EvictionsIssued", "AwaitingPlacement", "Executed")
+	})
+
+	It("executes the replacement protocol for a real vcjob", func() {
+		occupyMovableVCJob(ctx, "vcjob-moving", nodes[0], 4)
+		occupyMovableVCJob(ctx, "vcjob-staying", nodes[1], 2)
+
+		run, err := newRun("execute-vcjob", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(got.Status.Nominations).NotTo(BeEmpty())
+		for _, nomination := range got.Status.Nominations {
+			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			Expect(nomination.ReplacementPodName).NotTo(BeEmpty())
+			Expect(nomination.ActualNodeName).To(Equal(nomination.SelectedNodeName))
+		}
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+	})
+
+	It("reports a verified zero result for an Execute no-op", func() {
+		occupy(ctx, "execute-noop", nodes[0], 4)
+
+		run, err := newRun("execute-noop", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("NoFragmentation"))
+		Expect(got.Status.Plan).NotTo(BeNil())
+		Expect(got.Status.Plan.Moves).To(BeEmpty())
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MovedCardCount).To(BeEquivalentTo(0))
+		Expect(got.Status.Result.FreedNodeCount).To(BeEquivalentTo(0))
+		Expect(got.Status.Result.FragAfterPercent).To(Equal(got.Status.Plan.Summary.FragBeforePercent))
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Nominations).To(BeEmpty())
 	})
 
 	// C8: after an Execute finishes, a second Execute within the cooldown window is
@@ -142,6 +186,55 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		Expect(got.Status.Nominations).To(BeEmpty(), "rejected evictions must not retain placement intents")
 	})
 
+	It("preserves the full plan and reports only accepted disruption after a partial PDB rejection", func() {
+		blocked := occupyNativeDeployment(ctx, "partial-blocked", nodes[0], "move", 2)
+		accepted := occupyNativeDeployment(ctx, "partial-accepted", nodes[0], "move", 2)
+		staying := occupyNativeDeployment(ctx, "partial-staying", nodes[1], "stay", 4)
+		defer deleteNativeWorkloads(ctx, blocked, accepted, staying)
+
+		blockAll := intstr.FromInt(0)
+		_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
+			&policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Name: "block-partial"},
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					MaxUnavailable: &blockAll,
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						nativeWorkloadLabel: blocked.deployment.Name,
+					}},
+				},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() int32 {
+			pdb, getErr := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Get(
+				context.TODO(), "block-partial", metav1.GetOptions{})
+			if getErr != nil {
+				return -1
+			}
+			return pdb.Status.DisruptionsAllowed
+		}, repackTimeout, repackPoll).Should(Equal(int32(0)))
+
+		scope := &repackv1alpha1.RepackScope{Nodes: &repackv1alpha1.RepackSelectorTerm{
+			Include: &repackv1alpha1.RepackSelector{Names: []string{nodes[0]}},
+		}}
+		run, err := newRun("partial-pdb", repackv1alpha1.RepackModeExecute).
+			goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
+		Expect(completeReason(got)).To(Equal("ExecuteFailed"))
+		Expect(got.Status.Plan.Moves).To(HaveLen(2), "the immutable plan must retain both intended PodGroups")
+		Expect(got.Status.Plan.Summary.MovedCardCount).To(BeEquivalentTo(4))
+		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(1))
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MovedCardCount).To(BeEquivalentTo(2),
+			"result must count only the eviction accepted by the API")
+		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
+		Expect(got.Status.Nominations).To(HaveLen(1),
+			"only the accepted eviction may retain a replacement placement intent")
+	})
+
 	// E16: scope.nodes.exclude — an excluded node is never a drain target, so it is
 	// not freed even if it could be.
 	It("scope.nodes.exclude keeps a node from being drained", func() {
@@ -167,14 +260,14 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 	// E14: scope.podGroups.include by exact name — only the selected gang may move.
 	It("scope.podGroups.include limits which gangs move", func() {
 		occupy(ctx, "inc-a", nodes[0], 4)
-		occupy(ctx, "inc-b", nodes[1], 2)
-		pgs := podGroupNames(ctx)
-		Expect(len(pgs)).To(BeNumerically(">=", 2))
+		selectedJob := occupy(ctx, "inc-b", nodes[1], 2)
+		selectedPodGroup := podGroupNameForOwner(ctx, selectedJob.UID)
 
-		// Include only the first PodGroup.
+		// Include the known 2-card PodGroup, which can move onto inc-a's node and
+		// therefore must produce a non-empty plan. This avoids a vacuous pass.
 		scope := &repackv1alpha1.RepackScope{
 			PodGroups: &repackv1alpha1.RepackSelectorTerm{
-				Include: &repackv1alpha1.RepackSelector{Names: []string{pgs[0]}},
+				Include: &repackv1alpha1.RepackSelector{Names: []string{selectedPodGroup}},
 			},
 		}
 		run, err := newRun("scope-pg", repackv1alpha1.RepackModeDryRun).goal(npuResource).scope(scope).create(ctx)
@@ -182,10 +275,38 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", func() {
 		defer deleteRun(ctx, run.Name)
 
 		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Plan.Moves).NotTo(BeEmpty(), "the selected movable PodGroup must produce a plan")
 		// Every move must belong to the included PodGroup.
 		for _, m := range got.Status.Plan.Moves {
-			Expect(ctx.Namespace + "/" + m.PodGroupName).To(Equal(pgs[0]))
+			Expect(ctx.Namespace + "/" + m.PodGroupName).To(Equal(selectedPodGroup))
 		}
+	})
+
+	It("moves all replicas of a scoped vcjob PodGroup when minAvailable is one", func() {
+		multi := occupyVCJobReplicas(ctx, "gang-minavailable", nodes[0], 2, 2, 1)
+		occupy(ctx, "gang-receiver", nodes[1], 4)
+		selectedPodGroup := podGroupNameForOwner(ctx, multi.UID)
+		scope := &repackv1alpha1.RepackScope{
+			PodGroups: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{Names: []string{selectedPodGroup}},
+			},
+			Nodes: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{Names: []string{nodes[0]}},
+			},
+		}
+
+		run, err := newRun("gang-minavailable", repackv1alpha1.RepackModeDryRun).
+			goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(completeReason(got)).To(Equal("RepackRecommended"))
+		Expect(got.Status.Plan.Moves).To(HaveLen(1))
+		Expect(ctx.Namespace + "/" + got.Status.Plan.Moves[0].PodGroupName).To(Equal(selectedPodGroup))
+		Expect(got.Status.Plan.Moves[0].Pods).To(HaveLen(2),
+			"whole-PodGroup movement must include both replicas despite minAvailable=1")
+		Expect(got.Status.Plan.Moves[0].Cards).To(BeEquivalentTo(4))
 	})
 
 	// E14b/C6b: labels from a generic ReplicaSet-owned workload are projected to

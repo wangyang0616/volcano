@@ -29,7 +29,7 @@ import (
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
 
-var _ = Describe("Repack nominations & reliability boundaries", func() {
+var _ = Describe("Repack nominations & reliability boundaries", Serial, func() {
 	var ctx *e2eutil.TestContext
 	var nodes []string
 
@@ -38,10 +38,11 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 		nodes = npuFixture(ctx, 3)
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
+		e2eutil.CleanupTestContext(ctx)
 		for _, n := range nodes {
 			clearNPU(ctx, n)
 		}
-		e2eutil.CleanupTestContext(ctx)
 	})
 
 	// Execute records well-formed nominations wired to the plan. All assertions read
@@ -145,6 +146,7 @@ var _ = Describe("Repack nominations & reliability boundaries", func() {
 		Expect(b.Status.Plan.Summary.FragBeforePercent).To(Equal(a.Status.Plan.Summary.FragBeforePercent))
 		Expect(b.Status.Plan.Summary.FragAfterPercent).To(Equal(a.Status.Plan.Summary.FragAfterPercent))
 		Expect(b.Status.Plan.Summary.FreedNodeCount).To(Equal(a.Status.Plan.Summary.FreedNodeCount))
-		Expect(len(b.Status.Plan.Moves)).To(Equal(len(a.Status.Plan.Moves)))
+		Expect(b.Status.Plan).To(Equal(a.Status.Plan),
+			"the complete deterministic plan, not only its length, must remain identical")
 	})
 })

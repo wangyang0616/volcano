@@ -141,6 +141,8 @@ func (c *Controller) processNext(ctx context.Context) bool {
 
 	if err := c.reconcile(ctx, key); err != nil {
 		utilruntime.HandleError(fmt.Errorf("reconcile repackrun %q: %w", key, err))
+		klog.V(4).InfoS("repack controller: reconcile failed; requeueing with rate limit",
+			"run", key, "retryCount", c.workQueue.NumRequeues(key)+1, "error", err)
 		c.workQueue.AddRateLimited(key)
 		return true
 	}
@@ -153,6 +155,7 @@ func (c *Controller) processNext(ctx context.Context) bool {
 // apiserver; the engine owns all non-terminal lifecycle (phase/conditions); the
 // nomination reconciler (nominate.go) steers replacement pods.
 func (c *Controller) reconcile(ctx context.Context, name string) error {
+	klog.V(4).InfoS("repack controller: reconciling RepackRun lifecycle", "run", name)
 	run, err := c.repackRunLister.Get(name)
 	if apierrors.IsNotFound(err) {
 		return nil // deleted; nothing to do

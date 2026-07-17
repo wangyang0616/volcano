@@ -63,6 +63,7 @@ func (c *repackController) Initialize(opt *framework.ControllerOption) error {
 	podInformer := opt.SharedInformerFactory.Core().V1().Pods()
 	repackInformer := opt.VCSharedInformerFactory.Repack().V1alpha1().RepackRuns()
 	c.nominator = rc.NewNominator(opt.KubeClient, opt.VolcanoClient, podInformer, repackInformer)
+	c.nominator.SetEventRecorder(rc.NewEventRecorder(opt.KubeClient, "vc-controller-manager"))
 	return nil
 }
 

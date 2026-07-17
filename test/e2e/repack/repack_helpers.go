@@ -25,9 +25,12 @@ package repack
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -90,6 +93,7 @@ func schedulableNodes(ctx *e2eutil.TestContext) []string {
 			out = append(out, n.Name)
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -137,6 +141,33 @@ func npuFixture(ctx *e2eutil.TestContext, nodes int) []string {
 // scheduler places it (used for Execute, so the replacement can move). Waits Ready.
 func occupy(ctx *e2eutil.TestContext, name, node string, cards int) *batchv1alpha1.Job {
 	return occupyResource(ctx, name, node, npuResource, cards)
+}
+
+// occupyMovableVCJob places the initial Pod deterministically without persisting
+// spec.nodeName. Its replacement therefore remains free to follow Repack's live
+// receiver selection.
+func occupyMovableVCJob(ctx *e2eutil.TestContext, name, initialNode string, cards int) *batchv1alpha1.Job {
+	releaseNodes := holdNonTargetNodes(ctx, initialNode)
+	defer releaseNodes()
+	return occupy(ctx, name, "", cards)
+}
+
+func occupyVCJobReplicas(ctx *e2eutil.TestContext, name, node string, cardsPerPod int, replicas, minAvailable int32) *batchv1alpha1.Job {
+	quantity := resource.MustParse(fmt.Sprintf("%d", cardsPerPod))
+	resources := v1.ResourceList{npuResource: quantity}
+	taskMinAvailable := minAvailable
+	job := e2eutil.CreateJob(ctx, &e2eutil.JobSpec{
+		Name:      name,
+		Namespace: ctx.Namespace,
+		NodeName:  node,
+		Min:       minAvailable,
+		Tasks: []e2eutil.TaskSpec{{
+			Name: "w", Min: minAvailable, Rep: replicas, MinAvailable: &taskMinAvailable,
+			Img: e2eutil.DefaultNginxImage, Req: resources, Limit: resources,
+		}},
+	})
+	Expect(e2eutil.WaitTasksReady(ctx, job, int(replicas))).NotTo(HaveOccurred())
+	return job
 }
 
 // occupyResource creates a one-task vcjob requesting cards of res. It is used
@@ -382,12 +413,15 @@ func deleteRun(ctx *e2eutil.TestContext, name string) {
 // waitTerminal blocks until the run reaches a terminal phase and returns it.
 func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackRun {
 	var last *repackv1alpha1.RepackRun
+	var lastGetError error
 	err := wait.PollUntilContextTimeout(context.TODO(), repackPoll, repackTimeout, false,
 		func(c context.Context) (bool, error) {
 			r, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Get(c, name, metav1.GetOptions{})
 			if err != nil {
-				return false, err
+				lastGetError = err
+				return false, nil
 			}
+			lastGetError = nil
 			last = r
 			switch r.Status.Phase {
 			case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled:
@@ -395,6 +429,9 @@ func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackR
 			}
 			return false, nil
 		})
+	if err != nil {
+		recordRepackDiagnostics(ctx, name, fmt.Errorf("terminal wait failed: %w (last GET error: %v)", err, lastGetError))
+	}
 	Expect(err).NotTo(HaveOccurred(), "run %s did not reach a terminal phase (is the repack engine running?)", name)
 	Expect(last.Status.Message).NotTo(BeEmpty(), "terminal RepackRun must provide an operator-readable status.message")
 	Expect(last.Status.CompletionTime).NotTo(BeNil(), "terminal RepackRun must provide completionTime")
@@ -421,12 +458,15 @@ func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackR
 // its reason (used for the Queued gate, which is not terminal).
 func waitCondition(ctx *e2eutil.TestContext, name, condType string) string {
 	var reason string
+	var lastGetError error
 	err := wait.PollUntilContextTimeout(context.TODO(), repackPoll, repackTimeout, false,
 		func(c context.Context) (bool, error) {
 			r, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Get(c, name, metav1.GetOptions{})
 			if err != nil {
-				return false, err
+				lastGetError = err
+				return false, nil
 			}
+			lastGetError = nil
 			for _, cond := range r.Status.Conditions {
 				if cond.Type == condType && cond.Status == metav1.ConditionTrue {
 					reason = cond.Reason
@@ -435,8 +475,90 @@ func waitCondition(ctx *e2eutil.TestContext, name, condType string) string {
 			}
 			return false, nil
 		})
+	if err != nil {
+		recordRepackDiagnostics(ctx, name, fmt.Errorf("condition %s wait failed: %w (last GET error: %v)", condType, err, lastGetError))
+	}
 	Expect(err).NotTo(HaveOccurred(), "run %s never got a True %s condition", name, condType)
 	return reason
+}
+
+// recordSpecFailureDiagnostics captures the test namespace, RepackRun events,
+// and the tail of every Repack component log before cleanup destroys evidence.
+// It is intentionally best-effort and must never mask the original assertion.
+func recordSpecFailureDiagnostics(ctx *e2eutil.TestContext) {
+	if !CurrentSpecReport().Failed() {
+		return
+	}
+	recordRepackDiagnostics(ctx, "", fmt.Errorf("spec failed: %s", CurrentSpecReport().LeafNodeText))
+}
+
+func recordRepackDiagnostics(ctx *e2eutil.TestContext, runName string, cause error) {
+	if ctx == nil {
+		return
+	}
+	AddReportEntry("Repack failure cause", cause.Error())
+
+	snapshot := map[string]interface{}{}
+	if runName != "" {
+		if run, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Get(context.TODO(), runName, metav1.GetOptions{}); err == nil {
+			snapshot["run"] = run
+		} else {
+			snapshot["runGetError"] = err.Error()
+		}
+	} else if runs, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().List(context.TODO(), metav1.ListOptions{}); err == nil {
+		snapshot["runs"] = runs
+	} else {
+		snapshot["runListError"] = err.Error()
+	}
+	if pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
+		snapshot["namespacePods"] = pods
+	} else {
+		snapshot["podListError"] = err.Error()
+	}
+	if podGroups, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
+		snapshot["podGroups"] = podGroups
+	} else {
+		snapshot["podGroupListError"] = err.Error()
+	}
+	events := map[string]interface{}{}
+	for _, namespace := range []string{metav1.NamespaceDefault, ctx.Namespace} {
+		if eventList, err := ctx.Kubeclient.CoreV1().Events(namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
+			events[namespace] = eventList
+		} else {
+			events[namespace] = err.Error()
+		}
+	}
+	snapshot["events"] = events
+	if data, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
+		AddReportEntry("Repack API snapshot", string(data))
+	}
+
+	tailLines := int64(200)
+	for _, component := range []string{
+		"volcano-repack-engine",
+		"volcano-controller",
+		"volcano-admission",
+		"volcano-scheduler",
+	} {
+		pods, err := ctx.Kubeclient.CoreV1().Pods(repackSystemNamespace).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: "app=" + component,
+		})
+		if err != nil {
+			AddReportEntry("Repack component logs: "+component, "list Pods: "+err.Error())
+			continue
+		}
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			raw, logErr := ctx.Kubeclient.CoreV1().Pods(repackSystemNamespace).GetLogs(
+				pod.Name, &v1.PodLogOptions{TailLines: &tailLines}).DoRaw(context.TODO())
+			entryName := fmt.Sprintf("Repack component logs: %s/%s", component, pod.Name)
+			if logErr != nil {
+				AddReportEntry(entryName, logErr.Error())
+				continue
+			}
+			AddReportEntry(entryName, string(raw))
+		}
+	}
 }
 
 // completeReason returns the reason of the True Complete/Failed condition.
@@ -449,17 +571,71 @@ func completeReason(run *repackv1alpha1.RepackRun) string {
 	return ""
 }
 
-// podGroupNames returns the "namespace/name" of every PodGroup in the test
-// namespace (used to build scope.podGroups.include/exclude by exact name without
-// guessing the vcjob's PodGroup naming).
-func podGroupNames(ctx *e2eutil.TestContext) []string {
-	pgs, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
-	Expect(err).NotTo(HaveOccurred())
-	var out []string
-	for i := range pgs.Items {
-		out = append(out, ctx.Namespace+"/"+pgs.Items[i].Name)
+func waitRunEventReasons(ctx *e2eutil.TestContext, run *repackv1alpha1.RepackRun, reasons ...string) {
+	Expect(run).NotTo(BeNil())
+	want := make(map[string]bool, len(reasons))
+	for _, reason := range reasons {
+		want[reason] = true
 	}
-	return out
+	Eventually(func() map[string]bool {
+		found := make(map[string]bool)
+		events, err := ctx.Kubeclient.CoreV1().Events(metav1.NamespaceDefault).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return found
+		}
+		for index := range events.Items {
+			event := &events.Items[index]
+			if event.InvolvedObject.UID == run.UID && want[event.Reason] {
+				found[event.Reason] = true
+			}
+		}
+		return found
+	}, fixtureTimeout, repackPoll).Should(HaveLen(len(want)),
+		"RepackRun events must expose every core lifecycle milestone")
+}
+
+func waitPodEventReasons(ctx *e2eutil.TestContext, pod *v1.Pod, reasons ...string) {
+	Expect(pod).NotTo(BeNil())
+	want := make(map[string]bool, len(reasons))
+	for _, reason := range reasons {
+		want[reason] = true
+	}
+	Eventually(func() map[string]bool {
+		found := make(map[string]bool)
+		events, err := ctx.Kubeclient.CoreV1().Events(pod.Namespace).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return found
+		}
+		for index := range events.Items {
+			event := &events.Items[index]
+			if event.InvolvedObject.UID == pod.UID && want[event.Reason] {
+				found[event.Reason] = true
+			}
+		}
+		return found
+	}, fixtureTimeout, repackPoll).Should(HaveLen(len(want)),
+		"replacement Pod events must expose every placement milestone")
+}
+
+func podGroupNameForOwner(ctx *e2eutil.TestContext, ownerUID types.UID) string {
+	var result string
+	Eventually(func() string {
+		podGroups, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return ""
+		}
+		for index := range podGroups.Items {
+			podGroup := &podGroups.Items[index]
+			for _, owner := range podGroup.OwnerReferences {
+				if owner.UID == ownerUID {
+					result = ctx.Namespace + "/" + podGroup.Name
+					return result
+				}
+			}
+		}
+		return ""
+	}, fixtureTimeout, repackPoll).ShouldNot(BeEmpty(), "PodGroup for workload owner %s must exist", ownerUID)
+	return result
 }
 
 // runningPodCount is the number of Running pods in the test namespace (to assert

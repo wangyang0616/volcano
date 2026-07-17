@@ -37,7 +37,7 @@ import (
 
 const repackSystemNamespace = "volcano-system"
 
-var _ = Describe("Repack placement protocol", func() {
+var _ = Describe("Repack placement protocol", Serial, func() {
 	var ctx *e2eutil.TestContext
 	var nodes []string
 
@@ -46,10 +46,11 @@ var _ = Describe("Repack placement protocol", func() {
 		nodes = npuFixture(ctx, 3)
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
+		e2eutil.CleanupTestContext(ctx)
 		for _, node := range nodes {
 			clearNPU(ctx, node)
 		}
-		e2eutil.CleanupTestContext(ctx)
 	})
 
 	// This test pauses the Engine after it has started its informers. It creates a
@@ -78,6 +79,8 @@ var _ = Describe("Repack placement protocol", func() {
 		Expect(nomination.SelectedNodeName).To(Equal(nodes[1]), "the planned receiver is preferred when it remains immediately idle")
 		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.SelectedNodeName), "freed nodes are never placement receivers")
 		Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -181,6 +184,8 @@ var _ = Describe("Repack placement protocol", func() {
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
 		Expect(completeReason(got)).To(Equal("PlacementDegraded"))
 		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementExpired))
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
 
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -284,9 +289,24 @@ func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, f
 	pgName := fmt.Sprintf("%s-pg", run.Name)
 	podName := fmt.Sprintf("%s-replacement", run.Name)
 	expires := metav1.NewTime(time.Now().Add(deadline))
+	fromNode := ""
+	if len(freedNodes) > 0 {
+		fromNode = freedNodes[0]
+	}
 	run.Status = repackv1alpha1.RepackRunStatus{
 		Phase: repackv1alpha1.RepackRunning,
-		Plan:  &repackv1alpha1.RepackPlan{FreedNodes: freedNodes},
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary: &repackv1alpha1.RepackSummary{
+				FreedNodeCount: int32(len(freedNodes)),
+				MovedCardCount: 2,
+			},
+			FreedNodes: freedNodes,
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: ctx.Namespace, PodGroupName: pgName, Cards: 2,
+				Pods: []repackv1alpha1.PodMove{{Name: podName, FromNode: fromNode, ToNode: plannedNode, Cards: 2}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Nominations: []repackv1alpha1.PodNomination{{
 			Namespace: ctx.Namespace, PodGroupName: pgName, VictimPodName: podName,
 			NodeName: plannedNode, ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
@@ -355,6 +375,10 @@ func verifyNativeReplacementPlacement(ctx *e2eutil.TestContext, nodes []string, 
 	Expect(got.Status.Nominations[0].SelectedNodeName).NotTo(BeEmpty())
 	Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(got.Status.Nominations[0].SelectedNodeName))
 	Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(got.Status.Nominations[0].SelectedNodeName))
+	Expect(got.Status.Result).NotTo(BeNil())
+	Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+	waitPodEventReasons(ctx, replacement,
+		"RepackReplacementGated", "RepackPlacementNominated", "RepackPlacementSucceeded")
 	assertPlacementLeaseReleased(ctx, workload.podGroup)
 }
 
@@ -362,9 +386,26 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 	run, err := newRun(name, repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 	Expect(err).NotTo(HaveOccurred())
 	expires := metav1.NewTime(time.Now().Add(deadline))
+	fromNode := ""
+	if len(freedNodes) > 0 {
+		fromNode = freedNodes[0]
+	}
 	run.Status = repackv1alpha1.RepackRunStatus{
 		Phase: repackv1alpha1.RepackRunning,
-		Plan:  &repackv1alpha1.RepackPlan{FreedNodes: freedNodes},
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary: &repackv1alpha1.RepackSummary{
+				FreedNodeCount: int32(len(freedNodes)),
+				MovedCardCount: 2,
+			},
+			FreedNodes: freedNodes,
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: ctx.Namespace, PodGroupName: workload.podGroup, Cards: 2,
+				Pods: []repackv1alpha1.PodMove{{
+					Name: workload.podName, FromNode: fromNode, ToNode: plannedNode, Cards: 2,
+				}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Nominations: []repackv1alpha1.PodNomination{{
 			Namespace: ctx.Namespace, PodGroupName: workload.podGroup, VictimPodName: workload.podName,
 			NodeName: plannedNode, ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,

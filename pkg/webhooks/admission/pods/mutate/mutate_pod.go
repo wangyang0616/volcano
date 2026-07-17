@@ -81,7 +81,8 @@ const repackPlacementLookupTimeout = 2 * time.Second
 
 // Pods mutate pods.
 func Pods(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
-	klog.V(3).Infof("mutating pods -- %s", ar.Request.Operation)
+	klog.V(4).InfoS("mutating Pod admission request",
+		"operation", ar.Request.Operation, "namespace", ar.Request.Namespace, "name", ar.Request.Name)
 	pod, err := schema.DecodePod(ar.Request.Object, ar.Request.Resource)
 	if err != nil {
 		return util.ToAdmissionResponse(err)
@@ -182,10 +183,14 @@ func patchRepackPlacementGate(pod *v1.Pod) ([]patchOperation, error) {
 	if podGroupName == "" {
 		return nil, nil
 	}
+	klog.V(4).InfoS("repack webhook: checking PodGroup placement lease",
+		"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName)
 	ctx, cancel := context.WithTimeout(context.Background(), repackPlacementLookupTimeout)
 	defer cancel()
 	podGroup, err := config.VolcanoClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, podGroupName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		klog.V(4).InfoS("repack webhook: PodGroup not found; placement gate not added",
+			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName)
 		return nil, nil
 	}
 	if err != nil {
@@ -193,6 +198,8 @@ func patchRepackPlacementGate(pod *v1.Pod) ([]patchOperation, error) {
 	}
 	lease := podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation]
 	if lease == "" {
+		klog.V(4).InfoS("repack webhook: PodGroup has no placement lease",
+			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName)
 		return nil, nil
 	}
 	runName, runUID, ok := placement.ParseOwner(lease)
@@ -202,12 +209,17 @@ func patchRepackPlacementGate(pod *v1.Pod) ([]patchOperation, error) {
 	}
 	run, err := config.VolcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		klog.V(4).InfoS("repack webhook: placement lease owner Run no longer exists",
+			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName, "run", runName)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get RepackRun %q for PodGroup %s/%s placement: %w", runName, pod.Namespace, podGroupName, err)
 	}
 	if run.UID != runUID || !placement.ActiveForPodGroup(run, pod.Namespace, podGroupName) {
+		klog.V(4).InfoS("repack webhook: placement lease is not active for PodGroup",
+			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName,
+			"run", runName, "runPhase", run.Status.Phase, "uidMatches", run.UID == runUID)
 		return nil, nil
 	}
 	patches := make([]patchOperation, 0, 2)
@@ -217,6 +229,11 @@ func patchRepackPlacementGate(pod *v1.Pod) ([]patchOperation, error) {
 	}
 	if pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != lease {
 		patches = append(patches, patchPlacementGateOwner(pod, lease))
+	}
+	if len(patches) > 0 {
+		klog.V(3).InfoS("repack webhook: adding placement scheduling gate",
+			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName,
+			"run", run.Name, "lease", lease, "gateAlreadyPresent", gate == nil)
 	}
 	return patches, nil
 }

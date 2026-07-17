@@ -408,11 +408,14 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 				"Waiting to execute: the previous Execute RepackRun is cooling down; retrying after %s.",
 				gate.RequeueAfter.Round(time.Second))
 		}
-		state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
+		conditionChanged := state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
 			gate.Reason, message, work.Generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
 		if err := e.updateStatus(ctx, work); err != nil {
 			return err
+		}
+		if conditionChanged {
+			e.recordRunEvent(work, v1.EventTypeNormal, gate.Reason, message)
 		}
 		if gate.RequeueAfter > 0 {
 			e.workQueue.AddAfter(name, gate.RequeueAfter)

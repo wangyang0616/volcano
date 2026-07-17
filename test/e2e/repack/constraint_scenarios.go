@@ -85,7 +85,7 @@ func occupyPinnedToHost(ctx *e2eutil.TestContext, name, node string, cards int) 
 	Expect(e2eutil.WaitTasksReady(ctx, job, 1)).NotTo(HaveOccurred())
 }
 
-var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", func() {
+var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", Serial, func() {
 	var ctx *e2eutil.TestContext
 	var nodes []string
 	var tainted []string
@@ -96,13 +96,14 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", fu
 		tainted = nil
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
+		e2eutil.CleanupTestContext(ctx)
 		for _, n := range tainted {
 			untaintNode(ctx, n)
 		}
 		for _, n := range nodes {
 			clearNPU(ctx, n)
 		}
-		e2eutil.CleanupTestContext(ctx)
 	})
 
 	// A tainted node must not be chosen as a receiver. With BOTH occupied nodes

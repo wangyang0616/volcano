@@ -50,6 +50,8 @@ func (e *Engine) preparePlacementLeases(ctx context.Context, run *repackv1alpha1
 	}
 	lease := placement.OwnerValue(run.Name, run.UID)
 	groups := placementPodGroups(run)
+	klog.V(4).InfoS("repack: preparing PodGroup placement leases",
+		"run", run.Name, "podGroupCount", len(groups), "lease", lease)
 	for key := range groups {
 		namespace, podGroupName := splitPlacementPodGroupKey(key)
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -84,6 +86,8 @@ func (e *Engine) preparePlacementLeases(ctx context.Context, run *repackv1alpha1
 			}
 			return err
 		}
+		klog.V(4).InfoS("repack: PodGroup placement lease prepared",
+			"run", run.Name, "podGroup", namespace+"/"+podGroupName)
 	}
 	return nil
 }
@@ -137,6 +141,7 @@ func (e *Engine) releasePlacementLeases(ctx context.Context, run *repackv1alpha1
 		return nil
 	}
 	lease := placement.OwnerValue(run.Name, run.UID)
+	released := 0
 	for key := range groups {
 		namespace, podGroupName := splitPlacementPodGroupKey(key)
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -155,7 +160,12 @@ func (e *Engine) releasePlacementLeases(ctx context.Context, run *repackv1alpha1
 		if err != nil {
 			return fmt.Errorf("release placement lease for PodGroup %s/%s: %w", namespace, podGroupName, err)
 		}
+		released++
+		klog.V(4).InfoS("repack: PodGroup placement lease released",
+			"run", run.Name, "podGroup", namespace+"/"+podGroupName)
 	}
+	klog.V(3).InfoS("repack: placement lease cleanup completed",
+		"run", run.Name, "requestedPodGroupCount", len(groups), "releasedOrAlreadyAbsentCount", released)
 	return nil
 }
 
@@ -185,6 +195,10 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 	if run == nil {
 		return nil
 	}
+	placed, drifted, expiredCount := placementOutcomeCounts(run)
+	klog.V(4).InfoS("repack: reconciling replacement placement",
+		"run", run.Name, "nominationCount", len(run.Status.Nominations),
+		"placedCount", placed, "driftedCount", drifted, "expiredCount", expiredCount)
 	if expired, err := e.expirePlacements(ctx, run); err != nil {
 		return err
 	} else if expired {
@@ -200,6 +214,8 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		// until the durable deadline so an absent replacement cannot bypass the
 		// expiration escape hatch.
 		e.workQueue.AddAfter(run.Name, placementRetryInterval)
+		klog.V(4).InfoS("repack: no selectable replacement Pod observed yet; placement requeued",
+			"run", run.Name, "retryAfter", placementRetryInterval)
 		return nil
 	}
 
@@ -211,6 +227,10 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		return err
 	}
 	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
+	excludedFreedNodes := acceptedFreedNodeNames(run)
+	klog.V(4).InfoS("repack: evaluating live placement receivers",
+		"run", run.Name, "candidateCount", len(pending), "snapshotNodeCount", len(snapshot.Nodes()),
+		"excludedFreedNodes", excludedFreedNodes)
 	committed := make([]*engineapi.Move, 0, len(pending))
 	selected := make(map[string]string, len(pending))
 	for _, nomination := range pending {
@@ -228,13 +248,22 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		// scheduler TaskInfo from it preserves its current resource requests and
 		// scheduling constraints for the full predicate simulation below.
 		task := schedapi.NewTaskInfo(pod)
-		receivers := placementReceivers(snapshot.Nodes(), acceptedFreedNodeNames(run), nomination.NodeName, task)
+		receivers := placementReceivers(snapshot.Nodes(), excludedFreedNodes, nomination.NodeName, task)
+		klog.V(4).InfoS("repack: replacement receiver candidates evaluated",
+			"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
+			"plannedNode", nomination.NodeName, "receiverCount", len(receivers))
 		placements, fit := snapshot.FeasibleRelocation(committed, []*schedapi.TaskInfo{task}, receivers)
 		if !fit || len(placements) != 1 {
+			klog.V(3).InfoS("repack: replacement is awaiting receiver capacity",
+				"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
+				"plannedNode", nomination.NodeName, "receiverCount", len(receivers))
 			return e.markAwaitingPlacement(ctx, run.Name, pending)
 		}
 		committed = append(committed, placements[0])
 		selected[placementStatusKey(nomination)] = placements[0].To
+		klog.V(4).InfoS("repack: replacement receiver selected in scheduler simulation",
+			"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
+			"plannedNode", nomination.NodeName, "selectedNode", placements[0].To)
 	}
 	if len(selected) == 0 {
 		e.workQueue.AddAfter(run.Name, placementRetryInterval)
@@ -294,7 +323,8 @@ func placementReceivers(nodes []*schedapi.NodeInfo, freedNodes []string, planned
 }
 
 func (e *Engine) writePlacementSelection(ctx context.Context, runName string, selected map[string]string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	var updatedRun *repackv1alpha1.RepackRun
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		run, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -310,9 +340,17 @@ func (e *Engine) writePlacementSelection(ctx context.Context, runName string, se
 		if !changed {
 			return nil
 		}
-		_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+		updatedRun, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 		return err
 	})
+	if err != nil || updatedRun == nil {
+		return err
+	}
+	klog.V(3).InfoS("repack: live replacement receivers persisted",
+		"run", runName, "selectionCount", len(selected), "selections", selected)
+	e.recordRunEvent(updatedRun, v1.EventTypeNormal, eventReasonPlacementSelected,
+		fmt.Sprintf("Selected live receiver nodes for %d replacement Pods.", len(selected)))
+	return nil
 }
 
 func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nominations []*repackv1alpha1.PodNomination) error {
@@ -320,6 +358,8 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 	for _, nomination := range nominations {
 		keys[placementStatusKey(nomination)] = struct{}{}
 	}
+	var updatedRun *repackv1alpha1.RepackRun
+	placementStateChanged := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		run, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
@@ -331,6 +371,7 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 			if _, found := keys[placementStatusKey(nomination)]; found && nomination.SelectedNodeName == "" && nomination.Phase != repackv1alpha1.PodPlacementAwaitingCapacity {
 				nomination.Phase = repackv1alpha1.PodPlacementAwaitingCapacity
 				changed = true
+				placementStateChanged = true
 			}
 		}
 		if state.SetCondition(
@@ -346,11 +387,17 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 		if !changed {
 			return nil
 		}
-		_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+		updatedRun, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 		return err
 	})
 	if err == nil {
 		e.workQueue.AddAfter(runName, placementRetryInterval)
+	}
+	if err == nil && placementStateChanged && updatedRun != nil {
+		message := placementProgressMessage(updatedRun, e.resolveResource(updatedRun))
+		klog.V(3).InfoS("repack: replacement placement waiting for capacity",
+			"run", runName, "pendingCount", len(nominations), "retryAfter", placementRetryInterval)
+		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementAwaitingCapacity, message)
 	}
 	return err
 }
@@ -414,6 +461,12 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		reason = state.ReasonPlacementDegraded
 	}
 	message := placementStatusMessage(run, targetResource, degraded, metricsUnverified)
+	result := run.Status.Result
+	placedCount, driftedCount, expiredPlacementCount := placementOutcomeCounts(run)
+	klog.V(3).InfoS("repack: replacement placement reached terminal observation",
+		"run", run.Name, "degraded", degraded, "metricsUnverified", metricsUnverified,
+		"placedCount", placedCount, "driftedCount", driftedCount, "expiredCount", expiredPlacementCount,
+		"result", result)
 	run.Status.Message = message
 	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, message, run.Generation)
 	if degraded {
@@ -509,6 +562,11 @@ func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.
 	}
 	run.Status.Result.FreedNodeCount = actuallyFreed
 	run.Status.Result.MetricsVerified = true
+	klog.V(4).InfoS("repack: actual Execute benefit measured from scheduler snapshot",
+		"run", run.Name, "resource", targetResource,
+		"fragAfterPercent", run.Status.Result.FragAfterPercent,
+		"freedNodeCount", run.Status.Result.FreedNodeCount,
+		"movedCardCount", run.Status.Result.MovedCardCount)
 }
 
 func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
@@ -551,6 +609,9 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 	if len(keys) == 0 {
 		return false, nil
 	}
+	klog.V(3).InfoS("repack: replacement placement deadline reached",
+		"run", run.Name, "expiringNominationCount", len(keys))
+	var updatedRun *repackv1alpha1.RepackRun
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, run.Name, metav1.GetOptions{})
 		if err != nil {
@@ -568,11 +629,15 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		if !changed {
 			return nil
 		}
-		_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
+		updatedRun, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
 		return err
 	})
 	if err != nil {
 		return false, err
+	}
+	if updatedRun != nil {
+		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementExpired,
+			fmt.Sprintf("%d replacement placement intents expired; scheduling gates will be released.", len(keys)))
 	}
 	return true, nil
 }

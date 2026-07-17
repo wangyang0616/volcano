@@ -39,14 +39,20 @@ import (
 // an advertised-but-empty node, used to check empty nodes are excluded as receivers).
 // expectedFreed is the optimal number of nodes the plan should empty; the greedy
 // drain reaches the optimum for these shapes, so we assert FreedNodeCount >= it.
-var _ = Describe("Repack defragmentation scenarios (DryRun consolidation)", func() {
+var _ = Describe("Repack defragmentation scenarios (DryRun consolidation)", Serial, func() {
 	var ctx *e2eutil.TestContext
+	var nodes []string
 
 	BeforeEach(func() {
 		ctx = e2eutil.InitTestContext(e2eutil.Options{})
+		nodes = nil
 	})
 	AfterEach(func() {
+		recordSpecFailureDiagnostics(ctx)
 		e2eutil.CleanupTestContext(ctx)
+		for _, node := range nodes {
+			clearNPU(ctx, node)
+		}
 	})
 
 	type scenario struct {
@@ -80,18 +86,13 @@ var _ = Describe("Repack defragmentation scenarios (DryRun consolidation)", func
 	for _, sc := range scenarios {
 		sc := sc // capture per iteration
 		It("consolidates a "+sc.name+" layout", func() {
-			all := npuFixture(ctx, len(sc.cardsPerNode))
-			defer func() {
-				for _, n := range all {
-					clearNPU(ctx, n)
-				}
-			}()
+			nodes = npuFixture(ctx, len(sc.cardsPerNode))
 
 			occupied := map[string]bool{}
 			for i, cards := range sc.cardsPerNode {
 				if cards > 0 {
-					occupy(ctx, fmt.Sprintf("%s-%d", sc.name, i), all[i], cards)
-					occupied[all[i]] = true
+					occupy(ctx, fmt.Sprintf("%s-%d", sc.name, i), nodes[i], cards)
+					occupied[nodes[i]] = true
 				}
 			}
 			runningBefore := runningPodCount(ctx)

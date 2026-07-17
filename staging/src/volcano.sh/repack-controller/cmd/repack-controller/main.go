@@ -77,6 +77,7 @@ func main() {
 		podInformer := kubeFactory.Core().V1().Pods()
 		repackInformer := vcFactory.Repack().V1alpha1().RepackRuns()
 		nom := repackcontroller.NewNominator(kube, vc, podInformer, repackInformer)
+		nom.SetEventRecorder(repackcontroller.NewEventRecorder(kube, "volcano-repack-controller"))
 
 		kubeFactory.Start(ctx.Done())
 		go func() {
