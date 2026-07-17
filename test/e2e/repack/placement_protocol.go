@@ -157,18 +157,20 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		}, repackTimeout, repackPoll).Should(BeTrue(), "terminal cleanup must release the held scale-out Pod")
 	})
 
-	// The Engine sees no immediately idle receiver: node one is occupied, and the
-	// other fake-NPU nodes are the plan's freed nodes. The deadline must release
-	// the gate and fail the Run instead of stranding the workload indefinitely.
+	// The Engine sees no immediately idle receiver: the planned receiver and the
+	// only fallback receiver are both occupied, while the source node is excluded
+	// by the accepted plan. The deadline must release the gate and fail the Run
+	// instead of stranding the workload indefinitely.
 	It("keeps the gate while capacity is unavailable, then degrades and releases it at the deadline", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
-		occupy(ctx, "placement-blocker", nodes[1], npuPerNode)
+		occupy(ctx, "placement-planned-receiver-blocker", nodes[1], npuPerNode)
+		occupy(ctx, "placement-fallback-receiver-blocker", nodes[2], npuPerNode)
 		// Allow an Engine restart to finish informer cache synchronization before the
 		// deadline. The assertion below is specifically about the observable
 		// AwaitingCapacity state, not merely the terminal expiration.
-		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-expire", nodes[1], []string{nodes[0], nodes[2]}, time.Minute)
+		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-expire", nodes[1], []string{nodes[0]}, time.Minute)
 		defer deleteRun(ctx, run.Name)
 		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
 
