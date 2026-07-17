@@ -441,7 +441,7 @@ func TestAddStatefulSet(t *testing.T) {
 					Name:            vcbatch.PodgroupNamePrefix + fmt.Sprintf("%s-%s", namespace, podName),
 					Namespace:       namespace,
 					OwnerReferences: newPGOwnerReferences(volcanoSchedulerPod),
-					Labels:          map[string]string{},
+					Labels:          map[string]string{"app": stsName},
 					Annotations:     map[string]string{},
 				},
 				Spec: scheduling.PodGroupSpec{
@@ -1055,6 +1055,102 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 			t.Error("unexpected JDBMinAvailable annotation")
 		}
 	})
+}
+
+func TestPodGroupLabelsFromPod(t *testing.T) {
+	podLabels := map[string]string{
+		"app":                                      "training",
+		"tenant":                                   "research",
+		scheduling.PodPreemptable:                  "true",
+		podTemplateHashLabelKey:                    "7d8f9b",
+		controllerRevisionHashLabelKey:             "revision-2",
+		controllerUIDLabelKey:                      "controller-uid",
+		legacyJobNameLabelKey:                      "batch-job",
+		statefulSetPodNameLabelKey:                 "worker-0",
+		podIndexLabelKey:                           "0",
+		"batch.kubernetes.io/job-name":             "batch-job",
+		"batch.kubernetes.io/job-completion-index": "0",
+		"batch.kubernetes.io/controller-uid":       "controller-uid",
+	}
+
+	got := podGroupLabelsFromPod(podLabels)
+	want := map[string]string{
+		"app":                     "training",
+		"tenant":                  "research",
+		scheduling.PodPreemptable: "true",
+	}
+	assert.Equal(t, want, got)
+
+	podLabels["tenant"] = "production"
+	assert.Equal(t, "research", got["tenant"], "PodGroup labels must not alias Pod labels")
+}
+
+func TestPodGroupLabelSynchronization(t *testing.T) {
+	c := newFakeController()
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "worker-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                   "training",
+				"tenant":                "research",
+				podTemplateHashLabelKey: "old-revision",
+			},
+		},
+	}
+
+	podGroup := c.buildPodGroupFromPod(pod, "podgroup-owner")
+	assert.Equal(t, map[string]string{"app": "training", "tenant": "research"}, podGroup.Labels)
+
+	pod.Labels["tenant"] = "production"
+	pod.Labels[podTemplateHashLabelKey] = "new-revision"
+	assert.True(t, c.shouldUpdateExistingPodGroup(podGroup, pod))
+	assert.Equal(t, map[string]string{"app": "training", "tenant": "production"}, podGroup.Labels)
+}
+
+func TestMergePodGroupAnnotationsPreservesRuntimeLease(t *testing.T) {
+	existing := map[string]string{
+		"volcano.sh/custom-key":                      "old",
+		"repack.volcano.sh/placement-lease":          "run-a/uid-a",
+		"example.com/controller-owned-runtime-state": "keep",
+	}
+	desired := map[string]string{
+		"volcano.sh/custom-key":                      "new",
+		"scheduling.volcano.sh/group-min-member":     "3",
+		"example.com/controller-owned-runtime-state": "must-not-overwrite",
+	}
+
+	got := mergePodGroupAnnotations(existing, desired)
+	assert.Equal(t, "new", got["volcano.sh/custom-key"])
+	assert.Equal(t, "3", got["scheduling.volcano.sh/group-min-member"])
+	assert.Equal(t, "run-a/uid-a", got["repack.volcano.sh/placement-lease"])
+	assert.Equal(t, "keep", got["example.com/controller-owned-runtime-state"])
+	// Omission intentionally retains the last Volcano-derived value: pg-controller
+	// must not use a rollout update as an implicit delete for runtime state.
+	assert.Equal(t, "old", mergePodGroupAnnotations(existing, nil)["volcano.sh/custom-key"])
+}
+
+func TestPodLabelUpdateEnqueuesOnlyLabelChanges(t *testing.T) {
+	c := newFakeController()
+	oldPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "worker-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "training"},
+		},
+	}
+
+	c.updatePod(oldPod, oldPod.DeepCopy())
+	assert.Zero(t, c.queue.Len())
+
+	updatedPod := oldPod.DeepCopy()
+	updatedPod.Labels["tenant"] = "research"
+	c.updatePod(oldPod, updatedPod)
+	assert.Equal(t, 1, c.queue.Len())
+
+	item, shutdown := c.queue.Get()
+	assert.False(t, shutdown)
+	c.queue.Done(item)
 }
 
 func Test_pgcontroller_updateExistingPodGroup(t *testing.T) {

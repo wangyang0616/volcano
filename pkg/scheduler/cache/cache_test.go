@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 
+	vcclientfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
@@ -426,4 +428,36 @@ func (m *mockPreBinder) PreBind(ctx context.Context, bindCtx *BindContext) error
 
 func (m *mockPreBinder) PreBindRollBack(ctx context.Context, bindCtx *BindContext) {
 	// do nothing
+}
+func TestEnsureDefaultAndRootQueues(t *testing.T) {
+	const defaultQueue = "default"
+	client := vcclientfake.NewSimpleClientset()
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := EnsureDefaultAndRootQueues(client, defaultQueue); err != nil {
+				t.Errorf("EnsureDefaultAndRootQueues() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	root, err := client.SchedulingV1beta1().Queues().Get(context.TODO(), "root", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get root queue: %v", err)
+	}
+	if root.Spec.Reclaimable == nil || *root.Spec.Reclaimable {
+		t.Fatalf("root queue reclaimable = %v, want false", root.Spec.Reclaimable)
+	}
+
+	def, err := client.SchedulingV1beta1().Queues().Get(context.TODO(), defaultQueue, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get default queue: %v", err)
+	}
+	if def.Spec.Reclaimable == nil || !*def.Spec.Reclaimable {
+		t.Fatalf("default queue reclaimable = %v, want true", def.Spec.Reclaimable)
+	}
 }

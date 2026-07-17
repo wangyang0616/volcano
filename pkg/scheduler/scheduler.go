@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
+	vcclient "volcano.sh/apis/pkg/client/clientset/versioned"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
 	"volcano.sh/volcano/pkg/filewatcher"
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
@@ -74,6 +75,18 @@ func NewScheduler(config *rest.Config, opt *options.ServerOption) (*Scheduler, e
 	}
 
 	cache := schedcache.New(config, opt.SchedulerNames, opt.DefaultQueue, opt.NodeSelector, opt.NodeWorkerThreads, opt.IgnoredCSIProvisioners, opt.ResyncPeriod)
+
+	// Cluster bootstrap: ensure the default/root queues exist. This used to be a
+	// side effect of building the cache; it now lives here as an explicit scheduler
+	// startup step, so the cache stays a pure constructor reusable by read-only
+	// consumers (e.g. the repack engine) without queue-create RBAC.
+	vcClient, err := vcclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed building volcano client for queue bootstrap: %v", err)
+	}
+	if err := schedcache.EnsureDefaultAndRootQueues(vcClient, opt.DefaultQueue); err != nil {
+		return nil, fmt.Errorf("failed to ensure default/root queues: %v", err)
+	}
 	scheduler := &Scheduler{
 		schedulerConf:      opt.SchedulerConf,
 		fileWatcher:        watcher,

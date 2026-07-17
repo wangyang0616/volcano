@@ -600,6 +600,14 @@ func closeSession(ssn *Session) {
 
 	updateQueueStatus(ssn)
 
+	closeSessionCleanup(ssn)
+}
+
+// closeSessionCleanup releases in-memory session state and the cache's
+// per-session snapshot. It performs NO cluster writes — the PodGroup/Queue
+// status write-back lives in closeSession — so it can be reused by a read-only
+// session close (CloseSessionReadOnly).
+func closeSessionCleanup(ssn *Session) {
 	ssn.Jobs = nil
 	ssn.Nodes = nil
 	ssn.RevocableNodes = nil

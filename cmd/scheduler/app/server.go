@@ -76,7 +76,10 @@ func Run(opt *options.ServerOption) error {
 
 	sched, err := scheduler.NewScheduler(config, opt)
 	if err != nil {
-		panic(err)
+		// Any scheduler-construction failure (config filewatcher, volcano client, or
+		// default/root queue bootstrap) is fatal: log it through klog at FATAL for a
+		// clean, flushed, alertable line, then exit. Matches k8s startup conventions.
+		klog.Fatalf("failed to initialize scheduler: %v", err)
 	}
 
 	// InitKubeSchedulerRelatedMetrics must always be called to initialize

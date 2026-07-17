@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	"volcano.sh/apis/pkg/apis/helpers"
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	vcinformer "volcano.sh/apis/pkg/client/informers/externalversions"
@@ -91,7 +92,8 @@ func (pg *pgcontroller) Initialize(opt *framework.ControllerOption) error {
 	pg.podInformer = opt.SharedInformerFactory.Core().V1().Pods()
 	pg.podLister = pg.podInformer.Lister()
 	pg.podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: pg.addPod,
+		AddFunc:    pg.addPod,
+		UpdateFunc: pg.updatePod,
 	})
 
 	factory := opt.VCSharedInformerFactory
@@ -164,14 +166,16 @@ func (pg *pgcontroller) processNextReq() bool {
 		return true
 	}
 
-	if pod.Annotations != nil && pod.Annotations[scheduling.KubeGroupNameAnnotationKey] != "" {
-		klog.V(5).Infof("pod %v/%v has created podgroup", pod.Namespace, pod.Name)
+	pgName := helpers.GeneratePodgroupName(pod)
+	if assignedPGName := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]; assignedPGName != "" && assignedPGName != pgName {
+		klog.V(5).Infof("pod %v/%v is associated with PodGroup %s", pod.Namespace, pod.Name, assignedPGName)
 		return true
 	}
 
-	// normal pod use volcano
-	klog.V(4).Infof("Try to create podgroup for pod %s/%s", pod.Namespace, pod.Name)
-	if err := pg.createNormalPodPGIfNotExist(pod); err != nil {
+	// Normal pods use the deterministic, controller-managed PodGroup name. This
+	// also updates inherited labels after a pod-template label change.
+	klog.V(4).Infof("Try to create or update PodGroup for pod %s/%s", pod.Namespace, pod.Name)
+	if err := pg.createOrUpdateNormalPodPG(pod); err != nil {
 		klog.Errorf("Failed to handle Pod <%s/%s>: %v", pod.Namespace, pod.Name, err)
 		pg.queue.AddRateLimited(req)
 		return true

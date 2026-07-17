@@ -96,7 +96,12 @@ func init() {
 	utilruntime.Must(schemeBuilder.AddToScheme(scheme.Scheme))
 }
 
-// New returns a Cache implementation.
+// New returns a Cache implementation. New is a pure constructor: it builds the
+// in-memory cache and wires informers, but performs NO cluster writes. Creating
+// the default/root queues is a cluster-bootstrap concern owned by the scheduler
+// startup (see EnsureDefaultAndRootQueues), so read-only consumers that reuse the
+// cache (e.g. the repack engine) get an identical cluster view without needing
+// queue-create RBAC and without racing the scheduler to create the singletons.
 func New(config *rest.Config, schedulerNames []string, defaultQueue string, nodeSelectors []string, nodeWorkers uint32, ignoredProvisioners []string, resyncPeriod time.Duration) Cache {
 	return newSchedulerCache(config, schedulerNames, defaultQueue, nodeSelectors, nodeWorkers, ignoredProvisioners, resyncPeriod)
 }
@@ -446,59 +451,66 @@ func (sc *SchedulerCache) setBatchBindParallel() {
 	}
 }
 
-// newDefaultAndRootQueue init default queue and root queue
-func newDefaultAndRootQueue(vcClient vcclient.Interface, defaultQueue string) {
-	reclaimable := false
-	rootQueue := vcv1beta1.Queue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "root",
-		},
-		Spec: vcv1beta1.QueueSpec{
-			Reclaimable: &reclaimable,
-			Weight:      1,
-		},
-	}
+// EnsureDefaultAndRootQueues creates the cluster's root and default queues if
+// absent. This is a cluster-bootstrap concern owned by the scheduler startup and
+// is deliberately kept OUT of New(), so the cache stays a pure, side-effect-free
+// constructor. It returns an error (rather than calling Fatalf, as a constructor
+// once did): the caller — the scheduler's startup — decides how fatal a failure
+// is, while read-only consumers of the cache simply never call it.
+func EnsureDefaultAndRootQueues(vcClient vcclient.Interface, defaultQueue string) error {
+	createIfNotExists := func(name string, reclaimable bool) error {
+		_, err := vcClient.SchedulingV1beta1().Queues().Get(context.TODO(), name, metav1.GetOptions{})
+		if err == nil {
+			klog.V(2).Infof("Queue %s already exists, skip creating.", name)
+			return nil
+		}
 
-	err := retry.OnError(wait.Backoff{
-		Steps:    60,
-		Duration: time.Second,
-		Factor:   1,
-		Jitter:   0.1,
-	}, func(err error) bool {
-		return !apierrors.IsAlreadyExists(err)
-	}, func() error {
-		_, err := vcClient.SchedulingV1beta1().Queues().Create(context.TODO(), &rootQueue, metav1.CreateOptions{})
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get queue %s: %w", name, err)
+		}
+
+		// If queue does not exist, start to create it
+		newQueue := vcv1beta1.Queue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+			Spec: vcv1beta1.QueueSpec{
+				Reclaimable: &reclaimable,
+				Weight:      1,
+			},
+		}
+
+		err = retry.OnError(wait.Backoff{
+			Steps:    60,
+			Duration: time.Second,
+			Factor:   1,
+			Jitter:   0.1,
+		}, func(err error) bool {
+			return !apierrors.IsAlreadyExists(err)
+		}, func() error {
+			_, err := vcClient.SchedulingV1beta1().Queues().Create(context.TODO(), &newQueue, metav1.CreateOptions{})
+			return err
+		})
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
 		return err
-	})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		panic(fmt.Errorf("failed init root queue, with err: %v", err))
 	}
 
-	reclaimable = true
-	defaultQue := vcv1beta1.Queue{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: defaultQueue,
-		},
-		Spec: vcv1beta1.QueueSpec{
-			Reclaimable: &reclaimable,
-			Weight:      1,
-		},
+	if err := createIfNotExists("root", false); err != nil {
+		return fmt.Errorf("init root queue: %w", err)
 	}
 
-	err = retry.OnError(wait.Backoff{
-		Steps:    60,
-		Duration: time.Second,
-		Factor:   1,
-		Jitter:   0.1,
-	}, func(err error) bool {
-		return !apierrors.IsAlreadyExists(err)
-	}, func() error {
-		_, err := vcClient.SchedulingV1beta1().Queues().Create(context.TODO(), &defaultQue, metav1.CreateOptions{})
-		return err
-	})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		panic(fmt.Errorf("failed init default queue, with err: %v", err))
+	if err := createIfNotExists(defaultQueue, true); err != nil {
+		return fmt.Errorf("init default queue: %w", err)
 	}
+	return nil
+}
+
+func schedulerShardingEnabled() bool {
+	return options.ServerOpts != nil &&
+		(options.ServerOpts.ShardingMode == util.HardShardingMode ||
+			options.ServerOpts.ShardingMode == util.SoftShardingMode)
 }
 
 func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueue string, nodeSelectors []string, nodeWorkers uint32, ignoredProvisioners []string, resyncPeriod time.Duration) *SchedulerCache {
@@ -515,9 +527,10 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 		panic(fmt.Sprintf("failed init eventClient, with err: %v", err))
 	}
 
-	// create default queue and root queue
-	klog.Infof("Creating default queue and root queue")
-	newDefaultAndRootQueue(vcClient, defaultQueue)
+	// NOTE: default/root queue creation is intentionally NOT done here — it is a
+	// cluster-bootstrap side effect that belongs to the scheduler's startup, not
+	// to constructing an in-memory cache. The scheduler calls
+	// EnsureDefaultAndRootQueues explicitly; read-only consumers skip it.
 
 	errTaskRateLimiter := workqueue.NewTypedMaxOfRateLimiter[string](
 		workqueue.NewTypedItemExponentialFailureRateLimiter[string](5*time.Millisecond, 1000*time.Second),
@@ -553,7 +566,7 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 		nodeWorkers: nodeWorkers,
 	}
 
-	if options.ServerOpts.ShardingMode == util.HardShardingMode || options.ServerOpts.ShardingMode == util.SoftShardingMode {
+	if schedulerShardingEnabled() {
 		sc.shardUpdateCoordinator = NewShardUpdateCoordinator()
 	}
 
@@ -783,7 +796,7 @@ func (sc *SchedulerCache) addEventHandler() {
 		DeleteFunc: sc.DeleteHyperNode,
 	})
 
-	if options.ServerOpts.ShardingMode == commonutil.HardShardingMode || options.ServerOpts.ShardingMode == commonutil.SoftShardingMode {
+	if schedulerShardingEnabled() {
 		sc.nodeShardInformer = sc.vcInformerFactory.Shard().V1alpha1().NodeShards()
 		sc.nodeShardInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    sc.AddNodeShard,

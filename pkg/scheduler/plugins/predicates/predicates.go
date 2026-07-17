@@ -24,6 +24,8 @@ package predicates
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sort"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -341,6 +343,19 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 			}
 		}
 
+		// Keep topology-spread state in sync too, so the full-filter
+		// SimulatePredicateFn sees the added pod when checking spread constraints.
+		if pp.enabledPredicates.podTopologySpreadEnable {
+			if topologyFilter, exist := pp.FilterPlugins[podtopologyspread.Name].(*podtopologyspread.PodTopologySpread); exist {
+				if !handleSkipPredicatePlugin(cycleState, topologyFilter.Name()) {
+					status := topologyFilter.AddPod(ctx, cycleState, taskToSchedule.Pod, podInfoToAdd, k8sNodeInfo)
+					if !status.IsSuccess() {
+						return fmt.Errorf("failed to add pod to node %s for topology spread: %w", nodeInfo.Name, status.AsError())
+					}
+				}
+			}
+		}
+
 		return nil
 	})
 
@@ -367,31 +382,124 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				return fmt.Errorf("failed to call %s plugin for task %s/%s on node %s, plugin does not exist", interpodaffinity.Name, taskToRemove.Namespace, taskToRemove.Name, nodeInfo.Name)
 			}
 		}
-		return nil
-	})
 
-	// Add SimulatePredicate function
-	ssn.AddSimulatePredicateFn(pp.Name(), func(ctx context.Context, cycleState fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
-		k8sNodeInfo := k8sframework.NewNodeInfo(node.Pods()...)
-		k8sNodeInfo.SetNode(node.Node)
-
-		if pp.enabledPredicates.podAffinityEnable {
-			isSkipInterPodAffinity := handleSkipPredicatePlugin(cycleState, interpodaffinity.Name)
-			if !isSkipInterPodAffinity {
-				if podAffinityFilter, exist := pp.FilterPlugins[interpodaffinity.Name]; exist {
-					status := podAffinityFilter.Filter(ctx, cycleState, task.Pod, k8sNodeInfo)
+		// Keep topology-spread state in sync too, so the full-filter
+		// SimulatePredicateFn sees the removed pod when checking spread constraints.
+		if pp.enabledPredicates.podTopologySpreadEnable {
+			if topologyFilter, exist := pp.FilterPlugins[podtopologyspread.Name].(*podtopologyspread.PodTopologySpread); exist {
+				if !handleSkipPredicatePlugin(cycleState, topologyFilter.Name()) {
+					status := topologyFilter.RemovePod(ctx, cycleState, taskToSchedule.Pod, podInfoToRemove, k8sNodeInfo)
 					if !status.IsSuccess() {
-						return fmt.Errorf("failed to filter pod on node %s: %w", node.Name, status.AsError())
-					} else {
-						klog.Infof("pod affinity for task %s/%s filter success on node %s", task.Namespace, task.Name, node.Name)
+						return fmt.Errorf("failed to remove pod from node %s for topology spread: %w", nodeInfo.Name, status.AsError())
 					}
-				} else {
-					return fmt.Errorf("failed to call %s plugin for task %s/%s on node %s, plugin does not exist", interpodaffinity.Name, task.Namespace, task.Name, node.Name)
 				}
 			}
 		}
 		return nil
 	})
+
+	// Add SimulatePredicate function: the FULL filter stack for rescheduling
+	// feasibility (repack) and preemption dry-run. It mirrors Predicate's filter
+	// phase, but runs every enabled Filter plugin against the caller's simulated
+	// node — a NodeInfo built from node.Pods() (reflecting simulated
+	// evictions/placements) rather than the shared cache snapshot Predicate reads.
+	ssn.AddSimulatePredicateFn(pp.Name(), func(ctx context.Context, cycleState fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
+		k8sNodeInfo := k8sframework.NewNodeInfo(node.Pods()...)
+		k8sNodeInfo.SetNode(node.Node)
+		if err := pp.simulateFilter(ctx, cycleState, task, k8sNodeInfo); err != nil {
+			return err
+		}
+		// Device-aware feasibility (GPU/NPU sharing, topology) lives on the Volcano
+		// node.Others, not the k8s NodeInfo, so it is not one of the Filter plugins —
+		// check it separately.
+		return pp.filterDevices(task, node)
+	})
+}
+
+// filterDevices runs the Volcano device predicates (GPU/NPU sharing, topology) for
+// task on node, using each registered device's FilterNode (a pure read, no side
+// effects). Shared by SimulatePredicateFn so both preemption and repack judge
+// device availability identically.
+func (pp *PredicatesPlugin) filterDevices(task *api.TaskInfo, node *api.NodeInfo) error {
+	for _, val := range api.RegisteredDevices {
+		devObj, ok := node.Others[val]
+		if !ok {
+			continue
+		}
+		devs, ok := devObj.(api.Devices)
+		if !ok || isNilDevice(devs) {
+			continue
+		}
+		if !devs.HasDeviceRequest(task.Pod) {
+			continue
+		}
+		if code, msg, err := devs.FilterNode(task.Pod, ""); code != 0 || err != nil {
+			klog.Errorf("device %s FilterNode failed for task %s/%s on node %s: code=%d msg=%s err=%v",
+				val, task.Namespace, task.Name, node.Name, code, msg, err)
+			return fmt.Errorf("device %s cannot fit task %s/%s on node %s: %s", val, task.Namespace, task.Name, node.Name, msg)
+		}
+	}
+	return nil
+}
+
+func isNilDevice(device api.Devices) bool {
+	if device == nil {
+		return true
+	}
+	value := reflect.ValueOf(device)
+	return value.Kind() == reflect.Ptr && value.IsNil()
+}
+
+// simulateFilter runs every enabled Filter plugin (stable filters first, then the
+// rest, in registration order) for task against the given nodeInfo. It is the
+// simulation-safe twin of Predicate's filter phase: Predicate re-fetches the node
+// from the shared snapshot lister, whereas this evaluates the caller-supplied
+// nodeInfo, so it correctly reflects a simulated (evicted/relocated) node state.
+// The first plugin whose status is an unschedulable/abort verdict fails the fit.
+func (pp *PredicatesPlugin) simulateFilter(ctx context.Context, state fwk.CycleState, task *api.TaskInfo, nodeInfo fwk.NodeInfo) error {
+	runFilter := func(name string, plugin k8sframework.FilterPlugin) error {
+		if handleSkipPredicatePlugin(state, name) {
+			return nil
+		}
+		status := plugin.Filter(ctx, state, task.Pod, nodeInfo)
+		if !status.IsSuccess() {
+			return fmt.Errorf("plugin %s predicates failed: %s", name, status.Message())
+		}
+		return nil
+	}
+
+	stableNames := make([]string, 0, len(pp.StableFilterPlugins))
+	for name := range pp.StableFilterPlugins {
+		stableNames = append(stableNames, name)
+	}
+	sort.Strings(stableNames)
+	for _, name := range stableNames {
+		plugin, exists := pp.StableFilterPlugins[name]
+		if !exists {
+			continue
+		}
+		if err := runFilter(name, plugin); err != nil {
+			return err
+		}
+	}
+	filterNames := make([]string, 0, len(pp.FilterPlugins))
+	for name := range pp.FilterPlugins {
+		filterNames = append(filterNames, name)
+	}
+	sort.Strings(filterNames)
+	for _, name := range filterNames {
+		plugin, exists := pp.FilterPlugins[name]
+		if !exists {
+			continue
+		}
+		if _, isStable := pp.StableFilterPlugins[name]; isStable {
+			continue // already run in the stable loop above
+		}
+		if err := runFilter(name, plugin); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PrePredicate runs all PreFilter plugins for the given task.

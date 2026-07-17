@@ -41,7 +41,16 @@ import (
 
 const (
 	controllerRevisionHashLabelKey = "controller-revision-hash"
+	podTemplateHashLabelKey        = "pod-template-hash"
+	controllerUIDLabelKey          = "controller-uid"
+	legacyJobNameLabelKey          = "job-name"
+	statefulSetPodNameLabelKey     = "statefulset.kubernetes.io/pod-name"
+	podIndexLabelKey               = "apps.kubernetes.io/pod-index"
 )
+
+var podGroupExcludedPodLabelPrefixes = []string{
+	"batch.kubernetes.io/",
+}
 
 type podRequest struct {
 	podName      string
@@ -69,6 +78,25 @@ func (pg *pgcontroller) addPod(obj interface{}) {
 	}
 
 	pg.queue.Add(req)
+}
+
+// updatePod re-syncs an automatically managed PodGroup only when Pod labels
+// change. Status and other frequent Pod updates must not cause controller work.
+func (pg *pgcontroller) updatePod(oldObj, newObj interface{}) {
+	oldPod, ok := oldObj.(*v1.Pod)
+	if !ok {
+		klog.Errorf("Failed to convert old object %v to v1.Pod", oldObj)
+		return
+	}
+	newPod, ok := newObj.(*v1.Pod)
+	if !ok {
+		klog.Errorf("Failed to convert new object %v to v1.Pod", newObj)
+		return
+	}
+	if reflect.DeepEqual(oldPod.Labels, newPod.Labels) {
+		return
+	}
+	pg.addPod(newPod)
 }
 
 func (pg *pgcontroller) addReplicaSet(obj interface{}) {
@@ -383,7 +411,7 @@ func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) *schedu
 			Name:            pgName,
 			OwnerReferences: newPGOwnerReferences(pod),
 			Annotations:     map[string]string{},
-			Labels:          map[string]string{},
+			Labels:          podGroupLabelsFromPod(pod.Labels),
 		},
 		Spec: scheduling.PodGroupSpec{
 			MinMember:         minMember,
@@ -436,6 +464,44 @@ func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) *schedu
 	}
 
 	return obj
+}
+
+// podGroupLabelsFromPod copies the stable, user-facing labels from a Pod onto
+// an automatically managed PodGroup. Repack selects native workloads through
+// PodGroup labels, so this keeps a workload's pod-template labels available on
+// its scheduling unit without coupling Repack to workload-specific owners.
+//
+// Controller-generated and per-pod labels are deliberately excluded: they
+// either change across rollouts or distinguish replicas in one PodGroup, and
+// therefore would make a PodGroup selector unstable.
+func podGroupLabelsFromPod(podLabels map[string]string) map[string]string {
+	labels := make(map[string]string, len(podLabels))
+	for key, value := range podLabels {
+		if isPodGroupExcludedPodLabel(key) {
+			continue
+		}
+		labels[key] = value
+	}
+	return labels
+}
+
+func isPodGroupExcludedPodLabel(labelKey string) bool {
+	switch labelKey {
+	case podTemplateHashLabelKey,
+		controllerRevisionHashLabelKey,
+		controllerUIDLabelKey,
+		legacyJobNameLabelKey,
+		statefulSetPodNameLabelKey,
+		podIndexLabelKey:
+		return true
+	}
+
+	for _, prefix := range podGroupExcludedPodLabelPrefixes {
+		if strings.HasPrefix(labelKey, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseNetworkTopologyFromPod extracts NetworkTopology configuration from Pod annotations
@@ -493,12 +559,36 @@ func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGro
 		isUpdated = true
 	}
 
-	if !reflect.DeepEqual(newPodGroup.Annotations, podGroup.Annotations) {
-		podGroup.Annotations = newPodGroup.Annotations
+	mergedAnnotations := mergePodGroupAnnotations(podGroup.Annotations, newPodGroup.Annotations)
+	if !reflect.DeepEqual(mergedAnnotations, podGroup.Annotations) {
+		podGroup.Annotations = mergedAnnotations
 		isUpdated = true
 	}
 
 	return isUpdated
+}
+
+// mergePodGroupAnnotations preserves runtime annotations already attached to an
+// automatic PodGroup. The controller owns only Volcano annotation domains; a
+// newer value derived from the Pod or its owner wins, while an omitted value is
+// retained. In particular, Repack's placement lease must survive a native
+// workload's rollout until the Repack engine explicitly releases it.
+func mergePodGroupAnnotations(existing, desired map[string]string) map[string]string {
+	merged := make(map[string]string, len(existing)+len(desired))
+	for key, value := range existing {
+		merged[key] = value
+	}
+	for key, value := range desired {
+		if isVolcanoAnnotation(key) {
+			merged[key] = value
+		}
+	}
+	return merged
+}
+
+func isVolcanoAnnotation(key string) bool {
+	domain, _, found := strings.Cut(key, "/")
+	return found && (domain == "volcano.sh" || strings.HasSuffix(domain, ".volcano.sh"))
 }
 
 func newPGOwnerReferences(pod *v1.Pod) []metav1.OwnerReference {

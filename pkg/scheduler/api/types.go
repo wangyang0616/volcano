@@ -371,8 +371,15 @@ type SimulateRemoveTaskFn func(ctx context.Context, state fwk.CycleState, taskTo
 // SimulateAddTaskFn is the func declaration used to simulate the result of adding a task to a node.
 type SimulateAddTaskFn func(ctx context.Context, state fwk.CycleState, taskToSchedule *TaskInfo, taskInfoToAdd *TaskInfo, nodeInfo *NodeInfo) error
 
-// Simulate the predicate check for a task on a node.
-// Plugins implement this function to verify if the task can be scheduled to the node while maintaining topology constraints
+// SimulatePredicateFn simulates the predicate check for a task on a node. Plugins
+// implement it to verify a task can be scheduled onto the node while maintaining
+// topology constraints. The predicates plugin runs the FULL enabled Filter stack
+// (taints, node affinity, ports, inter-pod affinity, topology spread, devices,
+// volume, DRA, ...) against the caller-supplied nodeInfo and CycleState, so it can
+// be evaluated over a simulated (evicted/relocated) node state — giving exactly
+// what the scheduler would accept at bind time. Both preemption (victim selection)
+// and repack (reschedule feasibility) use it. Resource fit stays the caller's
+// responsibility (via NodeInfo.FutureIdle), matching the scheduler model.
 type SimulatePredicateFn func(ctx context.Context, state fwk.CycleState, task *TaskInfo, nodeInfo *NodeInfo) error
 
 // Simulate the allocatable check for a node
