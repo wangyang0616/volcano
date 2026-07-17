@@ -1,0 +1,69 @@
+<svg viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif" role="img">
+<title>碎片整理目标的泛化框架：三轴，P0 是特例，NVLink/超节点只换扩展点</title>
+<desc>三轴=目标粒度×目标形状×整理域。P0=整node×全局最大×全域。NVLink=island粒度×拓扑相干块×逐island。超节点=HyperNode内k-node块×每域配额k倍数×逐HyperNode。主干与A/B算法不变,只换扩展点。</desc>
+<rect width="900" height="540" fill="#ffffff"/>
+
+<text x="24" y="30" font-size="19" font-weight="700" fill="#1f2328">碎片整理目标的泛化框架（三轴）</text>
+<text x="24" y="54" font-size="12.5" fill="#57606a">P0「整节点」只是三轴的一个特例；NVLink / 超节点只换扩展点，编排骨架与 A/B 算法不变</text>
+
+<g font-size="12" font-weight="700" fill="#fff">
+<rect x="24" y="70" width="150" height="30" rx="5" fill="#57606a"/><text x="34" y="90">场景</text>
+<rect x="178" y="70" width="186" height="30" rx="5" fill="#57606a"/><text x="188" y="90">① 目标粒度（腾空的 bin）</text>
+<rect x="368" y="70" width="200" height="30" rx="5" fill="#57606a"/><text x="378" y="90">② 目标形状（怎样算达标）</text>
+<rect x="572" y="70" width="120" height="30" rx="5" fill="#57606a"/><text x="582" y="90">③ 整理域</text>
+<rect x="696" y="70" width="180" height="30" rx="5" fill="#57606a"/><text x="706" y="90">扩展点 · 阶段</text>
+</g>
+
+<g font-size="12" fill="#1f2328">
+<rect x="24" y="104" width="852" height="48" rx="5" fill="none" stroke="#22c55e" stroke-width="2"/>
+<text x="34" y="133" font-weight="700" fill="#22c55e">P0 · 整节点</text>
+<text x="188" y="133">整 node</text>
+<text x="378" y="133">全局最大化空 node  (B−A)/M</text>
+<text x="582" y="133">全域 scope</text>
+<text x="706" y="127" font-size="11">默认实现</text>
+<text x="706" y="143" font-size="11" font-weight="700" fill="#22c55e">P0（已实现）</text>
+</g>
+
+<g font-size="12" fill="#1f2328">
+<rect x="24" y="158" width="852" height="48" rx="5" fill="none" stroke="#d0d7de"/>
+<text x="34" y="187" font-weight="700">NVLink 节点内</text>
+<text x="188" y="187">NVLink island（节点内）</text>
+<text x="378" y="187">拓扑相干块可用</text>
+<text x="582" y="187">逐 island</text>
+<text x="706" y="181" font-size="11">FragmentScoreFn=</text>
+<text x="706" y="195" font-size="11">NVLinkBlockScore +Fit · <tspan font-weight="700" fill="#0ea5e9">P1</tspan></text>
+</g>
+
+<g font-size="12" fill="#1f2328">
+<rect x="24" y="212" width="852" height="48" rx="5" fill="none" stroke="#d0d7de"/>
+<text x="34" y="241" font-weight="700">超节点维度</text>
+<text x="188" y="241">HyperNode 内 k-node 块</text>
+<text x="378" y="241">每域配额：k 或其倍数 m·k</text>
+<text x="582" y="241">逐 HyperNode</text>
+<text x="706" y="235" font-size="11">PerDomainQuota{k}</text>
+<text x="706" y="249" font-size="11">+ 域枚举 · <tspan font-weight="700" fill="#0ea5e9">P1</tspan></text>
+</g>
+
+<text x="24" y="296" font-size="14" font-weight="700" fill="#1f2328">超节点示意：不腾空整个超节点，而是每个 HyperNode 内腾出 k（或倍数）个空 node</text>
+
+<g>
+  <rect x="24" y="312" width="270" height="120" rx="10" fill="none" stroke="#d0d7de"/>
+  <text x="36" y="332" font-size="12" font-weight="700" fill="#1f2328">HyperNode H1（k=2）</text>
+  <rect x="36" y="344" width="56" height="34" rx="4" fill="#6366f1"/><text x="64" y="365" text-anchor="middle" font-size="11" fill="#fff">满</text>
+  <rect x="100" y="344" width="56" height="34" rx="4" fill="#6366f1"/><text x="128" y="365" text-anchor="middle" font-size="11" fill="#fff">满</text>
+  <rect x="164" y="344" width="56" height="34" rx="4" fill="#6366f1"/><text x="192" y="365" text-anchor="middle" font-size="11" fill="#fff">满</text>
+  <rect x="228" y="344" width="56" height="34" rx="4" fill="#6366f1"/><text x="256" y="365" text-anchor="middle" font-size="11" fill="#fff">满</text>
+  <rect x="36" y="384" width="56" height="34" rx="4" fill="none" stroke="#22c55e" stroke-width="2"/><text x="64" y="405" text-anchor="middle" font-size="11" font-weight="700" fill="#22c55e">空</text>
+  <rect x="100" y="384" width="56" height="34" rx="4" fill="none" stroke="#22c55e" stroke-width="2"/><text x="128" y="405" text-anchor="middle" font-size="11" font-weight="700" fill="#22c55e">空</text>
+  <text x="170" y="406" font-size="11" fill="#57606a">→ 腾出 2 个（=k）</text>
+</g>
+
+<text x="320" y="356" font-size="12.5" fill="#57606a">· 目标形状 = 每域配额：每个 HyperNode 内空 node 数</text>
+<text x="320" y="376" font-size="12.5" fill="#57606a">  对齐到 k 的倍数（≥k），为下一个大 gang 预留整块</text>
+<text x="320" y="396" font-size="12.5" fill="#57606a">· 整理域 = 逐 HyperNode（默认不跨，省拓扑代价）</text>
+<text x="320" y="416" font-size="12.5" fill="#57606a">· 门控按域：每个 HyperNode 独立达标、独立报告</text>
+
+<rect x="24" y="452" width="852" height="60" rx="8" fill="none" stroke="#1f2328"/>
+<text x="38" y="476" font-size="13" font-weight="700" fill="#1f2328">主干不变：编排骨架 + 方案 A/B 算法 + 可调度性(INV-RESCHED) + 扰动评分 全部复用。</text>
+<text x="38" y="498" font-size="12.5" fill="#57606a">三轴 = 三个扩展点的取值：粒度→TargetProfileFn/FragmentScoreFn，形状→RepackBenefitFn，域→域枚举器。新目标 = 新实现，不改主干。</text>
+</svg>

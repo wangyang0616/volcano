@@ -1,0 +1,74 @@
+<svg viewBox="0 0 940 620" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
+  <title>core 的外层调用链</title>
+  <desc>engine reconcile→gate→process：开调度器 Session、ResolveScope、包 Snapshot；再开引擎 Session 跑各 plugin 注册回调、RunActions 跑 repack；action 里 GetCore(drain).Plan(esn)，Execute 再 CommitPlan(Evict)，engine 写回 status。</desc>
+  <style>
+    .t{fill:#111827;} .s{fill:#5b6472;}
+    .m{font-family:ui-monospace,Menlo,monospace;}
+    .eng{fill:#e9f7ef;stroke:#2f9e44;}
+    .ses{fill:#eef4ff;stroke:#1c7ed6;}
+    .act{fill:#fff4e6;stroke:#e8890c;}
+    .card{fill:#ffffff;stroke:#c4cbd4;}
+    .aw{stroke:#5b6472;fill:none;stroke-width:1.6;}
+    text{dominant-baseline:middle;}
+  </style>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#5b6472"/></marker></defs>
+
+  <text x="470" y="22" text-anchor="middle" font-size="15.5" font-weight="700" class="t">图1 · core 在外层怎么被调用（engine → session → action → core）</text>
+
+  <rect x="24" y="42" width="892" height="84" rx="9" class="eng"/>
+  <text x="40" y="60" font-size="12" font-weight="700" class="t">repack-engine（driver）</text>
+  <rect x="40" y="70" width="250" height="46" rx="6" class="card"/><text x="165" y="87" text-anchor="middle" font-size="10.5" class="t m">reconcile(key)  ← 事件</text><text x="165" y="103" text-anchor="middle" font-size="8.5" class="s">是候选(空/Pending) → 首见落 Pending</text>
+  <rect x="308" y="70" width="250" height="46" rx="6" class="card"/><text x="433" y="87" text-anchor="middle" font-size="10.5" class="t m">gate</text><text x="433" y="103" text-anchor="middle" font-size="8.5" class="s">Execute 串行 K=1 + 冷静期</text>
+  <rect x="576" y="70" width="322" height="46" rx="6" class="card"/><text x="737" y="87" text-anchor="middle" font-size="10.5" font-weight="700" class="t m">process(run)</text><text x="737" y="103" text-anchor="middle" font-size="8.5" class="s">放行后开下面两层 Session</text>
+
+  <path d="M737,126 L737,148" class="aw" marker-end="url(#a)"/>
+
+  <rect x="24" y="148" width="892" height="84" rx="9" class="ses"/>
+  <text x="40" y="166" font-size="12" font-weight="700" class="t">① 调度器 Session（复用 volcano-scheduler）</text>
+  <rect x="40" y="176" width="270" height="46" rx="6" class="card"/><text x="175" y="193" text-anchor="middle" font-size="10" class="t m">OpenSession(cache, tiers)</text><text x="175" y="209" text-anchor="middle" font-size="8.5" class="s">得真实 Nodes/Jobs + Predicate</text>
+  <rect x="328" y="176" width="250" height="46" rx="6" class="card"/><text x="453" y="193" text-anchor="middle" font-size="10" class="t m">ResolveScope(scope)</text><text x="453" y="209" text-anchor="middle" font-size="8.5" class="s">→ inScope / nodeInScope</text>
+  <rect x="596" y="176" width="302" height="46" rx="6" class="card"/><text x="747" y="193" text-anchor="middle" font-size="10" class="t m">NewSessionSnapshot(…)</text><text x="747" y="209" text-anchor="middle" font-size="8.5" class="s">Session 适配成 framework.Snapshot</text>
+
+  <path d="M470,232 L470,254" class="aw" marker-end="url(#a)"/>
+
+  <rect x="24" y="254" width="892" height="110" rx="9" class="ses"/>
+  <text x="40" y="272" font-size="12" font-weight="700" class="t">② 引擎 Session（framework.OpenSession → 跑 plugins → RunActions）</text>
+  <rect x="40" y="282" width="410" height="72" rx="6" class="card"/>
+  <text x="245" y="299" text-anchor="middle" font-size="10" class="t m">framework.OpenSession(cfg, plugins)</text>
+  <text x="245" y="317" text-anchor="middle" font-size="8.8" class="s">逐个 plugin.OnSessionOpen 注册回调</text>
+  <text x="245" y="332" text-anchor="middle" font-size="8.8" class="s m">movecost · node · gang</text>
+  <text x="245" y="347" text-anchor="middle" font-size="8.5" class="s">+ driver 注入 scope movable</text>
+  <rect x="468" y="282" width="430" height="72" rx="6" class="card"/>
+  <text x="683" y="299" text-anchor="middle" font-size="10" class="t m">RunActions(["repack"], esn)</text>
+  <text x="683" y="318" text-anchor="middle" font-size="8.8" class="s">cfg 带：Mode · Core=drain · Hooks{Evict,Nominate}</text>
+  <text x="683" y="335" text-anchor="middle" font-size="8.8" class="s">MaxPerRun · MinNodesFreed（来自 spec）</text>
+  <text x="683" y="350" text-anchor="middle" font-size="8.5" class="s">action 有序流水线（P0 只有 repack）</text>
+
+  <path d="M470,364 L470,386" class="aw" marker-end="url(#a)"/>
+
+  <rect x="24" y="386" width="892" height="116" rx="9" class="act"/>
+  <text x="40" y="404" font-size="12" font-weight="700" class="t">③ action: repack.Execute(esn)</text>
+  <rect x="40" y="414" width="300" height="80" rx="6" class="card"/>
+  <text x="190" y="431" text-anchor="middle" font-size="10.5" font-weight="700" class="t m">core := GetCore(CoreName)</text>
+  <text x="190" y="451" text-anchor="middle" font-size="11.5" font-weight="700" fill="#2f9e44" class="m">plan, ok := core.Plan(esn)</text>
+  <text x="190" y="470" text-anchor="middle" font-size="8.5" class="s">← core(drain) 在此跑（见 图2）</text>
+  <text x="190" y="485" text-anchor="middle" font-size="8.3" class="s">core 只读 esn，与 CRD/调度器解耦</text>
+  <rect x="358" y="414" width="258" height="80" rx="6" class="card"/>
+  <text x="487" y="431" text-anchor="middle" font-size="10" class="t m">SetPlan / SetReport</text>
+  <text x="487" y="450" text-anchor="middle" font-size="9.5" class="s m">RenderReport(plan)</text>
+  <text x="487" y="472" text-anchor="middle" font-size="8.7" class="s">DryRun 到此为止</text>
+  <text x="487" y="486" text-anchor="middle" font-size="8.7" class="s">（只出报告）</text>
+  <rect x="634" y="414" width="264" height="80" rx="6" class="card"/>
+  <text x="766" y="431" text-anchor="middle" font-size="10" font-weight="700" class="t m">if Execute:</text>
+  <text x="766" y="450" text-anchor="middle" font-size="9.8" class="t m">CommitPlan(plan, Hooks)</text>
+  <text x="766" y="470" text-anchor="middle" font-size="8.6" class="s">Evict victim（尊重 PDB）</text>
+  <text x="766" y="485" text-anchor="middle" font-size="8.6" class="s">nominations → status，交 controller</text>
+
+  <path d="M470,502 L470,524" class="aw" marker-end="url(#a)"/>
+
+  <rect x="210" y="524" width="520" height="44" rx="9" class="eng"/>
+  <text x="470" y="542" text-anchor="middle" font-size="11" font-weight="700" class="t">engine 写回 RepackRun.status</text>
+  <text x="470" y="558" text-anchor="middle" font-size="8.6" class="s">DryRun→report · Execute→result+nominations · phase/conditions · CloseSession</text>
+
+  <text x="470" y="592" text-anchor="middle" font-size="9" class="s">要点：core 只认 esn（Snapshot + 各 plugin 注册的回调），与调度器/CRD 解耦；两层 Session — 外层看集群，内层是引擎自己的扩展点框架。</text>
+</svg>

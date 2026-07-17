@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Volcano Repack 技术架构图</title>
+  <style>
+    :root {
+      --k8s: #326ce5;
+      --k8s-light: #eef3fc;
+      --k8s-border: #a8c7f5;
+      --orange: #e8590c;
+      --orange-bg: #fff8f3;
+      --orange-border: #ffc9a8;
+      --repack: #0ea5e9;
+      --repack-bg: #f0f9ff;
+      --repack-border: #7dd3fc;
+      --sched: #8250df;
+      --sched-bg: #fbefff;
+      --sched-border: #d8b4fe;
+      --green: #22c55e;
+      --green-bg: #f0fdf4;
+      --gray-bg: #f6f8fa;
+      --gray-border: #d0d7de;
+      --text: #1f2328;
+      --muted: #656d76;
+      --font: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font);
+      background: #fff;
+      color: var(--text);
+      padding: 28px 20px 40px;
+    }
+    .page { max-width: 1200px; margin: 0 auto; }
+
+    .title-bar {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .title-bar h1 {
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--k8s);
+      letter-spacing: 0.02em;
+    }
+    .title-bar p {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    .title-bar .nav {
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    .title-bar .nav a {
+      color: var(--k8s);
+      text-decoration: none;
+      margin: 0 6px;
+    }
+    .title-bar .nav a:hover { text-decoration: underline; }
+
+    /* ── diagram shell ── */
+    .diagram {
+      position: relative;
+      border: 2px dashed var(--k8s-border);
+      border-radius: 4px;
+      padding: 20px 16px 16px;
+      background: #fafcff;
+    }
+    .diagram-label {
+      position: absolute;
+      top: -11px;
+      left: 20px;
+      background: #fff;
+      padding: 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--k8s);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    /* left: external */
+    .external {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding-top: 8px;
+    }
+    .ext-card {
+      border: 1px dashed var(--gray-border);
+      border-radius: 4px;
+      background: #fff;
+      padding: 12px 8px;
+      text-align: center;
+    }
+    .ext-card .icon { font-size: 28px; line-height: 1; margin-bottom: 6px; }
+    .ext-card .name { font-size: 12px; font-weight: 600; }
+    .ext-card .desc { font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+    /* cluster inner */
+    .cluster {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .zone {
+      border: 1.5px dashed var(--gray-border);
+      border-radius: 4px;
+      padding: 14px 14px 12px;
+      background: #fff;
+      position: relative;
+    }
+    .zone-title {
+      position: absolute;
+      top: -10px;
+      left: 14px;
+      background: #fff;
+      padding: 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .zone.repack-zone {
+      border-color: var(--repack-border);
+      background: var(--repack-bg);
+    }
+    .zone.repack-zone .zone-title { color: var(--repack); }
+    .zone.sched-exec-zone {
+      border-color: var(--k8s-border);
+      background: linear-gradient(135deg, var(--repack-bg) 50%, #fbefff 50%);
+    }
+    .zone.sched-exec-zone .zone-title {
+      color: var(--k8s);
+      background: #fafcff;
+    }
+    .tile.sched {
+      border-color: #8250df;
+      box-shadow: 0 0 0 1px rgba(130, 80, 223, 0.12);
+    }
+    .tile.sched .name { color: #6f42c1; }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* component tile */
+    .tile {
+      flex: 0 0 auto;
+      min-width: 120px;
+      max-width: 160px;
+      border: 1px solid var(--gray-border);
+      border-radius: 4px;
+      background: #fff;
+      padding: 10px 10px 8px;
+      text-align: center;
+    }
+    .tile .logo {
+      width: 40px;
+      height: 40px;
+      margin: 0 auto 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .tile .logo svg { width: 36px; height: 36px; }
+    .tile .name {
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.35;
+      color: var(--text);
+      font-family: Consolas, "SF Mono", "PingFang SC", sans-serif;
+    }
+    .tile .sub {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 3px;
+      line-height: 1.35;
+    }
+    .tile.highlight {
+      border-color: var(--repack);
+      box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.15);
+    }
+    .tile.highlight .name { color: #0369a1; }
+
+    .nested-module {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border: 1px solid var(--repack-border);
+      border-radius: 4px;
+      background: var(--repack-bg);
+      text-align: left;
+    }
+    .nested-module .name { font-size: 10px; color: #0369a1; }
+    .nested-module .sub { text-align: left; }
+
+    .zone.control-plane-zone {
+      border-color: var(--orange-border);
+      background: var(--orange-bg);
+    }
+    .zone.control-plane-zone .zone-title {
+      color: var(--orange);
+      background: var(--orange-bg);
+    }
+    .zone.control-plane-zone .tile {
+      flex: 1;
+      min-width: 200px;
+      max-width: 340px;
+      text-align: left;
+    }
+
+    .badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--repack);
+      color: #fff;
+      vertical-align: middle;
+      margin-left: 3px;
+    }
+    .badge.p1 { background: #6366f1; }
+
+    /* ── extension framework section ── */
+    .extension-section { margin-top: 48px; padding-top: 8px; }
+    .extension-section .sub-title {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .extension-section .sub-title h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--repack);
+    }
+    .extension-section .sub-title p {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 900px) { .summary { grid-template-columns: repeat(2, 1fr); } }
+    .sum-card {
+      border: 1.5px solid var(--gray-border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      background: #fff;
+      text-align: center;
+    }
+    .sum-card .num { font-size: 28px; font-weight: 700; color: var(--k8s); line-height: 1.1; }
+    .sum-card .label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .sum-card.highlight { border-color: var(--repack-border); background: var(--repack-bg); }
+    .sum-card.highlight .num { color: var(--repack); }
+    .section-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      margin: 28px 0 12px;
+      padding-left: 10px;
+      border-left: 4px solid var(--k8s);
+    }
+    .extension-section .diagram { margin-bottom: 16px; padding: 18px 14px 14px; }
+    .dual-compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 900px) { .dual-compare { grid-template-columns: 1fr; } }
+    .framework-col {
+      border: 1.5px dashed var(--gray-border);
+      border-radius: 4px;
+      padding: 14px 12px 12px;
+      background: #fff;
+      position: relative;
+    }
+    .framework-col.sched { border-color: var(--sched-border); background: var(--sched-bg); }
+    .framework-col.repack { border-color: var(--repack-border); background: var(--repack-bg); }
+    .col-title {
+      position: absolute;
+      top: -10px;
+      left: 12px;
+      background: inherit;
+      padding: 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .framework-col.sched .col-title { color: var(--sched); }
+    .framework-col.repack .col-title { color: var(--repack); }
+    .pipe {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0;
+    }
+    .pipe-box {
+      width: 100%;
+      max-width: 340px;
+      border: 1.5px solid var(--gray-border);
+      border-radius: 4px;
+      background: #fff;
+      padding: 10px 12px;
+      text-align: center;
+    }
+    .pipe-box .name {
+      font-size: 12px;
+      font-weight: 600;
+      font-family: Consolas, "SF Mono", monospace;
+    }
+    .pipe-box .sub {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 3px;
+      line-height: 1.4;
+    }
+    .pipe-box.cache { border-color: var(--k8s-border); background: var(--k8s-light); }
+    .pipe-box.cache .name { color: var(--k8s); }
+    .pipe-box.session { border-style: dashed; border-color: #94a3b8; }
+    .pipe-box.actions { border-color: var(--sched-border); }
+    .pipe-box.actions .name { color: var(--sched); }
+    .pipe-box.repack-actions { border-color: var(--repack-border); }
+    .pipe-box.repack-actions .name { color: #0369a1; }
+    .pipe-box.core { border-color: var(--orange); background: var(--orange-bg); }
+    .pipe-box.core .name { color: var(--orange); }
+    .pipe-box.plugins {
+      border-color: var(--green);
+      background: var(--green-bg);
+      text-align: left;
+      max-width: 100%;
+    }
+    .pipe-box.plugins .name { color: #15803d; text-align: center; margin-bottom: 6px; }
+    .pipe-arrow {
+      width: 2px;
+      height: 14px;
+      background: #94a3b8;
+      position: relative;
+    }
+    .pipe-arrow::after {
+      content: "";
+      position: absolute;
+      bottom: -1px;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 5px solid transparent;
+      border-top-color: #94a3b8;
+    }
+    .ep-tag {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin: 2px 2px 0 0;
+      background: #e2e8f0;
+      color: #475569;
+      font-family: Consolas, "SF Mono", monospace;
+    }
+    .ep-tag.p0 { background: #dcfce7; color: #166534; }
+    .ep-tag.p1 { background: #dbeafe; color: #1d4ed8; }
+    .ep-tag.reuse { background: #fef3c7; color: #92400e; }
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--gray-border);
+      border-radius: 4px;
+      margin-bottom: 16px;
+    }
+    .extension-section table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    .extension-section th,
+    .extension-section td {
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--gray-border);
+      vertical-align: top;
+    }
+    .extension-section th {
+      background: var(--gray-bg);
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .extension-section tr:last-child td { border-bottom: none; }
+    .extension-section tr.p0-row { background: #fafafa; }
+    .extension-section tr.p1-row td:first-child { color: #6366f1; }
+    .extension-section code {
+      font-family: Consolas, "SF Mono", monospace;
+      font-size: 10px;
+      background: var(--gray-bg);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .scenario-grid {
+      display: grid;
+      grid-template-columns: 130px repeat(4, 1fr);
+      gap: 0;
+      border: 1px solid var(--gray-border);
+      border-radius: 4px;
+      overflow: hidden;
+      font-size: 11px;
+    }
+    @media (max-width: 900px) {
+      .scenario-grid { grid-template-columns: 1fr; }
+      .sg-head:not(:first-child) { display: none; }
+    }
+    .sg-head {
+      background: #57606a;
+      color: #fff;
+      font-weight: 600;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+    }
+    .sg-cell {
+      padding: 10px;
+      border-right: 1px solid var(--gray-border);
+      border-bottom: 1px solid var(--gray-border);
+      line-height: 1.45;
+    }
+    .sg-cell:last-child { border-right: none; }
+    .sg-row-label {
+      background: var(--gray-bg);
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+    }
+    .sg-row-label.p0 { color: var(--green); }
+    .sg-row-label.p1 { color: #6366f1; }
+    .sg-row:last-child .sg-cell { border-bottom: none; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .legend span { display: flex; align-items: center; gap: 5px; }
+    .dot {
+      width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+    }
+    .dot.p0 { background: #dcfce7; border: 1px solid #86efac; }
+    .dot.p1 { background: #dbeafe; border: 1px solid #93c5fd; }
+    .dot.reuse { background: #fef3c7; border: 1px solid #fcd34d; }
+
+    /* CRD pills row */
+    .crd-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      padding: 4px 0;
+    }
+    .crd-pill {
+      font-size: 11px;
+      padding: 5px 12px;
+      border: 1px solid var(--k8s-border);
+      border-radius: 14px;
+      background: var(--k8s-light);
+      color: var(--k8s);
+      font-weight: 500;
+    }
+    .crd-pill.main {
+      border-color: var(--repack);
+      background: #fff;
+      color: #0369a1;
+      font-weight: 600;
+    }
+    .crd-pill.dim {
+      border-style: dashed;
+      color: var(--muted);
+      background: #fff;
+    }
+
+    /* worker strip */
+    .worker-strip {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .node-box {
+      border: 1px solid var(--gray-border);
+      border-radius: 4px;
+      background: var(--gray-bg);
+      padding: 10px 16px;
+      text-align: center;
+      min-width: 200px;
+    }
+    .node-box .label { font-size: 11px; font-weight: 600; margin-bottom: 6px; }
+    .pods { display: flex; gap: 4px; justify-content: center; flex-wrap: wrap; }
+
+    /* hex pod icon */
+    .hex {
+      width: 28px;
+      height: 32px;
+    }
+
+    /* SVG overlay for arrows */
+    .arrows {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      overflow: visible;
+    }
+    .arrows line, .arrows path {
+      fill: none;
+      stroke: var(--k8s-border);
+      stroke-width: 1.5;
+      stroke-dasharray: 5 4;
+    }
+    .arrows .solid {
+      stroke-dasharray: none;
+      stroke: #94a3b8;
+    }
+    .arrow-label {
+      font-size: 10px;
+      fill: var(--muted);
+      font-family: var(--font);
+    }
+
+    /* flow legend bottom */
+    .flow-bar {
+      margin-top: 14px;
+      border: 1px solid var(--gray-border);
+      border-radius: 4px;
+      background: #fff;
+      padding: 12px 16px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 800px) {
+      .layout { grid-template-columns: 1fr; }
+      .flow-bar { grid-template-columns: 1fr; }
+    }
+    .flow-step {
+      font-size: 11px;
+      color: var(--muted);
+      padding-left: 10px;
+      border-left: 3px solid var(--k8s-border);
+    }
+    .flow-step strong {
+      display: block;
+      color: var(--text);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+    .flow-step.repack { border-left-color: var(--repack); }
+
+    footer {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 11px;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="title-bar">
+      <h1>Volcano Repack 技术架构图</h1>
+      <p>RepackRun · RepackPolicy · repack-controller · volcano-repack-engine</p>
+      <p class="nav">
+        <a href="#topology">部署架构</a>
+        · <a href="#extension-framework">扩展点框架</a>
+        · <a href="repack-lifecycle-journey.html">生命周期旅程</a>
+      </p>
+    </div>
+
+    <div id="topology">
+    <div class="diagram">
+      <span class="diagram-label">Kubernetes 集群</span>
+
+      <div class="layout">
+        <!-- 左侧：外部 -->
+        <div class="external">
+          <div class="ext-card">
+            <div class="icon">👤</div>
+            <div class="name">平台运维</div>
+            <div class="desc">手动触发整理</div>
+          </div>
+          <div class="ext-card">
+            <div class="icon">⌨</div>
+            <div class="name">kubectl / vcctl</div>
+            <div class="desc">CREATE RepackRun<br/>或 RepackPolicy</div>
+          </div>
+          <div class="ext-card">
+            <div class="icon">📋</div>
+            <div class="name">控制台 / CI</div>
+            <div class="desc">DryRun → Execute</div>
+          </div>
+        </div>
+
+        <!-- 右侧：集群内部 -->
+        <div class="cluster">
+
+          <!-- API 资源层 -->
+          <div class="zone">
+            <span class="zone-title">API 资源层 · kube-apiserver</span>
+            <div class="crd-row">
+              <span class="crd-pill">Pod · Node · Job</span>
+              <span class="crd-pill">PodGroup · Queue</span>
+              <span class="crd-pill">HyperNode · Volcano Job</span>
+            </div>
+            <div class="crd-row" style="margin-top:8px;">
+              <span style="font-size:10px;color:var(--muted);align-self:center;margin-right:4px;">repack.volcano.sh</span>
+              <span class="crd-pill main">RepackRun <span class="badge">NEW</span></span>
+              <span class="crd-pill main">RepackPolicy <span class="badge">NEW</span></span>
+            </div>
+            <div style="text-align:center;font-size:10px;color:var(--muted);margin-top:6px;">
+              RepackRun：一次性整理工单 · spec 不可变 · CEL 准入<br/>
+              RepackPolicy：集群级策略 · triggers 自动建 Run · repack-controller 读写
+            </div>
+          </div>
+
+          <!-- Volcano 控制面：webhook 与 controller 并列 -->
+          <div class="zone control-plane-zone">
+            <span class="zone-title">Volcano 控制面 · 独立 Deployment（两模块并列）</span>
+            <div class="row" style="align-items:stretch;justify-content:center;gap:16px;">
+              <div class="tile">
+                <div class="name">volcano-webhook-manager</div>
+                <div class="sub">Job / PodGroup / Queue / HyperNode<br/>Validating · Mutating Webhook</div>
+              </div>
+              <div class="tile">
+                <div class="name">volcano-controller-manager</div>
+                <div class="sub">Job · PodGroup · Queue · HyperNode · JobFlow …</div>
+                <div class="nested-module">
+                  <div class="name">repack-controller<span class="badge">NEW</span></div>
+                  <div class="sub">内嵌于 volcano-controller-manager 同进程部署<br/>
+                    watch RepackPolicy · triggers 自动 CREATE RepackRun · Admit 补全<br/>
+                    RepackRun TTL 回收 · nomination 落点引导</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 调度 / 执行面：repack-engine 与 scheduler 并列 -->
+          <div class="zone sched-exec-zone">
+            <span class="zone-title">调度 / 执行面 · 独立 Deployment（两模块并列）</span>
+            <div class="row" style="align-items:stretch;justify-content:center;gap:16px;">
+              <div class="tile highlight" style="flex:1;min-width:200px;max-width:300px;">
+                <div class="name">volcano-repack-engine<span class="badge">NEW</span></div>
+                <div class="sub">watch RepackRun · 复用 scheduler-conf<br/>DryRun 模拟 / Execute Eviction<br/>写 status · K=1 · cooldown</div>
+              </div>
+              <div class="tile sched" style="flex:1;min-width:200px;max-width:300px;">
+                <div class="name">volcano-scheduler</div>
+                <div class="sub">allocate · preempt · gang 调度<br/>不 watch RepackRun<br/>驱逐后 Pending Pod bind 落子</div>
+              </div>
+            </div>
+            <div style="text-align:center;font-size:10px;color:var(--muted);margin-top:10px;line-height:1.5;padding:0 8px;">
+              二者独立部署、共享 <code style="font-size:10px;">--scheduler-conf</code> 视图；volcano-repack-engine 负责规划 + Eviction，volcano-scheduler 负责 allocate · 可 honor <code style="font-size:10px;">nominatedNodeName</code>
+            </div>
+          </div>
+
+          <!-- Worker -->
+          <div class="zone">
+            <span class="zone-title">Worker Node · 计算节点</span>
+            <div class="worker-strip">
+              <div class="node-box">
+                <div class="label">GPU / AI 工作负载</div>
+                <div class="pods">
+                  <svg class="hex" viewBox="0 0 28 32"><polygon points="14,1 27,8 27,24 14,31 1,24 1,8" fill="#326ce5" opacity=".85"/></svg>
+                  <svg class="hex" viewBox="0 0 28 32"><polygon points="14,1 27,8 27,24 14,31 1,24 1,8" fill="#326ce5" opacity=".65"/></svg>
+                  <svg class="hex" viewBox="0 0 28 32"><polygon points="14,1 27,8 27,24 14,31 1,24 1,8" fill="#326ce5" opacity=".45"/></svg>
+                  <svg class="hex" viewBox="0 0 28 32"><polygon points="14,1 27,8 27,24 14,31 1,24 1,8" fill="#94a3b8" opacity=".4"/></svg>
+                </div>
+                <div style="font-size:10px;color:var(--muted);margin-top:4px;">Pod · Volcano Job · Gang</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- 数据流说明 -->
+      <div class="flow-bar">
+        <div class="flow-step repack">
+          <strong>① 手动触发</strong>
+          CREATE RepackRun → CEL 校验 → volcano-repack-engine 处理
+        </div>
+        <div class="flow-step repack">
+          <strong>② 策略触发</strong>
+          CREATE RepackPolicy → repack-controller 自动建 RepackRun
+        </div>
+        <div class="flow-step repack">
+          <strong>③ DryRun / Execute</strong>
+          engine 模拟或 Eviction → controller nomination → scheduler allocate
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:24px;border:1.5px dashed var(--repack-border);border-radius:4px;padding:18px 16px 14px;background:var(--repack-bg);position:relative;">
+      <span style="position:absolute;top:-10px;left:16px;background:var(--repack-bg);padding:0 8px;font-size:12px;font-weight:600;color:var(--repack);">Repack 组件协作</span>
+      <div style="display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:0;padding:8px 0;">
+        <div class="tile" style="min-width:90px;border-color:var(--k8s-border);">
+          <div class="name" style="font-size:10px;">用户</div>
+          <div class="sub">CREATE</div>
+        </div>
+        <svg width="40" height="20" style="flex-shrink:0;"><path d="M4 10 H32 M28 6 L36 10 L28 14" stroke="#94a3b8" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/></svg>
+        <div class="tile highlight" style="min-width:100px;">
+          <div class="name" style="font-size:10px;">RepackPolicy</div>
+          <div class="sub">策略</div>
+        </div>
+        <svg width="40" height="20"><path d="M4 10 H32 M28 6 L36 10 L28 14" stroke="#0f766e" stroke-width="1.5" fill="none"/></svg>
+        <div class="tile highlight" style="min-width:115px;">
+          <div class="name" style="font-size:10px;">repack-controller</div>
+          <div class="sub">建 Run · Admit</div>
+        </div>
+        <svg width="32" height="20" style="flex-shrink:0;"><path d="M4 10 H24 M20 6 L28 10 L20 14" stroke="#94a3b8" stroke-width="1.5" fill="none"/></svg>
+        <div class="tile highlight" style="min-width:100px;">
+          <div class="name" style="font-size:10px;">RepackRun</div>
+          <div class="sub">spec / status</div>
+        </div>
+        <svg width="40" height="20"><path d="M4 10 H32 M28 6 L36 10 L28 14" stroke="#0ea5e9" stroke-width="1.5" fill="none"/></svg>
+        <div class="tile highlight" style="min-width:130px;">
+          <div class="name" style="font-size:10px;">volcano-repack-engine</div>
+          <div class="sub">模拟 / Evict</div>
+        </div>
+        <svg width="40" height="20"><path d="M4 10 H32 M28 6 L36 10 L28 14" stroke="#8250df" stroke-width="1.5" fill="none"/></svg>
+        <div class="tile sched" style="min-width:120px;">
+          <div class="name" style="font-size:10px;">volcano-scheduler</div>
+          <div class="sub">allocate</div>
+        </div>
+      </div>
+      <div style="text-align:center;font-size:10px;color:var(--muted);margin-top:8px;line-height:1.5;">
+        也可跳过 RepackPolicy，用户直接 CREATE RepackRun → volcano-repack-engine<br/>
+        进程间无 RPC · 经 kube-apiserver 协作
+      </div>
+    </div>
+    </div><!-- /#topology -->
+
+    <!-- ═══ 扩展点框架 ═══ -->
+    <div id="extension-framework" class="extension-section">
+      <div class="sub-title">
+        <h2>Repack 扩展点框架</h2>
+        <p>镜像 Volcano Scheduler / kube-scheduler 经典「Cache → Session → Action → Plugin」范式<br/>
+          配置入口：<code>--scheduler-conf</code>（与 volcano-scheduler 同一份 ConfigMap）</p>
+      </div>
+
+      <div class="summary">
+        <div class="sum-card highlight">
+          <div class="num">17</div>
+          <div class="label">Repack 扩展点<strong>类型</strong><br/>3 结构槽 + 4 引擎回调 + 10 策略钩子</div>
+        </div>
+        <div class="sum-card">
+          <div class="num">11</div>
+          <div class="label">内置可配置<strong>实现</strong><br/>6 plugin + 3 action + 2 core</div>
+        </div>
+        <div class="sum-card">
+          <div class="num">7</div>
+          <div class="label">P0 已落地 / 默认启用<br/>3 plugin + 1 action + 1 core + 2 复用</div>
+        </div>
+        <div class="sum-card">
+          <div class="num">5</div>
+          <div class="label">典型<strong>场景</strong>行<br/>见下方场景矩阵</div>
+        </div>
+      </div>
+
+      <div class="section-title">① 经典框架对比（与 Volcano Scheduler 同构）</div>
+      <div class="diagram">
+        <span class="diagram-label">Scheduling Framework · 一次 Session 的生命周期</span>
+        <div class="dual-compare">
+          <div class="framework-col sched">
+            <span class="col-title">volcano-scheduler（已有）</span>
+            <div class="pipe">
+              <div class="pipe-box cache">
+                <div class="name">Informer + Cache</div>
+                <div class="sub">Pod · Node · PodGroup · Queue …<br/>持续同步，唯一事实源</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box">
+                <div class="name">runOnce() 调度周期</div>
+                <div class="sub">默认 ~1s 一轮</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box session">
+                <div class="name">OpenSession(cache.Snapshot())</div>
+                <div class="sub">快照 + 各 plugin 注册扩展函数<br/><span class="ep-tag reuse">PredicateFn</span><span class="ep-tag reuse">NodeOrderFn</span><span class="ep-tag reuse">UnifiedEvictableFn</span> …</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box actions">
+                <div class="name">actions（有序流水线）</div>
+                <div class="sub">enqueue → allocate → backfill → preempt → reclaim<br/>每 action 调用已注册的 Session 函数</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box plugins">
+                <div class="name">tiers / plugins（可组合）</div>
+                <span class="ep-tag reuse">predicates</span>
+                <span class="ep-tag reuse">nodeorder</span>
+                <span class="ep-tag reuse">binpack</span>
+                <span class="ep-tag reuse">gang</span>
+                <span class="ep-tag reuse">hypernode</span>
+                <span class="ep-tag reuse">pdb</span>
+                <span class="ep-tag reuse">priority</span>
+                <span class="ep-tag reuse">proportion</span>
+                <span class="ep-tag reuse">drf</span>
+                <div class="sub" style="margin-top:6px;">OnSessionOpen 注册 · OnSessionClose 清理</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box">
+                <div class="name">CloseSession → Bind Pod</div>
+                <div class="sub">allocate 落子 · 不读 RepackRun</div>
+              </div>
+            </div>
+          </div>
+          <div class="framework-col repack">
+            <span class="col-title">volcano-repack-engine<span class="badge">NEW</span></span>
+            <div class="pipe">
+              <div class="pipe-box cache">
+                <div class="name">Informer + Cache</div>
+                <div class="sub">独立进程自有 cache<br/>+ 复用 scheduler-conf 的 tiers</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box">
+                <div class="name">RunOnce(RepackRun)</div>
+                <div class="sub">watch RepackRun · K=1 · cooldown</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box session">
+                <div class="name">OpenSession(snapshot, plugins)</div>
+                <div class="sub">引擎 Session + 可调度性预言机<br/><span class="ep-tag p0">AddDomainFn</span><span class="ep-tag p0">AddDisruptionScoreFn</span><span class="ep-tag p1">AddMovableFn</span><span class="ep-tag p1">AddPredicateFn</span></div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box repack-actions">
+                <div class="name">actions（有序流水线）</div>
+                <div class="sub"><strong>P0</strong> <code>repack</code><br/><strong>P1</strong> <code>relief</code> → <code>simulate</code>（可追加）</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box core">
+                <div class="name">core（单选 · 互斥）</div>
+                <div class="sub"><strong>P0</strong> <code>drain</code> 节点腾空法<br/><strong>P1</strong> <code>concentration</code> 集中度爬山<br/>一次 Run 只跑一个 core</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box plugins">
+                <div class="name">repack plugins（可组合）</div>
+                <span class="ep-tag p0">base</span>
+                <span class="ep-tag p0">node</span>
+                <span class="ep-tag p0">gang</span>
+                <span class="ep-tag p1">hypernode</span>
+                <span class="ep-tag p1">pdb</span>
+                <span class="ep-tag p1">priority</span>
+                <div class="sub" style="margin-top:6px;">注册 Domain / Movable / DisruptionScore<br/>+ 复用 scheduler PredicateFn 做 INV-RESCHED</div>
+              </div>
+              <div class="pipe-arrow"></div>
+              <div class="pipe-box">
+                <div class="name">DryRun → report · Execute → Evict</div>
+                <div class="sub">写 status · controller nomination → scheduler allocate</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="dot p0"></i> P0 已落地 / 默认路径</span>
+          <span><i class="dot p1"></i> P1 预留接口 / 插件名</span>
+          <span><i class="dot reuse"></i> 复用 Volcano Scheduler Session 函数</span>
+        </div>
+      </div>
+
+      <div class="section-title">② 扩展点类型清单（共 17 种接口）</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:36px">#</th>
+              <th style="width:90px">层级</th>
+              <th style="width:180px">扩展点</th>
+              <th style="width:100px">组合语义</th>
+              <th>职责 / 默认实现</th>
+              <th style="width:52px">阶段</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="6" style="background:#f0f9ff;font-weight:600;color:#0369a1;">A. 结构槽（3）— 在配置里选用，决定「跑什么组件」</td></tr>
+            <tr class="p0-row">
+              <td>1</td><td>结构槽</td><td><code>Plugin</code></td><td>多个可开</td>
+              <td>能力 / 场景插件：<code>base</code>·<code>node</code>·<code>gang</code>（P0）·<code>hypernode</code>·<code>pdb</code>·<code>priority</code>（P1）</td><td>P0/P1</td>
+            </tr>
+            <tr class="p0-row">
+              <td>2</td><td>结构槽</td><td><code>Action</code></td><td>有序串联</td>
+              <td>流水线阶段：<code>repack</code>（P0）·<code>relief</code>·<code>simulate</code>（P1）</td><td>P0/P1</td>
+            </tr>
+            <tr class="p0-row">
+              <td>3</td><td>结构槽</td><td><code>Core</code></td><td>单选互斥</td>
+              <td>搜索策略：<code>drain</code> 腾空法（P0）·<code>concentration</code> 集中度法（P1）</td><td>P0/P1</td>
+            </tr>
+            <tr><td colspan="6" style="background:#f0fdf4;font-weight:600;color:#15803d;">B. 引擎 Session 回调（4）— plugin 在 OnSessionOpen 注册</td></tr>
+            <tr class="p0-row">
+              <td>4</td><td>引擎回调</td><td><code>AddDomainFn</code></td><td>union 并集</td>
+              <td>可释放单元枚举（node 一节点一单元；hypernode 更大块）；core 综合最优</td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>5</td><td>引擎回调</td><td><code>AddDisruptionScoreFn</code></td><td>加权归一化</td>
+              <td>扰动评分：<code>base</code>（PG数/GPU/Pod）· <code>gang</code>（破组/受损卡）</td><td>P0</td>
+            </tr>
+            <tr class="p1-row">
+              <td>6</td><td>引擎回调</td><td><code>AddMovableFn</code></td><td>AND 短路</td>
+              <td>可动性门控：PDB / 冻结 scope / 优先级保护</td><td>P1</td>
+            </tr>
+            <tr class="p1-row">
+              <td>7</td><td>引擎回调</td><td><code>AddPredicateFn</code></td><td>AND 短路</td>
+              <td>额外落点过滤（与 snapshot.Predicate 叠加）</td><td>P1</td>
+            </tr>
+            <tr><td colspan="6" style="background:#fef3c7;font-weight:600;color:#92400e;">C. 策略钩子（10）— §4.16 编排层</td></tr>
+            <tr class="p0-row">
+              <td>8</td><td>策略钩子</td><td><code>FragmentScoreFn</code></td><td>可组合</td>
+              <td>碎片度量；默认空节点口径 <code>(B−A)/M</code></td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>9</td><td>策略钩子</td><td><code>FragWeightFn</code></td><td>可组合</td>
+              <td>多层 / 多画像 KPI 加权合成</td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>10</td><td>策略钩子</td><td><code>RepackBenefitFn</code></td><td>bool 门控</td>
+              <td>收益判定：是否值得整理</td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>11</td><td>策略钩子</td><td><code>TargetProfileFn</code></td><td>可组合</td>
+              <td>目标画像来源：Pending + Default</td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>12</td><td>策略钩子</td><td><code>DisruptionCostFn</code></td><td>排序</td>
+              <td>victim 中断代价；资格复用 <code>UnifiedEvictableFn</code></td><td>P0</td>
+            </tr>
+            <tr class="p0-row">
+              <td>13</td><td>策略钩子</td><td><code>HyperNodeGradientForSubJobFn</code></td><td>复用</td>
+              <td>整理域 / 拓扑遍历顺序</td><td>复用</td>
+            </tr>
+            <tr class="p1-row">
+              <td>14</td><td>策略钩子</td><td><code>RepackDomainOrderFn</code></td><td>域顺序</td>
+              <td>整理域枚举 / 遍历顺序</td><td>P1</td>
+            </tr>
+            <tr class="p1-row">
+              <td>15</td><td>策略钩子</td><td><code>RepackPlanScoreFn</code></td><td>argmin</td>
+              <td>多候选 plan 择优</td><td>P1</td>
+            </tr>
+            <tr class="p1-row">
+              <td>16</td><td>策略钩子</td><td><code>ConsolidationGainFn</code></td><td>精修</td>
+              <td>集中度收益 ΔΣused²</td><td>P1</td>
+            </tr>
+            <tr class="p1-row">
+              <td>17</td><td>策略钩子</td><td><code>MoveScoreFn</code></td><td>精修</td>
+              <td>单步净分 <code>net = Σgain − λ·cost</code></td><td>P1</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="font-size:11px;color:var(--muted);margin-bottom:20px;">
+        可调度性预言机 <code>ValidatePlan</code> 另复用 scheduler 的 <code>PredicateFn</code> · <code>PrePredicateFn</code> · <code>NodeOrderFn</code> 等。
+      </p>
+
+      <div class="section-title">③ 编排骨架（核心库只编排，策略全可插拔）</div>
+      <div class="diagram" style="background:#fff;">
+        <span class="diagram-label">RepackEngine.Run(ssn) · 一次 pass</span>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px;padding:12px 8px;font-size:11px;">
+          <div class="pipe-box" style="max-width:140px;border-color:var(--repack-border);">
+            <div class="name" style="font-size:11px;">TargetProfileFn</div>
+            <div class="sub">画像</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:140px;border-color:var(--repack-border);">
+            <div class="name" style="font-size:11px;">FragmentScoreFn</div>
+            <div class="sub">before 度量</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:160px;border-color:var(--orange);background:var(--orange-bg);">
+            <div class="name" style="font-size:11px;">for domain</div>
+            <div class="sub">HyperNodeGradient…</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:180px;">
+            <div class="name" style="font-size:11px;">pick victims</div>
+            <div class="sub">DisruptionCost · UnifiedEvictable</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:160px;border-color:var(--k8s-border);background:var(--k8s-light);">
+            <div class="name" style="font-size:11px;">ValidatePlan</div>
+            <div class="sub">INV-RESCHED 预言机</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:140px;border-color:var(--repack-border);">
+            <div class="name" style="font-size:11px;">FragmentScoreFn</div>
+            <div class="sub">after 度量</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:150px;border-color:var(--green);background:var(--green-bg);">
+            <div class="name" style="font-size:11px;">RepackBenefitFn</div>
+            <div class="sub">worth? 门控</div>
+          </div>
+          <span style="color:#94a3b8;">→</span>
+          <div class="pipe-box" style="max-width:130px;">
+            <div class="name" style="font-size:11px;">commit</div>
+            <div class="sub">DryRun / Execute</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-title">④ 扩展点 × 场景矩阵（5 条典型路径）</div>
+      <div class="scenario-grid">
+        <div class="sg-head">场景</div>
+        <div class="sg-head">结构槽</div>
+        <div class="sg-head">引擎回调</div>
+        <div class="sg-head">策略钩子</div>
+        <div class="sg-head">复用 Scheduler</div>
+        <div class="sg-row">
+          <div class="sg-cell sg-row-label p0">P0 · 整节点腾空</div>
+          <div class="sg-cell"><code>node+base+gang</code><br/><code>repack</code> · <code>drain</code></div>
+          <div class="sg-cell"><code>DomainFn</code><br/><code>DisruptionScore</code></div>
+          <div class="sg-cell">空节点 <code>(B−A)/M</code><br/>收益阈值门控</div>
+          <div class="sg-cell"><code>PredicateFn</code><br/><code>ValidatePlan</code></div>
+        </div>
+        <div class="sg-row">
+          <div class="sg-cell sg-row-label p0">P0 · Gang 敏感</div>
+          <div class="sg-cell">+<code>gang</code> plugin</div>
+          <div class="sg-cell"><code>gangBreaches</code><br/><code>damagedGPU</code></div>
+          <div class="sg-cell"><code>DisruptionCostFn</code></div>
+          <div class="sg-cell"><code>UnifiedEvictable</code></div>
+        </div>
+        <div class="sg-row">
+          <div class="sg-cell sg-row-label p1">P1 · NVLink island</div>
+          <div class="sg-cell">+<code>resource-strategy-fit</code></div>
+          <div class="sg-cell">island <code>DomainFn</code></div>
+          <div class="sg-cell"><code>FragmentScoreFn</code>=NVLinkBlock</div>
+          <div class="sg-cell">NVLink 感知 Fit</div>
+        </div>
+        <div class="sg-row">
+          <div class="sg-cell sg-row-label p1">P1 · 超节点 k 配额</div>
+          <div class="sg-cell">+<code>hypernode</code></div>
+          <div class="sg-cell">node + hypernode 并集</div>
+          <div class="sg-cell"><code>PerDomainQuota{k}</code></div>
+          <div class="sg-cell"><code>HyperNodeGradient</code></div>
+        </div>
+        <div class="sg-row">
+          <div class="sg-cell sg-row-label p1">P1 · 解救 Pending</div>
+          <div class="sg-cell"><code>relief</code> · <code>simulate</code></div>
+          <div class="sg-cell">反向 victim 口径</div>
+          <div class="sg-cell">锁定 pending gang</div>
+          <div class="sg-cell">what-if 模拟</div>
+        </div>
+      </div>
+      <div class="legend" style="margin-top:16px;">
+        <span>新目标 = 换扩展点实现，不改编排骨架 + drain/concentration + INV-RESCHED</span>
+      </div>
+    </div>
+
+    <footer>
+      浏览器打开本文件即可预览 · Volcano Repack<br/>
+      <a href="#topology" style="color:var(--k8s);font-size:11px;">↑ 部署架构</a>
+      · <a href="#extension-framework" style="color:var(--repack);font-size:11px;">↑ 扩展点框架</a>
+      · <a href="repack-lifecycle-journey.html" style="color:var(--k8s);font-size:11px;">→ 生命周期旅程图</a>
+    </footer>
+  </div>
+</body>
+</html>
