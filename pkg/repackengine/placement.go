@@ -598,11 +598,7 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 	keys := map[string]struct{}{}
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		if nomination.ExpirationTime == nil || e.now().Before(nomination.ExpirationTime.Time) {
-			continue
-		}
-		switch nomination.Phase {
-		case repackv1alpha1.PodPlacementPrepared, repackv1alpha1.PodPlacementGated, repackv1alpha1.PodPlacementAwaitingCapacity:
+		if placementCanExpire(nomination, e.now()) {
 			keys[placementStatusKey(nomination)] = struct{}{}
 		}
 	}
@@ -612,19 +608,22 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 	klog.V(3).InfoS("repack: replacement placement deadline reached",
 		"run", run.Name, "expiringNominationCount", len(keys))
 	var updatedRun *repackv1alpha1.RepackRun
+	expiredCount := 0
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, run.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
 		changed := false
+		expiredCount = 0
 		for index := range latest.Status.Nominations {
 			nomination := &latest.Status.Nominations[index]
-			if _, found := keys[placementStatusKey(nomination)]; !found {
+			if _, found := keys[placementStatusKey(nomination)]; !found || !placementCanExpire(nomination, e.now()) {
 				continue
 			}
 			nomination.Phase = repackv1alpha1.PodPlacementExpired
 			changed = true
+			expiredCount++
 		}
 		if !changed {
 			return nil
@@ -637,7 +636,21 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 	}
 	if updatedRun != nil {
 		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementExpired,
-			fmt.Sprintf("%d replacement placement intents expired; scheduling gates will be released.", len(keys)))
+			fmt.Sprintf("%d replacement placement intents expired; scheduling gates will be released.", expiredCount))
+		return true, nil
 	}
-	return true, nil
+	return false, nil
+}
+
+func placementCanExpire(nomination *repackv1alpha1.PodNomination, now time.Time) bool {
+	if nomination == nil || nomination.ExpirationTime == nil || now.Before(nomination.ExpirationTime.Time) {
+		return false
+	}
+	switch nomination.Phase {
+	case repackv1alpha1.PodPlacementPrepared, repackv1alpha1.PodPlacementGated,
+		repackv1alpha1.PodPlacementAwaitingCapacity, repackv1alpha1.PodPlacementNominated:
+		return true
+	default:
+		return false
+	}
 }

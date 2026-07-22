@@ -175,6 +175,19 @@ func (n *Nominator) enqueue(obj interface{}) {
 		}
 		return
 	}
+	// A Repack-owned gate/owner marker represents an in-flight protocol that must
+	// be reconciled to completion even after nominatedNodeName has been written.
+	// In particular, a conflict or restart during status persistence, Pod status
+	// patching, or gate removal must not make the Pod disappear from this controller.
+	if hasPlacementGate(pod) || pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "" {
+		key, err := cache.MetaNamespaceKeyFunc(pod)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+		n.workQueue.Add(key)
+		return
+	}
 	if !needsNomination(pod) {
 		return // already nominated, terminating, or not Pending
 	}
@@ -456,30 +469,49 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		}
 		return n.clearPlacementGate(ctx, pod)
 	}
-	if !needsNomination(pod) {
+	hasGate := hasPlacementGate(pod)
+	gateOwner := pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]
+	if !hasGate && gateOwner == "" {
+		// Pods outside the placement protocol have no durable owner from which to
+		// recover a nomination. Ordinary already-nominated Pods are not ours.
 		return nil
-	}
-	if !hasPlacementGate(pod) {
-		run, err := n.placementRunForPod(ctx, pod)
-		if err != nil {
-			return err
-		}
-		if placementAwaitingBinding(run, pod) {
-			return nil
-		}
-		return n.clearPlacementGate(ctx, pod)
 	}
 
 	run, err := n.placementRunForPod(ctx, pod)
 	if err != nil {
 		return err
 	}
-	if run == nil {
-		klog.V(4).InfoS("repack nominator: releasing stale placement gate because owning Run is absent",
-			"pod", key, "gateOwner", pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation])
+	if run == nil || !placementRunActive(run) {
+		klog.V(4).InfoS("repack nominator: releasing placement metadata because owning Run is absent or inactive",
+			"pod", key, "gateOwner", gateOwner)
 		return n.clearPlacementGate(ctx, pod)
 	}
-	nomination, owningRunName := n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+
+	// Prefer the durable concrete association even for Nominated records. Generic
+	// matching deliberately treats Nominated as consumed, but an interrupted
+	// Nominated -> gate-open transition must be resumed rather than forgotten.
+	nomination := nominationForReplacement(run, pod)
+	if nomination != nil {
+		switch nomination.Phase {
+		case repackv1alpha1.PodPlacementPlaced,
+			repackv1alpha1.PodPlacementDegraded,
+			repackv1alpha1.PodPlacementExpired,
+			repackv1alpha1.PodNominationBound:
+			return n.clearPlacementGate(ctx, pod)
+		}
+	}
+
+	if !hasGate {
+		if placementAwaitingBinding(run, pod) {
+			return nil
+		}
+		return n.clearPlacementGate(ctx, pod)
+	}
+
+	owningRunName := run.Name
+	if nomination == nil {
+		nomination, owningRunName = n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+	}
 	if nomination == nil {
 		if pendingPlacementForPodGroup(run, pod, n.now()) {
 			// Deployment/ReplicaSet can create its replacement while the victim
@@ -498,7 +530,7 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		"pod", key, "run", owningRunName, "podGroup", nomination.PodGroupName,
 		"victimPod", nomination.VictimPodName, "plannedNode", nomination.NodeName,
 		"selectedNode", nomination.SelectedNodeName, "identityLabels", nomination.IdentityLabels)
-	if hasPlacementGate(pod) && nomination.SelectedNodeName == "" {
+	if nomination.SelectedNodeName == "" {
 		// The admission webhook has stopped the scheduler. Hand the placement
 		// decision to the engine, which owns the scheduler session and can choose
 		// a current receiver without duplicating predicate logic here.
@@ -506,14 +538,16 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	}
 
 	selectedNode := nomination.SelectedNodeName
-	if selectedNode == "" {
-		selectedNode = nomination.NodeName
-	}
-	if err := n.patchNominatedNode(ctx, pod, selectedNode); err != nil {
-		return err
-	}
+	// Persist the concrete association and selected receiver before mutating the
+	// Pod. Every following operation is then recoverable from Run status after a
+	// conflict, process restart, or partial API failure.
 	if err := n.markPlacementNominated(ctx, owningRunName, nomination, pod, selectedNode); err != nil {
 		return err
+	}
+	if pod.Status.NominatedNodeName != selectedNode {
+		if err := n.patchNominatedNode(ctx, pod, selectedNode); err != nil {
+			return err
+		}
 	}
 	if err := n.openPlacementGate(ctx, pod); err != nil {
 		return err
@@ -521,6 +555,23 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	klog.V(3).InfoS("repack placement nominated replacement pod", "pod", key, "node", selectedNode, "repackRun", owningRunName)
 	n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementNominated,
 		fmt.Sprintf("RepackRun %s selected node %s for this replacement Pod.", owningRunName, selectedNode))
+	return nil
+}
+
+// nominationForReplacement returns the durable placement record already claimed
+// by this concrete replacement. Unlike generic matching, it intentionally sees
+// Nominated records so an interrupted status-patch/gate-open sequence can resume.
+func nominationForReplacement(run *repackv1alpha1.RepackRun, pod *corev1.Pod) *repackv1alpha1.PodNomination {
+	if run == nil || pod == nil || pod.UID == "" {
+		return nil
+	}
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nomination.Namespace == pod.Namespace && nomination.ReplacementPodName == pod.Name &&
+			nomination.ReplacementPodUID == pod.UID {
+			return nomination
+		}
+	}
 	return nil
 }
 
@@ -772,13 +823,16 @@ func hasPlacementGate(pod *corev1.Pod) bool {
 // fungible native workloads.
 func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, nomination *repackv1alpha1.PodNomination, pod *corev1.Pod, selectedNode string) error {
 	if runName == "" || nomination == nil || pod == nil {
-		return nil
+		return fmt.Errorf("cannot persist replacement nomination without Run, placement, and Pod identity")
 	}
 	key := nominationStatusKey(nomination)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	durable := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
-			return ignoreNotFound(err)
+			// Do not open the gate when the owning Run vanished between lookup and
+			// status persistence. A fresh reconcile will release stale metadata.
+			return err
 		}
 		for index := range run.Status.Nominations {
 			current := &run.Status.Nominations[index]
@@ -786,6 +840,9 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 				continue
 			}
 			if placementConsumed(current) {
+				durable = current.Phase == repackv1alpha1.PodPlacementNominated &&
+					current.SelectedNodeName == selectedNode &&
+					current.ReplacementPodName == pod.Name && current.ReplacementPodUID == pod.UID
 				return nil
 			}
 			current.SelectedNodeName = selectedNode
@@ -793,10 +850,18 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 			current.ReplacementPodUID = pod.UID
 			current.Phase = repackv1alpha1.PodPlacementNominated
 			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
+			durable = err == nil
 			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !durable {
+		return fmt.Errorf("replacement placement %q in RepackRun %q changed before nomination became durable", key, runName)
+	}
+	return nil
 }
 
 func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod *corev1.Pod) error {

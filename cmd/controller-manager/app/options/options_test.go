@@ -105,7 +105,7 @@ func TestAddFlags(t *testing.T) {
 		WorkerThreadsForPG:    5,
 		WorkerThreadsForQueue: 5,
 		WorkerThreadsForGC:    1,
-		Controllers:           strings.Split("*,-sharding-controller", ","),
+		Controllers:           strings.Split("*,-sharding-controller,-repack-controller", ","),
 	}
 	expectedFeatureGates := map[featuregate.Feature]bool{features.ResourceTopology: false}
 

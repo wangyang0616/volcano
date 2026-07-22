@@ -21,7 +21,9 @@ limitations under the License.
 // that builds it from the shared ControllerOption and runs it alongside the
 // other controllers. Keeping the logic in a leaf module preserves "buildable on
 // its own", while this shim gives the default "runs inside volcano-controller-
-// manager" behaviour (registered like job/podgroup/queue).
+// manager" behaviour when Repack is explicitly enabled (registered like
+// job/podgroup/queue). It is disabled by default because its CRD and RBAC are
+// optional installation components.
 package repack
 
 import (

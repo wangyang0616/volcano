@@ -206,6 +206,10 @@ spec:
               {{- end }}
               {{- if .Values.custom.controller_enabled_controllers }}
             - --controllers={{.Values.custom.controller_enabled_controllers}}
+              {{- else if .Values.custom.repack_enable }}
+            - --controllers=*,-sharding-controller,+repack-controller
+              {{- else }}
+            - --controllers=*,-sharding-controller,-repack-controller
               {{- end }}
             - -v={{.Values.custom.controller_log_level}}
             - 2>&1

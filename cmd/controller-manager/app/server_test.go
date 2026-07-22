@@ -64,6 +64,18 @@ func TestIsControllerEnabled(t *testing.T) {
 			isEnable:          false,
 		},
 		{
+			name:              "optional repack controller should be disabled without its CRD",
+			gotControllerName: "repack-controller",
+			inputControllers:  []string{"*", "-sharding-controller", "-repack-controller"},
+			isEnable:          false,
+		},
+		{
+			name:              "repack controller should be enabled when the installation opts in",
+			gotControllerName: "repack-controller",
+			inputControllers:  []string{"*", "-sharding-controller", "+repack-controller"},
+			isEnable:          true,
+		},
+		{
 			name:              "gc-controller should be disable, input allow jobtemplate-controller, jobflow-controller, pg-controller, queue-controller",
 			gotControllerName: "gc-controller",
 			inputControllers:  []string{"-gc-controller", "+jobtemplate-controller", "+jobflow-controller", "+pg-controller", "+queue-controller"},

@@ -44,7 +44,11 @@ const (
 	defaultPodGroupWorkers     = 5
 	defaultQueueWorkers        = 5
 	defaultGCWorkers           = 1
-	defaultControllers         = "*,-sharding-controller"
+	// Controllers backed by optional CRDs must be explicitly enabled by the
+	// installation that also installs those CRDs and their RBAC. Otherwise a
+	// missing optional API can prevent the shared informer factory from syncing
+	// and block unrelated controllers such as queue-controller from starting.
+	defaultControllers = "*,-sharding-controller,-repack-controller"
 )
 
 // ServerOption is the main context object for the controllers.

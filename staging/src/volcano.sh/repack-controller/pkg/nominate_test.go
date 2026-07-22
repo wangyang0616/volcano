@@ -18,14 +18,17 @@ package repackcontroller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -308,6 +311,198 @@ func TestReconcilePatchesNominatedNodeAndRecordsPlacementNominated(t *testing.T)
 	expectRecorderEvent(t, nominator.recorder.(*record.FakeRecorder), eventReasonPlacementNominated)
 }
 
+func TestReconcileResumesInterruptedNominationAndOpensGate(t *testing.T) {
+	for _, initialPhase := range []repackv1alpha1.PodNominationPhase{
+		repackv1alpha1.PodPlacementGated,
+		repackv1alpha1.PodPlacementNominated,
+	} {
+		t.Run(string(initialPhase), func(t *testing.T) {
+			pod := pendingPod("ns", "replacement", "group", nil)
+			pod.UID = "replacement-uid"
+			pod.Status.NominatedNodeName = "n2"
+			pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+			pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+			run := runWithNoms("run", repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n2",
+				SelectedNodeName: "n2", ReplacementPodName: pod.Name, ReplacementPodUID: pod.UID, Phase: initialPhase,
+			})
+			pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := pods.Add(pod); err != nil {
+				t.Fatal(err)
+			}
+			kubernetesClient := k8sfake.NewSimpleClientset(pod.DeepCopy())
+			volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+			nominator := &Nominator{
+				kubernetesClient: kubernetesClient,
+				volcanoClient:    volcanoClient,
+				podLister:        corelisters.NewPodLister(pods),
+				now:              time.Now,
+			}
+
+			if err := nominator.reconcile(context.Background(), "ns/replacement"); err != nil {
+				t.Fatalf("reconcile() error = %v", err)
+			}
+			updatedRun, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if phase := updatedRun.Status.Nominations[0].Phase; phase != repackv1alpha1.PodPlacementNominated {
+				t.Fatalf("nomination phase = %q, want Nominated", phase)
+			}
+			updatedPod, err := kubernetesClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasPlacementGate(updatedPod) {
+				t.Fatal("an interrupted Nominated transition must eventually open the placement gate")
+			}
+			if updatedPod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == "" {
+				t.Fatal("gate owner must remain until binding is observed")
+			}
+		})
+	}
+}
+
+func TestReconcileDoesNotMutatePodBeforeNominationStatusIsDurable(t *testing.T) {
+	pod := pendingPod("ns", "replacement", "group", nil)
+	pod.UID = "replacement-uid"
+	pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+	pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n2",
+		SelectedNodeName: "n2", ReplacementPodName: pod.Name, ReplacementPodUID: pod.UID,
+		Phase: repackv1alpha1.PodPlacementGated,
+	})
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := pods.Add(pod); err != nil {
+		t.Fatal(err)
+	}
+	kubernetesClient := k8sfake.NewSimpleClientset(pod.DeepCopy())
+	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+	volcanoClient.PrependReactor("update", "repackruns", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewConflict(
+			schema.GroupResource{Group: repackv1alpha1.GroupName, Resource: "repackruns"},
+			run.Name, errors.New("forced status conflict"))
+	})
+	nominator := &Nominator{
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    volcanoClient,
+		podLister:        corelisters.NewPodLister(pods),
+		now:              time.Now,
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/replacement"); !apierrors.IsConflict(err) {
+		t.Fatalf("reconcile() error = %v, want conflict", err)
+	}
+	for _, action := range kubernetesClient.Actions() {
+		if action.GetVerb() == "patch" && action.GetResource().Resource == "pods" {
+			t.Fatalf("Pod was patched before RepackRun status became durable: %#v", action)
+		}
+	}
+}
+
+func TestReconcileRetriesEveryPodMutationAfterNominationIsDurable(t *testing.T) {
+	for _, failurePoint := range []string{"pod-status", "placement-gate"} {
+		t.Run(failurePoint, func(t *testing.T) {
+			pod := pendingPod("ns", "replacement", "group", nil)
+			pod.UID = "replacement-uid"
+			pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+			pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+			run := runWithNoms("run", repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n2",
+				SelectedNodeName: "n2", ReplacementPodName: pod.Name, ReplacementPodUID: pod.UID,
+				Phase: repackv1alpha1.PodPlacementNominated,
+			})
+			pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := pods.Add(pod); err != nil {
+				t.Fatal(err)
+			}
+			kubernetesClient := k8sfake.NewSimpleClientset(pod.DeepCopy())
+			failureInjected := false
+			kubernetesClient.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				if failureInjected {
+					return false, nil, nil
+				}
+				isStatusPatch := action.GetSubresource() == "status"
+				if (failurePoint == "pod-status" && isStatusPatch) || (failurePoint == "placement-gate" && !isStatusPatch) {
+					failureInjected = true
+					return true, nil, errors.New("forced Pod patch failure")
+				}
+				return false, nil, nil
+			})
+			nominator := &Nominator{
+				kubernetesClient: kubernetesClient,
+				volcanoClient:    vcfake.NewSimpleClientset(run.DeepCopy()),
+				podLister:        corelisters.NewPodLister(pods),
+				now:              time.Now,
+			}
+
+			if err := nominator.reconcile(context.Background(), "ns/replacement"); err == nil {
+				t.Fatalf("first reconcile() unexpectedly succeeded at failure point %s", failurePoint)
+			}
+			partiallyUpdatedPod, err := kubernetesClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasPlacementGate(partiallyUpdatedPod) {
+				t.Fatal("placement gate must remain until every preceding mutation succeeds")
+			}
+
+			if err := nominator.reconcile(context.Background(), "ns/replacement"); err != nil {
+				t.Fatalf("retry reconcile() error = %v", err)
+			}
+			updatedPod, err := kubernetesClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updatedPod.Status.NominatedNodeName != "n2" {
+				t.Fatalf("nominatedNodeName = %q, want n2", updatedPod.Status.NominatedNodeName)
+			}
+			if hasPlacementGate(updatedPod) {
+				t.Fatal("retry did not open the placement gate")
+			}
+			if updatedPod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == "" {
+				t.Fatal("gate owner must remain until binding is observed")
+			}
+		})
+	}
+}
+
+func TestReconcileExpiredNominationClearsGateFromAlreadyNominatedPod(t *testing.T) {
+	pod := pendingPod("ns", "replacement", "group", nil)
+	pod.UID = "replacement-uid"
+	pod.Status.NominatedNodeName = "n2"
+	pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+	pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n2",
+		SelectedNodeName: "n2", ReplacementPodName: pod.Name, ReplacementPodUID: pod.UID,
+		Phase: repackv1alpha1.PodPlacementExpired,
+	})
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := pods.Add(pod); err != nil {
+		t.Fatal(err)
+	}
+	kubernetesClient := k8sfake.NewSimpleClientset(pod.DeepCopy())
+	nominator := &Nominator{
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    vcfake.NewSimpleClientset(run.DeepCopy()),
+		podLister:        corelisters.NewPodLister(pods),
+		now:              time.Now,
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/replacement"); err != nil {
+		t.Fatal(err)
+	}
+	updatedPod, err := kubernetesClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasPlacementGate(updatedPod) || updatedPod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "" {
+		t.Fatalf("expired placement metadata was not cleared: gates=%v annotations=%v", updatedPod.Spec.SchedulingGates, updatedPod.Annotations)
+	}
+}
+
 func TestReconcileGatedReplacementReportsIdentityWithoutOpeningGate(t *testing.T) {
 	pod := pendingPod("ns", "replacement", "group", nil)
 	pod.UID = "replacement-uid"
@@ -509,6 +704,7 @@ func TestEnqueueTerminalRunUsesGateOwnerIndex(t *testing.T) {
 	run := runWithNoms("run")
 	run.Status.Phase = repackv1alpha1.RepackFailed
 	pod := pendingPod("ns", "held-scale-out", "group", nil)
+	pod.Status.NominatedNodeName = "n2"
 	pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
 	pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = placement.OwnerValue(run.Name, run.UID)
 	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
