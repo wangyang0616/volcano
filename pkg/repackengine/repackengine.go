@@ -308,6 +308,12 @@ func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
 // than retrying forever (which would also keep re-panicking on a bad object).
 const maxReconcileRetries = 5
 
+// statusConflictRequeueInterval is the outer retry delay after the status
+// writer's exponential conflict backoff is exhausted. Conflict is normal
+// optimistic-lock contention between the engine and nominator, so it must not
+// consume the poison-pill budget reserved for deterministic reconcile failures.
+const statusConflictRequeueInterval = time.Second
+
 func (e *Engine) processNext(ctx context.Context) bool {
 	key, shutdown := e.workQueue.Get()
 	if shutdown {
@@ -316,6 +322,16 @@ func (e *Engine) processNext(ctx context.Context) bool {
 	defer e.workQueue.Done(key)
 
 	if err := e.reconcileSafely(ctx, key); err != nil {
+		if !reconcileErrorConsumesRetryBudget(err) {
+			// AddAfter does not advance the rate-limiter counter, so status contention
+			// cannot turn into ReconcileGaveUp. RetryOnConflict already performed
+			// exponential backoff inside the status mutation; this delayed retry spans
+			// reconcile attempts while preserving any prior real-failure count.
+			klog.V(4).InfoS("requeueing RepackRun after status conflict",
+				"run", key, "retryAfter", statusConflictRequeueInterval, "error", err)
+			e.workQueue.AddAfter(key, statusConflictRequeueInterval)
+			return true
+		}
 		utilruntime.HandleError(fmt.Errorf("repack-engine reconcile %q: %w", key, err))
 		if e.workQueue.NumRequeues(key) < maxReconcileRetries {
 			klog.V(4).InfoS("requeueing RepackRun after error", "run", key, "retries", e.workQueue.NumRequeues(key)+1)
@@ -330,6 +346,10 @@ func (e *Engine) processNext(ctx context.Context) bool {
 	}
 	e.workQueue.Forget(key)
 	return true
+}
+
+func reconcileErrorConsumesRetryBudget(err error) bool {
+	return err != nil && !apierrors.IsConflict(err)
 }
 
 // reconcileSafely runs reconcile with panic recovery so a single bad RepackRun

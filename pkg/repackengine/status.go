@@ -75,7 +75,7 @@ func (e *Engine) updateStatus(ctx context.Context, run *repackv1alpha1.RepackRun
 }
 
 func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1alpha1.RepackRunStatus) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		latest, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err

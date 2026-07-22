@@ -51,7 +51,7 @@ var (
 	leaderElect = flag.Bool("leader-elect", true, "Enable leader election (run a single active replica)")
 	leNamespace = flag.String("leader-elect-namespace", "volcano-system", "Namespace for the leader-election lease")
 	resync      = flag.Duration("resync-period", 0, "Informer resync period (0 = disabled)")
-	workers     = flag.Int("workers", 1, "Reconcile worker count")
+	workers     = flag.Int("workers", 1, "RepackRun lifecycle reconcile worker count; replacement nomination status writes remain single-threaded")
 	// Keep in sync with the engine's --repack-execute-cooldown so GC does not delete
 	// a finished Execute run while it is still the engine's cooldown anchor.
 	execCooldown = flag.Duration("repack-execute-cooldown", 10*time.Minute, "Minimum gap the engine enforces between Execute runs; GC retains a finished Execute run at least this long to preserve the cooldown anchor")
@@ -86,7 +86,7 @@ func main() {
 			}
 		}()
 		go func() {
-			if err := nom.Run(ctx, *workers); err != nil {
+			if err := nom.Run(ctx); err != nil {
 				klog.ErrorS(err, "Repack nominator stopped")
 			}
 		}()

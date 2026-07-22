@@ -17,14 +17,32 @@ limitations under the License.
 package repackengine
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	commonutil "volcano.sh/volcano/pkg/util"
 )
+
+func TestReconcileConflictDoesNotConsumePoisonPillRetryBudget(t *testing.T) {
+	conflict := apierrors.NewConflict(
+		schema.GroupResource{Group: "repack.volcano.sh", Resource: "repackruns"},
+		"run", errors.New("concurrent status update"))
+	for _, err := range []error{conflict, fmt.Errorf("persist placement: %w", conflict)} {
+		if reconcileErrorConsumesRetryBudget(err) {
+			t.Fatalf("conflict %v must not consume the poison-pill retry budget", err)
+		}
+	}
+	if !reconcileErrorConsumesRetryBudget(errors.New("invalid scheduler configuration")) {
+		t.Fatal("a deterministic reconcile error must consume the poison-pill retry budget")
+	}
+}
 
 func TestNewEngineDoesNotPanicWithoutSchedulerServerOpts(t *testing.T) {
 	orig := schedoptions.ServerOpts

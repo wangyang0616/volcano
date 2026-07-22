@@ -324,7 +324,7 @@ func placementReceivers(nodes []*schedapi.NodeInfo, freedNodes []string, planned
 
 func (e *Engine) writePlacementSelection(ctx context.Context, runName string, selected map[string]string) error {
 	var updatedRun *repackv1alpha1.RepackRun
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -360,7 +360,7 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 	}
 	var updatedRun *repackv1alpha1.RepackRun
 	placementStateChanged := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -609,7 +609,7 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		"run", run.Name, "expiringNominationCount", len(keys))
 	var updatedRun *repackv1alpha1.RepackRun
 	expiredCount := 0
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		latest, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, run.Name, metav1.GetOptions{})
 		if err != nil {
 			return err

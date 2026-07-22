@@ -80,6 +80,12 @@ type Nominator struct {
 	now                     func() time.Time
 }
 
+// nominationWorkerCount is deliberately one. Execute admission already permits
+// only one active RepackRun, and every replacement transition updates that same
+// RepackRun status object. Parallel Pod workers therefore create resourceVersion
+// conflicts without providing useful status-write parallelism.
+const nominationWorkerCount = 1
+
 const (
 	eventReasonReplacementGated    = "RepackReplacementGated"
 	eventReasonPlacementNominated  = "RepackPlacementNominated"
@@ -406,19 +412,16 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 
 // Run launches the reconciler until ctx is cancelled. The caller starts the
 // informer factories.
-func (n *Nominator) Run(ctx context.Context, workers int) error {
+func (n *Nominator) Run(ctx context.Context) error {
 	defer utilruntime.HandleCrash()
 	defer n.workQueue.ShutDown()
 	if !cache.WaitForCacheSync(ctx.Done(), n.informerSyncs...) {
 		return fmt.Errorf("nominator: cache failed to sync")
 	}
-	if workers < 1 {
-		workers = 1
-	}
-	klog.V(3).InfoS("Starting repack nominator", "workers", workers,
+	klog.V(3).InfoS("Starting repack nominator", "workers", nominationWorkerCount,
 		"podGroupIndexEnabled", n.podGroupIndexAvailable, "gateOwnerIndexEnabled", n.gateOwnerIndexAvailable,
 		"victimIndexEnabled", n.victimIndexAvailable)
-	for i := 0; i < workers; i++ {
+	for i := 0; i < nominationWorkerCount; i++ {
 		go func() {
 			for n.processNext(ctx) {
 			}
@@ -827,7 +830,7 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 	}
 	key := nominationStatusKey(nomination)
 	durable := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			// Do not open the gate when the owning Run vanished between lookup and
@@ -869,7 +872,7 @@ func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod 
 		return nil
 	}
 	updated := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)
@@ -912,7 +915,7 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 	}
 	observedPhase := repackv1alpha1.PodNominationPhase("")
 	selectedNode := ""
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, cachedRun.Name, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)

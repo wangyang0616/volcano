@@ -55,6 +55,12 @@ func nominatorWith(runs ...*repackv1alpha1.RepackRun) *Nominator {
 	}
 }
 
+func TestNominatorSerializesRepackRunStatusWrites(t *testing.T) {
+	if nominationWorkerCount != 1 {
+		t.Fatalf("nominationWorkerCount = %d, want 1 to serialize the active Execute RepackRun status", nominationWorkerCount)
+	}
+}
+
 func matchNomination(n *Nominator, pod *corev1.Pod) (*repackv1alpha1.PodNomination, string) {
 	runs, _ := n.repackRunLister.List(labels.Everything())
 	return n.matchNominationInRuns(pod, runs)

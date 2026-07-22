@@ -86,7 +86,7 @@ func (c *repackController) Run(stopCh <-chan struct{}) {
 		}
 	}()
 	go func() {
-		if err := c.nominator.Run(ctx, c.workers); err != nil {
+		if err := c.nominator.Run(ctx); err != nil {
 			klog.ErrorS(err, "Repack nominator stopped")
 		}
 	}()
