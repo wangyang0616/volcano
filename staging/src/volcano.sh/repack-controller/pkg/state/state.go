@@ -67,9 +67,15 @@ const (
 	// ReasonExecuteFailed is terminal-Failed: a worthwhile plan was found but every
 	// eviction was rejected (e.g. by PDBs), so the repack achieved nothing.
 	ReasonExecuteFailed = "ExecuteFailed"
-	// ReasonPlacementDegraded reports that normal scheduling was allowed to
-	// restore a replacement Pod but the selected defragmentation placement drifted.
-	ReasonPlacementDegraded = "PlacementDegraded"
+	// ReasonExecutedWithPlacementDrift is terminal-Complete: every replacement
+	// Pod was scheduled and the complete planned node-freeing benefit was
+	// realized, although one or more Pods bound to a node other than the
+	// Repack-selected receiver.
+	ReasonExecutedWithPlacementDrift = "ExecutedWithPlacementDrift"
+	// Terminal-Failed Execute result reasons.
+	ReasonBenefitNotRealized = "BenefitNotRealized"
+	ReasonPlacementExpired   = "PlacementExpired"
+	ReasonMetricsUnverified  = "MetricsUnverified"
 )
 
 // DerivePhase projects conditions onto the coarse phase (§4.6.1). Precedence:

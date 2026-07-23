@@ -74,6 +74,8 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 		Expect(got.Status.Result.FreedNodeCount).To(BeNumerically(">=", 1), "Execute must report nodes actually free after replacement binding")
+		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes),
+			"successful Execute must verify the exact planned freed-node set, not only the count")
 		Expect(got.Status.Result.FragAfterPercent).To(BeNumerically("<=", got.Status.Plan.Summary.FragBeforePercent),
 			"Execute terminal status must report the remeasured cluster fragmentation")
 		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")

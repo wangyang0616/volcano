@@ -81,6 +81,8 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes),
+			"successful Execute must verify the exact planned freed-node set")
 
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -161,7 +163,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 	// only fallback receiver are both occupied, while the source node is excluded
 	// by the accepted plan. The deadline must release the gate and fail the Run
 	// instead of stranding the workload indefinitely.
-	It("keeps the gate while capacity is unavailable, then degrades and releases it at the deadline", func() {
+	It("keeps the gate while capacity is unavailable, then expires and releases it at the deadline", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
@@ -184,10 +186,11 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementAwaitingCapacity), "gate must remain while no immediately idle receiver exists")
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("PlacementDegraded"))
+		Expect(completeReason(got)).To(Equal("PlacementExpired"))
 		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementExpired))
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
+		Expect(got.Status.Result.FreedNodes).To(BeEmpty())
 
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -197,11 +200,11 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 	})
 
 	// A selected receiver can disappear after selection but before the scheduler
-	// binds the Pod. The controller must record the actual node as Degraded; it
-	// must not report a successful defragmentation merely because nomination was
-	// written. The explicit selection here models that short concurrent-change
-	// window while the Engine is paused at the durable checkpoint.
-	It("reports placement drift when the selected receiver is consumed before binding", func() {
+	// binds the Pod. The controller records the actual node as Degraded, but the
+	// Run still succeeds when the replacement binds and the exact planned source
+	// node is verified free. The explicit selection here models that short
+	// concurrent-change window while the Engine is paused at the durable checkpoint.
+	It("reports placement drift without failing a realized node-freeing plan", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
@@ -227,11 +230,15 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
-		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("PlacementDegraded"))
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("ExecutedWithPlacementDrift"))
 		Expect(got.Status.Nominations[0].SelectedNodeName).To(Equal(nodes[1]))
 		Expect(got.Status.Nominations[0].ActualNodeName).NotTo(BeEmpty())
 		Expect(got.Status.Nominations[0].ActualNodeName).NotTo(Equal(nodes[1]))
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes),
+			"placement drift is non-fatal only when the exact planned node set is free")
 		assertPlacementLeaseReleased(ctx, pgName)
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})

@@ -816,6 +816,7 @@ status (RepackRunStatus)
 ├── result (RepackResult)      Execute 独有
 │   ├── fragAfterPercent       int32   实际复测值
 │   ├── freedNodeCount         int32   实际腾空数
+│   ├── freedNodes[]           []string 已验证腾空的计划节点名
 │   ├── movedCardCount         int64   已接受驱逐对应卡数
 │   └── metricsVerified        bool    指标是否来自一致快照
 └── nominations[]             Execute 独有，仅保留已接受驱逐
@@ -883,7 +884,7 @@ kubectl get repackrun $NAME -o jsonpath='{.status.result}' | jq .
 
 #### 4.6.3 Execute 终态：`status.plan` + `status.result` + `nominations`
 
-Execute 与 DryRun **同一 `status.plan` 结构**，且 Execute 不覆盖原始计划。额外写 **`status.result`**（实际接受卡数、实际碎片率、实际腾空数及指标可信度）和 **`status.nominations[]`**（仅包含 Eviction API 已接受的 durable 落点意图）。实际落点/绑定看 `nominations[].phase`，实际聚合收益看 `result`。
+Execute 与 DryRun **同一 `status.plan` 结构**，且 Execute 不覆盖原始计划。额外写 **`status.result`**（实际接受卡数、实际碎片率、实际腾空节点集合及指标可信度）和 **`status.nominations[]`**（仅包含 Eviction API 已接受的 durable 落点意图）。实际落点/绑定看 `nominations[].phase`，实际聚合收益看 `result`。成功要求所有替身完成调度，且 `result.freedNodes[]` 与 `plan.freedNodes[]` 集合完全一致；仅 placement drift 但收益完整实现时以 `ExecutedWithPlacementDrift` 成功结束。
 
 ```yaml
 status:
@@ -914,6 +915,7 @@ status:
   result:
     fragAfterPercent: 31              # 替身绑定后的实际复测
     freedNodeCount: 1
+    freedNodes: [ node-3 ]            # 已验证腾空，成功时与 plan.freedNodes 集合一致
     movedCardCount: 27                # 实际被接受的驱逐对应卡数
     metricsVerified: true
   nominations:                        # 每搬一个 pod 一条（Execute 独有）
@@ -3159,13 +3161,15 @@ type RepackSummary struct { // 纯度量，无 verdict
     ResolvedScope     ResolvedScopeCount `json:"resolvedScope,omitempty"`
 }
 type RepackResult struct {
-    FragAfterPercent int32 `json:"fragAfterPercent"` // 实际复测；未验证时等于 plan before
-    FreedNodeCount   int32 `json:"freedNodeCount"`   // 实际腾空数
-    MovedCardCount   int64 `json:"movedCardCount"`   // 已接受驱逐对应卡数
-    MetricsVerified  bool  `json:"metricsVerified"`  // 实际碎片率/腾空数是否可信
+    FragAfterPercent int32    `json:"fragAfterPercent"`  // 实际复测；未验证时等于 plan before
+    FreedNodeCount   int32    `json:"freedNodeCount"`    // 实际腾空数
+    FreedNodes       []string `json:"freedNodes,omitempty"` // 已验证腾空的计划节点名
+    MovedCardCount   int64    `json:"movedCardCount"`    // 已接受驱逐对应卡数
+    MetricsVerified  bool     `json:"metricsVerified"`   // 实际碎片率/腾空节点集合是否可信
 }
 // 删 verdict → 收进 conditions[Complete].reason（conditions 权威、机器可读）：
 //   RepackRecommended（DryRun 找到划算方案）| Executed（Execute 已搬）|
+//   ExecutedWithPlacementDrift（落点漂移但完整计划收益已实现）|
 //   NoFragmentation（本就干净）| BelowGoalThreshold（有碎片但低于目标门控，未执行）。
 // 删 fragDeltaPercent（=before-after 派生）/podGroupsToMove（=distinct moves 派生）/
 // pendingRelieved（=len(relief)，relief 本身 P1）。

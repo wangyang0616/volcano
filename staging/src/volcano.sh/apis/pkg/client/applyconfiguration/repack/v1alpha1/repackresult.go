@@ -31,10 +31,14 @@ type RepackResultApplyConfiguration struct {
 	// FreedNodeCount is the number of plan.freedNodes actually free of the target
 	// resource in the verified terminal snapshot.
 	FreedNodeCount *int32 `json:"freedNodeCount,omitempty"`
+	// FreedNodes are the plan.freedNodes verified free of the target resource in
+	// the terminal scheduler snapshot. The list is sorted for deterministic
+	// status and lets operators compare the realized node set with plan.freedNodes.
+	FreedNodes []string `json:"freedNodes,omitempty"`
 	// MovedCardCount is the accelerator-card total for accepted Pod evictions.
 	MovedCardCount *int64 `json:"movedCardCount,omitempty"`
-	// MetricsVerified reports whether FragAfterPercent and FreedNodeCount came
-	// from a coherent scheduler snapshot after replacement binding.
+	// MetricsVerified reports whether FragAfterPercent, FreedNodeCount, and
+	// FreedNodes came from a coherent scheduler snapshot after replacement binding.
 	MetricsVerified *bool `json:"metricsVerified,omitempty"`
 }
 
@@ -57,6 +61,16 @@ func (b *RepackResultApplyConfiguration) WithFragAfterPercent(value int32) *Repa
 // If called multiple times, the FreedNodeCount field is set to the value of the last call.
 func (b *RepackResultApplyConfiguration) WithFreedNodeCount(value int32) *RepackResultApplyConfiguration {
 	b.FreedNodeCount = &value
+	return b
+}
+
+// WithFreedNodes adds the given value to the FreedNodes field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the FreedNodes field.
+func (b *RepackResultApplyConfiguration) WithFreedNodes(values ...string) *RepackResultApplyConfiguration {
+	for i := range values {
+		b.FreedNodes = append(b.FreedNodes, values[i])
+	}
 	return b
 }
 

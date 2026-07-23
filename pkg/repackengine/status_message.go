@@ -43,6 +43,13 @@ func completionStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.Re
 		return fmt.Sprintf(
 			"Repack completed for %s: moved %d PodGroups and %d cards, actually freed %d nodes; cluster fragmentation changed from %d%% to %d%%.",
 			resource, acceptedPodGroupCount(run), result.movedCards, result.freedNodes, summary.fragBefore, result.fragAfter)
+	case state.ReasonExecutedWithPlacementDrift:
+		result := runResult(run)
+		_, drifted, _ := placementOutcomeCounts(run)
+		return fmt.Sprintf(
+			"Repack completed for %s with %d %s: all planned nodes were verified free, %d cards were moved, and cluster fragmentation changed from %d%% to %d%%.",
+			resource, drifted, pluralNoun(drifted, "placement drift", "placement drifts"),
+			result.movedCards, summary.fragBefore, result.fragAfter)
 	case state.ReasonNoFragmentation:
 		return fmt.Sprintf(
 			"No repack needed for %s: cluster fragmentation is %d%%; the resolved scope contains %d resource nodes and %d target-resource PodGroups.",
@@ -56,23 +63,64 @@ func completionStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.Re
 	}
 }
 
-func placementStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceName, degraded, metricsUnverified bool) string {
+func placementStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceName, decision placementTerminalDecision) string {
 	plan := runSummary(run)
 	result := runResult(run)
 	placed, drifted, expired := placementOutcomeCounts(run)
-	if !degraded {
+	resource := displayResource(targetResource)
+	plannedNodes := formatNodeNames(decision.Nodes.Planned)
+	actualNodes := formatNodeNames(decision.Nodes.Actual)
+	switch decision.Reason {
+	case state.ReasonExecuted:
 		return fmt.Sprintf(
-			"Repack completed for %s: all %d replacement Pods reached their selected nodes, %d nodes were actually freed; cluster fragmentation changed from %d%% to %d%%.",
-			displayResource(targetResource), placed, result.freedNodes, plan.fragBefore, result.fragAfter)
-	}
-	if metricsUnverified {
+			"Repack succeeded for %s: all %d replacement %s were scheduled and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
+			resource, placed, pluralNoun(placed, "Pod", "Pods"),
+			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
+			plannedNodes, plan.fragBefore, result.fragAfter)
+	case state.ReasonExecutedWithPlacementDrift:
 		return fmt.Sprintf(
-			"Repack placement degraded for %s: replacement bindings were reported but could not be verified in a coherent scheduler snapshot before the deadline; no node-freeing benefit is claimed.",
-			displayResource(targetResource))
+			"Repack succeeded for %s despite placement drift: all %d replacement %s were scheduled (%d reached selected nodes and %d were placed elsewhere), and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
+			resource, placed+drifted, pluralNoun(placed+drifted, "Pod", "Pods"), placed, drifted,
+			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
+			plannedNodes, plan.fragBefore, result.fragAfter)
+	case state.ReasonPlacementExpired:
+		return fmt.Sprintf(
+			"Repack failed for %s because %d replacement %s did not bind before the placement deadline; %d reached selected nodes and %d were placed elsewhere. Planned nodes [%s] were not accepted as a verified complete result; inspect Pod scheduling events and available receiver capacity.",
+			resource, expired, pluralNoun(expired, "Pod", "Pods"), placed, drifted, plannedNodes)
+	case state.ReasonMetricsUnverified:
+		return fmt.Sprintf(
+			"Repack failed verification for %s: replacement bindings were reported, but the scheduler cache did not expose one coherent terminal snapshot before the deadline. Planned nodes [%s] cannot be confirmed free; inspect scheduler cache and Pod informer synchronization.",
+			resource, plannedNodes)
+	case state.ReasonBenefitNotRealized:
+		return fmt.Sprintf(
+			"Repack did not realize the planned benefit for %s: planned to free %d %s [%s], but verified %d %s free [%s]; nodes still occupied or unavailable: [%s]. All %d replacement %s were scheduled (%d %s); inspect target-resource usage on the missing nodes.",
+			resource, len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"), plannedNodes,
+			len(decision.Nodes.Actual), pluralNoun(len(decision.Nodes.Actual), "node", "nodes"), actualNodes,
+			formatNodeNames(decision.Nodes.Missing), placed+drifted, pluralNoun(placed+drifted, "Pod", "Pods"),
+			drifted, pluralNoun(drifted, "placement drift", "placement drifts"))
+	default:
+		return fmt.Sprintf(
+			"Repack for %s reached terminal placement outcome %s: planned nodes [%s], actually free nodes [%s].",
+			resource, decision.Reason, plannedNodes, actualNodes)
 	}
-	return fmt.Sprintf(
-		"Repack placement degraded for %s: %d replacement Pods reached their selected nodes, %d were placed elsewhere, and %d expired; %d nodes were actually freed and cluster fragmentation changed from %d%% to %d%%.",
-		displayResource(targetResource), placed, drifted, expired, result.freedNodes, plan.fragBefore, result.fragAfter)
+}
+
+func formatNodeNames(nodeNames []string) string {
+	const maxDisplayedNodes = 8
+	if len(nodeNames) == 0 {
+		return "none"
+	}
+	if len(nodeNames) <= maxDisplayedNodes {
+		return strings.Join(nodeNames, ", ")
+	}
+	return fmt.Sprintf("%s, ... (%d more)", strings.Join(nodeNames[:maxDisplayedNodes], ", "), len(nodeNames)-maxDisplayedNodes)
+}
+
+func pluralNoun(count int, singular, plural string) string {
+	if count == 1 {
+		return singular
+	}
+	return plural
 }
 
 func failureStatusMessage(targetResource v1.ResourceName, reason string, err error) string {
@@ -185,8 +233,12 @@ func failureStage(reason string) string {
 		return "scope resolution"
 	case state.ReasonExecuteFailed:
 		return "execution"
-	case state.ReasonPlacementDegraded:
+	case state.ReasonBenefitNotRealized:
+		return "benefit verification"
+	case state.ReasonPlacementExpired:
 		return "replacement placement"
+	case state.ReasonMetricsUnverified:
+		return "terminal metric verification"
 	case "Interrupted":
 		return "engine recovery"
 	case "ReconcileGaveUp":

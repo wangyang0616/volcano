@@ -209,6 +209,20 @@ func TestRepackResultSerializesZeroValues(t *testing.T) {
 	}
 }
 
+func TestRepackResultSerializesVerifiedFreedNodes(t *testing.T) {
+	data, err := json.Marshal(repackv1alpha1.RepackResult{
+		FreedNodeCount:  2,
+		FreedNodes:      []string{"node-a", "node-b"},
+		MetricsVerified: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"freedNodes":["node-a","node-b"]`) {
+		t.Fatalf("serialized result %s does not contain the verified freed-node set", data)
+	}
+}
+
 func TestBuildResolvedScope(t *testing.T) {
 	resource := func(cards int64) *schedapi.Resource {
 		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{gpuResource: float64(cards * 1000)}}

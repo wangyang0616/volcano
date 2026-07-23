@@ -153,7 +153,9 @@ PDB 约束；未来 PDB 的预检和被阻塞后的处理策略统一演进到 `
 
 替身出现后，controller 根据 Pod 上的 gate owner 只读取对应的 RepackRun，记录具体 Pod 的 name/UID 和 `Gated` 状态，不扫描或猜测其它 Run。Engine 再使用最新 scheduler Session 重算 receiver：排除本次要腾空的节点，要求当前 `Idle` 已足够，并通过完整 predicate 模拟验证；原计划 receiver 仍是首选。选点持久化为 `selectedNodeName` 后，controller 才写 `nominatedNodeName` 并解除 gate，但保留 owner 直到实际绑定被观察；绑定完成后回写 `Placed` 或 `Degraded`，再清除 owner。
 
-这不是 scheduler 的永久硬约束，也不保留节点。若并发任务抢占了可行容量，gate 会在 nomination deadline 前保持并定期重算；到期将 nomination 标记为 `Expired`，controller 据此只移除本机制添加的 gate，让 Pod 恢复正常调度，同时 Run 标记为 `Failed` / `PlacementDegraded`。原生负载在此窗口扩容时，新 Pod 可能短暂带 gate；对 Deployment 这类无单 Pod 稳定 identity 的负载，扩容 Pod 与替身在旧 victim 仍 Terminating 时不可区分，必须保持 gate 至 victim 消失后完成匹配、已有 nomination 被其它 Pod 认领，或 Run 终态统一放行。
+这不是 scheduler 的永久硬约束，也不保留节点。若并发任务抢占了可行容量，gate 会在 nomination deadline 前保持并定期重算；到期将 nomination 标记为 `Expired`，controller 据此只移除本机制添加的 gate，让 Pod 恢复正常调度，同时 Run 标记为 `Failed` / `PlacementExpired`。原生负载在此窗口扩容时，新 Pod 可能短暂带 gate；对 Deployment 这类无单 Pod 稳定 identity 的负载，扩容 Pod 与替身在旧 victim 仍 Terminating 时不可区分，必须保持 gate 至 victim 消失后完成匹配、已有 nomination 被其它 Pod 认领，或 Run 终态统一放行。
+
+Execute 的成功判据以计划收益为准：所有替身必须在 deadline 内完成绑定，且终态 scheduler 一致快照中 `status.result.freedNodes` 必须与 `status.plan.freedNodes` 集合完全一致。仅比较数量不够，任何计划节点仍被目标资源占用都会以 `Failed` / `BenefitNotRealized` 结束；无法取得可信终态快照则为 `Failed` / `MetricsUnverified`。替身没有落到 Repack 选定 receiver 只记为 placement drift；如果替身已经成功调度且完整计划节点集合确实腾空，Run 仍以 `Succeeded` / `ExecutedWithPlacementDrift` 结束。
 
 职责边界固定为：engine 创建、校验并回收 PodGroup lease，controller 独占 Pod gate/owner 的认领、放行与异常清理。Run 终态或被删除时，controller 通过 owner 索引唤醒所有相关 Pod；controller 重启时，Pod informer 的初始 Add 事件也会重新清理孤儿 gate。Webhook 只对配置给 Volcano scheduler 的 Pod 生效，并在 lease 对应 Run 不存在、UID 不一致或已终态时忽略 stale lease。下一 Run 仍会在写 lease 时回收残留值。
 

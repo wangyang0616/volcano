@@ -305,7 +305,7 @@ P1 的整体扰动/执行策略设计；在行为和 API 一并定稿前，P0 �
 
 - `phase`：`Pending` / `Running` / `Succeeded` / `Failed` / `Cancelled`（由 `conditions` 派生，`conditions` 为权威）。
 - `plan`（**DryRun 与 Execute 同一字段、同一结构**）：不可变的计划时快照。`summary` 始终记录完整计划的预期收益（目标资源的**全集群**碎片率 before/预测 after、预计腾出节点数、计划搬卡数、动作 scope 解析计数）；`moves[]` 与 `freedNodes[]` 始终保留驱逐前的完整方案。Execute 即使部分驱逐被拒绝或最终落点降级，也不得覆盖这份审计基线。
-- `result`（**Execute 独有**）：实际执行结果。`movedCardCount` 是被 Eviction API 接受的 Pod 所对应卡数；`fragAfterPercent` / `freedNodeCount` 来自替身绑定后的全集群一致快照；`metricsVerified=false` 表示未能可靠复测，此时碎片率保守回退为 plan before、实际腾空数为 0。若 Execute 在任何驱逐被接受前失败，`result` 不出现。
+- `result`（**Execute 独有**）：实际执行结果。`movedCardCount` 是被 Eviction API 接受的 Pod 所对应卡数；`fragAfterPercent` / `freedNodeCount` / `freedNodes[]` 来自替身绑定后的全集群一致快照。`freedNodes[]` 明确列出已验证腾空的计划节点，成功时必须与 `plan.freedNodes[]` 集合完全一致；`metricsVerified=false` 表示未能可靠复测，此时碎片率保守回退为 plan before、实际腾空数为 0、实际节点集合为空。若 Execute 在任何驱逐被接受前失败，`result` 不出现。
 - `nominations`（**Execute 独有**）：只保留驱逐已被接受的 durable 落点意图，交控制器的提名 reconciler 消费；计划与实际落点差异由 `nodeName` / `selectedNodeName` / `actualNodeName` 及 `phase` 表达。
 
 **RepackRun 结构体定义（Go，与 `types.go` 一致）**
@@ -423,20 +423,24 @@ type RepackSummary struct { // 扁平看板层（列表/告警读它）——纯
     ResolvedScope     *ResolvedScope `json:"resolvedScope,omitempty"`     // 解析后的有效范围计数
 }
 type RepackResult struct { // Execute-only；与 plan 分离，避免实际结果覆盖原始收益基线
-    FragAfterPercent int32 `json:"fragAfterPercent"` // 实际复测值；未验证时等于 plan.fragBeforePercent
-    FreedNodeCount   int32 `json:"freedNodeCount"`   // plan.freedNodes 中实际空闲的节点数
-    MovedCardCount   int64 `json:"movedCardCount"`   // Eviction API 接受的 Pod 对应卡数
-    MetricsVerified  bool  `json:"metricsVerified"`  // fragAfter/freedNodeCount 是否来自一致快照
+    FragAfterPercent int32    `json:"fragAfterPercent"`  // 实际复测值；未验证时等于 plan.fragBeforePercent
+    FreedNodeCount   int32    `json:"freedNodeCount"`    // plan.freedNodes 中实际空闲的节点数
+    FreedNodes       []string `json:"freedNodes,omitempty"` // 已验证空闲的计划节点名；排序且可与 plan 精确对比
+    MovedCardCount   int64    `json:"movedCardCount"`    // Eviction API 接受的 Pod 对应卡数
+    MetricsVerified  bool     `json:"metricsVerified"`   // fragAfter/freedNodeCount/freedNodes 是否来自一致快照
 }
 // 「值不值得整理」不放 summary，改由 conditions[Complete].reason 收口（conditions 权威、机器可读）：
 //   RepackRecommended  —— DryRun 找到划算方案（moves 非空）
 //   Executed           —— Execute 已执行搬迁
+//   ExecutedWithPlacementDrift —— 替身落点漂移，但完整计划节点集合已腾空
 //   NoFragmentation    —— 目标资源的全集群碎片率为 0，无需整理
 //   BelowGoalThreshold —— 全集群有碎片，但当前 scope 内没有达到目标门控的可行方案
+// Execute 失败由 conditions[Failed].reason 区分 BenefitNotRealized /
+// PlacementExpired / MetricsUnverified。
 // 已精简（对齐评审）：moves 删 role/moveKind/disruptionScore/outcome/actualNode（可读性/常量/
 // 内部打分/漂移不纠正；身份匹配的 role 只留在 nominations[]，Execute 落点看 nominations[].phase）；
-// 逐 pod 明细收进 pods[]PodMove（纯计划）；freedNodes 由 []FreedNode 塌缩为 []string
-// （actuallyFreed 可由 summary.freedNodeCount + nominations 表达，且「保持空」并非成功判据）；
+// 逐 pod 明细收进 pods[]PodMove（纯计划）；plan.freedNodes 由 []FreedNode 塌缩为 []string，
+// 实际集合显式记录在 result.freedNodes，成功判据是二者集合完全一致；
 // summary 删 verdict（→ conditions.reason）/fragDeltaPercent（=before−after 派生）/
 // podGroupsToMove（=distinct moves 派生）。
 type ResolvedScope struct {
@@ -532,6 +536,7 @@ status:
   result:                             # Execute-only 实际结果
     fragAfterPercent: 29              # 替身绑定后的全集群复测
     freedNodeCount: 2
+    freedNodes: [node-a17, node-a23]  # 必须与 plan.freedNodes 集合一致才可成功
     movedCardCount: 35                # 实际被接受的驱逐所对应卡数
     metricsVerified: true
   nominations:                        # 每搬一个 pod 一条，引导重建 pod 落到 nodeName

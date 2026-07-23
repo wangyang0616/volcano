@@ -52,7 +52,10 @@ RepackRun Events describe the global lifecycle:
 
 `PlanComputed` → `ExecutePrepared` → `EvictionsIssued` →
 `AwaitingPlacement` → `PlacementSelected` / `PlacementAwaitingCapacity` →
-terminal condition reason. `PlacementExpired` is a Warning.
+terminal condition reason. `PlacementExpired`, `MetricsUnverified`, and
+`BenefitNotRealized` are Warnings. `ExecutedWithPlacementDrift` is successful
+when every replacement is scheduled and the exact planned freed-node set is
+verified.
 
 Replacement Pod Events describe the concrete placement:
 

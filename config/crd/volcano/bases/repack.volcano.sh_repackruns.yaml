@@ -744,10 +744,19 @@ spec:
                       resource in the verified terminal snapshot.
                     format: int32
                     type: integer
+                  freedNodes:
+                    description: |-
+                      FreedNodes are the plan.freedNodes verified free of the target resource in
+                      the terminal scheduler snapshot. The list is sorted for deterministic
+                      status and lets operators compare the realized node set with plan.freedNodes.
+                    items:
+                      type: string
+                    maxItems: 2048
+                    type: array
                   metricsVerified:
                     description: |-
-                      MetricsVerified reports whether FragAfterPercent and FreedNodeCount came
-                      from a coherent scheduler snapshot after replacement binding.
+                      MetricsVerified reports whether FragAfterPercent, FreedNodeCount, and
+                      FreedNodes came from a coherent scheduler snapshot after replacement binding.
                     type: boolean
                   movedCardCount:
                     description: MovedCardCount is the accelerator-card total for

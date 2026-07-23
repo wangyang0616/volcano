@@ -417,13 +417,9 @@ func placementsComplete(run *repackv1alpha1.RepackRun) bool {
 }
 
 func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
-	degraded := false
 	expired := false
 	metricsUnverified := false
 	for index := range run.Status.Nominations {
-		if run.Status.Nominations[index].Phase != repackv1alpha1.PodPlacementPlaced {
-			degraded = true
-		}
 		if run.Status.Nominations[index].Phase == repackv1alpha1.PodPlacementExpired {
 			expired = true
 		}
@@ -447,7 +443,6 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 				e.workQueue.AddAfter(run.Name, placementRetryInterval)
 				return nil
 			}
-			degraded = true
 			metricsUnverified = true
 			markExecuteBenefitUnverified(run)
 		} else {
@@ -456,23 +451,30 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		}
 	}
 
-	reason := state.ReasonExecuted
-	if degraded {
-		reason = state.ReasonPlacementDegraded
-	}
-	message := placementStatusMessage(run, targetResource, degraded, metricsUnverified)
+	decision := evaluatePlacementTerminal(run, metricsUnverified)
+	message := placementStatusMessage(run, targetResource, decision)
 	result := run.Status.Result
+	resultMetrics := runResult(run)
 	placedCount, driftedCount, expiredPlacementCount := placementOutcomeCounts(run)
-	klog.V(3).InfoS("repack: replacement placement reached terminal observation",
-		"run", run.Name, "degraded", degraded, "metricsUnverified", metricsUnverified,
+	klog.V(3).InfoS("repack: replacement placement terminal result evaluated",
+		"run", run.Name, "succeeded", decision.Succeeded, "reason", decision.Reason,
+		"metricsUnverified", metricsUnverified,
 		"placedCount", placedCount, "driftedCount", driftedCount, "expiredCount", expiredPlacementCount,
+		"plannedFreedNodeCount", len(decision.Nodes.Planned), "actualFreedNodeCount", len(decision.Nodes.Actual),
+		"missingFreedNodeCount", len(decision.Nodes.Missing), "missingFreedNodes", formatNodeNames(decision.Nodes.Missing),
+		"unexpectedFreedNodeCount", len(decision.Nodes.Unexpected),
+		"fragAfterPercent", resultMetrics.fragAfter, "movedCardCount", resultMetrics.movedCards)
+	klog.V(4).InfoS("repack: terminal node-freeing set comparison",
+		"run", run.Name, "plannedFreedNodes", decision.Nodes.Planned,
+		"actualFreedNodes", decision.Nodes.Actual, "missingFreedNodes", decision.Nodes.Missing,
+		"unexpectedFreedNodes", decision.Nodes.Unexpected, "setsEqual", decision.Nodes.Equal,
 		"result", result)
 	run.Status.Message = message
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, message, run.Generation)
-	if degraded {
-		state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, message, run.Generation)
+	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, decision.Reason, message, run.Generation)
+	if decision.Succeeded {
+		state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, decision.Reason, message, run.Generation)
 	} else {
-		state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, reason, message, run.Generation)
+		state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, decision.Reason, message, run.Generation)
 	}
 	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
@@ -488,6 +490,86 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		return fmt.Errorf("cleanup placement after terminal result: %w", err)
 	}
 	return nil
+}
+
+type freedNodeSetComparison struct {
+	Planned    []string
+	Actual     []string
+	Missing    []string
+	Unexpected []string
+	Equal      bool
+}
+
+type placementTerminalDecision struct {
+	Succeeded bool
+	Reason    string
+	Nodes     freedNodeSetComparison
+}
+
+func evaluatePlacementTerminal(run *repackv1alpha1.RepackRun, metricsUnverified bool) placementTerminalDecision {
+	_, drifted, expired := placementOutcomeCounts(run)
+	nodes := compareFreedNodeSets(run)
+	switch {
+	case expired > 0:
+		return placementTerminalDecision{Reason: state.ReasonPlacementExpired, Nodes: nodes}
+	case metricsUnverified || run == nil || run.Status.Result == nil || !run.Status.Result.MetricsVerified:
+		return placementTerminalDecision{Reason: state.ReasonMetricsUnverified, Nodes: nodes}
+	case !nodes.Equal:
+		return placementTerminalDecision{Reason: state.ReasonBenefitNotRealized, Nodes: nodes}
+	case drifted > 0:
+		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecutedWithPlacementDrift, Nodes: nodes}
+	default:
+		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecuted, Nodes: nodes}
+	}
+}
+
+func compareFreedNodeSets(run *repackv1alpha1.RepackRun) freedNodeSetComparison {
+	var planned, actual []string
+	if run != nil && run.Status.Plan != nil {
+		planned = run.Status.Plan.FreedNodes
+	}
+	if run != nil && run.Status.Result != nil {
+		actual = run.Status.Result.FreedNodes
+	}
+	result := freedNodeSetComparison{
+		Planned: sortedUniqueNodeNames(planned),
+		Actual:  sortedUniqueNodeNames(actual),
+	}
+	plannedSet := make(map[string]struct{}, len(result.Planned))
+	actualSet := make(map[string]struct{}, len(result.Actual))
+	for _, nodeName := range result.Planned {
+		plannedSet[nodeName] = struct{}{}
+	}
+	for _, nodeName := range result.Actual {
+		actualSet[nodeName] = struct{}{}
+	}
+	for _, nodeName := range result.Planned {
+		if _, found := actualSet[nodeName]; !found {
+			result.Missing = append(result.Missing, nodeName)
+		}
+	}
+	for _, nodeName := range result.Actual {
+		if _, found := plannedSet[nodeName]; !found {
+			result.Unexpected = append(result.Unexpected, nodeName)
+		}
+	}
+	result.Equal = len(result.Missing) == 0 && len(result.Unexpected) == 0
+	return result
+}
+
+func sortedUniqueNodeNames(nodeNames []string) []string {
+	unique := make(map[string]struct{}, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		if nodeName != "" {
+			unique[nodeName] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(unique))
+	for nodeName := range unique {
+		result = append(result, nodeName)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func placementObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.Time) bool {
@@ -550,23 +632,59 @@ func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.
 			nodesByName[node.Name] = node
 		}
 	}
-	var actuallyFreed int32
-	for _, nodeName := range acceptedFreedNodeNames(run) {
-		node := nodesByName[nodeName]
-		if node == nil || engineapi.Scalar(node.Allocatable, targetResource) <= 0 {
+	acceptedCandidates := sortedUniqueNodeNames(acceptedFreedNodeNames(run))
+	acceptedCandidateSet := make(map[string]struct{}, len(acceptedCandidates))
+	for _, nodeName := range acceptedCandidates {
+		acceptedCandidateSet[nodeName] = struct{}{}
+	}
+	actuallyFreedNodes := make([]string, 0, len(acceptedCandidates))
+	for _, nodeName := range sortedUniqueNodeNames(run.Status.Plan.FreedNodes) {
+		if _, accepted := acceptedCandidateSet[nodeName]; !accepted {
+			klog.V(4).InfoS("repack: planned node is not an actual-free candidate because its complete eviction set was not accepted",
+				"run", run.Name, "node", nodeName, "resource", targetResource)
 			continue
 		}
-		if engineapi.Scalar(node.Used, targetResource) == 0 {
-			actuallyFreed++
+		node := nodesByName[nodeName]
+		if node == nil {
+			klog.V(4).InfoS("repack: planned node not present in terminal scheduler snapshot",
+				"run", run.Name, "node", nodeName, "resource", targetResource)
+			continue
 		}
+		allocatable := engineapi.Scalar(node.Allocatable, targetResource)
+		used := engineapi.Scalar(node.Used, targetResource)
+		if allocatable <= 0 {
+			klog.V(4).InfoS("repack: planned node no longer provides the target resource",
+				"run", run.Name, "node", nodeName, "resource", targetResource,
+				"allocatable", allocatable, "used", used)
+			continue
+		}
+		if used == 0 {
+			actuallyFreedNodes = append(actuallyFreedNodes, nodeName)
+			klog.V(4).InfoS("repack: planned node verified free of the target resource",
+				"run", run.Name, "node", nodeName, "resource", targetResource,
+				"allocatable", allocatable, "used", used)
+			continue
+		}
+		klog.V(4).InfoS("repack: planned node remains occupied by the target resource",
+			"run", run.Name, "node", nodeName, "resource", targetResource,
+			"allocatable", allocatable, "used", used)
 	}
-	run.Status.Result.FreedNodeCount = actuallyFreed
+	run.Status.Result.FreedNodes = actuallyFreedNodes
+	run.Status.Result.FreedNodeCount = int32(len(actuallyFreedNodes))
 	run.Status.Result.MetricsVerified = true
-	klog.V(4).InfoS("repack: actual Execute benefit measured from scheduler snapshot",
+	comparison := compareFreedNodeSets(run)
+	klog.V(3).InfoS("repack: actual Execute benefit measured from scheduler snapshot",
 		"run", run.Name, "resource", targetResource,
 		"fragAfterPercent", run.Status.Result.FragAfterPercent,
 		"freedNodeCount", run.Status.Result.FreedNodeCount,
-		"movedCardCount", run.Status.Result.MovedCardCount)
+		"movedCardCount", run.Status.Result.MovedCardCount,
+		"plannedFreedNodeCount", len(comparison.Planned),
+		"missingFreedNodeCount", len(comparison.Missing), "missingFreedNodes", formatNodeNames(comparison.Missing),
+		"unexpectedFreedNodeCount", len(comparison.Unexpected))
+	klog.V(4).InfoS("repack: actual Execute benefit node sets",
+		"run", run.Name, "resource", targetResource,
+		"plannedFreedNodes", comparison.Planned, "actualFreedNodes", comparison.Actual,
+		"missingFreedNodes", comparison.Missing, "unexpectedFreedNodes", comparison.Unexpected)
 }
 
 func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
@@ -578,6 +696,7 @@ func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
 	}
 	run.Status.Result.FragAfterPercent = run.Status.Plan.Summary.FragBeforePercent
 	run.Status.Result.FreedNodeCount = 0
+	run.Status.Result.FreedNodes = nil
 	run.Status.Result.MetricsVerified = false
 }
 

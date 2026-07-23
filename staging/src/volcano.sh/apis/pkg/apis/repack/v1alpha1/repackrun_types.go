@@ -365,10 +365,16 @@ type RepackResult struct {
 	// FreedNodeCount is the number of plan.freedNodes actually free of the target
 	// resource in the verified terminal snapshot.
 	FreedNodeCount int32 `json:"freedNodeCount"`
+	// FreedNodes are the plan.freedNodes verified free of the target resource in
+	// the terminal scheduler snapshot. The list is sorted for deterministic
+	// status and lets operators compare the realized node set with plan.freedNodes.
+	// +optional
+	// +kubebuilder:validation:MaxItems=2048
+	FreedNodes []string `json:"freedNodes,omitempty"`
 	// MovedCardCount is the accelerator-card total for accepted Pod evictions.
 	MovedCardCount int64 `json:"movedCardCount"`
-	// MetricsVerified reports whether FragAfterPercent and FreedNodeCount came
-	// from a coherent scheduler snapshot after replacement binding.
+	// MetricsVerified reports whether FragAfterPercent, FreedNodeCount, and
+	// FreedNodes came from a coherent scheduler snapshot after replacement binding.
 	MetricsVerified bool `json:"metricsVerified"`
 }
 

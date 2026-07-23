@@ -18,6 +18,8 @@ package repackengine
 
 import (
 	"context"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	state "volcano.sh/repack-controller/pkg/state"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
@@ -246,8 +249,175 @@ func TestUpdateActualExecuteResult(t *testing.T) {
 	if run.Status.Result.FreedNodeCount != 1 || !run.Status.Result.MetricsVerified {
 		t.Errorf("result=%+v, want actual freedNodeCount=1 and verified", run.Status.Result)
 	}
+	if got, want := run.Status.Result.FreedNodes, []string{"freed"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("result.freedNodes=%v, want %v; an unrelated already-empty node must not be counted", got, want)
+	}
 	if run.Status.Plan.Summary.FragAfterPercent != 11 || run.Status.Plan.Summary.FreedNodeCount != 1 {
 		t.Errorf("plan summary was overwritten: %+v", run.Status.Plan.Summary)
+	}
+}
+
+func TestUpdateActualExecuteResultDoesNotClaimOccupiedPlannedNode(t *testing.T) {
+	resource := v1.ResourceName("example.com/accelerator")
+	resourceOf := func(cards int64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(cards * 1000)}}
+	}
+	nodes := []*schedapi.NodeInfo{{
+		Name: "planned", Allocatable: resourceOf(8), Used: resourceOf(2),
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{"concurrent": {Resreq: resourceOf(2)}},
+	}}
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary:    &repackv1alpha1.RepackSummary{FragBeforePercent: 25, FreedNodeCount: 1},
+			FreedNodes: []string{"planned"},
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "pg",
+				Pods: []repackv1alpha1.PodMove{{Name: "victim", FromNode: "planned", ToNode: "receiver"}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{},
+		Nominations: []repackv1alpha1.PodNomination{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", NodeName: "receiver",
+			Phase: repackv1alpha1.PodPlacementPlaced,
+		}},
+	}}
+
+	updateActualExecuteResult(run, nodes, resource)
+	if len(run.Status.Result.FreedNodes) != 0 || run.Status.Result.FreedNodeCount != 0 {
+		t.Fatalf("result=%+v, want no freed node while planned node remains occupied", run.Status.Result)
+	}
+	decision := evaluatePlacementTerminal(run, false)
+	if decision.Succeeded || decision.Reason != state.ReasonBenefitNotRealized {
+		t.Fatalf("decision=%+v, want failed %s", decision, state.ReasonBenefitNotRealized)
+	}
+	if got, want := decision.Nodes.Missing, []string{"planned"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("missing=%v, want %v", got, want)
+	}
+}
+
+func TestEvaluatePlacementTerminal(t *testing.T) {
+	tests := []struct {
+		name              string
+		nominationPhases  []repackv1alpha1.PodNominationPhase
+		plannedNodes      []string
+		actualNodes       []string
+		metricsVerified   bool
+		metricsUnverified bool
+		wantSucceeded     bool
+		wantReason        string
+		wantMissing       []string
+		wantUnexpected    []string
+	}{
+		{
+			name: "exact planned node set",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementPlaced,
+			},
+			plannedNodes: []string{"node-b", "node-a"}, actualNodes: []string{"node-a", "node-b"},
+			metricsVerified: true, wantSucceeded: true, wantReason: state.ReasonExecuted,
+		},
+		{
+			name: "placement drift is diagnostic when benefit is realized",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementDegraded,
+			},
+			plannedNodes: []string{"node-a"}, actualNodes: []string{"node-a"},
+			metricsVerified: true, wantSucceeded: true, wantReason: state.ReasonExecutedWithPlacementDrift,
+		},
+		{
+			name: "same count but different node set",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementPlaced,
+			},
+			plannedNodes: []string{"node-a"}, actualNodes: []string{"node-b"},
+			metricsVerified: true, wantReason: state.ReasonBenefitNotRealized,
+			wantMissing: []string{"node-a"}, wantUnexpected: []string{"node-b"},
+		},
+		{
+			name: "planned node remains occupied",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementPlaced,
+			},
+			plannedNodes: []string{"node-a", "node-b"}, actualNodes: []string{"node-a"},
+			metricsVerified: true, wantReason: state.ReasonBenefitNotRealized,
+			wantMissing: []string{"node-b"},
+		},
+		{
+			name: "replacement placement expired",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementExpired,
+			},
+			plannedNodes: []string{"node-a"}, actualNodes: nil,
+			wantReason: state.ReasonPlacementExpired, wantMissing: []string{"node-a"},
+		},
+		{
+			name: "terminal scheduler metrics unverified",
+			nominationPhases: []repackv1alpha1.PodNominationPhase{
+				repackv1alpha1.PodPlacementPlaced,
+			},
+			plannedNodes: []string{"node-a"}, actualNodes: nil,
+			metricsUnverified: true, wantReason: state.ReasonMetricsUnverified,
+			wantMissing: []string{"node-a"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nominations := make([]repackv1alpha1.PodNomination, len(test.nominationPhases))
+			for index, phase := range test.nominationPhases {
+				nominations[index].Phase = phase
+			}
+			run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+				Plan:        &repackv1alpha1.RepackPlan{FreedNodes: test.plannedNodes},
+				Result:      &repackv1alpha1.RepackResult{FreedNodes: test.actualNodes, MetricsVerified: test.metricsVerified},
+				Nominations: nominations,
+			}}
+			got := evaluatePlacementTerminal(run, test.metricsUnverified)
+			if got.Succeeded != test.wantSucceeded || got.Reason != test.wantReason {
+				t.Fatalf("decision=%+v, want succeeded=%t reason=%s", got, test.wantSucceeded, test.wantReason)
+			}
+			if !reflect.DeepEqual(got.Nodes.Missing, test.wantMissing) {
+				t.Errorf("missing=%v, want %v", got.Nodes.Missing, test.wantMissing)
+			}
+			if !reflect.DeepEqual(got.Nodes.Unexpected, test.wantUnexpected) {
+				t.Errorf("unexpected=%v, want %v", got.Nodes.Unexpected, test.wantUnexpected)
+			}
+		})
+	}
+}
+
+func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
+	resource := v1.ResourceName("example.com/accelerator")
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{Summary: &repackv1alpha1.RepackSummary{
+			FragBeforePercent: 50,
+		}},
+		Nominations: []repackv1alpha1.PodNomination{
+			{Phase: repackv1alpha1.PodPlacementPlaced},
+			{Phase: repackv1alpha1.PodPlacementDegraded},
+		},
+	}}
+	decision := placementTerminalDecision{
+		Reason: state.ReasonBenefitNotRealized,
+		Nodes: freedNodeSetComparison{
+			Planned: []string{"node-a", "node-b"},
+			Actual:  []string{"node-a"},
+			Missing: []string{"node-b"},
+		},
+	}
+
+	message := placementStatusMessage(run, resource, decision)
+	for _, want := range []string{
+		"did not realize the planned benefit",
+		"node-a, node-b",
+		"node-b",
+		"2 replacement Pods were scheduled",
+		"1 placement drift",
+		"inspect target-resource usage",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message %q does not contain operator detail %q", message, want)
+		}
 	}
 }
 
@@ -258,11 +428,14 @@ func TestExpiredPlacementDoesNotClaimUnverifiedBenefit(t *testing.T) {
 			FragAfterPercent:  20,
 			FreedNodeCount:    2,
 		}},
-		Result: &repackv1alpha1.RepackResult{FragAfterPercent: 30, FreedNodeCount: 1, MovedCardCount: 6, MetricsVerified: true},
+		Result: &repackv1alpha1.RepackResult{
+			FragAfterPercent: 30, FreedNodeCount: 1, FreedNodes: []string{"node-a"},
+			MovedCardCount: 6, MetricsVerified: true,
+		},
 	}}
 	markExecuteBenefitUnverified(run)
 	if run.Status.Result.FragAfterPercent != 40 || run.Status.Result.FreedNodeCount != 0 ||
-		run.Status.Result.MovedCardCount != 6 || run.Status.Result.MetricsVerified {
+		len(run.Status.Result.FreedNodes) != 0 || run.Status.Result.MovedCardCount != 6 || run.Status.Result.MetricsVerified {
 		t.Fatalf("expired placement result=%+v, want conservative 40%%/0 with accepted cards retained", run.Status.Result)
 	}
 	if run.Status.Plan.Summary.FragAfterPercent != 20 || run.Status.Plan.Summary.FreedNodeCount != 2 {
