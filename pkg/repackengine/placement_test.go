@@ -106,6 +106,177 @@ func TestPreparePlacementLeaseReclaimsTerminalLease(t *testing.T) {
 	}
 }
 
+func TestCleanupPlacementFindsUnclaimedWebhookLeaseAndClearsDiscoveryLabel(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "run", UID: types.UID("run-uid"),
+			Labels: map[string]string{repackv1alpha1.PlacementActiveLabel: "true"},
+		},
+		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackFailed,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+			}}},
+		},
+	}
+	unclaimed := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "scale-out",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	client := vcfake.NewSimpleClientset(run.DeepCopy(), unclaimed)
+	engine := &Engine{volcanoClient: client}
+	if err := engine.cleanupPlacement(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	updatedPodGroup, err := client.SchedulingV1beta1().PodGroups("ns").Get(
+		context.Background(), "scale-out", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedPodGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] != "" {
+		t.Fatalf("unclaimed admission lease was not removed: %+v", updatedPodGroup.Annotations)
+	}
+	updatedRun, err := client.RepackV1alpha1().RepackRuns().Get(
+		context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedRun.Labels[repackv1alpha1.PlacementActiveLabel] != "" {
+		t.Fatalf("placement discovery label was not removed: %+v", updatedRun.Labels)
+	}
+}
+
+func TestReleasePlacementLeasesPreservesAnotherRunOwner(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{ObjectMeta: metav1.ObjectMeta{
+		Name: "run", UID: types.UID("run-uid"),
+	}}
+	owned := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "owned",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	notOwned := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "not-owned",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "other/other-uid"},
+	}}
+	client := vcfake.NewSimpleClientset(owned, notOwned)
+	engine := &Engine{volcanoClient: client}
+	groups := map[types.NamespacedName]struct{}{
+		{Namespace: "ns", Name: "owned"}:     {},
+		{Namespace: "ns", Name: "not-owned"}: {},
+		{Namespace: "ns", Name: "missing"}:   {},
+	}
+	if err := engine.releasePlacementLeases(context.Background(), run, groups); err != nil {
+		t.Fatal(err)
+	}
+	updatedOwned, err := client.SchedulingV1beta1().PodGroups("ns").Get(
+		context.Background(), "owned", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedOwned.Annotations[repackv1alpha1.PlacementLeaseAnnotation] != "" {
+		t.Fatalf("owned lease was not released: %+v", updatedOwned.Annotations)
+	}
+	updatedNotOwned, err := client.SchedulingV1beta1().PodGroups("ns").Get(
+		context.Background(), "not-owned", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := updatedNotOwned.Annotations[repackv1alpha1.PlacementLeaseAnnotation]; got != "other/other-uid" {
+		t.Fatalf("another Run's lease changed to %q", got)
+	}
+}
+
+func TestRecreatedPodGroupLeaseRepairIsIndependentlyRateLimited(t *testing.T) {
+	controller := true
+	start := metav1.NewTime(time.Unix(100, 0))
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase:     repackv1alpha1.RepackRunning,
+			StartTime: &start,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+				Owner: &repackv1alpha1.WorkloadRef{
+					APIVersion: "serving.example/v1", Kind: "Serving", Name: "model",
+				},
+			}}},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	candidate := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "new", CreationTimestamp: metav1.NewTime(time.Unix(101, 0)),
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	client := vcfake.NewSimpleClientset(run.DeepCopy(), candidate)
+	now := time.Unix(101, 0)
+	engine := &Engine{volcanoClient: client, now: func() time.Time { return now }}
+	listCount := func() int {
+		count := 0
+		for _, action := range client.Actions() {
+			if action.GetVerb() == "list" && action.GetResource().Resource == "podgroups" {
+				count++
+			}
+		}
+		return count
+	}
+
+	if err := engine.repairRecreatedPodGroupLeasesIfDue(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.repairRecreatedPodGroupLeasesIfDue(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if got := listCount(); got != 1 {
+		t.Fatalf("PodGroup LIST count before repair interval = %d, want 1", got)
+	}
+
+	now = now.Add(placementLeaseRepairInterval + time.Second)
+	if err := engine.repairRecreatedPodGroupLeasesIfDue(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if got := listCount(); got != 2 {
+		t.Fatalf("PodGroup LIST count after repair interval = %d, want 2", got)
+	}
+	updated, err := client.SchedulingV1beta1().PodGroups("ns").Get(context.Background(), "new", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Annotations[repackv1alpha1.PlacementLeaseAnnotation]; got != "run/run-uid" {
+		t.Fatalf("repaired placement lease = %q, want run/run-uid", got)
+	}
+}
+
+func TestRecreatedPodGroupLeaseRepairSkipsCompletedWorkloads(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Status: repackv1alpha1.RepackRunStatus{
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "workload"},
+			}}},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPlaced,
+			}},
+		},
+	}
+	client := vcfake.NewSimpleClientset(run.DeepCopy())
+	engine := &Engine{volcanoClient: client}
+	if err := engine.repairRecreatedPodGroupLeasesIfDue(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "list" && action.GetResource().Resource == "podgroups" {
+			t.Fatalf("completed workload triggered unnecessary PodGroup LIST: %#v", action)
+		}
+	}
+}
+
 func TestPlacementBindingsVisible(t *testing.T) {
 	nodes := []*schedapi.NodeInfo{{
 		Name: "n1",
@@ -393,7 +564,10 @@ func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
 			FragBeforePercent: 50,
 		}},
 		Nominations: []repackv1alpha1.PodNomination{
-			{Phase: repackv1alpha1.PodPlacementPlaced},
+			{
+				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
+				Phase: repackv1alpha1.PodPlacementPlaced,
+			},
 			{Phase: repackv1alpha1.PodPlacementDegraded},
 		},
 	}}
@@ -414,6 +588,7 @@ func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
 		"2 replacement Pods were scheduled",
 		"1 placement drift",
 		"inspect target-resource usage",
+		"ns/old -> ns/new",
 	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("message %q does not contain operator detail %q", message, want)

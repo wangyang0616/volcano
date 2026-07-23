@@ -17,10 +17,13 @@ limitations under the License.
 package repack
 
 import (
+	"context"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 
@@ -122,4 +125,49 @@ var _ = Describe("Repack defragmentation scenarios (DryRun consolidation)", Seri
 			Expect(runningPodCount(ctx)).To(Equal(runningBefore), "DryRun must not evict pods")
 		})
 	}
+
+	// Historical regression: both directions free one node, but draining the
+	// lightly used node moves one PodGroup while draining the packed node moves
+	// three. The planner must preserve the lower-disruption B -> A direction.
+	It("drains one lightly used PodGroup instead of three packed PodGroups", func() {
+		nodes = npuFixture(ctx, 3)
+		packedWorkloads := []*nativeWorkload{
+			occupyNativeDeployment(ctx, "direction-packed-1", nodes[0], "packed", 2),
+			occupyNativeDeployment(ctx, "direction-packed-2", nodes[0], "packed", 2),
+			occupyNativeDeployment(ctx, "direction-packed-3", nodes[0], "packed", 2),
+		}
+		lightWorkload := occupyNativeDeployment(ctx, "direction-light", nodes[1], "light", 2)
+		allWorkloads := append(append([]*nativeWorkload{}, packedWorkloads...), lightWorkload)
+		defer deleteNativeWorkloads(ctx, allWorkloads...)
+
+		for _, workload := range allWorkloads {
+			podGroup, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Get(
+				context.TODO(), workload.podGroup, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(podGroup.Spec.MinMember).To(BeEquivalentTo(1),
+				"the regression layout requires each workload to remain an independent minAvailable=1 PodGroup")
+		}
+
+		scope := &repackv1alpha1.RepackScope{
+			Nodes: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{Names: []string{nodes[0], nodes[1]}},
+			},
+		}
+		run, err := newRun("direction-regression", repackv1alpha1.RepackModeDryRun).
+			goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("RepackRecommended"))
+		Expect(got.Status.Plan.FreedNodes).To(Equal([]string{nodes[1]}),
+			"the lightly used node must be the exact drain target")
+		Expect(got.Status.Plan.Moves).To(HaveLen(1),
+			"lower disruption means moving only the single PodGroup from the lightly used node")
+		Expect(got.Status.Plan.Moves[0].PodGroupName).To(Equal(lightWorkload.podGroup))
+		Expect(got.Status.Plan.Moves[0].Pods).To(HaveLen(1))
+		Expect(got.Status.Plan.Moves[0].Pods[0].FromNode).To(Equal(nodes[1]))
+		Expect(got.Status.Plan.Moves[0].Pods[0].ToNode).To(Equal(nodes[0]))
+	})
 })

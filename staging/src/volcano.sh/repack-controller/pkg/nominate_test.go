@@ -151,6 +151,16 @@ func TestMatchNomination(t *testing.T) {
 		}
 	})
 
+	t.Run("victimPodName exact remains scoped to PodGroup", func(t *testing.T) {
+		n := nominatorWith(runWithNoms("r1",
+			repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "source", VictimPodName: "w-0", NodeName: "n2", ExpirationTime: &future},
+		))
+		rec, _ := matchNomination(n, pendingPod("ns", "w-0", "concurrent-scale-out", nil))
+		if rec != nil {
+			t.Fatalf("exact Pod name must not bypass PodGroup identity: %+v", rec)
+		}
+	})
+
 	t.Run("identityLabels superset match", func(t *testing.T) {
 		n := nominatorWith(runWithNoms("r1",
 			repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", IdentityLabels: map[string]string{"apps.kubernetes.io/pod-index": "3"}, NodeName: "n5", ExpirationTime: &future},
@@ -208,6 +218,51 @@ func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
 	}
 }
 
+func TestMatchNominationUsesRecordedReplacementPodGroupForEveryIdentityStrategy(t *testing.T) {
+	future := metav1.NewTime(time.Unix(5000, 0))
+	tests := []struct {
+		name       string
+		nomination repackv1alpha1.PodNomination
+		pod        *corev1.Pod
+	}{
+		{
+			name: "exact Pod name",
+			nomination: repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
+				VictimPodName: "worker-0", NodeName: "node-a", ExpirationTime: &future,
+			},
+			pod: pendingPod("ns", "worker-0", "new", nil),
+		},
+		{
+			name: "identity label",
+			nomination: repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
+				VictimPodName: "old-worker", NodeName: "node-a", ExpirationTime: &future,
+				IdentityLabels: map[string]string{"apps.kubernetes.io/pod-index": "1"},
+			},
+			pod: pendingPod("ns", "new-worker", "new", map[string]string{"apps.kubernetes.io/pod-index": "1"}),
+		},
+		{
+			name: "fungible Pod",
+			nomination: repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
+				VictimPodName: "old-random", NodeName: "node-a", ExpirationTime: &future,
+			},
+			pod: pendingPod("ns", "new-random", "new", nil),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			nominator := nominatorWith(runWithNoms("run", test.nomination))
+			nomination, owner := matchNomination(nominator, test.pod)
+			if nomination == nil || owner != "run" {
+				t.Fatalf("recorded replacement PodGroup did not match %s: nomination=%+v owner=%q",
+					test.name, nomination, owner)
+			}
+		})
+	}
+}
+
 func TestRemovePlacementGateRemovesOwnerMarker(t *testing.T) {
 	pod := pendingPod("ns", "scale-out", "group", nil)
 	pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
@@ -248,6 +303,46 @@ func TestPendingPlacementForPodGroup(t *testing.T) {
 	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
 	if pendingPlacementForPodGroup(run, pod, time.Unix(1000, 0)) {
 		t.Fatal("placed nomination must not hold an unrelated Pod")
+	}
+}
+
+func TestPendingPlacementForLeasedWorkloadProtectsUnmappedPodGroup(t *testing.T) {
+	controller := true
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "old", VictimPodName: "old-0",
+		Phase: repackv1alpha1.PodPlacementPrepared,
+	})
+	run.Status.Plan = &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+		Namespace: "ns", PodGroupName: "old",
+		Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+	}}}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "candidate",
+		Annotations: map[string]string{
+			repackv1alpha1.PlacementLeaseAnnotation: placement.OwnerValue(run.Name, run.UID),
+		},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	nominator := &Nominator{volcanoClient: vcfake.NewSimpleClientset(podGroup)}
+	pending, err := nominator.pendingPlacementForLeasedWorkload(
+		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("unmapped leased PodGroup must remain gated while its workload has pending placements")
+	}
+
+	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
+	pending, err = nominator.pendingPlacementForLeasedWorkload(
+		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("workload candidate must be released after all placements finish")
 	}
 }
 
@@ -673,6 +768,128 @@ func TestMarkPlacementGatedClaimsFreshUnassignedNomination(t *testing.T) {
 	}
 	if !got[first.Name] || !got[second.Name] {
 		t.Fatalf("replacement claims = %v, want both Pods", got)
+	}
+}
+
+func TestEnsureReplacementPodGroupRecordsWorkloadRecreation(t *testing.T) {
+	controller := true
+	run := runWithNoms("run",
+		repackv1alpha1.PodNomination{
+			Namespace: "ns", PodGroupName: "old", VictimPodName: "old-0",
+			NodeName: "n1", Phase: repackv1alpha1.PodPlacementPrepared,
+		},
+		repackv1alpha1.PodNomination{
+			Namespace: "ns", PodGroupName: "old", VictimPodName: "old-1",
+			NodeName: "n2", Phase: repackv1alpha1.PodPlacementPrepared,
+		},
+	)
+	run.Status.Plan = &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+		Namespace: "ns", PodGroupName: "old",
+		Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+	}}}
+	newPodGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "new",
+		Annotations: map[string]string{
+			repackv1alpha1.PlacementLeaseAnnotation: placement.OwnerValue(run.Name, run.UID),
+		},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	pod := pendingPod("ns", "new-0", "new", nil)
+	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy(), newPodGroup)
+	nominator := &Nominator{
+		volcanoClient: volcanoClient,
+		recorder:      record.NewFakeRecorder(10),
+	}
+
+	updated, err := nominator.ensureReplacementPodGroup(context.Background(), run.DeepCopy(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range updated.Status.Nominations {
+		if got := updated.Status.Nominations[index].ReplacementPodGroupName; got != "new" {
+			t.Fatalf("nomination[%d].replacementPodGroupName = %q, want new", index, got)
+		}
+	}
+	expectRecorderEvent(t, nominator.recorder.(*record.FakeRecorder), eventReasonPodGroupRecreated)
+
+	// Reconciliation is idempotent: the durable mapping is reused and no second
+	// status mutation is required.
+	again, err := nominator.ensureReplacementPodGroup(context.Background(), updated.DeepCopy(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status.Nominations[0].ReplacementPodGroupName != "new" {
+		t.Fatalf("durable mapping was not retained: %+v", again.Status.Nominations[0])
+	}
+}
+
+func TestSourcePodGroupForReplacementIncludesNamespace(t *testing.T) {
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "namespace-a", PodGroupName: "old", ReplacementPodGroupName: "new",
+	})
+	if source, found := sourcePodGroupForReplacement(run, "namespace-a", "new"); !found || source != "old" {
+		t.Fatalf("namespace-a/new mapping = %q,%t; want old,true", source, found)
+	}
+	if source, found := sourcePodGroupForReplacement(run, "namespace-b", "new"); found || source != "" {
+		t.Fatalf("namespace-b/new must not reuse namespace-a mapping: %q,%t", source, found)
+	}
+}
+
+func TestEnsureReplacementPodGroupAdvancesAfterRepeatedRecreation(t *testing.T) {
+	controller := true
+	run := runWithNoms("run",
+		repackv1alpha1.PodNomination{
+			Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "replacement-v1",
+			VictimPodName: "worker-0", NodeName: "node-a", SelectedNodeName: "node-b",
+			ReplacementPodName: "replacement-v1-0", ReplacementPodUID: types.UID("replacement-v1-uid"),
+			Phase: repackv1alpha1.PodPlacementNominated,
+		},
+		repackv1alpha1.PodNomination{
+			Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "replacement-v1",
+			VictimPodName: "worker-1", NodeName: "node-a", SelectedNodeName: "node-b",
+			ReplacementPodName: "replacement-v1-1", ReplacementPodUID: types.UID("replacement-v1-uid-1"),
+			ActualNodeName: "node-b", Phase: repackv1alpha1.PodPlacementPlaced,
+		},
+	)
+	run.Status.Plan = &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+		Namespace: "ns", PodGroupName: "old",
+		Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+	}}}
+	replacementV2 := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "replacement-v2",
+		Annotations: map[string]string{
+			repackv1alpha1.PlacementLeaseAnnotation: placement.OwnerValue(run.Name, run.UID),
+		},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	pod := pendingPod("ns", "worker-0", "replacement-v2", nil)
+	nominator := &Nominator{
+		volcanoClient: vcfake.NewSimpleClientset(run.DeepCopy(), replacementV2),
+		recorder:      record.NewFakeRecorder(10),
+		now:           time.Now,
+	}
+
+	updated, err := nominator.ensureReplacementPodGroup(context.Background(), run.DeepCopy(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range updated.Status.Nominations {
+		nomination := &updated.Status.Nominations[index]
+		if nomination.ReplacementPodGroupName != "replacement-v2" {
+			t.Fatalf("nomination[%d] replacement PodGroup = %q, want replacement-v2", index, nomination.ReplacementPodGroupName)
+		}
+		if nomination.Phase != repackv1alpha1.PodPlacementPrepared ||
+			nomination.ReplacementPodName != "" || nomination.ReplacementPodUID != "" ||
+			nomination.SelectedNodeName != "" || nomination.ActualNodeName != "" {
+			t.Fatalf("nomination[%d] was not reset for the next PodGroup generation: %+v", index, nomination)
+		}
+	}
+	if nomination, _ := nominator.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{updated}); nomination == nil {
+		t.Fatal("same-name Pod in replacement-v2 did not match the advanced PodGroup mapping")
 	}
 }
 

@@ -75,7 +75,7 @@ func ActiveForPodGroup(run *repackv1alpha1.RepackRun, namespace, podGroupName st
 	}
 	for i := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[i]
-		if nomination.Namespace != namespace || nomination.PodGroupName != podGroupName {
+		if nomination.Namespace != namespace || !NominationUsesPodGroup(nomination, podGroupName) {
 			continue
 		}
 		switch nomination.Phase {
@@ -89,4 +89,147 @@ func ActiveForPodGroup(run *repackv1alpha1.RepackRun, namespace, podGroupName st
 		}
 	}
 	return false
+}
+
+// NominationUsesPodGroup reports whether podGroupName is either the immutable
+// plan-time group or the group that recreated the replacement Pod.
+func NominationUsesPodGroup(nomination *repackv1alpha1.PodNomination, podGroupName string) bool {
+	if nomination == nil || podGroupName == "" {
+		return false
+	}
+	return nomination.PodGroupName == podGroupName ||
+		nomination.ReplacementPodGroupName == podGroupName
+}
+
+// WorkloadKey is the workload identity used by the current replacement
+// protocol. UID is intentionally excluded in P0; deleting and recreating a
+// workload under the same name during Execute remains an unsupported boundary.
+type WorkloadKey struct {
+	Namespace  string
+	APIVersion string
+	Kind       string
+	Name       string
+}
+
+func (key WorkloadKey) Empty() bool {
+	return key.Namespace == "" || key.APIVersion == "" || key.Kind == "" || key.Name == ""
+}
+
+func workloadKeyForMove(move *repackv1alpha1.RepackMove) WorkloadKey {
+	if move == nil || move.Owner == nil {
+		return WorkloadKey{}
+	}
+	return WorkloadKey{
+		Namespace:  move.Namespace,
+		APIVersion: move.Owner.APIVersion,
+		Kind:       move.Owner.Kind,
+		Name:       move.Owner.Name,
+	}
+}
+
+// WorkloadKeyForPodGroup returns the direct controller owner recorded on a
+// PodGroup. Repack stays workload-kind agnostic and never traverses owner chains.
+func WorkloadKeyForPodGroup(podGroup *schedulingv1beta1.PodGroup) WorkloadKey {
+	if podGroup == nil {
+		return WorkloadKey{}
+	}
+	owner := metav1.GetControllerOf(podGroup)
+	if owner == nil {
+		return WorkloadKey{}
+	}
+	return WorkloadKey{
+		Namespace:  podGroup.Namespace,
+		APIVersion: owner.APIVersion,
+		Kind:       owner.Kind,
+		Name:       owner.Name,
+	}
+}
+
+// SourcePodGroupsByWorkload groups the original PodGroups by workload owner.
+// status.plan.moves is the authoritative affected set; no duplicate status list
+// is needed for replacement discovery.
+func SourcePodGroupsByWorkload(run *repackv1alpha1.RepackRun) map[WorkloadKey][]string {
+	result := map[WorkloadKey][]string{}
+	if run == nil || run.Status.Plan == nil {
+		return result
+	}
+	for index := range run.Status.Plan.Moves {
+		move := &run.Status.Plan.Moves[index]
+		key := workloadKeyForMove(move)
+		if key.Empty() || move.PodGroupName == "" {
+			continue
+		}
+		result[key] = appendUnique(result[key], move.PodGroupName)
+	}
+	return result
+}
+
+// HasPendingPlacementsForWorkload reports whether a workload still owns an unfinished
+// placement. Concrete Pod-to-nomination claiming remains the nominator's job.
+func HasPendingPlacementsForWorkload(run *repackv1alpha1.RepackRun, workload WorkloadKey) bool {
+	if run == nil || workload.Empty() {
+		return false
+	}
+	sources := SourcePodGroupsByWorkload(run)[workload]
+	sourceSet := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		sourceSet[source] = struct{}{}
+	}
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nomination.Namespace != workload.Namespace || PlacementReachedTerminalPhase(nomination) {
+			continue
+		}
+		if _, found := sourceSet[nomination.PodGroupName]; found {
+			return true
+		}
+	}
+	return false
+}
+
+// PlacementAppliesToPodGroup reports whether the active Run covers a PodGroup.
+// Callers validate or inject the lease separately. A newly
+// recreated PodGroup is accepted by workload owner while unfinished nominations
+// remain, closing the admission window before ReplacementPodGroupName is durable.
+func PlacementAppliesToPodGroup(run *repackv1alpha1.RepackRun, podGroup *schedulingv1beta1.PodGroup) bool {
+	if run == nil || podGroup == nil ||
+		run.Spec.Mode != repackv1alpha1.RepackModeExecute ||
+		run.Status.Phase != repackv1alpha1.RepackRunning {
+		return false
+	}
+	if ActiveForPodGroup(run, podGroup.Namespace, podGroup.Name) {
+		return true
+	}
+	if run.Status.StartTime != nil && !podGroup.CreationTimestamp.IsZero() &&
+		podGroup.CreationTimestamp.Time.Before(run.Status.StartTime.Time) {
+		return false
+	}
+	return HasPendingPlacementsForWorkload(run, WorkloadKeyForPodGroup(podGroup))
+}
+
+// PlacementReachedTerminalPhase is intentionally different from the
+// nominator's nominationUnavailableForClaim predicate: Nominated has claimed a
+// concrete Pod but is not terminal until the scheduler's binding is observed.
+func PlacementReachedTerminalPhase(nomination *repackv1alpha1.PodNomination) bool {
+	if nomination == nil {
+		return true
+	}
+	switch nomination.Phase {
+	case repackv1alpha1.PodPlacementPlaced,
+		repackv1alpha1.PodPlacementDegraded,
+		repackv1alpha1.PodPlacementExpired,
+		repackv1alpha1.PodNominationBound:
+		return true
+	default:
+		return false
+	}
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }

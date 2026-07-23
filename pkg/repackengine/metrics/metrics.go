@@ -36,11 +36,11 @@ var (
 		Help:      "Number of finished RepackRuns by mode and terminal outcome.",
 	}, []string{"mode", "outcome"})
 
-	// EvictionsTotal counts pod evictions attempted during Execute, by result.
+	// EvictionsTotal counts planned Pod disruption outcomes during Execute.
 	EvictionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: subsystem,
 		Name:      "evictions_total",
-		Help:      "Number of pod evictions attempted during Execute, by result (evicted/rejected).",
+		Help:      "Number of planned Pod disruption outcomes during Execute, by result (evicted/rejected/cascade_deleted).",
 	}, []string{"result"})
 
 	// CycleDurationSeconds observes how long one reconcile's plan/act took.
@@ -97,6 +97,14 @@ func ObserveEvictions(evicted, rejected int) {
 	}
 	if rejected > 0 {
 		EvictionsTotal.WithLabelValues("rejected").Add(float64(rejected))
+	}
+}
+
+// ObserveCascadeDeletions records planned victims removed indirectly when one
+// accepted eviction causes the workload controller to recreate its PodGroup.
+func ObserveCascadeDeletions(count int) {
+	if count > 0 {
+		EvictionsTotal.WithLabelValues("cascade_deleted").Add(float64(count))
 	}
 }
 

@@ -36,6 +36,9 @@ type PodNominationApplyConfiguration struct {
 	Namespace *string `json:"namespace,omitempty"`
 	// PodGroupName the pod belongs to.
 	PodGroupName *string `json:"podGroupName,omitempty"`
+	// ReplacementPodGroupName is the PodGroup that actually recreated this
+	// nomination's replacement Pod.
+	ReplacementPodGroupName *string `json:"replacementPodGroupName,omitempty"`
 	// VictimPodName is the evicted pod's name: audit + exact fast-path when the
 	// controller recreates the replacement with the same name.
 	VictimPodName *string `json:"victimPodName,omitempty"`
@@ -86,6 +89,14 @@ func (b *PodNominationApplyConfiguration) WithNamespace(value string) *PodNomina
 // If called multiple times, the PodGroupName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithPodGroupName(value string) *PodNominationApplyConfiguration {
 	b.PodGroupName = &value
+	return b
+}
+
+// WithReplacementPodGroupName sets the ReplacementPodGroupName field in the declarative configuration
+// to the given value and returns the receiver. If called multiple times, the field is set to the
+// value of the last call.
+func (b *PodNominationApplyConfiguration) WithReplacementPodGroupName(value string) *PodNominationApplyConfiguration {
+	b.ReplacementPodGroupName = &value
 	return b
 }
 

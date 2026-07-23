@@ -405,7 +405,7 @@ func TestApplyPlan(t *testing.T) {
 	}
 }
 
-func TestRetainAcceptedNominationsPreservesDeadlineAndFiltersRejected(t *testing.T) {
+func TestRetainRealizedNominationsPreservesDeadlineAndFiltersRejected(t *testing.T) {
 	acceptedMove := mkMove("accepted", "ns/g", 2, "n0", "n2")
 	acceptedMove.Task.Namespace = "ns"
 	rejectedMove := mkMove("rejected", "ns/g", 2, "n1", "n2")
@@ -414,7 +414,7 @@ func TestRetainAcceptedNominationsPreservesDeadlineAndFiltersRejected(t *testing
 	existing := buildPodNominations(fullPlan, time.Hour)
 	deadline := existing[0].ExpirationTime.DeepCopy()
 
-	got := retainAcceptedNominations(existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}}, time.Minute)
+	got := retainRealizedNominations(existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}}, time.Minute)
 	if len(got) != 1 || got[0].VictimPodName != "accepted" {
 		t.Fatalf("accepted nominations = %+v, want accepted only", got)
 	}
@@ -423,7 +423,7 @@ func TestRetainAcceptedNominationsPreservesDeadlineAndFiltersRejected(t *testing
 	}
 }
 
-func TestAcceptedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
+func TestRealizedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
 		Plan: &repackv1alpha1.RepackPlan{
 			FreedNodes: []string{"n0", "n1"},
@@ -442,7 +442,7 @@ func TestAcceptedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
 			{Namespace: "ns", PodGroupName: "b", VictimPodName: "b-0", NodeName: "n2"},
 		},
 	}}
-	got := acceptedFreedNodeNames(run)
+	got := realizedFreedNodeNames(run)
 	if len(got) != 1 || got[0] != "n1" {
 		t.Fatalf("accepted freed nodes = %v, want [n1]", got)
 	}
@@ -488,8 +488,8 @@ func TestRealizedPlanDropsFailedMovesAndFreedNodes(t *testing.T) {
 		Before: engineapi.ResourceFragmentation{Resource: gpuResource, ProvidingNodeCount: 3, OccupiedNodeCount: 2, OptimalOccupiedNodeCount: 1},
 	}
 	commit := &engineframework.CommitResult{
-		Evicted: []engineframework.MoveOutcome{{Namespace: "ns", Task: "a", From: "n0", To: "n2"}},
-		Failed:  []engineframework.MoveOutcome{{Namespace: "ns", Task: "b", From: "n1", To: "n2", Err: "pdb"}},
+		Evicted: []engineframework.MoveOutcome{{Namespace: "ns", PodName: "a", SourceNode: "n0", TargetNode: "n2"}},
+		Failed:  []engineframework.MoveOutcome{{Namespace: "ns", PodName: "b", SourceNode: "n1", TargetNode: "n2", Err: "pdb"}},
 	}
 	realized := realizedPlan(plan, commit)
 	if len(realized.Moves) != 1 || realized.Moves[0].Task.Name != "a" {
@@ -500,6 +500,44 @@ func TestRealizedPlanDropsFailedMovesAndFreedNodes(t *testing.T) {
 	}
 	if len(realized.FreedUnits) != 1 || realized.FreedUnits[0].Nodes[0] != "n0" {
 		t.Fatalf("realized freed units=%+v, want n0 unit", realized.FreedUnits)
+	}
+}
+
+func TestRealizedPlanRetainsCascadeDeletedMove(t *testing.T) {
+	move := mkMove("cascade", "ns/g", 2, "n0", "n1")
+	move.Task.Namespace = "ns"
+	plan := &engineapi.RepackPlan{
+		Moves:      []*engineapi.Move{move},
+		FreedNodes: []string{"n0"},
+		Before:     engineapi.ResourceFragmentation{Resource: gpuResource},
+	}
+	realized := realizedPlan(plan, &engineframework.CommitResult{
+		CascadeDeleted: []engineframework.MoveOutcome{{
+			Namespace: "ns", PodGroupID: "ns/g", PodName: "cascade", SourceNode: "n0", TargetNode: "n1",
+		}},
+	})
+	if len(realized.Moves) != 1 || len(realized.FreedNodes) != 1 {
+		t.Fatalf("cascade-deleted victim was not retained for replacement: moves=%d freedNodes=%v",
+			len(realized.Moves), realized.FreedNodes)
+	}
+}
+
+func TestPlanAcceptedByEvictionAPIExcludesCascadeDeletedMove(t *testing.T) {
+	move := mkMove("cascade", "ns/g", 2, "n0", "n1")
+	move.Task.Namespace = "ns"
+	plan := &engineapi.RepackPlan{
+		Moves:      []*engineapi.Move{move},
+		FreedNodes: []string{"n0"},
+		Before:     engineapi.ResourceFragmentation{Resource: gpuResource},
+	}
+	accepted := planAcceptedByEvictionAPI(plan, &engineframework.CommitResult{
+		CascadeDeleted: []engineframework.MoveOutcome{{
+			Namespace: "ns", PodGroupID: "ns/g", PodName: "cascade", SourceNode: "n0", TargetNode: "n1",
+		}},
+	})
+	if len(accepted.Moves) != 0 || len(accepted.FreedNodes) != 0 {
+		t.Fatalf("Eviction API result included workload-cascade deletion: moves=%d freedNodes=%v",
+			len(accepted.Moves), accepted.FreedNodes)
 	}
 }
 
@@ -532,6 +570,20 @@ func TestMergeNominationPhasesPreservesControllerOwnedPlacementPhase(t *testing.
 	}
 	if desired[0].ReplacementPodName != "replacement" || desired[0].ReplacementPodUID != "replacement-uid" {
 		t.Fatalf("replacement identity=%q/%q, want replacement/replacement-uid", desired[0].ReplacementPodName, desired[0].ReplacementPodUID)
+	}
+}
+
+func TestMergeNominationPhasesPreservesPreparedPodGroupReplacement(t *testing.T) {
+	desired := []repackv1alpha1.PodNomination{{
+		Namespace: "ns", PodGroupName: "old", VictimPodName: "pod", NodeName: "node",
+		Phase: repackv1alpha1.PodPlacementPrepared,
+	}}
+	latest := append([]repackv1alpha1.PodNomination(nil), desired...)
+	latest[0].ReplacementPodGroupName = "new"
+
+	mergeNominationPhases(desired, latest)
+	if desired[0].ReplacementPodGroupName != "new" {
+		t.Fatalf("replacementPodGroupName = %q, want new", desired[0].ReplacementPodGroupName)
 	}
 }
 

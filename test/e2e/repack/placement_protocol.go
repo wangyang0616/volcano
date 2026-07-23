@@ -26,8 +26,10 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -91,6 +93,54 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		assertPlacementLeaseReleased(ctx, pgName)
 	})
 
+	// The nomination protocol deliberately persists the selected receiver in the
+	// RepackRun before it patches Pod status and opens the scheduling gate. Stop
+	// the controller at exactly that durable checkpoint and verify that a fresh
+	// controller process resumes the remaining idempotent operations.
+	It("resumes a nominated replacement after controller-manager restart", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		run, pgName, replacement := prepareGatedPlacement(
+			ctx, "placement-controller-recover", nodes[1], []string{nodes[0]}, 90*time.Second)
+		defer deleteRun(ctx, run.Name)
+		Eventually(func() repackv1alpha1.PodNominationPhase {
+			return getRun(ctx, run.Name).Status.Nominations[0].Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+
+		restoreController := pauseRepackControllerManager(ctx)
+		defer restoreController()
+		setPlacementSelection(ctx, run.Name, nodes[1])
+
+		Consistently(func() bool {
+			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), replacement.Name, metav1.GetOptions{})
+			return err == nil && pod.Status.NominatedNodeName == "" &&
+				hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
+		}, 5*time.Second, repackPoll).Should(BeTrue(),
+			"while the controller is stopped, the durable selection must not mutate the Pod")
+
+		restoreController()
+		Eventually(func() bool {
+			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), replacement.Name, metav1.GetOptions{})
+			return err == nil && pod.Spec.NodeName == nodes[1] &&
+				!hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
+		}, repackTimeout, repackPoll).Should(BeTrue(),
+			"a restarted nominator must patch nominatedNodeName, open the gate, and observe binding")
+		Eventually(func() repackv1alpha1.PodNominationPhase {
+			return getRun(ctx, run.Name).Status.Nominations[0].Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementPlaced))
+
+		restoreEngine()
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(got.Status.Nominations[0].SelectedNodeName).To(Equal(nodes[1]))
+		Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(nodes[1]))
+		assertPlacementLeaseReleased(ctx, pgName)
+	})
+
 	// These are real controller replacement paths: Repack's drain operation is
 	// modeled with the Eviction API against an already-running native workload.
 	// The replacement is therefore created by its Deployment/StatefulSet only
@@ -106,6 +156,593 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		workload := occupyNativeStatefulSet(ctx, "placement-statefulset", nodes[0], "move", 2)
 		defer deleteNativeWorkloads(ctx, workload)
 		verifyNativeReplacementPlacement(ctx, nodes, workload, "placement-statefulset")
+	})
+
+	// Exercise the complete Execute path without importing a workload-specific
+	// controller. The test creates an ordinary owner and models only the generic
+	// cascade behavior after Repack has issued its real evictions: the workload
+	// removes the old unit and reconstructs an equivalent PodGroup under a new
+	// name. Planning, lease activation, eviction, admission gating, nomination,
+	// scheduling, and benefit verification all remain production code paths.
+	It("executes through workload-level cascading PodGroup recreation", func() {
+		controller := true
+		owner, err := ctx.Kubeclient.CoreV1().ConfigMaps(ctx.Namespace).Create(
+			context.TODO(), &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "placement-cascade-owner", Namespace: ctx.Namespace},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		ownerReference := metav1.OwnerReference{
+			APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name, UID: owner.UID, Controller: &controller,
+		}
+
+		originalPodGroupName := "placement-cascade-original"
+		_, err = ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(
+			context.TODO(), &schedulingv1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: originalPodGroupName, Namespace: ctx.Namespace,
+					OwnerReferences: []metav1.OwnerReference{ownerReference},
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 2},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		oneCard := resource.MustParse("1")
+		createPod := func(name, podGroupName, nodeName string) *v1.Pod {
+			pod, createErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Create(
+				context.TODO(), &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: name, Namespace: ctx.Namespace,
+						Annotations: map[string]string{
+							schedulingv1beta1.KubeGroupNameAnnotationKey: podGroupName,
+						},
+					},
+					Spec: v1.PodSpec{
+						NodeName: nodeName, SchedulerName: e2eutil.SchedulerName,
+						RestartPolicy: v1.RestartPolicyNever,
+						Containers: []v1.Container{{
+							Name: name, Image: e2eutil.DefaultNginxImage,
+							ImagePullPolicy: v1.PullIfNotPresent,
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{npuResource: oneCard},
+								Limits:   v1.ResourceList{npuResource: oneCard},
+							},
+						}},
+					},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			return pod
+		}
+		originalPods := []*v1.Pod{
+			createPod("placement-cascade-original-0", originalPodGroupName, nodes[0]),
+			createPod("placement-cascade-original-1", originalPodGroupName, nodes[0]),
+		}
+		for _, pod := range originalPods {
+			Expect(e2eutil.WaitPodReady(ctx, pod)).To(Succeed())
+		}
+
+		// Leave exactly two cards on the receiver. This makes moving the two-card
+		// source group both feasible and beneficial while scope prevents any
+		// unrelated workload from becoming a drain target.
+		sixCards := resource.MustParse("6")
+		receiver, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Create(
+			context.TODO(), &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "placement-cascade-receiver", Namespace: ctx.Namespace},
+				Spec: v1.PodSpec{
+					NodeName: nodes[1], RestartPolicy: v1.RestartPolicyNever,
+					Containers: []v1.Container{{
+						Name: "receiver", Image: e2eutil.DefaultNginxImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{npuResource: sixCards},
+							Limits:   v1.ResourceList{npuResource: sixCards},
+						},
+					}},
+				},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(e2eutil.WaitPodReady(ctx, receiver)).To(Succeed())
+
+		scope := &repackv1alpha1.RepackScope{
+			PodGroups: &repackv1alpha1.RepackSelectorTerm{
+				Include: &repackv1alpha1.RepackSelector{
+					Names: []string{ctx.Namespace + "/" + originalPodGroupName},
+				},
+			},
+		}
+		run, err := newRun("placement-cascade", repackv1alpha1.RepackModeExecute).
+			goal(npuResource).scope(scope).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+
+		Eventually(func() bool {
+			latest := getRun(ctx, run.Name)
+			return latest.Status.Phase == repackv1alpha1.RepackRunning &&
+				latest.Status.Plan != nil && len(latest.Status.Plan.Moves) == 1 &&
+				latest.Status.Plan.Moves[0].PodGroupName == originalPodGroupName &&
+				len(latest.Status.Nominations) == 2
+		}, repackTimeout, repackPoll).Should(BeTrue(),
+			"the real Engine must plan and prepare both original Pod evictions")
+
+		Eventually(func() int {
+			remaining := 0
+			for _, pod := range originalPods {
+				_, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+					context.TODO(), pod.Name, metav1.GetOptions{})
+				if getErr == nil {
+					remaining++
+				}
+			}
+			return remaining
+		}, repackTimeout, repackPoll).Should(Equal(0), "Engine must evict the original PodGroup")
+
+		// Model a generic workload controller's group-level recovery after the
+		// first eviction has cascaded through its old serving unit.
+		Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Delete(
+			context.TODO(), originalPodGroupName, metav1.DeleteOptions{})).To(Succeed())
+		waitPodGroupDeleted(ctx, ctx.Namespace, originalPodGroupName)
+		replacementPodGroupName := "placement-cascade-replacement"
+		replacementPodGroup, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(
+			context.TODO(), &schedulingv1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: replacementPodGroupName, Namespace: ctx.Namespace,
+					OwnerReferences: []metav1.OwnerReference{ownerReference},
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 2},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(replacementPodGroup.Annotations).To(HaveKeyWithValue(
+			repackv1alpha1.PlacementLeaseAnnotation, run.Name+"/"+string(run.UID)),
+			"the PodGroup CREATE webhook must carry the active placement lease onto the new generation")
+
+		replacementPods := []*v1.Pod{
+			createPod("placement-cascade-replacement-0", replacementPodGroupName, ""),
+			createPod("placement-cascade-replacement-1", replacementPodGroupName, ""),
+		}
+		for _, pod := range replacementPods {
+			Expect(hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)).To(BeTrue(),
+				"every Pod in the reconstructed unit must be gated before scheduling")
+		}
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(got.Status.Plan.FreedNodes).To(Equal([]string{nodes[0]}))
+		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes))
+		Expect(got.Status.Nominations).To(HaveLen(2))
+		for index := range got.Status.Nominations {
+			nomination := &got.Status.Nominations[index]
+			Expect(nomination.PodGroupName).To(Equal(originalPodGroupName))
+			Expect(nomination.ReplacementPodGroupName).To(Equal(replacementPodGroupName))
+			Expect(nomination.ReplacementPodName).To(HavePrefix("placement-cascade-replacement-"))
+			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
+		}
+		assertPlacementLeaseReleased(ctx, replacementPodGroupName)
+	})
+
+	// Models a controller such as Kthena ServingGroupRecreate without importing
+	// that project: one eviction has caused the workload to delete its original
+	// PodGroup and recreate both the group and Pod under different names.
+	It("gates and places a replacement whose workload recreates the entire PodGroup", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		controller := true
+		owner, err := ctx.Kubeclient.CoreV1().ConfigMaps(ctx.Namespace).Create(context.TODO(), &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "placement-pg-recreate-owner", Namespace: ctx.Namespace},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		ownerReference := metav1.OwnerReference{
+			APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name, UID: owner.UID, Controller: &controller,
+		}
+
+		run, err := newRun("placement-pg-recreate", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+		oldPodGroupName := run.Name + "-old"
+		newPodGroupName := run.Name + "-new"
+		victimPodName := run.Name + "-victim"
+		replacementPodName := run.Name + "-replacement"
+		expires := metav1.NewTime(time.Now().Add(90 * time.Second))
+		started := metav1.Now()
+		run.Status = repackv1alpha1.RepackRunStatus{
+			Phase:     repackv1alpha1.RepackRunning,
+			StartTime: &started,
+			Plan: &repackv1alpha1.RepackPlan{
+				Summary:    &repackv1alpha1.RepackSummary{FreedNodeCount: 1, MovedCardCount: 2},
+				FreedNodes: []string{nodes[0]},
+				Moves: []repackv1alpha1.RepackMove{{
+					Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, Cards: 2,
+					Owner: &repackv1alpha1.WorkloadRef{APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name},
+					Pods: []repackv1alpha1.PodMove{{
+						Name: victimPodName, FromNode: nodes[0], ToNode: nodes[1], Cards: 2,
+					}},
+				}},
+			},
+			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, VictimPodName: victimPodName,
+				NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		}
+		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().Patch(
+			context.TODO(), run.Name, types.MergePatchType,
+			[]byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"true"}}}`,
+				repackv1alpha1.PlacementActiveLabel)),
+			metav1.PatchOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(context.TODO(), &schedulingv1beta1.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: oldPodGroupName, Namespace: ctx.Namespace, OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+			Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Delete(
+			context.TODO(), oldPodGroupName, metav1.DeleteOptions{})).To(Succeed())
+		Eventually(func() bool {
+			_, getErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Get(
+				context.TODO(), oldPodGroupName, metav1.GetOptions{})
+			return apierrors.IsNotFound(getErr)
+		}, fixtureTimeout, repackPoll).Should(BeTrue())
+
+		newPodGroup, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(
+			context.TODO(), &schedulingv1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: newPodGroupName, Namespace: ctx.Namespace, OwnerReferences: []metav1.OwnerReference{ownerReference},
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(newPodGroup.Annotations).To(HaveKeyWithValue(
+			repackv1alpha1.PlacementLeaseAnnotation, run.Name+"/"+string(run.UID)),
+			"PodGroup CREATE webhook must atomically inject the active placement lease")
+
+		quantity := resource.MustParse("2")
+		replacement := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
+			Name: replacementPodName, SchedulerName: e2eutil.SchedulerName, RestartPolicy: v1.RestartPolicyNever,
+			Req: v1.ResourceList{npuResource: quantity}, Limit: v1.ResourceList{npuResource: quantity},
+			Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: newPodGroupName},
+		})
+		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
+
+		Eventually(func() repackv1alpha1.PodNomination {
+			return getRun(ctx, run.Name).Status.Nominations[0]
+		}, repackTimeout, repackPoll).Should(And(
+			HaveField("ReplacementPodGroupName", newPodGroupName),
+			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+		))
+
+		restoreEngine()
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(got.Status.Nominations[0].ReplacementPodGroupName).To(Equal(newPodGroupName))
+		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+		Expect(got.Status.Message).To(ContainSubstring(
+			ctx.Namespace + "/" + oldPodGroupName + " -> " + ctx.Namespace + "/" + newPodGroupName))
+		assertPlacementLeaseReleased(ctx, newPodGroupName)
+	})
+
+	// Some serving controllers can reconstruct the same logical workload more
+	// than once while recovery is in progress. The original PodGroup remains the
+	// audit identity, while ReplacementPodGroupName must advance from v1 to v2
+	// and forget the deleted v1 Pod before v2 claims the nomination.
+	It("advances placement mapping across repeated PodGroup recreation", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		controller := true
+		owner, err := ctx.Kubeclient.CoreV1().ConfigMaps(ctx.Namespace).Create(context.TODO(), &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "placement-pg-recreate-twice-owner", Namespace: ctx.Namespace},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		ownerReference := metav1.OwnerReference{
+			APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name, UID: owner.UID, Controller: &controller,
+		}
+
+		run, err := newRun("placement-pg-recreate-twice", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+		originalPodGroupName := run.Name + "-original"
+		victimPodName := run.Name + "-victim"
+		expires := metav1.NewTime(time.Now().Add(90 * time.Second))
+		run.Status = repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Plan: &repackv1alpha1.RepackPlan{
+				Summary:    &repackv1alpha1.RepackSummary{FreedNodeCount: 1, MovedCardCount: 2},
+				FreedNodes: []string{nodes[0]},
+				Moves: []repackv1alpha1.RepackMove{{
+					Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, Cards: 2,
+					Owner: &repackv1alpha1.WorkloadRef{APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name},
+					Pods: []repackv1alpha1.PodMove{{
+						Name: victimPodName, FromNode: nodes[0], ToNode: nodes[1], Cards: 2,
+					}},
+				}},
+			},
+			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+				NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		}
+		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(
+			context.TODO(), run, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().Patch(
+			context.TODO(), run.Name, types.MergePatchType,
+			[]byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"true"}}}`,
+				repackv1alpha1.PlacementActiveLabel)),
+			metav1.PatchOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(
+			context.TODO(), &schedulingv1beta1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: originalPodGroupName, Namespace: ctx.Namespace,
+					OwnerReferences: []metav1.OwnerReference{ownerReference},
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Delete(
+			context.TODO(), originalPodGroupName, metav1.DeleteOptions{})).To(Succeed())
+		waitPodGroupDeleted(ctx, ctx.Namespace, originalPodGroupName)
+
+		createGeneration := func(generation string) (string, *v1.Pod) {
+			podGroupName := run.Name + "-" + generation
+			podGroup, createErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Create(
+				context.TODO(), &schedulingv1beta1.PodGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: podGroupName, Namespace: ctx.Namespace,
+						OwnerReferences: []metav1.OwnerReference{ownerReference},
+					},
+					Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			Expect(podGroup.Annotations).To(HaveKeyWithValue(
+				repackv1alpha1.PlacementLeaseAnnotation, run.Name+"/"+string(run.UID)))
+
+			quantity := resource.MustParse("2")
+			pod := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
+				Name: run.Name + "-" + generation + "-pod", SchedulerName: e2eutil.SchedulerName,
+				RestartPolicy: v1.RestartPolicyNever,
+				Req:           v1.ResourceList{npuResource: quantity},
+				Limit:         v1.ResourceList{npuResource: quantity},
+				Annotations: map[string]string{
+					schedulingv1beta1.KubeGroupNameAnnotationKey: podGroupName,
+				},
+			})
+			Expect(hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)).To(BeTrue())
+			return podGroupName, pod
+		}
+
+		firstPodGroupName, firstPod := createGeneration("v1")
+		Eventually(func() repackv1alpha1.PodNomination {
+			return getRun(ctx, run.Name).Status.Nominations[0]
+		}, repackTimeout, repackPoll).Should(And(
+			HaveField("ReplacementPodGroupName", firstPodGroupName),
+			HaveField("ReplacementPodName", firstPod.Name),
+			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+		))
+
+		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
+			context.TODO(), firstPod.Name, metav1.DeleteOptions{})).To(Succeed())
+		Eventually(func() bool {
+			_, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), firstPod.Name, metav1.GetOptions{})
+			return apierrors.IsNotFound(getErr)
+		}, fixtureTimeout, repackPoll).Should(BeTrue())
+		Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Delete(
+			context.TODO(), firstPodGroupName, metav1.DeleteOptions{})).To(Succeed())
+		waitPodGroupDeleted(ctx, ctx.Namespace, firstPodGroupName)
+
+		secondPodGroupName, secondPod := createGeneration("v2")
+		Eventually(func() repackv1alpha1.PodNomination {
+			return getRun(ctx, run.Name).Status.Nominations[0]
+		}, repackTimeout, repackPoll).Should(And(
+			HaveField("PodGroupName", originalPodGroupName),
+			HaveField("ReplacementPodGroupName", secondPodGroupName),
+			HaveField("ReplacementPodName", secondPod.Name),
+			HaveField("ReplacementPodUID", secondPod.UID),
+			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+		))
+
+		restoreEngine()
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(got.Status.Nominations[0].ReplacementPodGroupName).To(Equal(secondPodGroupName))
+		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+		Expect(got.Status.Message).To(ContainSubstring(
+			ctx.Namespace + "/" + originalPodGroupName + " -> " + ctx.Namespace + "/" + secondPodGroupName))
+		assertPlacementLeaseReleased(ctx, secondPodGroupName)
+	})
+
+	// Names are only unique inside a namespace. Use deliberately identical
+	// workload, PodGroup, victim, and replacement Pod names in two namespaces to
+	// prove that lease discovery, recreation mapping, and concrete Pod claiming
+	// all key their state by namespace as well as name.
+	It("keeps identical PodGroup recreation identities isolated by namespace", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		peerNamespace := ctx.Namespace + "-peer"
+		_, err := ctx.Kubeclient.CoreV1().Namespaces().Create(context.TODO(), &v1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: peerNamespace},
+		}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			foreground := metav1.DeletePropagationForeground
+			_ = ctx.Kubeclient.CoreV1().Namespaces().Delete(
+				context.TODO(), peerNamespace, metav1.DeleteOptions{PropagationPolicy: &foreground})
+			Eventually(func() bool {
+				_, getErr := ctx.Kubeclient.CoreV1().Namespaces().Get(
+					context.TODO(), peerNamespace, metav1.GetOptions{})
+				return apierrors.IsNotFound(getErr)
+			}, repackTimeout, repackPoll).Should(BeTrue(), "peer namespace must be deleted")
+		}()
+
+		const (
+			ownerName               = "same-workload"
+			originalPodGroupName    = "same-original-pg"
+			replacementPodGroupName = "same-replacement-pg"
+			victimPodName           = "same-victim"
+			replacementPodName      = "same-replacement"
+		)
+		controller := true
+		ownerReferences := map[string]metav1.OwnerReference{}
+		for _, namespace := range []string{ctx.Namespace, peerNamespace} {
+			owner, createErr := ctx.Kubeclient.CoreV1().ConfigMaps(namespace).Create(
+				context.TODO(), &v1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: ownerName, Namespace: namespace},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			ownerReferences[namespace] = metav1.OwnerReference{
+				APIVersion: "v1", Kind: "ConfigMap", Name: owner.Name, UID: owner.UID, Controller: &controller,
+			}
+		}
+
+		run, err := newRun("placement-namespace-isolation", repackv1alpha1.RepackModeExecute).
+			goal(npuResource).create(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		defer deleteRun(ctx, run.Name)
+		expires := metav1.NewTime(time.Now().Add(90 * time.Second))
+		run.Status = repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Plan: &repackv1alpha1.RepackPlan{
+				Summary:    &repackv1alpha1.RepackSummary{FreedNodeCount: 1, MovedCardCount: 4},
+				FreedNodes: []string{nodes[0]},
+				Moves: []repackv1alpha1.RepackMove{
+					{
+						Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, Cards: 2,
+						Owner: &repackv1alpha1.WorkloadRef{APIVersion: "v1", Kind: "ConfigMap", Name: ownerName},
+						Pods: []repackv1alpha1.PodMove{{
+							Name: victimPodName, FromNode: nodes[0], ToNode: nodes[1], Cards: 2,
+						}},
+					},
+					{
+						Namespace: peerNamespace, PodGroupName: originalPodGroupName, Cards: 2,
+						Owner: &repackv1alpha1.WorkloadRef{APIVersion: "v1", Kind: "ConfigMap", Name: ownerName},
+						Pods: []repackv1alpha1.PodMove{{
+							Name: victimPodName, FromNode: nodes[0], ToNode: nodes[2], Cards: 2,
+						}},
+					},
+				},
+			},
+			Result: &repackv1alpha1.RepackResult{MovedCardCount: 4},
+			Nominations: []repackv1alpha1.PodNomination{
+				{
+					Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+					NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+				},
+				{
+					Namespace: peerNamespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+					NodeName: nodes[2], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+				},
+			},
+		}
+		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(
+			context.TODO(), run, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().Patch(
+			context.TODO(), run.Name, types.MergePatchType,
+			[]byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"true"}}}`,
+				repackv1alpha1.PlacementActiveLabel)),
+			metav1.PatchOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		for _, namespace := range []string{ctx.Namespace, peerNamespace} {
+			_, createErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).Create(
+				context.TODO(), &schedulingv1beta1.PodGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: originalPodGroupName, Namespace: namespace,
+						OwnerReferences: []metav1.OwnerReference{ownerReferences[namespace]},
+					},
+					Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).Delete(
+				context.TODO(), originalPodGroupName, metav1.DeleteOptions{})).To(Succeed())
+			waitPodGroupDeleted(ctx, namespace, originalPodGroupName)
+		}
+
+		replacements := map[string]*v1.Pod{}
+		quantity := resource.MustParse("2")
+		for _, namespace := range []string{ctx.Namespace, peerNamespace} {
+			podGroup, createErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).Create(
+				context.TODO(), &schedulingv1beta1.PodGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: replacementPodGroupName, Namespace: namespace,
+						OwnerReferences: []metav1.OwnerReference{ownerReferences[namespace]},
+					},
+					Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			Expect(podGroup.Annotations).To(HaveKeyWithValue(
+				repackv1alpha1.PlacementLeaseAnnotation, run.Name+"/"+string(run.UID)))
+
+			pod, createErr := ctx.Kubeclient.CoreV1().Pods(namespace).Create(
+				context.TODO(), &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: replacementPodName, Namespace: namespace,
+						Annotations: map[string]string{
+							schedulingv1beta1.KubeGroupNameAnnotationKey: replacementPodGroupName,
+						},
+					},
+					Spec: v1.PodSpec{
+						SchedulerName: e2eutil.SchedulerName,
+						RestartPolicy: v1.RestartPolicyNever,
+						Containers: []v1.Container{{
+							Name: replacementPodName, Image: e2eutil.DefaultNginxImage,
+							ImagePullPolicy: v1.PullIfNotPresent,
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{npuResource: quantity},
+								Limits:   v1.ResourceList{npuResource: quantity},
+							},
+						}},
+					},
+				}, metav1.CreateOptions{})
+			Expect(createErr).NotTo(HaveOccurred())
+			Expect(hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)).To(BeTrue())
+			replacements[namespace] = pod
+		}
+
+		Eventually(func() bool {
+			latest := getRun(ctx, run.Name)
+			if len(latest.Status.Nominations) != 2 {
+				return false
+			}
+			seenNamespaces := map[string]bool{}
+			for index := range latest.Status.Nominations {
+				nomination := &latest.Status.Nominations[index]
+				replacement := replacements[nomination.Namespace]
+				if replacement == nil ||
+					nomination.PodGroupName != originalPodGroupName ||
+					nomination.ReplacementPodGroupName != replacementPodGroupName ||
+					nomination.ReplacementPodName != replacement.Name ||
+					nomination.ReplacementPodUID != replacement.UID ||
+					nomination.Phase != repackv1alpha1.PodPlacementGated {
+					return false
+				}
+				seenNamespaces[nomination.Namespace] = true
+			}
+			return seenNamespaces[ctx.Namespace] && seenNamespaces[peerNamespace]
+		}, repackTimeout, repackPoll).Should(BeTrue(),
+			"same-named PodGroups and Pods must claim only nominations from their own namespaces")
+
+		restoreEngine()
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(got.Status.Nominations).To(HaveLen(2))
+		for index := range got.Status.Nominations {
+			nomination := &got.Status.Nominations[index]
+			Expect(nomination.ReplacementPodGroupName).To(Equal(replacementPodGroupName))
+			Expect(nomination.ReplacementPodName).To(Equal(replacementPodName))
+			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			assertPlacementLeaseReleasedInNamespace(ctx, nomination.Namespace, replacementPodGroupName)
+		}
 	})
 
 	// A PodGroup lease intentionally closes admission for every new Pod in the
@@ -245,14 +882,58 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			return err == nil && !hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
 		}, repackTimeout, repackPoll).Should(BeTrue())
 	})
+
+	// A replacement can bind successfully while unrelated concurrent work lands
+	// on the planned source node. Success is defined by the exact freed-node set,
+	// not only by replacement health, so this must be an operator-visible failure.
+	It("fails when a replacement is placed but the exact planned node is not freed", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		run, pgName, replacement := prepareGatedPlacement(
+			ctx, "placement-benefit-missed", nodes[1], []string{nodes[0]}, 90*time.Second)
+		defer deleteRun(ctx, run.Name)
+		Eventually(func() repackv1alpha1.PodNominationPhase {
+			return getRun(ctx, run.Name).Status.Nominations[0].Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+
+		occupy(ctx, "placement-benefit-blocker", nodes[0], 1)
+		restoreEngine()
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
+		Expect(completeReason(got)).To(Equal("BenefitNotRealized"))
+		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced),
+			"replacement health alone must not turn an unrealized plan into success")
+		Expect(got.Status.Result).NotTo(BeNil())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Result.FreedNodes).NotTo(ContainElement(nodes[0]))
+		Expect(got.Status.Message).To(ContainSubstring(nodes[0]),
+			"status.message must identify the planned node that remained occupied")
+		Eventually(func() bool {
+			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), replacement.Name, metav1.GetOptions{})
+			return err == nil && pod.Spec.NodeName == nodes[1]
+		}, repackTimeout, repackPoll).Should(BeTrue())
+		assertPlacementLeaseReleased(ctx, pgName)
+	})
 })
 
 // pauseRepackEngine gives the test a stable protocol checkpoint. The return
 // function is idempotent so it is safe in both normal and deferred cleanup paths.
 func pauseRepackEngine(ctx *e2eutil.TestContext) func() {
-	deployments, err := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).List(context.TODO(), metav1.ListOptions{LabelSelector: "app=volcano-repack-engine"})
-	Expect(err).NotTo(HaveOccurred(), "list repack Engine deployments")
-	Expect(deployments.Items).To(HaveLen(1), "exactly one repack Engine deployment must exist")
+	return pauseSystemDeployment(ctx, "app=volcano-repack-engine", "repack Engine")
+}
+
+func pauseRepackControllerManager(ctx *e2eutil.TestContext) func() {
+	return pauseSystemDeployment(ctx, "app=volcano-controller", "Volcano controller-manager")
+}
+
+func pauseSystemDeployment(ctx *e2eutil.TestContext, labelSelector, component string) func() {
+	deployments, err := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).List(
+		context.TODO(), metav1.ListOptions{LabelSelector: labelSelector})
+	Expect(err).NotTo(HaveOccurred(), "list %s deployments", component)
+	Expect(deployments.Items).To(HaveLen(1), "exactly one %s deployment must exist", component)
 	deployment := deployments.Items[0].DeepCopy()
 	deploymentName := deployment.Name
 	original := int32(1)
@@ -262,14 +943,15 @@ func pauseRepackEngine(ctx *e2eutil.TestContext) func() {
 	zero := int32(0)
 	deployment.Spec.Replicas = &zero
 	_, err = ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
-	Expect(err).NotTo(HaveOccurred(), "scale down repack Engine")
+	Expect(err).NotTo(HaveOccurred(), "scale down %s", component)
 	Eventually(func() int {
-		pods, listErr := ctx.Kubeclient.CoreV1().Pods(repackSystemNamespace).List(context.TODO(), metav1.ListOptions{LabelSelector: "app=volcano-repack-engine"})
+		pods, listErr := ctx.Kubeclient.CoreV1().Pods(repackSystemNamespace).List(
+			context.TODO(), metav1.ListOptions{LabelSelector: labelSelector})
 		if listErr != nil {
 			return -1
 		}
 		return len(pods.Items)
-	}, repackTimeout, repackPoll).Should(Equal(0), "repack Engine must be stopped before creating checkpoint state")
+	}, repackTimeout, repackPoll).Should(Equal(0), "%s must be stopped before creating checkpoint state", component)
 
 	restored := false
 	return func() {
@@ -281,15 +963,23 @@ func pauseRepackEngine(ctx *e2eutil.TestContext) func() {
 		Expect(getErr).NotTo(HaveOccurred())
 		current.Spec.Replicas = &original
 		_, updateErr := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Update(context.TODO(), current, metav1.UpdateOptions{})
-		Expect(updateErr).NotTo(HaveOccurred(), "restore repack Engine")
+		Expect(updateErr).NotTo(HaveOccurred(), "restore %s", component)
 		Eventually(func() int32 {
 			latest, latestErr := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 			if latestErr != nil {
 				return -1
 			}
 			return latest.Status.AvailableReplicas
-		}, repackTimeout, repackPoll).Should(BeNumerically(">=", original), "repack Engine must become available")
+		}, repackTimeout, repackPoll).Should(BeNumerically(">=", original), "%s must become available", component)
 	}
+}
+
+func waitPodGroupDeleted(ctx *e2eutil.TestContext, namespace, podGroupName string) {
+	Eventually(func() bool {
+		_, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).Get(
+			context.TODO(), podGroupName, metav1.GetOptions{})
+		return apierrors.IsNotFound(err)
+	}, fixtureTimeout, repackPoll).Should(BeTrue(), "PodGroup %s/%s must be deleted", namespace, podGroupName)
 }
 
 func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, freedNodes []string, deadline time.Duration) (*repackv1alpha1.RepackRun, string, *v1.Pod) {
@@ -446,13 +1136,19 @@ func workloadName(workload *nativeWorkload) string {
 }
 
 func assertPlacementLeaseReleased(ctx *e2eutil.TestContext, podGroupName string) {
+	assertPlacementLeaseReleasedInNamespace(ctx, ctx.Namespace, podGroupName)
+}
+
+func assertPlacementLeaseReleasedInNamespace(ctx *e2eutil.TestContext, namespace, podGroupName string) {
 	Eventually(func() string {
-		pg, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Get(context.TODO(), podGroupName, metav1.GetOptions{})
+		pg, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).Get(
+			context.TODO(), podGroupName, metav1.GetOptions{})
 		if err != nil {
 			return "unexpected-error"
 		}
 		return pg.Annotations[repackv1alpha1.PlacementLeaseAnnotation]
-	}, repackTimeout, repackPoll).Should(BeEmpty(), "terminal Run must release its PodGroup placement lease")
+	}, repackTimeout, repackPoll).Should(BeEmpty(),
+		"terminal Run must release PodGroup %s/%s placement lease", namespace, podGroupName)
 }
 
 func setPlacementSelection(ctx *e2eutil.TestContext, runName, selectedNode string) {

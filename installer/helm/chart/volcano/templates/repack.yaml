@@ -31,7 +31,7 @@ rules:
   # --- repack-specific ---
   - apiGroups: ["repack.volcano.sh"]
     resources: ["repackruns"]
-    verbs: ["get", "list", "watch", "update"]
+    verbs: ["get", "list", "watch", "update", "patch"] # patch = placement-active discovery label
   - apiGroups: ["repack.volcano.sh"]
     resources: ["repackruns/status"]
     verbs: ["get", "update", "patch"]
@@ -219,6 +219,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["patch"] # nomination reconciler writes pod.status.nominatedNodeName
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups"]
+    verbs: ["get"] # confirm original deletion before recording a replacement PodGroup
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

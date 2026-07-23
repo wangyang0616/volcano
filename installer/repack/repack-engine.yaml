@@ -19,7 +19,7 @@ rules:
   # --- repack-specific ---
   - apiGroups: ["repack.volcano.sh"]
     resources: ["repackruns"]
-    verbs: ["get", "list", "watch", "update"]
+    verbs: ["get", "list", "watch", "update", "patch"] # patch = placement-active discovery label
   - apiGroups: ["repack.volcano.sh"]
     resources: ["repackruns/status"]
     verbs: ["get", "update", "patch"]

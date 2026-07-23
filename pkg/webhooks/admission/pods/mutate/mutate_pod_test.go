@@ -265,6 +265,52 @@ func TestPatchRepackPlacementGate(t *testing.T) {
 	}
 }
 
+func TestPatchRepackPlacementGateBeforeReplacementPodGroupMapping(t *testing.T) {
+	controller := true
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+			}}},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "old", NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	newPodGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "new",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	previousClient, previousSchedulers := config.VolcanoClient, config.SchedulerNames
+	defer func() {
+		config.VolcanoClient = previousClient
+		config.SchedulerNames = previousSchedulers
+	}()
+	config.VolcanoClient = vcfake.NewSimpleClientset(run, newPodGroup)
+	config.SchedulerNames = []string{"volcano"}
+
+	patches, err := patchRepackPlacementGate(&v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "replacement",
+			Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: "new"},
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(patches) != 2 || patches[0].Path != "/spec/schedulingGates" {
+		t.Fatalf("replacement Pod was not gated before PodGroup mapping became durable: %#v", patches)
+	}
+}
+
 func TestRepackPlacementPodGroupName(t *testing.T) {
 	controller := true
 	deploymentReplicaSetOwner := metav1.OwnerReference{

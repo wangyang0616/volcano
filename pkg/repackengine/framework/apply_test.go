@@ -52,10 +52,10 @@ func TestCommitPlan_EvictOrderAndOpenLoop(t *testing.T) {
 	if len(order) != 2 || order[0] != "a" || order[1] != "b" {
 		t.Fatalf("evict order=%v, want [a b] (freed-node source first)", order)
 	}
-	if len(res.Evicted) != 1 || res.Evicted[0].Task != "a" {
+	if len(res.Evicted) != 1 || res.Evicted[0].PodName != "a" {
 		t.Errorf("evicted=%+v, want [a]", res.Evicted)
 	}
-	if len(res.Failed) != 1 || res.Failed[0].Task != "b" {
+	if len(res.Failed) != 1 || res.Failed[0].PodName != "b" {
 		t.Errorf("failed=%+v, want [b]", res.Failed)
 	}
 }

@@ -118,6 +118,13 @@ type Engine struct {
 	executeStateMutex     sync.Mutex
 	activeExecuteRunName  string
 	lastExecuteFinishTime time.Time
+
+	// The PodGroup webhook is the primary placement-lease barrier. This timestamp
+	// independently rate-limits the engine's namespace-wide fallback scan so the
+	// two-second placement loop does not repeatedly list every PodGroup.
+	placementLeaseRepairMutex       sync.Mutex
+	placementLeaseRepairRunIdentity string
+	lastPlacementLeaseRepairTime    time.Time
 }
 
 const (
@@ -292,7 +299,14 @@ func isPlacementCandidate(run *repackv1alpha1.RepackRun) bool {
 // retry idempotent removal of its gate-owner markers and PodGroup leases. It
 // never re-enters planning or eviction.
 func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
-	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute || len(run.Status.Nominations) == 0 {
+	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute {
+		return false
+	}
+	// A failure before the first eviction clears nominations but can still leave
+	// the admission discovery label or an original PodGroup lease behind. The
+	// metadata label therefore also makes a terminal Run cleanup-retryable.
+	if len(run.Status.Nominations) == 0 &&
+		run.Labels[repackv1alpha1.PlacementActiveLabel] != "true" {
 		return false
 	}
 	switch run.Status.Phase {

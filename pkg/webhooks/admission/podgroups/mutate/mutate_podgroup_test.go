@@ -21,13 +21,16 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
-	"volcano.sh/volcano/pkg/webhooks/router"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	vcfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
+	"volcano.sh/volcano/pkg/webhooks/router"
 )
 
 func Test_createPodGroupPatch(t *testing.T) {
@@ -134,5 +137,57 @@ func Test_createPodGroupPatch(t *testing.T) {
 				t.Errorf("createPodGroupPatch() got = %v, want %v", gotPatch, tt.wantPatch)
 			}
 		})
+	}
+}
+
+func TestCreateRepackPlacementLeasePatch(t *testing.T) {
+	controller := true
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "run",
+			UID:    types.UID("run-uid"),
+			Labels: map[string]string{repackv1alpha1.PlacementActiveLabel: "true"},
+		},
+		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackRunning,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+			}}},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	candidate := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "new",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	previous := config
+	defer func() { config = previous }()
+	config = &router.AdmissionServiceConfig{VolcanoClient: vcfake.NewSimpleClientset(run)}
+
+	patch := createRepackPlacementLeasePatch(candidate)
+	if patch == nil || patch.Path != "/metadata/annotations" {
+		t.Fatalf("placement lease patch = %#v", patch)
+	}
+	annotations, ok := patch.Value.(map[string]string)
+	if !ok || annotations[repackv1alpha1.PlacementLeaseAnnotation] != "run/run-uid" {
+		t.Fatalf("placement lease annotations = %#v", patch.Value)
+	}
+
+	unrelated := candidate.DeepCopy()
+	unrelated.OwnerReferences[0].Name = "other"
+	if patch := createRepackPlacementLeasePatch(unrelated); patch != nil {
+		t.Fatalf("unrelated workload received placement lease: %#v", patch)
+	}
+
+	existing := candidate.DeepCopy()
+	existing.Annotations = map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "other/uid"}
+	if patch := createRepackPlacementLeasePatch(existing); patch != nil {
+		t.Fatalf("existing lease must not be overwritten: %#v", patch)
 	}
 }

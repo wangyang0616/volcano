@@ -18,6 +18,7 @@ package repackengine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -25,6 +26,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
@@ -52,8 +54,8 @@ func (e *Engine) preparePlacementLeases(ctx context.Context, run *repackv1alpha1
 	groups := placementPodGroups(run)
 	klog.V(4).InfoS("repack: preparing PodGroup placement leases",
 		"run", run.Name, "podGroupCount", len(groups), "lease", lease)
-	for key := range groups {
-		namespace, podGroupName := splitPlacementPodGroupKey(key)
+	for podGroupKey := range groups {
+		namespace, podGroupName := podGroupKey.Namespace, podGroupKey.Name
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			podGroup, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Get(ctx, podGroupName, metav1.GetOptions{})
 			if err != nil {
@@ -110,22 +112,27 @@ func (e *Engine) placementLeaseActive(ctx context.Context, lease, namespace, pod
 	return placement.ActiveForPodGroup(run, namespace, podGroupName), nil
 }
 
-func placementPodGroups(run *repackv1alpha1.RepackRun) map[string]struct{} {
-	groups := make(map[string]struct{})
+func placementPodGroups(run *repackv1alpha1.RepackRun) map[types.NamespacedName]struct{} {
+	groups := make(map[types.NamespacedName]struct{})
 	if run == nil {
 		return groups
 	}
 	for i := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[i]
 		if nomination.Namespace != "" && nomination.PodGroupName != "" {
-			groups[nomination.Namespace+"\x00"+nomination.PodGroupName] = struct{}{}
+			groups[types.NamespacedName{Namespace: nomination.Namespace, Name: nomination.PodGroupName}] = struct{}{}
+		}
+		if nomination.Namespace != "" && nomination.ReplacementPodGroupName != "" {
+			groups[types.NamespacedName{Namespace: nomination.Namespace, Name: nomination.ReplacementPodGroupName}] = struct{}{}
 		}
 	}
 	return groups
 }
 
-func placementGroupsDifference(all, retain map[string]struct{}) map[string]struct{} {
-	result := make(map[string]struct{})
+func placementGroupsDifference(
+	all, retain map[types.NamespacedName]struct{},
+) map[types.NamespacedName]struct{} {
+	result := make(map[types.NamespacedName]struct{})
 	for key := range all {
 		if _, stillNeeded := retain[key]; !stillNeeded {
 			result[key] = struct{}{}
@@ -134,38 +141,85 @@ func placementGroupsDifference(all, retain map[string]struct{}) map[string]struc
 	return result
 }
 
+type placementLeaseReleaseOutcome int
+
+const (
+	placementLeaseReleased placementLeaseReleaseOutcome = iota
+	placementLeaseAlreadyAbsent
+	placementLeasePodGroupNotFound
+	placementLeaseNotOwned
+)
+
 // releasePlacementLeases removes only annotations owned by this Run. It is safe
 // to call on every terminal/error path: a newer Run's lease is never touched.
-func (e *Engine) releasePlacementLeases(ctx context.Context, run *repackv1alpha1.RepackRun, groups map[string]struct{}) error {
+func (e *Engine) releasePlacementLeases(
+	ctx context.Context,
+	run *repackv1alpha1.RepackRun,
+	groups map[types.NamespacedName]struct{},
+) error {
 	if run == nil || len(groups) == 0 {
 		return nil
 	}
 	lease := placement.OwnerValue(run.Name, run.UID)
-	released := 0
-	for key := range groups {
-		namespace, podGroupName := splitPlacementPodGroupKey(key)
+	releasedCount, alreadyAbsentCount, notFoundCount, notOwnedCount := 0, 0, 0, 0
+	for podGroupKey := range groups {
+		namespace, podGroupName := podGroupKey.Namespace, podGroupKey.Name
+		outcome := placementLeaseAlreadyAbsent
+		observedLease := ""
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			outcome = placementLeaseAlreadyAbsent
+			observedLease = ""
 			podGroup, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Get(ctx, podGroupName, metav1.GetOptions{})
 			if apierrors.IsNotFound(err) {
+				outcome = placementLeasePodGroupNotFound
 				return nil
 			}
-			if err != nil || podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] != lease {
+			if err != nil {
 				return err
+			}
+			observedLease = podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation]
+			if observedLease == "" {
+				outcome = placementLeaseAlreadyAbsent
+				return nil
+			}
+			if observedLease != lease {
+				outcome = placementLeaseNotOwned
+				return nil
 			}
 			podGroup = podGroup.DeepCopy()
 			delete(podGroup.Annotations, repackv1alpha1.PlacementLeaseAnnotation)
 			_, err = e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Update(ctx, podGroup, metav1.UpdateOptions{})
+			if err == nil {
+				outcome = placementLeaseReleased
+			}
 			return err
 		})
 		if err != nil {
 			return fmt.Errorf("release placement lease for PodGroup %s/%s: %w", namespace, podGroupName, err)
 		}
-		released++
-		klog.V(4).InfoS("repack: PodGroup placement lease released",
-			"run", run.Name, "podGroup", namespace+"/"+podGroupName)
+		switch outcome {
+		case placementLeaseReleased:
+			releasedCount++
+			klog.V(4).InfoS("repack: PodGroup placement lease released",
+				"run", run.Name, "podGroup", namespace+"/"+podGroupName)
+		case placementLeaseAlreadyAbsent:
+			alreadyAbsentCount++
+			klog.V(4).InfoS("repack: PodGroup placement lease was already absent",
+				"run", run.Name, "podGroup", namespace+"/"+podGroupName)
+		case placementLeasePodGroupNotFound:
+			notFoundCount++
+			klog.V(4).InfoS("repack: PodGroup already deleted during placement lease cleanup",
+				"run", run.Name, "podGroup", namespace+"/"+podGroupName)
+		case placementLeaseNotOwned:
+			notOwnedCount++
+			klog.V(3).InfoS("repack: PodGroup placement lease belongs to another owner; cleanup skipped",
+				"run", run.Name, "podGroup", namespace+"/"+podGroupName, "observedLease", observedLease)
+		}
 	}
 	klog.V(3).InfoS("repack: placement lease cleanup completed",
-		"run", run.Name, "requestedPodGroupCount", len(groups), "releasedOrAlreadyAbsentCount", released)
+		"run", run.Name, "requestedPodGroupCount", len(groups),
+		"releasedCount", releasedCount, "alreadyAbsentCount", alreadyAbsentCount,
+		"notFoundCount", notFoundCount, "notOwnedCount", notOwnedCount)
 	return nil
 }
 
@@ -173,16 +227,188 @@ func (e *Engine) releasePlacementLeases(ctx context.Context, run *repackv1alpha1
 // owned exclusively by the nomination controller, which watches terminal and
 // deleted Runs through the gate-owner Pod index.
 func (e *Engine) cleanupPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
-	return e.releasePlacementLeases(ctx, run, placementPodGroups(run))
+	groups, err := e.ownedPlacementLeaseGroups(ctx, run)
+	if err != nil {
+		return err
+	}
+	if err := e.releasePlacementLeases(ctx, run, groups); err != nil {
+		return err
+	}
+	return e.setPlacementActive(ctx, run, false)
 }
 
-func splitPlacementPodGroupKey(key string) (string, string) {
-	for i := range key {
-		if key[i] == '\x00' {
-			return key[:i], key[i+1:]
+// ownedPlacementLeaseGroups includes both status-recorded groups and admission-
+// time candidate groups that were never claimed by a nomination (for example a
+// concurrent scale-out). Terminal cleanup must not leave those Pods gated.
+func (e *Engine) ownedPlacementLeaseGroups(
+	ctx context.Context,
+	run *repackv1alpha1.RepackRun,
+) (map[types.NamespacedName]struct{}, error) {
+	groups := placementPodGroups(run)
+	if run == nil || e.volcanoClient == nil {
+		return groups, nil
+	}
+	lease := placement.OwnerValue(run.Name, run.UID)
+	namespaces := map[string]struct{}{}
+	if run.Status.Plan != nil {
+		for index := range run.Status.Plan.Moves {
+			if namespace := run.Status.Plan.Moves[index].Namespace; namespace != "" {
+				namespaces[namespace] = struct{}{}
+			}
 		}
 	}
-	return "", ""
+	for namespace := range namespaces {
+		podGroups, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list PodGroups in namespace %s for placement cleanup: %w", namespace, err)
+		}
+		for index := range podGroups.Items {
+			podGroup := &podGroups.Items[index]
+			if podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] == lease {
+				groups[types.NamespacedName{Namespace: namespace, Name: podGroup.Name}] = struct{}{}
+			}
+		}
+	}
+	return groups, nil
+}
+
+// setPlacementActive maintains the metadata index used by the PodGroup webhook.
+// The label is not authoritative: webhooks still validate phase, Run UID, owner,
+// creation time, and unfinished nominations.
+func (e *Engine) setPlacementActive(ctx context.Context, run *repackv1alpha1.RepackRun, active bool) error {
+	if run == nil || e.volcanoClient == nil {
+		return nil
+	}
+	value := interface{}(nil)
+	if active {
+		value = "true"
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{
+				repackv1alpha1.PlacementActiveLabel: value,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().Patch(
+		ctx, run.Name, types.MergePatchType, body, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("set placement-active=%t on RepackRun %s: %w", active, run.Name, err)
+	}
+	klog.V(4).InfoS("repack: placement discovery label reconciled",
+		"run", run.Name, "active", active)
+	return nil
+}
+
+const placementLeaseRepairInterval = 30 * time.Second
+
+// repairRecreatedPodGroupLeasesIfDue is the eventual-consistency fallback for a
+// PodGroup CREATE that bypassed or raced admission mutation. The webhook remains
+// the primary barrier; this independently rate-limited repair protects later
+// Pods without placing namespace-wide LIST load on every placement retry.
+func (e *Engine) repairRecreatedPodGroupLeasesIfDue(ctx context.Context, run *repackv1alpha1.RepackRun) error {
+	if run == nil || run.Status.Plan == nil {
+		return nil
+	}
+	pendingWorkload := false
+	for workload := range placement.SourcePodGroupsByWorkload(run) {
+		if placement.HasPendingPlacementsForWorkload(run, workload) {
+			pendingWorkload = true
+			break
+		}
+	}
+	if !pendingWorkload || !e.placementLeaseRepairDue(run) {
+		return nil
+	}
+
+	lease := placement.OwnerValue(run.Name, run.UID)
+	namespaces := map[string]struct{}{}
+	for index := range run.Status.Plan.Moves {
+		namespaces[run.Status.Plan.Moves[index].Namespace] = struct{}{}
+	}
+	scannedPodGroupCount, repairedLeaseCount, conflictingLeaseCount := 0, 0, 0
+	klog.V(4).InfoS("repack: scanning for recreated PodGroups that missed admission-time placement lease",
+		"run", run.Name, "namespaceCount", len(namespaces))
+	for namespace := range namespaces {
+		podGroups, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return err
+		}
+		scannedPodGroupCount += len(podGroups.Items)
+		for index := range podGroups.Items {
+			podGroup := &podGroups.Items[index]
+			if !placement.PlacementAppliesToPodGroup(run, podGroup) ||
+				podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] == lease {
+				continue
+			}
+			if current := podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation]; current != "" {
+				conflictingLeaseCount++
+				klog.V(3).InfoS("repack: recreated PodGroup has a different placement lease; repair skipped",
+					"run", run.Name, "podGroup", namespace+"/"+podGroup.Name, "lease", current)
+				continue
+			}
+			repaired := false
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest, err := e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Get(ctx, podGroup.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				if latest.Annotations[repackv1alpha1.PlacementLeaseAnnotation] != "" {
+					return nil
+				}
+				latest = latest.DeepCopy()
+				if latest.Annotations == nil {
+					latest.Annotations = map[string]string{}
+				}
+				latest.Annotations[repackv1alpha1.PlacementLeaseAnnotation] = lease
+				_, err = e.volcanoClient.SchedulingV1beta1().PodGroups(namespace).Update(ctx, latest, metav1.UpdateOptions{})
+				repaired = err == nil
+				return err
+			}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("repair placement lease for PodGroup %s/%s: %w", namespace, podGroup.Name, err)
+			}
+			if !repaired {
+				continue
+			}
+			repairedLeaseCount++
+			klog.V(3).InfoS("repack: repaired placement lease on recreated PodGroup",
+				"run", run.Name, "podGroup", namespace+"/"+podGroup.Name, "lease", lease)
+			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonPlacementLeaseRepaired,
+				fmt.Sprintf("Repaired placement lease on recreated PodGroup %s/%s.", namespace, podGroup.Name))
+		}
+	}
+	klog.V(4).InfoS("repack: recreated PodGroup placement lease repair scan completed",
+		"run", run.Name, "namespaceCount", len(namespaces),
+		"scannedPodGroupCount", scannedPodGroupCount,
+		"repairedLeaseCount", repairedLeaseCount,
+		"conflictingLeaseCount", conflictingLeaseCount)
+	return nil
+}
+
+func (e *Engine) placementLeaseRepairDue(run *repackv1alpha1.RepackRun) bool {
+	if run == nil {
+		return false
+	}
+	now := time.Now()
+	if e.now != nil {
+		now = e.now()
+	}
+	runIdentity := run.Name + "/" + string(run.UID)
+	e.placementLeaseRepairMutex.Lock()
+	defer e.placementLeaseRepairMutex.Unlock()
+	if e.placementLeaseRepairRunIdentity == runIdentity &&
+		now.Before(e.lastPlacementLeaseRepairTime.Add(placementLeaseRepairInterval)) {
+		klog.V(5).InfoS("repack: recreated PodGroup lease repair scan rate-limited",
+			"run", run.Name, "lastRepairTime", e.lastPlacementLeaseRepairTime,
+			"nextRepairTime", e.lastPlacementLeaseRepairTime.Add(placementLeaseRepairInterval))
+		return false
+	}
+	e.placementLeaseRepairRunIdentity = runIdentity
+	e.lastPlacementLeaseRepairTime = now
+	return true
 }
 
 const placementRetryInterval = 2 * time.Second
@@ -199,6 +425,9 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 	klog.V(4).InfoS("repack: reconciling replacement placement",
 		"run", run.Name, "nominationCount", len(run.Status.Nominations),
 		"placedCount", placed, "driftedCount", drifted, "expiredCount", expiredCount)
+	if err := e.repairRecreatedPodGroupLeasesIfDue(ctx, run); err != nil {
+		return fmt.Errorf("reconcile recreated PodGroup leases: %w", err)
+	}
 	if expired, err := e.expirePlacements(ctx, run); err != nil {
 		return err
 	} else if expired {
@@ -227,12 +456,12 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		return err
 	}
 	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
-	excludedFreedNodes := acceptedFreedNodeNames(run)
+	excludedFreedNodes := realizedFreedNodeNames(run)
 	klog.V(4).InfoS("repack: evaluating live placement receivers",
 		"run", run.Name, "candidateCount", len(pending), "snapshotNodeCount", len(snapshot.Nodes()),
 		"excludedFreedNodes", excludedFreedNodes)
 	committed := make([]*engineapi.Move, 0, len(pending))
-	selected := make(map[string]string, len(pending))
+	selected := make(map[placementIdentity]string, len(pending))
 	for _, nomination := range pending {
 		pod, err := e.schedulerCache.Client().CoreV1().Pods(nomination.Namespace).Get(ctx, nomination.ReplacementPodName, metav1.GetOptions{})
 		if err != nil {
@@ -260,7 +489,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			return e.markAwaitingPlacement(ctx, run.Name, pending)
 		}
 		committed = append(committed, placements[0])
-		selected[placementStatusKey(nomination)] = placements[0].To
+		selected[placementIdentityForNomination(nomination)] = placements[0].To
 		klog.V(4).InfoS("repack: replacement receiver selected in scheduler simulation",
 			"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
 			"plannedNode", nomination.NodeName, "selectedNode", placements[0].To)
@@ -283,7 +512,9 @@ func placementCandidates(run *repackv1alpha1.RepackRun) []*repackv1alpha1.PodNom
 			result = append(result, nomination)
 		}
 	}
-	sort.Slice(result, func(i, j int) bool { return placementStatusKey(result[i]) < placementStatusKey(result[j]) })
+	sort.Slice(result, func(i, j int) bool {
+		return placementIdentityForNomination(result[i]).less(placementIdentityForNomination(result[j]))
+	})
 	return result
 }
 
@@ -322,7 +553,11 @@ func placementReceivers(nodes []*schedapi.NodeInfo, freedNodes []string, planned
 	return receivers
 }
 
-func (e *Engine) writePlacementSelection(ctx context.Context, runName string, selected map[string]string) error {
+func (e *Engine) writePlacementSelection(
+	ctx context.Context,
+	runName string,
+	selected map[placementIdentity]string,
+) error {
 	var updatedRun *repackv1alpha1.RepackRun
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := e.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, runName, metav1.GetOptions{})
@@ -332,7 +567,7 @@ func (e *Engine) writePlacementSelection(ctx context.Context, runName string, se
 		changed := false
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
-			if node, found := selected[placementStatusKey(nomination)]; found && nomination.SelectedNodeName == "" {
+			if node, found := selected[placementIdentityForNomination(nomination)]; found && nomination.SelectedNodeName == "" {
 				nomination.SelectedNodeName = node
 				changed = true
 			}
@@ -347,16 +582,16 @@ func (e *Engine) writePlacementSelection(ctx context.Context, runName string, se
 		return err
 	}
 	klog.V(3).InfoS("repack: live replacement receivers persisted",
-		"run", runName, "selectionCount", len(selected), "selections", selected)
+		"run", runName, "selectionCount", len(selected))
 	e.recordRunEvent(updatedRun, v1.EventTypeNormal, eventReasonPlacementSelected,
 		fmt.Sprintf("Selected live receiver nodes for %d replacement Pods.", len(selected)))
 	return nil
 }
 
 func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nominations []*repackv1alpha1.PodNomination) error {
-	keys := make(map[string]struct{}, len(nominations))
+	keys := make(map[placementIdentity]struct{}, len(nominations))
 	for _, nomination := range nominations {
-		keys[placementStatusKey(nomination)] = struct{}{}
+		keys[placementIdentityForNomination(nomination)] = struct{}{}
 	}
 	var updatedRun *repackv1alpha1.RepackRun
 	placementStateChanged := false
@@ -368,7 +603,7 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 		changed := false
 		for index := range run.Status.Nominations {
 			nomination := &run.Status.Nominations[index]
-			if _, found := keys[placementStatusKey(nomination)]; found && nomination.SelectedNodeName == "" && nomination.Phase != repackv1alpha1.PodPlacementAwaitingCapacity {
+			if _, found := keys[placementIdentityForNomination(nomination)]; found && nomination.SelectedNodeName == "" && nomination.Phase != repackv1alpha1.PodPlacementAwaitingCapacity {
 				nomination.Phase = repackv1alpha1.PodPlacementAwaitingCapacity
 				changed = true
 				placementStateChanged = true
@@ -632,15 +867,15 @@ func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.
 			nodesByName[node.Name] = node
 		}
 	}
-	acceptedCandidates := sortedUniqueNodeNames(acceptedFreedNodeNames(run))
-	acceptedCandidateSet := make(map[string]struct{}, len(acceptedCandidates))
-	for _, nodeName := range acceptedCandidates {
-		acceptedCandidateSet[nodeName] = struct{}{}
+	realizedCandidates := sortedUniqueNodeNames(realizedFreedNodeNames(run))
+	realizedCandidateSet := make(map[string]struct{}, len(realizedCandidates))
+	for _, nodeName := range realizedCandidates {
+		realizedCandidateSet[nodeName] = struct{}{}
 	}
-	actuallyFreedNodes := make([]string, 0, len(acceptedCandidates))
+	actuallyFreedNodes := make([]string, 0, len(realizedCandidates))
 	for _, nodeName := range sortedUniqueNodeNames(run.Status.Plan.FreedNodes) {
-		if _, accepted := acceptedCandidateSet[nodeName]; !accepted {
-			klog.V(4).InfoS("repack: planned node is not an actual-free candidate because its complete eviction set was not accepted",
+		if _, realized := realizedCandidateSet[nodeName]; !realized {
+			klog.V(4).InfoS("repack: planned node is not an actual-free candidate because its complete victim set was not removed",
 				"run", run.Name, "node", nodeName, "resource", targetResource)
 			continue
 		}
@@ -700,13 +935,6 @@ func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
 	run.Status.Result.MetricsVerified = false
 }
 
-func placementStatusKey(nomination *repackv1alpha1.PodNomination) string {
-	if nomination == nil {
-		return ""
-	}
-	return nomination.Namespace + "\x00" + nomination.PodGroupName + "\x00" + nomination.VictimPodName + "\x00" + nomination.NodeName
-}
-
 // expirePlacements is the liveness escape hatch. A scheduling gate deliberately
 // fails closed while the engine is deciding a receiver, but it must never leave
 // a workload unavailable forever when concurrent work consumed every viable
@@ -714,11 +942,11 @@ func placementStatusKey(nomination *repackv1alpha1.PodNomination) string {
 // normal scheduling restore the Pod; the Run then ends Failed with explicit
 // placement status instead of silently claiming defragmentation success.
 func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.RepackRun) (bool, error) {
-	keys := map[string]struct{}{}
+	keys := map[placementIdentity]struct{}{}
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
 		if placementCanExpire(nomination, e.now()) {
-			keys[placementStatusKey(nomination)] = struct{}{}
+			keys[placementIdentityForNomination(nomination)] = struct{}{}
 		}
 	}
 	if len(keys) == 0 {
@@ -737,7 +965,7 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		expiredCount = 0
 		for index := range latest.Status.Nominations {
 			nomination := &latest.Status.Nominations[index]
-			if _, found := keys[placementStatusKey(nomination)]; !found || !placementCanExpire(nomination, e.now()) {
+			if _, found := keys[placementIdentityForNomination(nomination)]; !found || !placementCanExpire(nomination, e.now()) {
 				continue
 			}
 			nomination.Phase = repackv1alpha1.PodPlacementExpired

@@ -28,8 +28,10 @@ const (
 	eventReasonPlanComputed              = "PlanComputed"
 	eventReasonExecutePrepared           = "ExecutePrepared"
 	eventReasonEvictionsIssued           = "EvictionsIssued"
+	eventReasonCascadeDeletionObserved   = "CascadeDeletionObserved"
 	eventReasonAwaitingPlacement         = "AwaitingPlacement"
 	eventReasonPlacementSelected         = "PlacementSelected"
+	eventReasonPlacementLeaseRepaired    = "PlacementLeaseRepaired"
 	eventReasonPlacementAwaitingCapacity = "PlacementAwaitingCapacity"
 	eventReasonPlacementExpired          = "PlacementExpired"
 )

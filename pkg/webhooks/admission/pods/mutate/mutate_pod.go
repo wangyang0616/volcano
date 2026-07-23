@@ -216,10 +216,11 @@ func patchRepackPlacementGate(pod *v1.Pod) ([]patchOperation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get RepackRun %q for PodGroup %s/%s placement: %w", runName, pod.Namespace, podGroupName, err)
 	}
-	if run.UID != runUID || !placement.ActiveForPodGroup(run, pod.Namespace, podGroupName) {
+	if run.UID != runUID || !placement.PlacementAppliesToPodGroup(run, podGroup) {
 		klog.V(4).InfoS("repack webhook: placement lease is not active for PodGroup",
 			"pod", pod.Namespace+"/"+pod.Name, "podGroup", pod.Namespace+"/"+podGroupName,
-			"run", runName, "runPhase", run.Status.Phase, "uidMatches", run.UID == runUID)
+			"run", runName, "runPhase", run.Status.Phase, "uidMatches", run.UID == runUID,
+			"workload", placement.WorkloadKeyForPodGroup(podGroup))
 		return nil, nil
 	}
 	patches := make([]patchOperation, 0, 2)

@@ -17,12 +17,15 @@ limitations under the License.
 package repackengine
 
 import (
+	"errors"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -30,6 +33,7 @@ import (
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 )
 
 func TestHooksForEvictionGracePeriod(t *testing.T) {
@@ -83,6 +87,41 @@ func TestHooksForEvictionGracePeriod(t *testing.T) {
 func TestHooksForDryRunDoesNotExposeEviction(t *testing.T) {
 	if hooks := hooksFor(&repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeDryRun}}, fake.NewSimpleClientset()); hooks.Evict != nil {
 		t.Fatal("DryRun must not expose an eviction hook")
+	}
+}
+
+func TestHooksForPreservesVictimNotFoundReason(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "victim")
+	})
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	move := &engineapi.Move{Task: &schedapi.TaskInfo{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "victim", Namespace: "workload",
+	}}}}
+	err := hooksFor(run, client).Evict(move)
+	if !errors.Is(err, engineframework.ErrVictimNotFound) {
+		t.Fatalf("Evict() error = %v, want ErrVictimNotFound", err)
+	}
+}
+
+func TestClassifyCascadeDeletionsRetainsOnlySiblingNotFound(t *testing.T) {
+	result := &engineframework.CommitResult{
+		Evicted: []engineframework.MoveOutcome{{
+			Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-0",
+		}},
+		Failed: []engineframework.MoveOutcome{
+			{Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-1", VictimPodNotFound: true, Err: "not found"},
+			{Namespace: "ns", PodGroupID: "ns/group-b", PodName: "b-0", VictimPodNotFound: true, Err: "not found"},
+			{Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-2", Err: "pdb"},
+		},
+	}
+	classifyCascadeDeletions(result)
+	if len(result.CascadeDeleted) != 1 || result.CascadeDeleted[0].PodName != "a-1" {
+		t.Fatalf("cascadeDeleted = %+v, want only a-1", result.CascadeDeleted)
+	}
+	if len(result.Failed) != 2 {
+		t.Fatalf("failed = %+v, want unrelated NotFound and PDB rejection", result.Failed)
 	}
 }
 

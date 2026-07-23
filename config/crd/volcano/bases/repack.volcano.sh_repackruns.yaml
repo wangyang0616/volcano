@@ -550,6 +550,12 @@ spec:
                     podGroupName:
                       description: PodGroupName the pod belongs to.
                       type: string
+                    replacementPodGroupName:
+                      description: |-
+                        ReplacementPodGroupName is the latest PodGroup generation that recreates
+                        this nomination's replacement Pod. PodGroupName remains the immutable
+                        plan-time identity.
+                      type: string
                     replacementPodName:
                       description: |-
                         ReplacementPodName and ReplacementPodUID identify the concrete Pod held by

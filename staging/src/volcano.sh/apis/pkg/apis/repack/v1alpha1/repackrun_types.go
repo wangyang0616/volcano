@@ -38,6 +38,10 @@ const (
 	// It records the exact Run name and UID that owns the gate, allowing terminal
 	// cleanup to release unrelated scale-out Pods without touching another Run.
 	PlacementGateOwnerAnnotation = "repack.volcano.sh/placement-gate-owner"
+	// PlacementActiveLabel indexes the single Execute RepackRun whose replacement
+	// placement protocol is active. Admission webhooks use the label only to find
+	// a candidate Run efficiently and always validate its phase and nominations.
+	PlacementActiveLabel = "repack.volcano.sh/placement-active"
 )
 
 // RepackMode selects whether a RepackRun only simulates or actually evicts.
@@ -266,8 +270,8 @@ type RepackRunStatus struct {
 // PodNomination records one relocated pod's replacement placement
 // (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
 // the replacement per the placement identity contract (proposal §5.2.2):
-// victimPodName exact match -> identityLabels (label match) -> fungible (any
-// pending pod in the PodGroup).
+// victimPodName exact match in the active PodGroup -> identityLabels (label
+// match) -> fungible (any pending pod in the active PodGroup).
 type PodNomination struct {
 	// Namespace of the target pod (PodGroup shares this namespace).
 	// +kubebuilder:validation:Required
@@ -275,6 +279,13 @@ type PodNomination struct {
 	// PodGroupName the pod belongs to.
 	// +optional
 	PodGroupName string `json:"podGroupName,omitempty"`
+	// ReplacementPodGroupName is the latest PodGroup generation that recreates
+	// this nomination's replacement Pod. It remains empty when the workload reuses
+	// the original PodGroup name. The placement controller owns this runtime field
+	// and may advance it after another full-group recreation; PodGroupName remains
+	// the immutable plan-time identity for audit.
+	// +optional
+	ReplacementPodGroupName string `json:"replacementPodGroupName,omitempty"`
 	// VictimPodName is the evicted pod's name: audit + exact fast-path when the
 	// controller recreates the replacement with the same name.
 	// +optional

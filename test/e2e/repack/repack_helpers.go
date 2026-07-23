@@ -499,35 +499,72 @@ func recordRepackDiagnostics(ctx *e2eutil.TestContext, runName string, cause err
 	AddReportEntry("Repack failure cause", cause.Error())
 
 	snapshot := map[string]interface{}{}
+	diagnosticNamespaces := map[string]struct{}{
+		metav1.NamespaceDefault: {},
+		ctx.Namespace:           {},
+	}
+	collectRunNamespaces := func(run *repackv1alpha1.RepackRun) {
+		if run == nil {
+			return
+		}
+		for index := range run.Status.Nominations {
+			namespace := run.Status.Nominations[index].Namespace
+			if namespace != "" {
+				diagnosticNamespaces[namespace] = struct{}{}
+			}
+		}
+		if run.Status.Plan != nil {
+			for index := range run.Status.Plan.Moves {
+				namespace := run.Status.Plan.Moves[index].Namespace
+				if namespace != "" {
+					diagnosticNamespaces[namespace] = struct{}{}
+				}
+			}
+		}
+	}
 	if runName != "" {
 		if run, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Get(context.TODO(), runName, metav1.GetOptions{}); err == nil {
 			snapshot["run"] = run
+			collectRunNamespaces(run)
 		} else {
 			snapshot["runGetError"] = err.Error()
 		}
 	} else if runs, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().List(context.TODO(), metav1.ListOptions{}); err == nil {
 		snapshot["runs"] = runs
+		for index := range runs.Items {
+			collectRunNamespaces(&runs.Items[index])
+		}
 	} else {
 		snapshot["runListError"] = err.Error()
 	}
-	if pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
-		snapshot["namespacePods"] = pods
-	} else {
-		snapshot["podListError"] = err.Error()
+	namespaces := make([]string, 0, len(diagnosticNamespaces))
+	for namespace := range diagnosticNamespaces {
+		namespaces = append(namespaces, namespace)
 	}
-	if podGroups, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
-		snapshot["podGroups"] = podGroups
-	} else {
-		snapshot["podGroupListError"] = err.Error()
-	}
+	sort.Strings(namespaces)
+
+	namespacePods := map[string]interface{}{}
+	podGroups := map[string]interface{}{}
 	events := map[string]interface{}{}
-	for _, namespace := range []string{metav1.NamespaceDefault, ctx.Namespace} {
+	for _, namespace := range namespaces {
+		if pods, err := ctx.Kubeclient.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
+			namespacePods[namespace] = pods
+		} else {
+			namespacePods[namespace] = err.Error()
+		}
+		if groups, err := ctx.Vcclient.SchedulingV1beta1().PodGroups(namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
+			podGroups[namespace] = groups
+		} else {
+			podGroups[namespace] = err.Error()
+		}
 		if eventList, err := ctx.Kubeclient.CoreV1().Events(namespace).List(context.TODO(), metav1.ListOptions{}); err == nil {
 			events[namespace] = eventList
 		} else {
 			events[namespace] = err.Error()
 		}
 	}
+	snapshot["namespacePods"] = namespacePods
+	snapshot["podGroups"] = podGroups
 	snapshot["events"] = events
 	if data, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
 		AddReportEntry("Repack API snapshot", string(data))

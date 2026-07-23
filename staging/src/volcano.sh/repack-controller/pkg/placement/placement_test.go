@@ -18,6 +18,7 @@ package placement
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -108,5 +109,53 @@ func TestActiveForPodGroup(t *testing.T) {
 	}
 	if ActiveForPodGroup(run, "other", "pg") {
 		t.Fatal("another namespace must not be active")
+	}
+}
+
+func TestPlacementAppliesToPodGroupAcceptsRecordedAndWorkloadReplacement(t *testing.T) {
+	controller := true
+	start := metav1.NewTime(time.Unix(100, 0))
+	run := &repackv1alpha1.RepackRun{
+		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase:     repackv1alpha1.RepackRunning,
+			StartTime: &start,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "old",
+				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
+			}}},
+			Nominations: []repackv1alpha1.PodNomination{{
+				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			}},
+		},
+	}
+	replacement := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace:         "ns",
+		Name:              "new",
+		CreationTimestamp: metav1.NewTime(time.Unix(101, 0)),
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
+		}},
+	}}
+	if !PlacementAppliesToPodGroup(run, replacement) {
+		t.Fatal("new PodGroup owned by an affected workload must be active before mapping is recorded")
+	}
+
+	run.Status.Nominations[0].ReplacementPodGroupName = "new"
+	if !ActiveForPodGroup(run, "ns", "new") {
+		t.Fatal("recorded replacement PodGroup must be active")
+	}
+
+	run.Status.Nominations[0].ReplacementPodGroupName = ""
+	unrelated := replacement.DeepCopy()
+	unrelated.OwnerReferences[0].Name = "another-model"
+	if PlacementAppliesToPodGroup(run, unrelated) {
+		t.Fatal("PodGroup owned by another workload must not be active")
+	}
+
+	preexisting := replacement.DeepCopy()
+	preexisting.CreationTimestamp = metav1.NewTime(time.Unix(99, 0))
+	if PlacementAppliesToPodGroup(run, preexisting) {
+		t.Fatal("PodGroup created before Execute started must not be inferred as a replacement")
 	}
 }

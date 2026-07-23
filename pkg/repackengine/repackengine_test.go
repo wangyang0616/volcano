@@ -23,9 +23,11 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	commonutil "volcano.sh/volcano/pkg/util"
 )
@@ -41,6 +43,25 @@ func TestReconcileConflictDoesNotConsumePoisonPillRetryBudget(t *testing.T) {
 	}
 	if !reconcileErrorConsumesRetryBudget(errors.New("invalid scheduler configuration")) {
 		t.Fatal("a deterministic reconcile error must consume the poison-pill retry budget")
+	}
+}
+
+func TestPlacementCleanupCandidateRetainsLabelOnlyFailure(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{repackv1alpha1.PlacementActiveLabel: "true"},
+		},
+		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackFailed,
+		},
+	}
+	if !isPlacementCleanupCandidate(run) {
+		t.Fatal("terminal Execute with placement-active label must retry cleanup even when nominations were cleared")
+	}
+	delete(run.Labels, repackv1alpha1.PlacementActiveLabel)
+	if isPlacementCleanupCandidate(run) {
+		t.Fatal("terminal Execute without nominations or active label needs no placement cleanup")
 	}
 }
 

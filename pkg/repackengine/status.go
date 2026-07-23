@@ -92,18 +92,25 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 }
 
 func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
-	placements := make(map[string]repackv1alpha1.PodNomination, len(latest))
+	placements := make(map[placementIdentity]repackv1alpha1.PodNomination, len(latest))
+	replacements := make(map[placementIdentity]string, len(latest))
 	for i := range latest {
 		r := &latest[i]
+		if r.ReplacementPodGroupName != "" {
+			replacements[placementIdentityForNomination(r)] = r.ReplacementPodGroupName
+		}
 		if r.Phase == repackv1alpha1.PodPlacementGated || r.Phase == repackv1alpha1.PodPlacementAwaitingCapacity ||
 			r.Phase == repackv1alpha1.PodPlacementNominated || r.Phase == repackv1alpha1.PodPlacementPlaced ||
 			r.Phase == repackv1alpha1.PodPlacementDegraded || r.Phase == repackv1alpha1.PodPlacementExpired ||
 			r.Phase == repackv1alpha1.PodNominationBound || r.Phase == repackv1alpha1.PodNominationExpired {
-			placements[nominationKey(r)] = *r
+			placements[placementIdentityForNomination(r)] = *r
 		}
 	}
 	for i := range desired {
-		if placement, found := placements[nominationKey(&desired[i])]; found {
+		if replacementPodGroupName := replacements[placementIdentityForNomination(&desired[i])]; replacementPodGroupName != "" {
+			desired[i].ReplacementPodGroupName = replacementPodGroupName
+		}
+		if placement, found := placements[placementIdentityForNomination(&desired[i])]; found {
 			desired[i].Phase = placement.Phase
 			desired[i].SelectedNodeName = placement.SelectedNodeName
 			desired[i].ReplacementPodName = placement.ReplacementPodName
@@ -113,11 +120,41 @@ func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
 	}
 }
 
-func nominationKey(r *repackv1alpha1.PodNomination) string {
+type placementIdentity struct {
+	Namespace    string
+	PodGroupName string
+	PodName      string
+	TargetNode   string
+}
+
+func placementIdentityForNomination(r *repackv1alpha1.PodNomination) placementIdentity {
 	if r == nil {
-		return ""
+		return placementIdentity{}
 	}
-	return r.Namespace + "\x00" + r.PodGroupName + "\x00" + r.VictimPodName + "\x00" + r.NodeName
+	return placementIdentity{
+		Namespace: r.Namespace, PodGroupName: r.PodGroupName,
+		PodName: r.VictimPodName, TargetNode: r.NodeName,
+	}
+}
+
+func placementIdentityForMove(namespace, podGroupName, podName, targetNode string) placementIdentity {
+	return placementIdentity{
+		Namespace: namespace, PodGroupName: podGroupName,
+		PodName: podName, TargetNode: targetNode,
+	}
+}
+
+func (identity placementIdentity) less(other placementIdentity) bool {
+	switch {
+	case identity.Namespace != other.Namespace:
+		return identity.Namespace < other.Namespace
+	case identity.PodGroupName != other.PodGroupName:
+		return identity.PodGroupName < other.PodGroupName
+	case identity.PodName != other.PodName:
+		return identity.PodName < other.PodName
+	default:
+		return identity.TargetNode < other.TargetNode
+	}
 }
 
 // updateStatusTerminal keeps retrying until the terminal result is durable or
@@ -254,7 +291,8 @@ func markExecuteNotPerformed(run *repackv1alpha1.RepackRun) {
 }
 
 // prepareExecuteNominations records the complete set of placement intents before
-// the eviction barrier. A later commit filters this set to accepted evictions.
+// the eviction barrier. A later commit filters this set to Pods that actually
+// require replacement: accepted evictions plus confirmed group cascades.
 func prepareExecuteNominations(run *repackv1alpha1.RepackRun, plan *engineapi.RepackPlan, nominationTTL time.Duration) {
 	if run == nil {
 		return
@@ -262,28 +300,28 @@ func prepareExecuteNominations(run *repackv1alpha1.RepackRun, plan *engineapi.Re
 	run.Status.Nominations = buildPodNominations(plan, nominationTTL)
 }
 
-// retainAcceptedNominations keeps only intents whose evictions were accepted.
-// Existing records are retained verbatim so their durable expiration deadline
-// and any concurrently observed replacement association are never reset.
-func retainAcceptedNominations(
+// retainRealizedNominations keeps only intents whose Pods were removed by an
+// accepted eviction or a confirmed workload-level cascade. Existing records are
+// retained verbatim so deadlines and concurrent replacement associations survive.
+func retainRealizedNominations(
 	existing []repackv1alpha1.PodNomination,
-	acceptedPlan *engineapi.RepackPlan,
+	realizedPlan *engineapi.RepackPlan,
 	nominationTTL time.Duration,
 ) []repackv1alpha1.PodNomination {
-	accepted := buildPodNominations(acceptedPlan, nominationTTL)
-	if len(accepted) == 0 {
+	realized := buildPodNominations(realizedPlan, nominationTTL)
+	if len(realized) == 0 {
 		return nil
 	}
-	existingByKey := make(map[string]repackv1alpha1.PodNomination, len(existing))
+	existingByKey := make(map[placementIdentity]repackv1alpha1.PodNomination, len(existing))
 	for index := range existing {
-		existingByKey[nominationKey(&existing[index])] = existing[index]
+		existingByKey[placementIdentityForNomination(&existing[index])] = existing[index]
 	}
-	for index := range accepted {
-		if record, found := existingByKey[nominationKey(&accepted[index])]; found {
-			accepted[index] = record
+	for index := range realized {
+		if record, found := existingByKey[placementIdentityForNomination(&realized[index])]; found {
+			realized[index] = record
 		}
 	}
-	return accepted
+	return realized
 }
 
 // initializeExecuteResult publishes the accepted disruption amount immediately
@@ -318,17 +356,17 @@ func movedCardCount(plan *engineapi.RepackPlan, targetResource v1.ResourceName) 
 	return cards
 }
 
-// acceptedFreedNodeNames derives the source nodes whose complete planned victim
-// set was accepted. status.plan remains the complete proposal, so placement must
-// not exclude a source node whose eviction set was only partially accepted.
-func acceptedFreedNodeNames(run *repackv1alpha1.RepackRun) []string {
+// realizedFreedNodeNames derives source nodes whose complete planned victim set
+// was removed and retained as placement nominations. status.plan remains the
+// complete proposal, so a source with a genuinely rejected victim is not excluded.
+func realizedFreedNodeNames(run *repackv1alpha1.RepackRun) []string {
 	if run == nil || run.Status.Plan == nil {
 		return nil
 	}
-	accepted := make(map[string]struct{}, len(run.Status.Nominations))
+	accepted := make(map[placementIdentity]struct{}, len(run.Status.Nominations))
 	for index := range run.Status.Nominations {
 		nomination := &run.Status.Nominations[index]
-		accepted[nomination.Namespace+"\x00"+nomination.PodGroupName+"\x00"+nomination.VictimPodName+"\x00"+nomination.NodeName] = struct{}{}
+		accepted[placementIdentityForNomination(nomination)] = struct{}{}
 	}
 	var result []string
 	for _, nodeName := range run.Status.Plan.FreedNodes {
@@ -342,7 +380,7 @@ func acceptedFreedNodeNames(run *repackv1alpha1.RepackRun) []string {
 					continue
 				}
 				hasPlannedVictim = true
-				key := move.Namespace + "\x00" + move.PodGroupName + "\x00" + pod.Name + "\x00" + pod.ToNode
+				key := placementIdentityForMove(move.Namespace, move.PodGroupName, pod.Name, pod.ToNode)
 				if _, found := accepted[key]; !found {
 					complete = false
 					break

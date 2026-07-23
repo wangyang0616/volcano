@@ -65,7 +65,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["repack.volcano.sh"]
     resources: ["repackruns"]
-    verbs: ["get"]
+    verbs: ["get", "list"] # Pod and PodGroup mutators validate active placement leases
   {{- if .Values.custom.enabled_admissions | regexMatch "/podgroups/mutate" }}
   - apiGroups: [""]
     resources: ["namespaces"]

@@ -26,6 +26,7 @@ limitations under the License.
 package framework
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
@@ -131,19 +132,27 @@ func resolveIdentityLabels(pod *corev1.Pod) map[string]string {
 
 // MoveOutcome records one move's commit result (engine-internal).
 type MoveOutcome struct {
-	Namespace string
-	Task      string
-	From      string
-	To        string
-	Err       string // non-empty if the eviction failed (open-loop: not fatal)
+	Namespace         string
+	PodGroupID        string
+	PodName           string
+	SourceNode        string
+	TargetNode        string
+	Err               string // non-empty if the eviction failed (open-loop: not fatal)
+	VictimPodNotFound bool   // the victim disappeared while the commit was in progress
 }
 
 // CommitResult is what the commit attempted — raw material for status.result.
 type CommitResult struct {
-	Evicted   []MoveOutcome
-	Failed    []MoveOutcome
-	Nominated []Nomination
+	Evicted        []MoveOutcome
+	CascadeDeleted []MoveOutcome
+	Failed         []MoveOutcome
+	Nominated      []Nomination
 }
+
+// ErrVictimNotFound preserves the semantic reason of a Kubernetes NotFound
+// response across the framework's generic eviction hook. The engine later
+// distinguishes a workload-level cascade from an unrelated failed eviction.
+var ErrVictimNotFound = errors.New("repack victim Pod not found")
 
 // CommitHooks are the injected side effects. Evict is required; Nominate is for
 // relief pending targets (added later). Funcs so production supplies Eviction-API /
@@ -173,9 +182,16 @@ func CommitPlan(plan *api.RepackPlan, h CommitHooks) (CommitResult, error) {
 		}
 	}
 	for _, m := range orderedMoves(plan) {
-		oc := MoveOutcome{Namespace: m.Task.Namespace, Task: taskName(m), From: m.From, To: m.To}
+		oc := MoveOutcome{
+			Namespace:  m.Task.Namespace,
+			PodGroupID: string(m.Task.Job),
+			PodName:    taskName(m),
+			SourceNode: m.From,
+			TargetNode: m.To,
+		}
 		if err := h.Evict(m); err != nil {
 			oc.Err = err.Error()
+			oc.VictimPodNotFound = errors.Is(err, ErrVictimNotFound)
 			res.Failed = append(res.Failed, oc)
 			continue
 		}

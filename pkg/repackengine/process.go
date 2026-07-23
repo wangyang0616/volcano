@@ -24,6 +24,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -198,6 +199,16 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			markExecuteNotPerformed(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, fmt.Errorf("prepare placement leases: %w", err))
 		}
+		// Publish the admission lookup index only after the complete nomination
+		// set and every original PodGroup lease are durable. From this point a
+		// workload-level recreation may safely be recognized by the PodGroup
+		// webhook before its first replacement Pod is created.
+		if err := e.setPlacementActive(ctx, run, true); err != nil {
+			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
+			markExecuteNotPerformed(run)
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+				fmt.Errorf("publish placement discovery: %w", err))
+		}
 		e.recordRunEvent(run, v1.EventTypeNormal, eventReasonExecutePrepared,
 			fmt.Sprintf("Prepared %d replacement placement intents across %d PodGroups before eviction.",
 				len(run.Status.Nominations), len(preparedPlacementGroups)))
@@ -208,41 +219,63 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		var commitResult *engineframework.CommitResult
 		result, err := engineframework.CommitPlan(plan, engineSession.Hooks())
 		if err != nil {
-			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
+			e.cleanupPlacement(ctx, run)
 			markExecuteNotPerformed(run)
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
 		commitResult = &result
+		classifyCascadeDeletions(commitResult)
 		engineSession.SetCommit(commitResult)
 
-		evictedCount, rejectedCount := len(commitResult.Evicted), len(commitResult.Failed)
+		evictedCount, cascadeDeletedCount, rejectedCount :=
+			len(commitResult.Evicted), len(commitResult.CascadeDeleted), len(commitResult.Failed)
 		metrics.ObserveEvictions(evictedCount, rejectedCount)
-		klog.V(3).InfoS("evictions issued", "run", run.Name, "evictedCount", evictedCount, "rejectedCount", rejectedCount)
+		metrics.ObserveCascadeDeletions(cascadeDeletedCount)
+		klog.V(3).InfoS("evictions issued", "run", run.Name,
+			"evictedCount", evictedCount, "cascadeDeletedCount", cascadeDeletedCount,
+			"rejectedCount", rejectedCount)
 		for _, outcome := range commitResult.Evicted {
 			klog.V(4).InfoS("repack: eviction accepted", "run", run.Name,
-				"pod", outcome.Namespace+"/"+outcome.Task, "fromNode", outcome.From, "plannedNode", outcome.To)
+				"pod", outcome.Namespace+"/"+outcome.PodName,
+				"fromNode", outcome.SourceNode, "plannedNode", outcome.TargetNode)
 		}
 		for _, outcome := range commitResult.Failed {
 			klog.V(4).InfoS("repack: eviction rejected", "run", run.Name,
-				"pod", outcome.Namespace+"/"+outcome.Task, "fromNode", outcome.From,
-				"plannedNode", outcome.To, "error", outcome.Err)
+				"pod", outcome.Namespace+"/"+outcome.PodName, "fromNode", outcome.SourceNode,
+				"plannedNode", outcome.TargetNode, "error", outcome.Err)
+		}
+		for _, outcome := range commitResult.CascadeDeleted {
+			klog.V(3).InfoS("repack: victim disappeared through workload-level PodGroup cascade; placement intent retained",
+				"run", run.Name, "podGroup", outcome.PodGroupID,
+				"pod", outcome.Namespace+"/"+outcome.PodName, "fromNode", outcome.SourceNode,
+				"plannedNode", outcome.TargetNode)
 		}
 		evictionEventType := v1.EventTypeNormal
 		if rejectedCount > 0 {
 			evictionEventType = v1.EventTypeWarning
 		}
 		e.recordRunEvent(run, evictionEventType, eventReasonEvictionsIssued,
-			fmt.Sprintf("Eviction API accepted %d Pods and rejected %d Pods.", evictedCount, rejectedCount))
+			fmt.Sprintf("Eviction API accepted %d Pods; the workload cascade deleted %d additional planned Pods; %d requests were rejected.",
+				evictedCount, cascadeDeletedCount, rejectedCount))
+		if cascadeDeletedCount > 0 {
+			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonCascadeDeletionObserved,
+				fmt.Sprintf("Retained %d replacement placement intents after their workload deleted the remaining Pods with the original PodGroup.",
+					cascadeDeletedCount))
+		}
 
-		// Preserve the complete pre-eviction status.plan, and report the accepted
-		// subset through nominations/result. Release a lease as soon as none of its
-		// moves were accepted; otherwise a rejected eviction could leave future Pods
-		// in that PodGroup gated indefinitely.
+		// Preserve the complete pre-eviction status.plan. Nominations retain every
+		// Pod that now requires replacement (accepted eviction or group cascade);
+		// Result.MovedCardCount remains the narrower Eviction-API-accepted amount.
+		// Release a lease as soon as a PodGroup has no realized replacement work.
 		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
-		acceptedPlan := realizedPlan(plan, commitResult)
-		acceptedReport := engineframework.RenderReport(acceptedPlan)
-		run.Status.Nominations = retainAcceptedNominations(run.Status.Nominations, acceptedPlan, nominationTTL)
-		initializeExecuteResult(run, acceptedPlan, targetResource)
+		evictionAcceptedPlan := planAcceptedByEvictionAPI(plan, commitResult)
+		replacementPlacementPlan := planRequiringReplacementPlacement(plan, commitResult)
+		realizedReport := engineframework.RenderReport(replacementPlacementPlan)
+		run.Status.Nominations = retainRealizedNominations(run.Status.Nominations, replacementPlacementPlan, nominationTTL)
+		// MovedCardCount intentionally remains the amount accepted by the Eviction
+		// API. Cascade-deleted Pods participate in replacement completion and
+		// freed-node verification without silently changing that public metric.
+		initializeExecuteResult(run, evictionAcceptedPlan, targetResource)
 		groupsToRelease := placementGroupsDifference(preparedPlacementGroups, placementPodGroups(run))
 		if len(groupsToRelease) > 0 {
 			// Persist the realized nomination set before relinquishing any lease. A
@@ -257,8 +290,11 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
 		}
 		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
-			"run", run.Name, "plannedMoveCount", plannedMoveCount, "acceptedMoveCount", len(acceptedPlan.Moves),
-			"plannedFreedNodeCount", plannedFreedNodeCount, "acceptedFreedNodeCount", len(acceptedPlan.FreedNodes),
+			"run", run.Name, "plannedMoveCount", plannedMoveCount,
+			"replacementRequiredMoveCount", len(replacementPlacementPlan.Moves),
+			"cascadeDeletedMoveCount", cascadeDeletedCount,
+			"plannedFreedNodeCount", plannedFreedNodeCount,
+			"replacementRequiredFreedNodeCount", len(replacementPlacementPlan.FreedNodes),
 			"acceptedMovedCardCount", run.Status.Result.MovedCardCount,
 			"remainingNominationCount", len(run.Status.Nominations))
 
@@ -266,9 +302,10 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
 				fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
 		}
-		if acceptedReport.NodesFreed == 0 {
+		if realizedReport.NodesFreed == 0 {
 			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-				fmt.Errorf("evicted %d pods but no planned node was fully freed (%d evictions rejected)", evictedCount, rejectedCount))
+				fmt.Errorf("Eviction API accepted %d Pods and workload cascade deleted %d additional planned Pods, but no planned node was fully freed (%d requests rejected)",
+					evictedCount, cascadeDeletedCount, rejectedCount))
 		}
 		if evictedCount > 0 {
 			// An accepted eviction only begins the replacement placement protocol. Keep
@@ -285,7 +322,8 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 				placementProgressMessage(run, targetResource))
 			releaseExecuteSlot = false
 			klog.V(3).InfoS("repack: evictions accepted; awaiting replacement placement", "run", run.Name,
-				"evictedCount", evictedCount, "nominationCount", len(run.Status.Nominations))
+				"evictedCount", evictedCount, "cascadeDeletedCount", cascadeDeletedCount,
+				"nominationCount", len(run.Status.Nominations))
 			// The replacement Pod is created asynchronously by its workload controller.
 			// A status update is not a reliable queue wake-up (the informer may already
 			// have observed this object), so guarantee a later placement reconciliation.
@@ -349,7 +387,11 @@ func hooksFor(run *repackv1alpha1.RepackRun, kubernetesClient kubernetes.Interfa
 			if gracePeriodSeconds != nil {
 				eviction.DeleteOptions = &metav1.DeleteOptions{GracePeriodSeconds: gracePeriodSeconds}
 			}
-			return kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), eviction)
+			err := kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), eviction)
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("%w: %s/%s", engineframework.ErrVictimNotFound, pod.Namespace, pod.Name)
+			}
+			return err
 		},
 	}
 }
@@ -370,21 +412,60 @@ func supportedTarget(targetResource v1.ResourceName) bool {
 	return strings.Contains(string(targetResource), "/")
 }
 
+// planAcceptedByEvictionAPI is the narrow public execution result: only Pods
+// accepted by the Eviction API contribute to moved-card accounting. A
+// workload-level cascade still prevents the source from being reported as freed
+// at this stage; final freed-node verification uses live cluster state.
+func planAcceptedByEvictionAPI(
+	plan *engineapi.RepackPlan,
+	commitResult *engineframework.CommitResult,
+) *engineapi.RepackPlan {
+	if commitResult == nil {
+		return nil
+	}
+	failed := append([]engineframework.MoveOutcome(nil), commitResult.CascadeDeleted...)
+	failed = append(failed, commitResult.Failed...)
+	return realizedPlanForOutcomes(plan, commitResult.Evicted, failed)
+}
+
+// planRequiringReplacementPlacement includes both directly evicted and
+// cascade-deleted victims because both need replacement Pods before the Run can
+// complete.
+func planRequiringReplacementPlacement(
+	plan *engineapi.RepackPlan,
+	commitResult *engineframework.CommitResult,
+) *engineapi.RepackPlan {
+	return realizedPlan(plan, commitResult)
+}
+
 // realizedPlan filters an optimistic plan through the actual eviction results.
 // A node is reported freed only when every planned move sourced from that node
-// was accepted. The returned plan retains the original fragmentation baseline so
-// RenderReport can describe the realized benefit without inventing a new metric.
+// either had its eviction accepted or was removed by the same workload cascade.
+// The returned plan retains the original fragmentation baseline so RenderReport
+// can describe the realized benefit without inventing a new metric.
 func realizedPlan(plan *engineapi.RepackPlan, commitResult *engineframework.CommitResult) *engineapi.RepackPlan {
 	if plan == nil || commitResult == nil {
 		return nil
 	}
-	succeeded := make(map[string]int, len(commitResult.Evicted))
-	failedSource := make(map[string]bool, len(commitResult.Failed))
-	for _, moveOutcome := range commitResult.Evicted {
-		succeeded[moveOutcomeKey(moveOutcome.Namespace, moveOutcome.Task, moveOutcome.From, moveOutcome.To)]++
+	succeededOutcomes := append([]engineframework.MoveOutcome(nil), commitResult.Evicted...)
+	succeededOutcomes = append(succeededOutcomes, commitResult.CascadeDeleted...)
+	return realizedPlanForOutcomes(plan, succeededOutcomes, commitResult.Failed)
+}
+
+func realizedPlanForOutcomes(
+	plan *engineapi.RepackPlan,
+	succeededOutcomes, failedOutcomes []engineframework.MoveOutcome,
+) *engineapi.RepackPlan {
+	if plan == nil {
+		return nil
 	}
-	for _, moveOutcome := range commitResult.Failed {
-		failedSource[moveOutcome.From] = true
+	succeeded := make(map[moveOutcomeIdentity]int, len(succeededOutcomes))
+	failedSource := make(map[string]bool, len(failedOutcomes))
+	for _, moveOutcome := range succeededOutcomes {
+		succeeded[moveOutcomeKey(moveOutcome.Namespace, moveOutcome.PodName, moveOutcome.SourceNode, moveOutcome.TargetNode)]++
+	}
+	for _, moveOutcome := range failedOutcomes {
+		failedSource[moveOutcome.SourceNode] = true
 	}
 
 	realized := &engineapi.RepackPlan{Before: plan.Before}
@@ -420,6 +501,44 @@ func realizedPlan(plan *engineapi.RepackPlan, commitResult *engineframework.Comm
 	return realized
 }
 
-func moveOutcomeKey(namespace, task, from, to string) string {
-	return namespace + "\x00" + task + "\x00" + from + "\x00" + to
+// classifyCascadeDeletions separates a workload-controller cascade from real
+// eviction rejection. A NotFound victim is treated as cascade-deleted only when
+// at least one sibling in the same PodGroup was accepted by the Eviction API in
+// this commit. Retaining those intents is safer than dropping them: the workload
+// has already demonstrated that it is rebuilding the scheduling unit, and every
+// retained nomination is still bounded by the normal placement deadline.
+func classifyCascadeDeletions(commitResult *engineframework.CommitResult) {
+	if commitResult == nil || len(commitResult.Failed) == 0 {
+		return
+	}
+	evictedPodGroups := make(map[string]struct{}, len(commitResult.Evicted))
+	for _, outcome := range commitResult.Evicted {
+		if outcome.PodGroupID != "" {
+			evictedPodGroups[outcome.PodGroupID] = struct{}{}
+		}
+	}
+	failed := make([]engineframework.MoveOutcome, 0, len(commitResult.Failed))
+	for _, outcome := range commitResult.Failed {
+		_, siblingEvicted := evictedPodGroups[outcome.PodGroupID]
+		if outcome.VictimPodNotFound && siblingEvicted {
+			commitResult.CascadeDeleted = append(commitResult.CascadeDeleted, outcome)
+			continue
+		}
+		failed = append(failed, outcome)
+	}
+	commitResult.Failed = failed
+}
+
+type moveOutcomeIdentity struct {
+	Namespace  string
+	PodName    string
+	SourceNode string
+	TargetNode string
+}
+
+func moveOutcomeKey(namespace, podName, sourceNode, targetNode string) moveOutcomeIdentity {
+	return moveOutcomeIdentity{
+		Namespace: namespace, PodName: podName,
+		SourceNode: sourceNode, TargetNode: targetNode,
+	}
 }

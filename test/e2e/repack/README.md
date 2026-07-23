@@ -9,12 +9,12 @@ The Repack suite mutates node capacity, node taints, and the singleton
 | Area | E2E coverage |
 |---|---|
 | DryRun and status | fragmented, clean, below-threshold, default/explicit/absent resource, deterministic complete plan |
-| Planning | nine consolidation layouts, whole-PodGroup movement with `minAvailable=1`, empty-node exclusion |
+| Planning | nine consolidation layouts, lower-disruption migration direction, whole-PodGroup movement with `minAvailable=1`, empty-node exclusion |
 | Scheduler fidelity | taints, required node affinity, receiver ordering, immediately-idle capacity |
 | Scope and limits | node exclusion, exact PodGroup name, automatic PodGroup labels, PodGroup/card limits |
-| Execute result | success, verified no-op, all PDB rejections, partial PDB rejection and plan/result separation |
-| Workloads | successful vcjob and Deployment Execute; Deployment and StatefulSet replacement admission |
-| Placement protocol | synchronous gate, engine restart, scale-out ambiguity, capacity expiry, binding drift |
+| Execute result | success, verified no-op, all PDB rejections, partial PDB rejection and plan/result separation, exact planned/actual freed-node mismatch |
+| Workloads | successful vcjob and Deployment Execute; Deployment and StatefulSet replacement admission; full Execute plus repeated workload-level PodGroup recreation with different PG/Pod names |
+| Placement protocol | synchronous gate, engine and controller-manager restart checkpoints, scale-out ambiguity, capacity expiry, binding drift |
 | Lifecycle | Execute cooldown, TTL garbage collection, status conditions/message/completion time |
 | Observability | RepackRun milestone Events and replacement Pod placement Events |
 
