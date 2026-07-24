@@ -35,7 +35,7 @@ const (
 	PlacementGateOwnerAnnotation = "repack.volcano.sh/placement-gate-owner"
 	// PlacementActiveLabel indexes the single Execute RepackRun whose replacement
 	// placement protocol is active. Admission webhooks use the label only to find
-	// a candidate Run efficiently and always validate its phase and nominations.
+	// a candidate Run efficiently and always validate its phase and relocations.
 	PlacementActiveLabel = "repack.volcano.sh/placement-active"
 )
 
@@ -52,7 +52,7 @@ const (
 
 // RepackPhase is the coarse lifecycle phase. Conditions are authoritative;
 // phase is a derived projection for kubectl wait / list views.
-// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Cancelled
+// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed
 type RepackPhase string
 
 const (
@@ -60,39 +60,34 @@ const (
 	RepackRunning   RepackPhase = "Running"
 	RepackSucceeded RepackPhase = "Succeeded"
 	RepackFailed    RepackPhase = "Failed"
-	RepackCancelled RepackPhase = "Cancelled"
 )
 
-// PodNominationPhase reports the state of an Execute-mode replacement placement.
-// +kubebuilder:validation:Enum=Prepared;Gated;AwaitingCapacity;Nominated;Placed;Degraded;Expired;Pending;Bound
-type PodNominationPhase string
+// PodPlacementPhase reports the lifecycle of one replacement Pod placement.
+// It deliberately describes observable progress rather than implementation
+// mechanisms such as scheduling gates.
+// +kubebuilder:validation:Enum=WaitingForReplacement;WaitingForNodeSelection;Nominated;Placed;TimedOut
+type PodPlacementPhase string
 
 const (
-	// PodPlacementPrepared is persisted before eviction, before a replacement exists.
-	PodPlacementPrepared PodNominationPhase = "Prepared"
-	// PodPlacementGated identifies a concrete replacement held by the placement gate.
-	PodPlacementGated PodNominationPhase = "Gated"
-	// PodPlacementAwaitingCapacity is waiting for an immediately schedulable receiver.
-	PodPlacementAwaitingCapacity PodNominationPhase = "AwaitingCapacity"
+	// PodPlacementWaitingForReplacement is persisted before eviction and remains
+	// active until a concrete replacement Pod is identified.
+	PodPlacementWaitingForReplacement PodPlacementPhase = "WaitingForReplacement"
+	// PodPlacementWaitingForNodeSelection identifies a concrete replacement Pod
+	// while Repack is selecting a live receiver node.
+	PodPlacementWaitingForNodeSelection PodPlacementPhase = "WaitingForNodeSelection"
 	// PodPlacementNominated has had its selected node written to nominatedNodeName.
-	PodPlacementNominated PodNominationPhase = "Nominated"
-	// PodPlacementPlaced means the replacement was bound to its selected node.
-	PodPlacementPlaced PodNominationPhase = "Placed"
-	// PodPlacementDegraded releases the gate so normal scheduling can restore service.
-	PodPlacementDegraded PodNominationPhase = "Degraded"
-	// PodPlacementExpired elapsed without completing placement.
-	PodPlacementExpired PodNominationPhase = "Expired"
-
-	// Deprecated aliases retain v1alpha1 status compatibility for existing runs.
-	PodNominationPending PodNominationPhase = "Pending"
-	PodNominationBound   PodNominationPhase = "Bound"
-	PodNominationExpired PodNominationPhase = "Expired"
+	PodPlacementNominated PodPlacementPhase = "Nominated"
+	// PodPlacementPlaced means the replacement was bound. SelectedNodeName and
+	// ActualNodeName show whether the scheduler honored the selected receiver.
+	PodPlacementPlaced PodPlacementPhase = "Placed"
+	// PodPlacementTimedOut means placement did not complete before its deadline.
+	PodPlacementTimedOut PodPlacementPhase = "TimedOut"
 )
 
 // PodEvictionPhase reports the durable execution state of one planned victim.
-// It is independent from PodNominationPhase: eviction is engine-owned, while
+// It is independent from PodPlacementPhase: eviction is engine-owned, while
 // replacement placement is controller-owned.
-// +kubebuilder:validation:Enum=Pending;InProgress;Accepted;VictimNotFound;CascadeDeleted;Rejected
+// +kubebuilder:validation:Enum=Pending;InProgress;Accepted;IndirectlyRemoved;Rejected
 type PodEvictionPhase string
 
 const (
@@ -103,12 +98,10 @@ const (
 	PodEvictionInProgress PodEvictionPhase = "InProgress"
 	// PodEvictionAccepted means the Eviction API accepted this victim.
 	PodEvictionAccepted PodEvictionPhase = "Accepted"
-	// PodEvictionVictimNotFound is an intermediate result classified after all
-	// siblings have been attempted.
-	PodEvictionVictimNotFound PodEvictionPhase = "VictimNotFound"
-	// PodEvictionCascadeDeleted means a sibling eviction caused the workload to
-	// delete this victim while recreating the scheduling unit.
-	PodEvictionCascadeDeleted PodEvictionPhase = "CascadeDeleted"
+	// PodEvictionIndirectlyRemoved means the original victim disappeared after
+	// another eviction in the same PodGroup was accepted. Repack did not receive
+	// an accepted Eviction API response for this individual Pod.
+	PodEvictionIndirectlyRemoved PodEvictionPhase = "IndirectlyRemoved"
 	// PodEvictionRejected means the planned victim was not evicted by this run.
 	PodEvictionRejected PodEvictionPhase = "Rejected"
 )
@@ -236,17 +229,19 @@ type MaxPerRun struct {
 
 // RepackRunStatus reports lifecycle and business output. Conditions are
 // authoritative; phase is derived. "Worth repacking?" is folded into the
-// terminal Complete condition's reason (RepackRecommended / Executed /
-// NoFragmentation / BelowGoalThreshold), not a summary field.
+// terminal Complete condition's reason (RepackRecommended /
+// ExecutionCompleted / NoFragmentation / InsufficientImprovement), not a
+// summary field.
 type RepackRunStatus struct {
 	// Phase is a derived projection of conditions.
 	// +optional
 	Phase RepackPhase `json:"phase,omitempty"`
 
-	// Conditions are the authoritative facts (Job-style: Queued/
-	// Progressing/Complete/Failed/Cancelled). Admission is CEL-only, so there is
-	// no Admitted condition. The Complete condition's reason also encodes whether
-	// repacking was worthwhile.
+	// Conditions are the authoritative facts (Job-style:
+	// Progressing/Complete/Failed). Admission is CEL-only, so there is no
+	// Admitted condition. Progressing=False explains why a Pending run is
+	// waiting. The Complete condition's reason also encodes whether repacking
+	// was worthwhile.
 	// +optional
 	// +patchMergeKey=type
 	// +patchStrategy=merge
@@ -254,7 +249,7 @@ type RepackRunStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
-	// Message is a one-line human summary written at terminal state.
+	// Message is the current one-line operator summary.
 	// +optional
 	Message string `json:"message,omitempty"`
 
@@ -268,7 +263,8 @@ type RepackRunStatus struct {
 
 	// Plan is the immutable plan-time decision in both modes. DryRun reports what
 	// would be done; Execute preserves the complete pre-eviction plan so rejected
-	// or degraded actions remain auditable. Actual Execute metrics live in Result.
+	// or alternatively placed actions remain auditable. Actual Execute metrics
+	// live in Result.
 	// +optional
 	Plan *RepackPlan `json:"plan,omitempty"`
 
@@ -277,22 +273,19 @@ type RepackRunStatus struct {
 	// +optional
 	Result *RepackResult `json:"result,omitempty"`
 
-	// Nominations are the durable placement-steering intents produced by Execute:
-	// one entry per relocated pod, consumed by the nomination reconciler per the
+	// Relocations are the durable per-Pod execution records produced by Execute:
+	// one entry per relocated Pod, consumed by the placement reconciler per the
 	// replacement matching contract (victimPodName exact match ->
 	// schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
 	// design proposal §5.2.2.
 	// +optional
 	// +kubebuilder:validation:MaxItems=4096
-	Nominations []PodNomination `json:"nominations,omitempty"`
+	Relocations []PodRelocationStatus `json:"relocations,omitempty"`
 }
 
-// PodNomination records one relocated pod's replacement placement
-// (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
-// the replacement per the placement matching contract (proposal §5.2.2):
-// victimPodName exact match in the active PodGroup -> schedulingRequirementsHash
-// equality -> homogeneous PodGroup fallback.
-type PodNomination struct {
+// PodRelocationStatus records the immutable plan identity and the independently
+// reconciled eviction and replacement placement state for one relocated Pod.
+type PodRelocationStatus struct {
 	// Namespace of the target pod (PodGroup shares this namespace).
 	// +kubebuilder:validation:Required
 	Namespace string `json:"namespace"`
@@ -300,7 +293,7 @@ type PodNomination struct {
 	// +optional
 	PodGroupName string `json:"podGroupName,omitempty"`
 	// ReplacementPodGroupName is the latest PodGroup generation that recreates
-	// this nomination's replacement Pod. It remains empty when the workload reuses
+	// this relocation's replacement Pod. It remains empty when the workload reuses
 	// the original PodGroup name. The placement controller owns this runtime field
 	// and may advance it after another full-group recreation; PodGroupName remains
 	// the immutable plan-time identity for audit.
@@ -315,42 +308,53 @@ type PodNomination struct {
 	// same-name replacement is never evicted by a replayed request.
 	// +optional
 	VictimPodUID types.UID `json:"victimPodUID,omitempty"`
-	// EvictionPhase is the engine-owned, durable execution state for this victim.
-	// +optional
-	EvictionPhase PodEvictionPhase `json:"evictionPhase,omitempty"`
-	// EvictionMessage contains an operator-readable rejection or recovery detail.
-	// +optional
-	EvictionMessage string `json:"evictionMessage,omitempty"`
 	// SchedulingRequirementsHash is an opaque hash of normalized scheduling
 	// requirements from the victim Pod. It is populated only when the PodGroup
 	// defines SubGroup policies and is compared only for equality when matching a
 	// renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
 	// +optional
 	SchedulingRequirementsHash string `json:"schedulingRequirementsHash,omitempty"`
-	// NodeName is the immutable plan-time target node. It is retained for audit even
-	// if a later placement reconciliation selects another receiver.
+	// PlannedNodeName is the immutable plan-time target node. It is retained for
+	// audit even if a later placement reconciliation selects another receiver.
 	// +kubebuilder:validation:Required
-	NodeName string `json:"nodeName"`
-	// SelectedNodeName is the current receiver selected from the live scheduler
-	// snapshot. It is written before the placement gate is removed.
+	PlannedNodeName string `json:"plannedNodeName"`
+	// Eviction is the engine-owned durable victim eviction state.
+	Eviction PodEvictionStatus `json:"eviction"`
+	// Placement is the controller-owned replacement placement state.
+	Placement PodPlacementStatus `json:"placement"`
+}
+
+// PodEvictionStatus contains the durable eviction journal for one victim Pod.
+type PodEvictionStatus struct {
+	// Phase is the current eviction lifecycle phase.
+	Phase PodEvictionPhase `json:"phase"`
+	// Message contains operator-readable rejection or recovery detail.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// PodPlacementStatus contains the replacement Pod identity, selected receiver,
+// observed binding, and placement deadline.
+type PodPlacementStatus struct {
+	// Phase is the current replacement placement lifecycle phase.
+	Phase PodPlacementPhase `json:"phase"`
+	// SelectedNodeName is the receiver selected from the live scheduler snapshot.
+	// It is written before the placement gate is removed.
 	// +optional
 	SelectedNodeName string `json:"selectedNodeName,omitempty"`
-	// ReplacementPodName and ReplacementPodUID identify the concrete Pod held by
-	// the placement gate. They are controller-owned status fields.
+	// ReplacementPodName and ReplacementPodUID identify the concrete replacement
+	// Pod held by the placement gate.
 	// +optional
 	ReplacementPodName string `json:"replacementPodName,omitempty"`
 	// +optional
 	ReplacementPodUID types.UID `json:"replacementPodUID,omitempty"`
-	// ActualNodeName is populated after the replacement is bound. It makes drift
-	// visible without overwriting the plan-time or selected target.
+	// ActualNodeName is populated after the replacement is bound. Comparing it
+	// with SelectedNodeName reveals an alternative scheduler placement.
 	// +optional
 	ActualNodeName string `json:"actualNodeName,omitempty"`
-	// ExpirationTime bounds re-assertion; after it the nomination is Expired.
+	// ExpirationTime bounds placement reconciliation.
 	// +optional
 	ExpirationTime *metav1.Time `json:"expirationTime,omitempty"`
-	// Phase is the controller-owned placement lifecycle.
-	// +optional
-	Phase PodNominationPhase `json:"phase,omitempty"`
 }
 
 // RepackPlan is the immutable plan-time output in both modes. Three progressive

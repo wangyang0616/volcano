@@ -53,6 +53,25 @@ type scoreTerm struct {
 	fn     DisruptionScoreFn
 }
 
+// DisruptionScoreTerm explains one enabled scoring dimension for one candidate.
+// Raw is the value returned by the plugin. Normalized is its min-max normalized
+// value within the current candidate batch, and Contribution is the weighted
+// value added to the candidate's Total score.
+type DisruptionScoreTerm struct {
+	Name         string
+	Weight       float64
+	Raw          float64
+	Normalized   float64
+	Contribution float64
+}
+
+// CandidateDisruptionScore is the complete, operator-explainable score used to
+// rank one candidate. Lower Total is preferred.
+type CandidateDisruptionScore struct {
+	Total float64
+	Terms []DisruptionScoreTerm
+}
+
 // SessionConfig is the per-run input the driver supplies to OpenSession.
 type SessionConfig struct {
 	Snapshot      Snapshot
@@ -256,45 +275,62 @@ func (s *Session) CurrentFragmentationRate() float64 {
 	return api.MeasureResourceFragmentation(s.Nodes(), s.configuration.Resource).FragmentationRate()
 }
 
-// LeastDisruptive returns the index of the least-disruptive candidate, applying
-// the registered score terms with min-max normalization across the batch (a term
-// where all candidates tie contributes nothing). Ties keep the earliest index, so
-// callers should pass candidates in a meaningful order (e.g. max benefit first).
-// Returns 0 for a single/empty batch.
-func (s *Session) LeastDisruptive(cands []*api.CandidatePlan) int {
-	if len(cands) <= 1 {
-		return 0
+// DisruptionScores evaluates the registered disruption terms with min-max
+// normalization across the candidate batch. A term where all candidates tie
+// contributes zero, but its raw value remains available for diagnostics.
+func (s *Session) DisruptionScores(candidates []*api.CandidatePlan) []CandidateDisruptionScore {
+	scores := make([]CandidateDisruptionScore, len(candidates))
+	if len(candidates) == 0 {
+		return scores
 	}
 	ctx := s.PlanContext()
-	totals := make([]float64, len(cands))
-	for _, t := range s.scoreTerms {
-		if t.weight <= 0 {
+	for _, term := range s.scoreTerms {
+		if term.weight <= 0 {
 			continue
 		}
-		raw := make([]float64, len(cands))
-		mn, mx := 0.0, 0.0
-		for i, p := range cands {
-			raw[i] = t.fn(ctx, p)
-			if i == 0 || raw[i] < mn {
-				mn = raw[i]
+		rawValues := make([]float64, len(candidates))
+		minimum, maximum := 0.0, 0.0
+		for index, candidate := range candidates {
+			rawValues[index] = term.fn(ctx, candidate)
+			if index == 0 || rawValues[index] < minimum {
+				minimum = rawValues[index]
 			}
-			if i == 0 || raw[i] > mx {
-				mx = raw[i]
+			if index == 0 || rawValues[index] > maximum {
+				maximum = rawValues[index]
 			}
 		}
-		span := mx - mn
-		for i := range cands {
-			norm := 0.0
+		span := maximum - minimum
+		for index := range candidates {
+			normalized := 0.0
 			if span > 0 {
-				norm = (raw[i] - mn) / span
+				normalized = (rawValues[index] - minimum) / span
 			}
-			totals[i] += t.weight * norm
+			contribution := term.weight * normalized
+			scores[index].Total += contribution
+			scores[index].Terms = append(scores[index].Terms, DisruptionScoreTerm{
+				Name:         term.name,
+				Weight:       term.weight,
+				Raw:          rawValues[index],
+				Normalized:   normalized,
+				Contribution: contribution,
+			})
 		}
 	}
-	best, bestScore := 0, totals[0]
-	for i, sc := range totals {
-		if sc < bestScore {
-			best, bestScore = i, sc
+	return scores
+}
+
+// LeastDisruptive returns the index of the least-disruptive candidate. Ties
+// keep the earliest index, so callers should pass candidates in a meaningful
+// order (for example, higher benefit first). Returns 0 for a single/empty batch.
+func (s *Session) LeastDisruptive(candidates []*api.CandidatePlan) int {
+	if len(candidates) <= 1 {
+		return 0
+	}
+	scores := s.DisruptionScores(candidates)
+	best, bestScore := 0, scores[0].Total
+	for index := range scores {
+		if scores[index].Total < bestScore {
+			best, bestScore = index, scores[index].Total
 		}
 	}
 	return best

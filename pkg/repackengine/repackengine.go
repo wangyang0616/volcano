@@ -305,37 +305,36 @@ func isEvictionCandidate(run *repackv1alpha1.RepackRun) bool {
 		return false
 	}
 	evictionJournalPresent := false
-	for index := range run.Status.Nominations {
-		if run.Status.Nominations[index].EvictionPhase != "" {
+	for index := range run.Status.Relocations {
+		if run.Status.Relocations[index].Eviction.Phase != "" {
 			evictionJournalPresent = true
 		}
-		switch run.Status.Nominations[index].EvictionPhase {
+		switch run.Status.Relocations[index].Eviction.Phase {
 		case repackv1alpha1.PodEvictionPending,
-			repackv1alpha1.PodEvictionInProgress,
-			repackv1alpha1.PodEvictionVictimNotFound:
+			repackv1alpha1.PodEvictionInProgress:
 			return true
 		}
 	}
 	if !evictionJournalPresent {
-		return false // compatibility with Runs created before the eviction journal
+		return false
 	}
 	for index := range run.Status.Conditions {
 		condition := &run.Status.Conditions[index]
 		if condition.Type == state.CondProgressing &&
 			condition.Status == metav1.ConditionTrue &&
-			condition.Reason == state.ReasonAwaitingPlacement {
+			condition.Reason == state.ReasonReconcilingPlacements {
 			return false
 		}
 	}
-	// All per-Pod outcomes may be final while the aggregate accepted subset and
-	// AwaitingPlacement barrier are not yet durable. Resume finalization.
+	// All per-Pod outcomes may be final while the accepted subset and the
+	// ReconcilingPlacements barrier are not yet durable. Resume finalization.
 	return true
 }
 
 func isPlacementCandidate(run *repackv1alpha1.RepackRun) bool {
 	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
 		run.Status.Phase == repackv1alpha1.RepackRunning && run.Status.Plan != nil &&
-		len(run.Status.Nominations) > 0 && !isEvictionCandidate(run)
+		len(run.Status.Relocations) > 0 && !isEvictionCandidate(run)
 }
 
 // isPlacementCleanupCandidate admits an already-terminal Execute Run only to
@@ -345,15 +344,15 @@ func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
 	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute {
 		return false
 	}
-	// A failure before the first eviction clears nominations but can still leave
+	// A failure before the first eviction clears relocations but can still leave
 	// the admission discovery label or an original PodGroup lease behind. The
 	// metadata label therefore also makes a terminal Run cleanup-retryable.
-	if len(run.Status.Nominations) == 0 &&
+	if len(run.Status.Relocations) == 0 &&
 		run.Labels[repackv1alpha1.PlacementActiveLabel] != "true" {
 		return false
 	}
 	switch run.Status.Phase {
-	case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled:
+	case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed:
 		return true
 	default:
 		return false
@@ -397,7 +396,7 @@ func (e *Engine) processNext(ctx context.Context) bool {
 		// Poison pill: stop retrying and fail the run so it does not loop forever
 		// (and its Execute slot, if any, was already released by process's defer).
 		e.workQueue.Forget(key)
-		e.failByName(ctx, key, "ReconcileGaveUp", fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
+		e.failByName(ctx, key, state.ReasonReconcileFailed, fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
 		return true
 	}
 	e.workQueue.Forget(key)
@@ -493,14 +492,12 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		klog.V(3).InfoS("RepackRun deferred by execute gate",
 			"run", name, "reason", gate.Reason, "requeueAfter", gate.RequeueAfter)
 		message := "Waiting to execute: another Execute RepackRun is active; this run will be retried when the active run finishes."
-		if gate.Reason == state.ReasonExecuteCoolingDown {
+		if gate.Reason == state.ReasonExecuteCooldownActive {
 			message = fmt.Sprintf(
 				"Waiting to execute: the previous Execute RepackRun is cooling down; retrying after %s.",
 				gate.RequeueAfter.Round(time.Second))
 		}
-		conditionChanged := state.SetCondition(&work.Status.Conditions, state.CondQueued, metav1.ConditionTrue,
-			gate.Reason, message, work.Generation)
-		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
+		conditionChanged := state.MarkPending(work, gate.Reason, message)
 		if err := e.updateStatus(ctx, work); err != nil {
 			return err
 		}
@@ -528,7 +525,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		return e.executePreparedEvictions(ctx, work, work.Generation, e.resolveResource(work))
 	}
 	if isPlacementCandidate(work) {
-		// A crash can occur after the accepted nomination subset becomes durable
+		// A crash can occur after the accepted relocation subset becomes durable
 		// but before leases for rejected PodGroups are released. Reconcile that
 		// one-way cleanup before placement; retained groups remain protected.
 		groupsToRelease := placementGroupsDifference(plannedPodGroups(work), placementPodGroups(work))
@@ -589,14 +586,10 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 			continue
 		}
 		work := r.DeepCopy()
-		generation := work.Generation
-		const reason = "Interrupted"
+		reason := state.ReasonExecutionInterrupted
 		cause := fmt.Errorf("engine restarted while this run was in progress")
 		msg := failureStatusMessage(e.resolveResource(work), reason, cause)
-		work.Status.Message = msg
-		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, generation)
-		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, generation)
-		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
+		state.MarkFailed(work, reason, msg)
 		stampLifecycle(work, e.now())
 		e.rememberPendingTerminalStatus(work.Name, work.Status.DeepCopy())
 		e.workQueue.Add(work.Name)

@@ -25,15 +25,15 @@ import (
 )
 
 const (
-	eventReasonPlanComputed              = "PlanComputed"
-	eventReasonExecutePrepared           = "ExecutePrepared"
-	eventReasonEvictionsIssued           = "EvictionsIssued"
-	eventReasonCascadeDeletionObserved   = "CascadeDeletionObserved"
-	eventReasonAwaitingPlacement         = "AwaitingPlacement"
-	eventReasonPlacementSelected         = "PlacementSelected"
-	eventReasonPlacementLeaseRepaired    = "PlacementLeaseRepaired"
-	eventReasonPlacementAwaitingCapacity = "PlacementAwaitingCapacity"
-	eventReasonPlacementExpired          = "PlacementExpired"
+	eventReasonPlanComputed            = "PlanComputed"
+	eventReasonExecutePrepared         = "ExecutePrepared"
+	eventReasonEvictionsIssued         = "EvictionsIssued"
+	eventReasonIndirectRemovalObserved = "IndirectRemovalObserved"
+	eventReasonReconcilingPlacements   = "ReconcilingPlacements"
+	eventReasonPlacementSelected       = "PlacementSelected"
+	eventReasonPlacementLeaseRepaired  = "PlacementLeaseRepaired"
+	eventReasonWaitingForNodeSelection = "WaitingForNodeSelection"
+	eventReasonPlacementTimedOut       = "PlacementTimedOut"
 )
 
 func (e *Engine) recordRunEvent(run *repackv1alpha1.RepackRun, eventType, reason, message string) {

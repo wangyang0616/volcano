@@ -40,23 +40,23 @@ func completionStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.Re
 		return fmt.Sprintf(
 			"Repack recommended for %s: move %d PodGroups and %d cards to free %d nodes; cluster fragmentation is expected to improve from %d%% to %d%%.",
 			resource, summary.podGroups, summary.movedCards, summary.freedNodes, summary.fragBefore, summary.fragAfter)
-	case state.ReasonExecuted:
+	case state.ReasonExecutionCompleted:
 		result := runResult(run)
 		return fmt.Sprintf(
 			"Repack completed for %s: moved %d PodGroups and %d cards, actually freed %d nodes; cluster fragmentation changed from %d%% to %d%%.",
 			resource, acceptedPodGroupCount(run), result.movedCards, result.freedNodes, summary.fragBefore, result.fragAfter)
-	case state.ReasonExecutedWithPlacementDrift:
+	case state.ReasonExecutionCompletedWithAlternativePlacement:
 		result := runResult(run)
-		_, drifted, _ := placementOutcomeCounts(run)
+		_, alternativeNodePlacements, _ := placementOutcomeCounts(run)
 		return fmt.Sprintf(
-			"Repack completed for %s with %d %s: all planned nodes were verified free, %d cards were moved, and cluster fragmentation changed from %d%% to %d%%.",
-			resource, drifted, pluralNoun(drifted, "placement drift", "placement drifts"),
+			"Repack completed for %s with %d replacement %s scheduled on alternative nodes: all planned nodes were verified free, %d cards were moved, and cluster fragmentation changed from %d%% to %d%%.",
+			resource, alternativeNodePlacements, pluralNoun(alternativeNodePlacements, "Pod", "Pods"),
 			result.movedCards, summary.fragBefore, result.fragAfter)
 	case state.ReasonNoFragmentation:
 		return fmt.Sprintf(
 			"No repack needed for %s: cluster fragmentation is %d%%; the resolved scope contains %d resource nodes and %d target-resource PodGroups.",
 			resource, summary.fragBefore, summary.scopeNodes, summary.scopePodGroups)
-	case state.ReasonBelowGoalThreshold:
+	case state.ReasonInsufficientImprovement:
 		return fmt.Sprintf(
 			"No repack performed for %s: cluster fragmentation is %d%%, but no feasible plan within the resolved scope met the required %d percentage-point improvement.",
 			resource, summary.fragBefore, minFragImprovement(run))
@@ -68,29 +68,32 @@ func completionStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.Re
 func placementStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceName, decision placementTerminalDecision) string {
 	plan := runSummary(run)
 	result := runResult(run)
-	placed, drifted, expired := placementOutcomeCounts(run)
+	selectedNodePlacements, alternativeNodePlacements, timedOutPlacements := placementOutcomeCounts(run)
 	resource := displayResource(targetResource)
 	plannedNodes := formatNodeNames(decision.Nodes.Planned)
 	actualNodes := formatNodeNames(decision.Nodes.Actual)
 	switch decision.Reason {
-	case state.ReasonExecuted:
+	case state.ReasonExecutionCompleted:
 		return fmt.Sprintf(
 			"Repack succeeded for %s: all %d replacement %s were scheduled and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
-			resource, placed, pluralNoun(placed, "Pod", "Pods"),
+			resource, selectedNodePlacements, pluralNoun(selectedNodePlacements, "Pod", "Pods"),
 			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
 			plannedNodes, plan.fragBefore, result.fragAfter) + podGroupReplacementStatusSuffix(run)
-	case state.ReasonExecutedWithPlacementDrift:
+	case state.ReasonExecutionCompletedWithAlternativePlacement:
 		return fmt.Sprintf(
-			"Repack succeeded for %s despite placement drift: all %d replacement %s were scheduled (%d reached selected nodes and %d were placed elsewhere), and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
-			resource, placed+drifted, pluralNoun(placed+drifted, "Pod", "Pods"), placed, drifted,
+			"Repack succeeded for %s with alternative placement: all %d replacement %s were scheduled (%d reached selected nodes and %d used alternative nodes), and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
+			resource, selectedNodePlacements+alternativeNodePlacements,
+			pluralNoun(selectedNodePlacements+alternativeNodePlacements, "Pod", "Pods"),
+			selectedNodePlacements, alternativeNodePlacements,
 			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
 			plannedNodes, plan.fragBefore, result.fragAfter) + podGroupReplacementStatusSuffix(run)
-	case state.ReasonPlacementExpired:
+	case state.ReasonPlacementTimedOut:
 		return fmt.Sprintf(
 			"Repack failed for %s because %d replacement %s did not bind before the placement deadline; %d reached selected nodes and %d were placed elsewhere. Planned nodes [%s] were not accepted as a verified complete result; inspect Pod scheduling events and available receiver capacity.",
-			resource, expired, pluralNoun(expired, "Pod", "Pods"), placed, drifted, plannedNodes) +
+			resource, timedOutPlacements, pluralNoun(timedOutPlacements, "Pod", "Pods"),
+			selectedNodePlacements, alternativeNodePlacements, plannedNodes) +
 			podGroupReplacementStatusSuffix(run)
-	case state.ReasonMetricsUnverified:
+	case state.ReasonResultVerificationFailed:
 		return fmt.Sprintf(
 			"Repack failed verification for %s: replacement bindings were reported, but the scheduler cache did not expose one coherent terminal snapshot before the deadline. Planned nodes [%s] cannot be confirmed free; inspect scheduler cache and Pod informer synchronization.",
 			resource, plannedNodes) + podGroupReplacementStatusSuffix(run)
@@ -99,8 +102,10 @@ func placementStatusMessage(run *repackv1alpha1.RepackRun, targetResource v1.Res
 			"Repack did not realize the planned benefit for %s: planned to free %d %s [%s], but verified %d %s free [%s]; nodes still occupied or unavailable: [%s]. All %d replacement %s were scheduled (%d %s); inspect target-resource usage on the missing nodes.",
 			resource, len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"), plannedNodes,
 			len(decision.Nodes.Actual), pluralNoun(len(decision.Nodes.Actual), "node", "nodes"), actualNodes,
-			formatNodeNames(decision.Nodes.Missing), placed+drifted, pluralNoun(placed+drifted, "Pod", "Pods"),
-			drifted, pluralNoun(drifted, "placement drift", "placement drifts")) +
+			formatNodeNames(decision.Nodes.Missing),
+			selectedNodePlacements+alternativeNodePlacements,
+			pluralNoun(selectedNodePlacements+alternativeNodePlacements, "Pod", "Pods"),
+			alternativeNodePlacements, pluralNoun(alternativeNodePlacements, "alternative placement", "alternative placements")) +
 			podGroupReplacementStatusSuffix(run)
 	default:
 		return fmt.Sprintf(
@@ -133,7 +138,7 @@ func failureStatusMessage(targetResource v1.ResourceName, reason string, err err
 		detail = strings.TrimSpace(err.Error())
 	}
 	message := fmt.Sprintf("Repack failed for %s during %s: %s", displayResource(targetResource), failureStage(reason), detail)
-	if reason == state.ReasonExecuteFailed &&
+	if reason == state.ReasonEvictionFailed &&
 		(strings.Contains(strings.ToLower(detail), "evict") || strings.Contains(strings.ToLower(detail), "reject")) {
 		message += "; check PodDisruptionBudgets and Kubernetes eviction events"
 	}
@@ -141,12 +146,13 @@ func failureStatusMessage(targetResource v1.ResourceName, reason string, err err
 }
 
 func placementProgressMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceName) string {
-	total := len(run.Status.Nominations)
-	placed, drifted, expired := placementOutcomeCounts(run)
-	remaining := total - placed - drifted - expired
+	total := len(run.Status.Relocations)
+	selectedNodePlacements, alternativeNodePlacements, timedOutPlacements := placementOutcomeCounts(run)
+	remaining := total - selectedNodePlacements - alternativeNodePlacements - timedOutPlacements
 	return fmt.Sprintf(
-		"Waiting for replacement placement for %s: %d of %d Pods placed, %d placed elsewhere, %d expired, and %d still pending.",
-		displayResource(targetResource), placed, total, drifted, expired, remaining) +
+		"Reconciling replacement placement for %s: %d of %d Pods reached selected nodes, %d used alternative nodes, %d timed out, and %d are still pending.",
+		displayResource(targetResource), selectedNodePlacements, total,
+		alternativeNodePlacements, timedOutPlacements, remaining) +
 		podGroupReplacementStatusSuffix(run)
 }
 
@@ -155,8 +161,8 @@ func podGroupReplacementStatusSuffix(run *repackv1alpha1.RepackRun) string {
 		return ""
 	}
 	replacements := map[string]struct{}{}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nomination.Namespace == "" || nomination.PodGroupName == "" ||
 			nomination.ReplacementPodGroupName == "" ||
 			nomination.ReplacementPodGroupName == nomination.PodGroupName {
@@ -225,21 +231,25 @@ func runResult(run *repackv1alpha1.RepackRun) statusSummaryValues {
 	return result
 }
 
-func placementOutcomeCounts(run *repackv1alpha1.RepackRun) (placed, drifted, expired int) {
+func placementOutcomeCounts(run *repackv1alpha1.RepackRun) (selectedNodePlacements, alternativeNodePlacements, timedOut int) {
 	if run == nil {
 		return 0, 0, 0
 	}
-	for index := range run.Status.Nominations {
-		switch run.Status.Nominations[index].Phase {
+	for index := range run.Status.Relocations {
+		placementStatus := &run.Status.Relocations[index].Placement
+		switch placementStatus.Phase {
 		case repackv1alpha1.PodPlacementPlaced:
-			placed++
-		case repackv1alpha1.PodPlacementDegraded:
-			drifted++
-		case repackv1alpha1.PodPlacementExpired:
-			expired++
+			if placementStatus.SelectedNodeName != "" &&
+				placementStatus.SelectedNodeName == placementStatus.ActualNodeName {
+				selectedNodePlacements++
+			} else {
+				alternativeNodePlacements++
+			}
+		case repackv1alpha1.PodPlacementTimedOut:
+			timedOut++
 		}
 	}
-	return placed, drifted, expired
+	return selectedNodePlacements, alternativeNodePlacements, timedOut
 }
 
 func acceptedPodGroupCount(run *repackv1alpha1.RepackRun) int {
@@ -247,8 +257,8 @@ func acceptedPodGroupCount(run *repackv1alpha1.RepackRun) int {
 		return 0
 	}
 	podGroups := make(map[types.NamespacedName]struct{})
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		podGroups[types.NamespacedName{
 			Namespace: nomination.Namespace,
 			Name:      nomination.PodGroupName,
@@ -266,23 +276,23 @@ func displayResource(targetResource v1.ResourceName) string {
 
 func failureStage(reason string) string {
 	switch reason {
-	case "NoTargetResource", "UnsupportedResource":
-		return "target resource validation"
-	case "InvalidEngineConfiguration":
-		return "engine configuration validation"
-	case "ScopeError":
+	case state.ReasonInvalidConfiguration:
+		return "configuration validation"
+	case state.ReasonScopeResolutionFailed:
 		return "scope resolution"
-	case state.ReasonExecuteFailed:
-		return "execution"
+	case state.ReasonExecutionPreparationFailed:
+		return "execution preparation"
+	case state.ReasonEvictionFailed:
+		return "Pod eviction"
 	case state.ReasonBenefitNotRealized:
 		return "benefit verification"
-	case state.ReasonPlacementExpired:
+	case state.ReasonPlacementTimedOut:
 		return "replacement placement"
-	case state.ReasonMetricsUnverified:
+	case state.ReasonResultVerificationFailed:
 		return "terminal metric verification"
-	case "Interrupted":
+	case state.ReasonExecutionInterrupted:
 		return "engine recovery"
-	case "ReconcileGaveUp":
+	case state.ReasonReconcileFailed:
 		return "reconciliation"
 	default:
 		return reason

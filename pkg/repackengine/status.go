@@ -44,10 +44,7 @@ import (
 func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, generation int64, reason string, err error) error {
 	klog.ErrorS(err, "repack: run failed", "run", run.Name, "reason", reason)
 	message := failureStatusMessage(e.resolveResource(run), reason, err)
-	run.Status.Message = message
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, message, generation)
-	state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, message, generation)
-	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	state.MarkFailed(run, reason, message)
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
 		return err
 	}
@@ -55,7 +52,7 @@ func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, genera
 		return nil
 	}
 	// A failure after the prepare barrier must release its PodGroup lease.
-	// Pod-level gate cleanup is driven by the nomination controller from this
+	// Pod-level gate cleanup is driven by the placement controller from this
 	// terminal status. Return lease cleanup failures so the terminal-only
 	// reconcile path can retry without replaying an eviction.
 	e.markExecuteDone(run.Name)
@@ -86,47 +83,50 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 		// controller-owned; preserve a concurrently observed replacement association or
 		// terminal placement result instead of resetting it during an engine write.
 		merged := desired.DeepCopy()
-		mergeNominationPhases(merged.Nominations, latest.Status.Nominations)
+		mergeRelocationProgress(merged.Relocations, latest.Status.Relocations)
 		merged.DeepCopyInto(&latest.Status)
 		_, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, latest, metav1.UpdateOptions{})
 		return err
 	})
 }
 
-func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
-	placements := make(map[placementIdentity]repackv1alpha1.PodNomination, len(latest))
-	evictions := make(map[placementIdentity]repackv1alpha1.PodNomination, len(latest))
+// mergeRelocationProgress preserves the two independently owned journals when
+// an engine status retry races with placement-controller updates.
+func mergeRelocationProgress(desired, latest []repackv1alpha1.PodRelocationStatus) {
+	placements := make(map[placementIdentity]repackv1alpha1.PodRelocationStatus, len(latest))
+	evictions := make(map[placementIdentity]repackv1alpha1.PodRelocationStatus, len(latest))
 	replacements := make(map[placementIdentity]string, len(latest))
 	for i := range latest {
 		r := &latest[i]
-		evictions[placementIdentityForNomination(r)] = *r
+		evictions[placementIdentityForRelocation(r)] = *r
 		if r.ReplacementPodGroupName != "" {
-			replacements[placementIdentityForNomination(r)] = r.ReplacementPodGroupName
+			replacements[placementIdentityForRelocation(r)] = r.ReplacementPodGroupName
 		}
-		if r.Phase == repackv1alpha1.PodPlacementGated || r.Phase == repackv1alpha1.PodPlacementAwaitingCapacity ||
-			r.Phase == repackv1alpha1.PodPlacementNominated || r.Phase == repackv1alpha1.PodPlacementPlaced ||
-			r.Phase == repackv1alpha1.PodPlacementDegraded || r.Phase == repackv1alpha1.PodPlacementExpired ||
-			r.Phase == repackv1alpha1.PodNominationBound || r.Phase == repackv1alpha1.PodNominationExpired {
-			placements[placementIdentityForNomination(r)] = *r
+		switch r.Placement.Phase {
+		case repackv1alpha1.PodPlacementWaitingForNodeSelection,
+			repackv1alpha1.PodPlacementNominated,
+			repackv1alpha1.PodPlacementPlaced,
+			repackv1alpha1.PodPlacementTimedOut:
+			placements[placementIdentityForRelocation(r)] = *r
 		}
 	}
 	for i := range desired {
-		if persisted, found := evictions[placementIdentityForNomination(&desired[i])]; found &&
-			persisted.EvictionPhase != "" &&
-			evictionPhaseRank(persisted.EvictionPhase) >= evictionPhaseRank(desired[i].EvictionPhase) {
+		if persisted, found := evictions[placementIdentityForRelocation(&desired[i])]; found &&
+			persisted.Eviction.Phase != "" &&
+			evictionPhaseRank(persisted.Eviction.Phase) >= evictionPhaseRank(desired[i].Eviction.Phase) {
 			desired[i].VictimPodUID = persisted.VictimPodUID
-			desired[i].EvictionPhase = persisted.EvictionPhase
-			desired[i].EvictionMessage = persisted.EvictionMessage
+			desired[i].Eviction.Phase = persisted.Eviction.Phase
+			desired[i].Eviction.Message = persisted.Eviction.Message
 		}
-		if replacementPodGroupName := replacements[placementIdentityForNomination(&desired[i])]; replacementPodGroupName != "" {
+		if replacementPodGroupName := replacements[placementIdentityForRelocation(&desired[i])]; replacementPodGroupName != "" {
 			desired[i].ReplacementPodGroupName = replacementPodGroupName
 		}
-		if placement, found := placements[placementIdentityForNomination(&desired[i])]; found {
-			desired[i].Phase = placement.Phase
-			desired[i].SelectedNodeName = placement.SelectedNodeName
-			desired[i].ReplacementPodName = placement.ReplacementPodName
-			desired[i].ReplacementPodUID = placement.ReplacementPodUID
-			desired[i].ActualNodeName = placement.ActualNodeName
+		if placement, found := placements[placementIdentityForRelocation(&desired[i])]; found {
+			desired[i].Placement.Phase = placement.Placement.Phase
+			desired[i].Placement.SelectedNodeName = placement.Placement.SelectedNodeName
+			desired[i].Placement.ReplacementPodName = placement.Placement.ReplacementPodName
+			desired[i].Placement.ReplacementPodUID = placement.Placement.ReplacementPodUID
+			desired[i].Placement.ActualNodeName = placement.Placement.ActualNodeName
 		}
 	}
 }
@@ -137,10 +137,8 @@ func evictionPhaseRank(phase repackv1alpha1.PodEvictionPhase) int {
 		return 1
 	case repackv1alpha1.PodEvictionInProgress:
 		return 2
-	case repackv1alpha1.PodEvictionVictimNotFound:
-		return 3
 	case repackv1alpha1.PodEvictionAccepted,
-		repackv1alpha1.PodEvictionCascadeDeleted,
+		repackv1alpha1.PodEvictionIndirectlyRemoved,
 		repackv1alpha1.PodEvictionRejected:
 		return 4
 	default:
@@ -155,13 +153,13 @@ type placementIdentity struct {
 	TargetNode   string
 }
 
-func placementIdentityForNomination(r *repackv1alpha1.PodNomination) placementIdentity {
-	if r == nil {
+func placementIdentityForRelocation(relocation *repackv1alpha1.PodRelocationStatus) placementIdentity {
+	if relocation == nil {
 		return placementIdentity{}
 	}
 	return placementIdentity{
-		Namespace: r.Namespace, PodGroupName: r.PodGroupName,
-		PodName: r.VictimPodName, TargetNode: r.NodeName,
+		Namespace: relocation.Namespace, PodGroupName: relocation.PodGroupName,
+		PodName: relocation.VictimPodName, TargetNode: relocation.PlannedNodeName,
 	}
 }
 
@@ -232,7 +230,7 @@ func (e *Engine) updateStatusTerminal(ctx context.Context, run *repackv1alpha1.R
 	outcome := terminalOutcome(run)
 	metrics.ObserveRun(string(run.Spec.Mode), outcome)
 	klog.V(4).InfoS("repack: terminal status persisted", "run", run.Name, "mode", run.Spec.Mode,
-		"phase", run.Status.Phase, "outcome", outcome, "nominationCount", len(run.Status.Nominations))
+		"phase", run.Status.Phase, "outcome", outcome, "relocationCount", len(run.Status.Relocations))
 	if e.recorder != nil {
 		etype := v1.EventTypeNormal
 		if run.Status.Phase == repackv1alpha1.RepackFailed {
@@ -247,12 +245,12 @@ func (e *Engine) updateStatusTerminal(ctx context.Context, run *repackv1alpha1.R
 	return nil
 }
 
-// terminalOutcome is the reason of the True Complete/Failed/Cancelled condition
+// terminalOutcome is the reason of the True Complete/Failed condition
 // (the run's terminal verdict) for the runs_total metric; "Unknown" if none.
 func terminalOutcome(run *repackv1alpha1.RepackRun) string {
 	for _, c := range run.Status.Conditions {
 		if c.Status == metav1.ConditionTrue &&
-			(c.Type == state.CondComplete || c.Type == state.CondFailed || c.Type == state.CondCancelled) {
+			(c.Type == state.CondComplete || c.Type == state.CondFailed) {
 			return c.Reason
 		}
 	}
@@ -277,7 +275,7 @@ func stampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 // applyPlan maps the search outcome onto the immutable status.plan. DryRun and
 // Execute expose the same complete pre-eviction decision, including predicted
 // benefit. Execute acceptance and observed cluster metrics are deliberately
-// reported through status.nominations and status.result instead of rewriting
+// reported through status.relocations and status.result instead of rewriting
 // this audit record.
 func applyPlan(
 	run *repackv1alpha1.RepackRun,
@@ -338,17 +336,17 @@ func markExecuteNotPerformed(run *repackv1alpha1.RepackRun) {
 		return
 	}
 	run.Status.Result = nil
-	run.Status.Nominations = nil
+	run.Status.Relocations = nil
 }
 
-// prepareExecuteNominations records the complete set of placement intents before
-// the eviction barrier. A later commit filters this set to Pods that actually
-// require replacement: accepted evictions plus confirmed group cascades.
+// prepareExecuteRelocations records the complete per-Pod execution journal
+// before the eviction barrier. A later commit retains only Pods that require a
+// replacement after a directly accepted or indirectly observed removal.
 type podGroupPlacementPolicyReader interface {
 	PodGroupUsesSubGroupPolicy(schedapi.JobID) bool
 }
 
-func prepareExecuteNominations(
+func prepareExecuteRelocations(
 	run *repackv1alpha1.RepackRun,
 	plan *engineapi.RepackPlan,
 	nominationTTL time.Duration,
@@ -357,11 +355,11 @@ func prepareExecuteNominations(
 	if run == nil {
 		return nil
 	}
-	nominations, err := buildPodNominations(plan, nominationTTL, policyReader)
+	relocations, err := buildPodRelocations(plan, nominationTTL, policyReader)
 	if err != nil {
 		return err
 	}
-	run.Status.Nominations = nominations
+	run.Status.Relocations = relocations
 	return nil
 }
 
@@ -376,16 +374,16 @@ func initializeNoopExecuteResult(run *repackv1alpha1.RepackRun) {
 }
 
 // realizedFreedNodeNames derives source nodes whose complete planned victim set
-// was removed and retained as placement nominations. status.plan remains the
+// was removed and retained as a relocation record. status.plan remains the
 // complete proposal, so a source with a genuinely rejected victim is not excluded.
 func realizedFreedNodeNames(run *repackv1alpha1.RepackRun) []string {
 	if run == nil || run.Status.Plan == nil {
 		return nil
 	}
-	accepted := make(map[placementIdentity]struct{}, len(run.Status.Nominations))
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
-		accepted[placementIdentityForNomination(nomination)] = struct{}{}
+	accepted := make(map[placementIdentity]struct{}, len(run.Status.Relocations))
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		accepted[placementIdentityForRelocation(relocation)] = struct{}{}
 	}
 	var result []string
 	for _, nodeName := range run.Status.Plan.FreedNodes {
@@ -552,16 +550,16 @@ func percentagePoints(fraction float64) int32 {
 	return percentage
 }
 
-// buildPodNominations renders per-Pod placement-steering intents. PodGroups
+// buildPodRelocations renders per-Pod relocation journals. PodGroups
 // without SubGroup policies are explicitly treated as homogeneous, so they do
-// not pay the API-size cost of storing a hash on every nomination. A SubGroup
+// not pay the API-size cost of storing a hash on every relocation. A SubGroup
 // policy opts the PodGroup into hash-based matching for renamed heterogeneous
 // replacements.
-func buildPodNominations(
+func buildPodRelocations(
 	plan *engineapi.RepackPlan,
 	nominationTTL time.Duration,
 	policyReader podGroupPlacementPolicyReader,
-) ([]repackv1alpha1.PodNomination, error) {
+) ([]repackv1alpha1.PodRelocationStatus, error) {
 	if plan == nil {
 		return nil, nil
 	}
@@ -569,7 +567,7 @@ func buildPodNominations(
 		return nil, fmt.Errorf("PodGroup placement policy reader is required")
 	}
 	expirationTime := metav1.NewTime(time.Now().Add(nominationTTL))
-	nominations := make([]repackv1alpha1.PodNomination, 0, len(plan.Moves))
+	relocations := make([]repackv1alpha1.PodRelocationStatus, 0, len(plan.Moves))
 	for _, move := range plan.Moves {
 		if move == nil || move.Task == nil || move.To == move.From {
 			continue
@@ -593,21 +591,25 @@ func buildPodNominations(
 				"pod", task.Namespace+"/"+task.Name, "podGroup", task.Job,
 				"schedulingRequirementsHash", schedulingRequirementsHash)
 		}
-		nominations = append(nominations, repackv1alpha1.PodNomination{
+		relocations = append(relocations, repackv1alpha1.PodRelocationStatus{
 			Namespace:                  task.Namespace,
 			PodGroupName:               podGroupName,
 			VictimPodName:              task.Name,
 			VictimPodUID:               victimPodUID,
-			EvictionPhase:              repackv1alpha1.PodEvictionPending,
 			SchedulingRequirementsHash: schedulingRequirementsHash,
-			NodeName:                   move.To,
-			Phase:                      repackv1alpha1.PodPlacementPrepared,
-			ExpirationTime:             &expirationTime,
+			PlannedNodeName:            move.To,
+			Eviction: repackv1alpha1.PodEvictionStatus{
+				Phase: repackv1alpha1.PodEvictionPending,
+			},
+			Placement: repackv1alpha1.PodPlacementStatus{
+				Phase:          repackv1alpha1.PodPlacementWaitingForReplacement,
+				ExpirationTime: &expirationTime,
+			},
 		})
 	}
-	sort.Slice(nominations, func(left, right int) bool {
-		return placementIdentityForNomination(&nominations[left]).less(
-			placementIdentityForNomination(&nominations[right]))
+	sort.Slice(relocations, func(left, right int) bool {
+		return placementIdentityForRelocation(&relocations[left]).less(
+			placementIdentityForRelocation(&relocations[right]))
 	})
-	return nominations, nil
+	return relocations, nil
 }

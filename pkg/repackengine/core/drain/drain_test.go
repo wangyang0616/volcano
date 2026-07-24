@@ -19,6 +19,7 @@ package drain
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -224,6 +225,101 @@ func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
 	moves := realMoves(plan)
 	if len(moves) != 1 || moves[0].Task.Name != "b-0" || moves[0].From != "node-b" || moves[0].To != "node-a" {
 		t.Fatalf("moves=%+v, want b-0:node-b->node-a", moves)
+	}
+}
+
+func TestRankCandidatesUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
+	session := drainSessionWithPlugins(&fakeSnap{}, allMovable, 1, 0, 0, []string{"base"})
+	defer framework.CloseSession(session)
+	state := &drainState{ssn: session}
+
+	moreDisruptive := candidate{
+		unit: api.FreeableUnit{Level: "node", Nodes: []string{"node-a"}, Weight: 1},
+		key:  "node-a",
+		placed: []*api.Move{
+			{Task: gpuTask("a-0", "pg-a0", 2), From: "node-a", To: "receiver"},
+			{Task: gpuTask("a-1", "pg-a1", 2), From: "node-a", To: "receiver"},
+		},
+	}
+	lessDisruptive := candidate{
+		unit: api.FreeableUnit{Level: "node", Nodes: []string{"node-b"}, Weight: 1},
+		key:  "node-b",
+		placed: []*api.Move{
+			{Task: gpuTask("b-0", "pg-b0", 1), From: "node-b", To: "receiver"},
+		},
+	}
+	scored := state.scoreCandidates([]candidate{moreDisruptive, lessDisruptive})
+	if chosen := leastDisruptiveCandidate(scored); chosen.key != "node-b" {
+		t.Fatalf("chosen=%s, want node-b", chosen.key)
+	}
+	ranked := rankScoredCandidates(scored)
+	if len(ranked) != 2 || ranked[0].candidate.key != "node-b" ||
+		ranked[0].score.Total >= ranked[1].score.Total {
+		t.Fatalf("ranked=%+v, want node-b first with the lower disruption score", ranked)
+	}
+
+	// All scoring dimensions tie, so the larger freeable-unit benefit wins even
+	// though it appears later in the input.
+	higherBenefit := candidate{
+		unit: api.FreeableUnit{Level: "hypernode", Nodes: []string{"node-c", "node-d"}, Weight: 2},
+		key:  "node-c,node-d",
+	}
+	lowerBenefit := candidate{
+		unit: api.FreeableUnit{Level: "node", Nodes: []string{"node-a"}, Weight: 1},
+		key:  "node-a",
+	}
+	ranked = rankScoredCandidates(state.scoreCandidates([]candidate{lowerBenefit, higherBenefit}))
+	if ranked[0].candidate.key != higherBenefit.key ||
+		ranked[0].score.Total != ranked[1].score.Total {
+		t.Fatalf("tie ranking=%+v, want higher-benefit unit first", ranked)
+	}
+}
+
+func TestFormatRankedCandidatesShowsOnlyThreeBestAndThreeWorst(t *testing.T) {
+	ranked := make([]scoredCandidate, 8)
+	for index := range ranked {
+		nodeName := fmt.Sprintf("node-%d", index)
+		ranked[index] = scoredCandidate{
+			candidate: candidate{
+				unit: api.FreeableUnit{Level: "node", Nodes: []string{nodeName}, Weight: 1},
+				key:  nodeName,
+			},
+			score: framework.CandidateDisruptionScore{
+				Total: float64(index),
+				Terms: []framework.DisruptionScoreTerm{{
+					Name: "movedPods", Weight: 0.1, Raw: float64(index),
+					Normalized: float64(index) / 7, Contribution: float64(index) / 70,
+				}},
+			},
+		}
+	}
+
+	formatted := formatRankedCandidates(ranked)
+	if len(formatted) != 7 {
+		t.Fatalf("formatted entries=%d, want 7 (top 3 + marker + bottom 3): %v", len(formatted), formatted)
+	}
+	for index, want := range []string{"#1 unit=node-0", "#2 unit=node-1", "#3 unit=node-2"} {
+		if !strings.Contains(formatted[index], want) {
+			t.Errorf("formatted[%d]=%q, want %q", index, formatted[index], want)
+		}
+	}
+	if formatted[3] != "... 2 candidates omitted ..." {
+		t.Errorf("middle marker=%q, want omitted count 2", formatted[3])
+	}
+	for index, want := range []string{"#6 unit=node-5", "#7 unit=node-6", "#8 unit=node-7"} {
+		if !strings.Contains(formatted[index+4], want) {
+			t.Errorf("formatted[%d]=%q, want %q", index+4, formatted[index+4], want)
+		}
+	}
+
+	complete := formatRankedCandidates(ranked[:6])
+	if len(complete) != 6 {
+		t.Fatalf("six candidates must be shown completely: %v", complete)
+	}
+	for _, entry := range complete {
+		if strings.Contains(entry, "omitted") {
+			t.Fatalf("six-candidate ranking unexpectedly truncated: %v", complete)
+		}
 	}
 }
 

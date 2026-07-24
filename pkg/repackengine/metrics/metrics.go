@@ -40,7 +40,7 @@ var (
 	EvictionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: subsystem,
 		Name:      "evictions_total",
-		Help:      "Number of planned Pod disruption outcomes during Execute, by result (evicted/rejected/cascade_deleted).",
+		Help:      "Number of planned Pod disruption outcomes during Execute, by result (evicted/rejected/indirectly_removed).",
 	}, []string{"result"})
 
 	// CycleDurationSeconds observes how long one reconcile's plan/act took.
@@ -100,11 +100,11 @@ func ObserveEvictions(evicted, rejected int) {
 	}
 }
 
-// ObserveCascadeDeletions records planned victims removed indirectly when one
-// accepted eviction causes the workload controller to recreate its PodGroup.
-func ObserveCascadeDeletions(count int) {
+// ObserveIndirectRemovals records planned victims that disappeared after
+// another eviction in the same PodGroup was accepted.
+func ObserveIndirectRemovals(count int) {
 	if count > 0 {
-		EvictionsTotal.WithLabelValues("cascade_deleted").Add(float64(count))
+		EvictionsTotal.WithLabelValues("indirectly_removed").Add(float64(count))
 	}
 }
 

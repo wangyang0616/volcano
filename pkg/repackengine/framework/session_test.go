@@ -82,3 +82,38 @@ func TestSession_LeastDisruptive(t *testing.T) {
 		t.Errorf("LeastDisruptive=%d, want 1 (the cheaper candidate)", idx)
 	}
 }
+
+func TestSession_DisruptionScoresExplainNormalizationAndWeighting(t *testing.T) {
+	ssn := newSession(&fakeSnap{})
+	ssn.AddDisruptionScoreFn("movedPods", 0.5, func(ctx *api.PlanContext, plan *api.CandidatePlan) float64 {
+		return float64(plan.MoveAggregate(ctx).MovedPods)
+	})
+	ssn.AddDisruptionScoreFn("constantRisk", 2, func(*api.PlanContext, *api.CandidatePlan) float64 {
+		return 7
+	})
+	cheap := &api.CandidatePlan{Moves: []*api.Move{
+		move(task("a", "ga", 1), "n0", "n1"),
+	}}
+	costly := &api.CandidatePlan{Moves: []*api.Move{
+		move(task("b", "gb", 1), "n0", "n1"),
+		move(task("c", "gc", 1), "n0", "n1"),
+	}}
+
+	scores := ssn.DisruptionScores([]*api.CandidatePlan{costly, cheap})
+	if len(scores) != 2 || len(scores[0].Terms) != 2 || len(scores[1].Terms) != 2 {
+		t.Fatalf("scores=%+v, want two candidates with two term explanations each", scores)
+	}
+	if scores[0].Total != 0.5 || scores[1].Total != 0 {
+		t.Fatalf("totals=(%v,%v), want (0.5,0)", scores[0].Total, scores[1].Total)
+	}
+	movedPods := scores[0].Terms[0]
+	if movedPods.Name != "movedPods" || movedPods.Raw != 2 || movedPods.Weight != 0.5 ||
+		movedPods.Normalized != 1 || movedPods.Contribution != 0.5 {
+		t.Errorf("costly movedPods explanation=%+v", movedPods)
+	}
+	constantRisk := scores[0].Terms[1]
+	if constantRisk.Name != "constantRisk" || constantRisk.Raw != 7 ||
+		constantRisk.Normalized != 0 || constantRisk.Contribution != 0 {
+		t.Errorf("constant term explanation=%+v; tied terms must contribute zero", constantRisk)
+	}
+}

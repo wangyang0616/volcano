@@ -39,11 +39,11 @@ func TestDerivePhase(t *testing.T) {
 		want  repackv1alpha1.RepackPhase
 	}{
 		{"empty -> Pending", nil, repackv1alpha1.RepackPending},
-		{"queued still Pending",
-			[]metav1.Condition{cond(CondQueued, tt)},
+		{"not progressing -> Pending",
+			[]metav1.Condition{cond(CondProgressing, ff)},
 			repackv1alpha1.RepackPending},
 		{"progressing -> Running",
-			[]metav1.Condition{cond(CondQueued, ff), cond(CondProgressing, tt)},
+			[]metav1.Condition{cond(CondProgressing, tt)},
 			repackv1alpha1.RepackRunning},
 		{"complete -> Succeeded",
 			[]metav1.Condition{cond(CondProgressing, ff), cond(CondComplete, tt)},
@@ -51,9 +51,6 @@ func TestDerivePhase(t *testing.T) {
 		{"failed beats complete",
 			[]metav1.Condition{cond(CondComplete, tt), cond(CondFailed, tt)},
 			repackv1alpha1.RepackFailed},
-		{"cancelled beats all",
-			[]metav1.Condition{cond(CondComplete, tt), cond(CondFailed, tt), cond(CondCancelled, tt)},
-			repackv1alpha1.RepackCancelled},
 	}
 	for _, c := range cases {
 		if got := DerivePhase(c.conds); got != c.want {
@@ -64,7 +61,7 @@ func TestDerivePhase(t *testing.T) {
 
 func TestIsTerminal(t *testing.T) {
 	term := []repackv1alpha1.RepackPhase{
-		repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled,
+		repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed,
 	}
 	for _, p := range term {
 		if !IsTerminal(p) {
@@ -94,7 +91,7 @@ func TestEvaluateGate(t *testing.T) {
 		Mode: repackv1alpha1.RepackModeExecute, Cooldown: 10 * time.Minute,
 		LastExecuteFinish: now.Add(-4 * time.Minute), Now: now,
 	})
-	if d.Admit || d.Reason != ReasonExecuteCoolingDown {
+	if d.Admit || d.Reason != ReasonExecuteCooldownActive {
 		t.Errorf("expected ExecuteCoolingDown, got %+v", d)
 	}
 	if d.RequeueAfter != 6*time.Minute {
@@ -180,14 +177,73 @@ func TestCooldownRetained(t *testing.T) {
 
 func TestSetCondition(t *testing.T) {
 	var conds []metav1.Condition
-	if !SetCondition(&conds, CondQueued, metav1.ConditionTrue, ReasonAnotherRunActive, "ok", 1) {
+	if !SetCondition(&conds, CondProgressing, metav1.ConditionFalse, ReasonAnotherRunActive, "ok", 1) {
 		t.Error("first set should report changed")
 	}
 	if DerivePhase(conds) != repackv1alpha1.RepackPending {
-		t.Error("queued-only should still be Pending")
+		t.Error("Progressing=False should derive Pending")
 	}
 	SetCondition(&conds, CondProgressing, metav1.ConditionTrue, ReasonEvicting, "evicting", 1)
 	if DerivePhase(conds) != repackv1alpha1.RepackRunning {
 		t.Error("progressing should derive Running")
 	}
+}
+
+func TestLifecycleTransitionsKeepTerminalConditionsExclusive(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Generation: 3},
+	}
+
+	if !MarkRunning(run, ReasonPlanning, "Planning a repack operation.") {
+		t.Fatal("MarkRunning should report the initial transition")
+	}
+	if run.Status.Phase != repackv1alpha1.RepackRunning ||
+		!conditionIsTrue(run.Status.Conditions, CondProgressing) {
+		t.Fatalf("running state is inconsistent: phase=%s conditions=%v", run.Status.Phase, run.Status.Conditions)
+	}
+
+	if !MarkSucceeded(run, ReasonExecutionCompleted, "Execution completed.") {
+		t.Fatal("MarkSucceeded should report the terminal transition")
+	}
+	if run.Status.Phase != repackv1alpha1.RepackSucceeded ||
+		!conditionIsTrue(run.Status.Conditions, CondComplete) ||
+		conditionExists(run.Status.Conditions, CondFailed) {
+		t.Fatalf("successful state is inconsistent: phase=%s conditions=%v", run.Status.Phase, run.Status.Conditions)
+	}
+
+	if !MarkFailed(run, ReasonResultVerificationFailed, "Result verification failed.") {
+		t.Fatal("MarkFailed should replace a stale successful terminal observation")
+	}
+	if run.Status.Phase != repackv1alpha1.RepackFailed ||
+		!conditionIsTrue(run.Status.Conditions, CondFailed) ||
+		conditionExists(run.Status.Conditions, CondComplete) {
+		t.Fatalf("failed state is inconsistent: phase=%s conditions=%v", run.Status.Phase, run.Status.Conditions)
+	}
+
+	if !MarkPending(run, ReasonAnotherRunActive, "Waiting for the active Execute run.") {
+		t.Fatal("MarkPending should clear stale terminal observations")
+	}
+	if run.Status.Phase != repackv1alpha1.RepackPending ||
+		conditionExists(run.Status.Conditions, CondComplete) ||
+		conditionExists(run.Status.Conditions, CondFailed) {
+		t.Fatalf("pending state is inconsistent: phase=%s conditions=%v", run.Status.Phase, run.Status.Conditions)
+	}
+}
+
+func conditionExists(conditions []metav1.Condition, conditionType string) bool {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return true
+		}
+	}
+	return false
+}
+
+func conditionIsTrue(conditions []metav1.Condition, conditionType string) bool {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return conditions[i].Status == metav1.ConditionTrue
+		}
+	}
+	return false
 }

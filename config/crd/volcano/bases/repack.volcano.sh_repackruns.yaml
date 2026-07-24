@@ -414,8 +414,9 @@ spec:
             description: |-
               RepackRunStatus reports lifecycle and business output. Conditions are
               authoritative; phase is derived. "Worth repacking?" is folded into the
-              terminal Complete condition's reason (RepackRecommended / Executed /
-              NoFragmentation / BelowGoalThreshold), not a summary field.
+              terminal Complete condition's reason (RepackRecommended /
+              ExecutionCompleted / NoFragmentation / InsufficientImprovement), not a
+              summary field.
             properties:
               completionTime:
                 description: CompletionTime is when the run first reached a terminal
@@ -424,10 +425,11 @@ spec:
                 type: string
               conditions:
                 description: |-
-                  Conditions are the authoritative facts (Job-style: Queued/
-                  Progressing/Complete/Failed/Cancelled). Admission is CEL-only, so there is
-                  no Admitted condition. The Complete condition's reason also encodes whether
-                  repacking was worthwhile.
+                  Conditions are the authoritative facts (Job-style:
+                  Progressing/Complete/Failed). Admission is CEL-only, so there is no
+                  Admitted condition. Progressing=False explains why a Pending run is
+                  waiting. The Complete condition's reason also encodes whether repacking
+                  was worthwhile.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -487,122 +489,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               message:
-                description: Message is a one-line human summary written at terminal
-                  state.
+                description: Message is the current one-line operator summary.
                 type: string
-              nominations:
-                description: |-
-                  Nominations are the durable placement-steering intents produced by Execute:
-                  one entry per relocated pod, consumed by the nomination reconciler per the
-                  replacement matching contract (victimPodName exact match ->
-                  schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
-                  design proposal §5.2.2.
-                items:
-                  description: |-
-                    PodNomination records one relocated pod's replacement placement
-                    (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
-                    the replacement per the placement matching contract (proposal §5.2.2):
-                    victimPodName exact match in the active PodGroup -> schedulingRequirementsHash
-                    equality -> homogeneous PodGroup fallback.
-                  properties:
-                    actualNodeName:
-                      description: |-
-                        ActualNodeName is populated after the replacement is bound. It makes drift
-                        visible without overwriting the plan-time or selected target.
-                      type: string
-                    evictionMessage:
-                      description: EvictionMessage contains an operator-readable rejection
-                        or recovery detail.
-                      type: string
-                    evictionPhase:
-                      description: EvictionPhase is the engine-owned, durable execution
-                        state for this victim.
-                      enum:
-                      - Pending
-                      - InProgress
-                      - Accepted
-                      - VictimNotFound
-                      - CascadeDeleted
-                      - Rejected
-                      type: string
-                    expirationTime:
-                      description: ExpirationTime bounds re-assertion; after it the
-                        nomination is Expired.
-                      format: date-time
-                      type: string
-                    namespace:
-                      description: Namespace of the target pod (PodGroup shares this
-                        namespace).
-                      type: string
-                    nodeName:
-                      description: |-
-                        NodeName is the immutable plan-time target node. It is retained for audit even
-                        if a later placement reconciliation selects another receiver.
-                      type: string
-                    phase:
-                      description: Phase is the controller-owned placement lifecycle.
-                      enum:
-                      - Prepared
-                      - Gated
-                      - AwaitingCapacity
-                      - Nominated
-                      - Placed
-                      - Degraded
-                      - Expired
-                      - Pending
-                      - Bound
-                      type: string
-                    podGroupName:
-                      description: PodGroupName the pod belongs to.
-                      type: string
-                    replacementPodGroupName:
-                      description: |-
-                        ReplacementPodGroupName is the latest PodGroup generation that recreates
-                        this nomination's replacement Pod. It remains empty when the workload reuses
-                        the original PodGroup name. The placement controller owns this runtime field
-                        and may advance it after another full-group recreation; PodGroupName remains
-                        the immutable plan-time identity for audit.
-                      type: string
-                    replacementPodName:
-                      description: |-
-                        ReplacementPodName and ReplacementPodUID identify the concrete Pod held by
-                        the placement gate. They are controller-owned status fields.
-                      type: string
-                    replacementPodUID:
-                      description: |-
-                        UID is a type that holds unique ID values, including UUIDs.  Because we
-                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
-                        intent and helps make sure that UIDs and names do not get conflated.
-                      type: string
-                    schedulingRequirementsHash:
-                      description: |-
-                        SchedulingRequirementsHash is an opaque hash of normalized scheduling
-                        requirements from the victim Pod. It is populated only when the PodGroup
-                        defines SubGroup policies and is compared only for equality when matching a
-                        renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
-                      type: string
-                    selectedNodeName:
-                      description: |-
-                        SelectedNodeName is the current receiver selected from the live scheduler
-                        snapshot. It is written before the placement gate is removed.
-                      type: string
-                    victimPodName:
-                      description: |-
-                        VictimPodName is the evicted pod's name: audit + exact fast-path when the
-                        controller recreates the replacement with the same name.
-                      type: string
-                    victimPodUID:
-                      description: |-
-                        VictimPodUID identifies the exact Pod instance selected by the plan. The
-                        engine uses it as an eviction precondition and during crash recovery so a
-                        same-name replacement is never evicted by a replayed request.
-                      type: string
-                  required:
-                  - namespace
-                  - nodeName
-                  type: object
-                maxItems: 4096
-                type: array
               phase:
                 description: Phase is a derived projection of conditions.
                 enum:
@@ -610,13 +498,13 @@ spec:
                 - Running
                 - Succeeded
                 - Failed
-                - Cancelled
                 type: string
               plan:
                 description: |-
                   Plan is the immutable plan-time decision in both modes. DryRun reports what
                   would be done; Execute preserves the complete pre-eviction plan so rejected
-                  or degraded actions remain auditable. Actual Execute metrics live in Result.
+                  or alternatively placed actions remain auditable. Actual Execute metrics
+                  live in Result.
                 properties:
                   freedNodes:
                     description: FreedNodes are the names of nodes the plan empties.
@@ -749,6 +637,126 @@ spec:
                     - movedCardCount
                     type: object
                 type: object
+              relocations:
+                description: |-
+                  Relocations are the durable per-Pod execution records produced by Execute:
+                  one entry per relocated Pod, consumed by the placement reconciler per the
+                  replacement matching contract (victimPodName exact match ->
+                  schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
+                  design proposal §5.2.2.
+                items:
+                  description: |-
+                    PodRelocationStatus records the immutable plan identity and the independently
+                    reconciled eviction and replacement placement state for one relocated Pod.
+                  properties:
+                    eviction:
+                      description: Eviction is the engine-owned durable victim eviction
+                        state.
+                      properties:
+                        message:
+                          description: Message contains operator-readable rejection
+                            or recovery detail.
+                          type: string
+                        phase:
+                          description: Phase is the current eviction lifecycle phase.
+                          enum:
+                          - Pending
+                          - InProgress
+                          - Accepted
+                          - IndirectlyRemoved
+                          - Rejected
+                          type: string
+                      required:
+                      - phase
+                      type: object
+                    namespace:
+                      description: Namespace of the target pod (PodGroup shares this
+                        namespace).
+                      type: string
+                    placement:
+                      description: Placement is the controller-owned replacement placement
+                        state.
+                      properties:
+                        actualNodeName:
+                          description: |-
+                            ActualNodeName is populated after the replacement is bound. Comparing it
+                            with SelectedNodeName reveals an alternative scheduler placement.
+                          type: string
+                        expirationTime:
+                          description: ExpirationTime bounds placement reconciliation.
+                          format: date-time
+                          type: string
+                        phase:
+                          description: Phase is the current replacement placement
+                            lifecycle phase.
+                          enum:
+                          - WaitingForReplacement
+                          - WaitingForNodeSelection
+                          - Nominated
+                          - Placed
+                          - TimedOut
+                          type: string
+                        replacementPodName:
+                          description: |-
+                            ReplacementPodName and ReplacementPodUID identify the concrete replacement
+                            Pod held by the placement gate.
+                          type: string
+                        replacementPodUID:
+                          description: |-
+                            UID is a type that holds unique ID values, including UUIDs.  Because we
+                            don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                            intent and helps make sure that UIDs and names do not get conflated.
+                          type: string
+                        selectedNodeName:
+                          description: |-
+                            SelectedNodeName is the receiver selected from the live scheduler snapshot.
+                            It is written before the placement gate is removed.
+                          type: string
+                      required:
+                      - phase
+                      type: object
+                    plannedNodeName:
+                      description: |-
+                        PlannedNodeName is the immutable plan-time target node. It is retained for
+                        audit even if a later placement reconciliation selects another receiver.
+                      type: string
+                    podGroupName:
+                      description: PodGroupName the pod belongs to.
+                      type: string
+                    replacementPodGroupName:
+                      description: |-
+                        ReplacementPodGroupName is the latest PodGroup generation that recreates
+                        this relocation's replacement Pod. It remains empty when the workload reuses
+                        the original PodGroup name. The placement controller owns this runtime field
+                        and may advance it after another full-group recreation; PodGroupName remains
+                        the immutable plan-time identity for audit.
+                      type: string
+                    schedulingRequirementsHash:
+                      description: |-
+                        SchedulingRequirementsHash is an opaque hash of normalized scheduling
+                        requirements from the victim Pod. It is populated only when the PodGroup
+                        defines SubGroup policies and is compared only for equality when matching a
+                        renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
+                      type: string
+                    victimPodName:
+                      description: |-
+                        VictimPodName is the evicted pod's name: audit + exact fast-path when the
+                        controller recreates the replacement with the same name.
+                      type: string
+                    victimPodUID:
+                      description: |-
+                        VictimPodUID identifies the exact Pod instance selected by the plan. The
+                        engine uses it as an eviction precondition and during crash recovery so a
+                        same-name replacement is never evicted by a replayed request.
+                      type: string
+                  required:
+                  - eviction
+                  - namespace
+                  - placement
+                  - plannedNodeName
+                  type: object
+                maxItems: 4096
+                type: array
               result:
                 description: |-
                   Result is the Execute-only observed outcome. It is absent for DryRun and

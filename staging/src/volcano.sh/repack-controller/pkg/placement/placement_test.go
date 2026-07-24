@@ -95,15 +95,15 @@ func TestActiveForPodGroup(t *testing.T) {
 		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "pg", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
 	if !ActiveForPodGroup(run, "ns", "pg") {
 		t.Fatal("prepared placement must be active")
 	}
-	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
+	run.Status.Relocations[0].Placement.Phase = repackv1alpha1.PodPlacementPlaced
 	if ActiveForPodGroup(run, "ns", "pg") {
 		t.Fatal("placed nomination must not remain active")
 	}
@@ -118,15 +118,14 @@ func TestEvictionAllowsPlacement(t *testing.T) {
 		phase repackv1alpha1.PodEvictionPhase
 		want  bool
 	}{
-		{name: "legacy status", want: true},
 		{name: "accepted", phase: repackv1alpha1.PodEvictionAccepted, want: true},
-		{name: "cascade deleted", phase: repackv1alpha1.PodEvictionCascadeDeleted, want: true},
+		{name: "indirectly removed", phase: repackv1alpha1.PodEvictionIndirectlyRemoved, want: true},
 		{name: "pending", phase: repackv1alpha1.PodEvictionPending},
 		{name: "in progress", phase: repackv1alpha1.PodEvictionInProgress},
 		{name: "rejected", phase: repackv1alpha1.PodEvictionRejected},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			nomination := &repackv1alpha1.PodNomination{EvictionPhase: testCase.phase}
+			nomination := &repackv1alpha1.PodRelocationStatus{Eviction: repackv1alpha1.PodEvictionStatus{Phase: testCase.phase}}
 			if got := EvictionAllowsPlacement(nomination); got != testCase.want {
 				t.Fatalf("EvictionAllowsPlacement() = %t, want %t", got, testCase.want)
 			}
@@ -146,8 +145,8 @@ func TestPlacementAppliesToPodGroupAcceptsRecordedAndWorkloadReplacement(t *test
 				Namespace: "ns", PodGroupName: "old",
 				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
 			}}},
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "old", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -163,12 +162,12 @@ func TestPlacementAppliesToPodGroupAcceptsRecordedAndWorkloadReplacement(t *test
 		t.Fatal("new PodGroup owned by an affected workload must be active before mapping is recorded")
 	}
 
-	run.Status.Nominations[0].ReplacementPodGroupName = "new"
+	run.Status.Relocations[0].ReplacementPodGroupName = "new"
 	if !ActiveForPodGroup(run, "ns", "new") {
 		t.Fatal("recorded replacement PodGroup must be active")
 	}
 
-	run.Status.Nominations[0].ReplacementPodGroupName = ""
+	run.Status.Relocations[0].ReplacementPodGroupName = ""
 	unrelated := replacement.DeepCopy()
 	unrelated.OwnerReferences[0].Name = "another-model"
 	if PlacementAppliesToPodGroup(run, unrelated) {

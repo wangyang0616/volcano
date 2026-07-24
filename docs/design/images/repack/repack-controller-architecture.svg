@@ -1,6 +1,6 @@
 <svg viewBox="0 0 1040 560" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
   <title>volcano repack-controller 架构与职责</title>
-  <desc>三列：左=apiserver 上的 RepackRun / RepackPolicy(P1) / 替身 Pod；中=repack-controller 的三个 reconciler（RunGC·TTL、提名 reconciler、RepackPolicy 生成 P1）+ pkg/state 纯函数；右=协作与产出（vc-repack-engine 写 nominations、patch pod.nominatedNodeName、scheduler honor、DELETE/CREATE Run）。底部收纳边界、部署、配置。控制器不做准入(CEL)、不做规划/驱逐(引擎)。</desc>
+  <desc>三列：左=apiserver 上的 RepackRun / RepackPolicy(P1) / 替身 Pod；中=repack-controller 的三个 reconciler（RunGC·TTL、提名 reconciler、RepackPolicy 生成 P1）+ pkg/state 纯函数；右=协作与产出（vc-repack-engine 写 relocations、patch pod.nominatedNodeName、scheduler honor、DELETE/CREATE Run）。底部收纳边界、部署、配置。控制器不做准入(CEL)、不做规划/驱逐(引擎)。</desc>
   <style>
     .t{fill:#111827;} .s{fill:#667085;}
     .m{font-family:ui-monospace,Menlo,monospace;}
@@ -31,7 +31,7 @@
   <text x="117" y="96" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">RepackRun (CRD)</text>
   <text x="117" y="114" text-anchor="middle" font-size="8.5" fill="#e9f7ef">spec 只读 · status 权威</text>
   <rect x="46" y="140" width="142" height="30" rx="5" class="cache"/>
-  <text x="117" y="151" text-anchor="middle" font-size="9.5" class="t m">status.nominations[]</text>
+  <text x="117" y="151" text-anchor="middle" font-size="9.5" class="t m">status.relocations[]</text>
   <text x="117" y="163" text-anchor="middle" font-size="8" class="s">引擎写 · 控制器读</text>
 
   <rect x="30" y="184" width="174" height="46" rx="6" class="amb"/>
@@ -71,7 +71,7 @@
   <rect x="262" y="210" width="438" height="80" rx="6" class="card"/>
   <text x="278" y="229" font-size="11.5" font-weight="700" class="t">② 提名 reconciler（Nominator）</text>
   <text x="278" y="249" font-size="9.5" class="s">watch 替身 pending pod → 按 <tspan class="t" font-weight="600">PodName 精确</tspan>（确定性命名）/ <tspan class="t" font-weight="600">gang+role</tspan> 兜底</text>
-  <text x="278" y="266" font-size="9.5" class="s">匹配 <tspan class="m">status.nominations[]</tspan> 一条意图，重申至绑定 / ExpireAt →</text>
+  <text x="278" y="266" font-size="9.5" class="s">匹配 <tspan class="m">status.relocations[]</tspan> 一条记录，重申至绑定 / deadline →</text>
   <text x="278" y="283" font-size="9.5" class="blu" font-weight="600">patch pod.status.nominatedNodeName = node</text>
 
   <!-- reconciler 3 -->
@@ -83,7 +83,7 @@
   <rect x="262" y="366" width="438" height="66" rx="6" class="foot"/>
   <text x="278" y="384" font-size="10.5" font-weight="700" class="t m">pkg/state（纯函数）</text>
   <text x="278" y="403" font-size="9" class="s">DerivePhase(conditions→phase) · TTLExpired · SetCondition · IsTerminal</text>
-  <text x="278" y="420" font-size="9" class="s">条件/原因常量（Queued / Progressing / Complete / Failed / Cancelled；无 Admitted）</text>
+  <text x="278" y="420" font-size="9" class="s">条件/原因常量（Progressing / Complete / Failed；无 Admitted）</text>
 
   <!-- ================= COLUMN 3: 协作与产出 ================= -->
   <rect x="742" y="42" width="284" height="404" rx="8" class="card"/>
@@ -92,7 +92,7 @@
   <rect x="758" y="78" width="252" height="58" rx="6" class="card dash" stroke="#2f9e44"/>
   <text x="884" y="97" text-anchor="middle" font-size="11" font-weight="700" class="grn">vc-repack-engine（独立进程）</text>
   <text x="884" y="114" text-anchor="middle" font-size="8.5" class="s">读 spec → 规划/驱逐 →</text>
-  <text x="884" y="127" text-anchor="middle" font-size="8.5" class="s">写 <tspan class="m">status.nominations[]</tspan></text>
+  <text x="884" y="127" text-anchor="middle" font-size="8.5" class="s">写 <tspan class="m">status.relocations[]</tspan></text>
 
   <rect x="758" y="176" width="252" height="52" rx="6" class="blu"/>
   <text x="884" y="194" text-anchor="middle" font-size="10" font-weight="700" fill="#ffffff" class="m">pod.status.nominatedNodeName</text>
@@ -110,9 +110,9 @@
   <path d="M884,136 C884,150 884,158 884,176" class="ag" marker-end="url(#ag)"/>
   <path d="M884,228 L884,248" class="aw" marker-end="url(#ah)"/>
 
-  <!-- engine writes nominations back to RepackRun (col3 -> col1) -->
+  <!-- engine writes relocations back to RepackRun (col3 -> col1) -->
   <path d="M758,100 C560,150 300,150 205,150" class="ag dash" marker-end="url(#ag)"/>
-  <text x="470" y="140" text-anchor="middle" font-size="8" class="grn">引擎写 status.nominations</text>
+  <text x="470" y="140" text-anchor="middle" font-size="8" class="grn">引擎写 status.relocations</text>
 
   <!-- controller ② patches pod (col2 -> col3) -->
   <path d="M700,270 C724,240 730,210 758,202" class="aw" marker-end="url(#ah)"/>

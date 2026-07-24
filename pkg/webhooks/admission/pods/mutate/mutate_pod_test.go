@@ -265,8 +265,8 @@ func TestPatchRepackPlacementGate(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "pg", NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", PlannedNodeName: "node-b", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -313,8 +313,8 @@ func TestPatchRepackPlacementGateBeforeReplacementPodGroupMapping(t *testing.T) 
 				Namespace: "ns", PodGroupName: "old",
 				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
 			}}},
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "old", NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "old", PlannedNodeName: "node-b", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -394,8 +394,8 @@ func TestPatchRepackPlacementGateDerivesNormalPodGroup(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: podGroupName, NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: podGroupName, PlannedNodeName: "node-b", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -432,8 +432,8 @@ func TestPatchRepackPlacementGateSafetyBoundaries(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "pg", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}

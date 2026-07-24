@@ -68,20 +68,20 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		defer deleteRun(ctx, run.Name)
 		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue(), "webhook must synchronously gate the replacement")
 
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated), "controller must report the concrete gated replacement")
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection), "controller must report the concrete gated replacement")
 
 		restoreEngine()
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
-		nomination := got.Status.Nominations[0]
-		Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
-		Expect(nomination.SelectedNodeName).To(Equal(nodes[1]), "the planned receiver is preferred when it remains immediately idle")
-		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.SelectedNodeName), "freed nodes are never placement receivers")
-		Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
+		nomination := got.Status.Relocations[0]
+		Expect(nomination.Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+		Expect(nomination.Placement.SelectedNodeName).To(Equal(nodes[1]), "the planned receiver is preferred when it remains immediately idle")
+		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.Placement.SelectedNodeName), "freed nodes are never placement receivers")
+		Expect(nomination.Placement.ActualNodeName).To(Equal(nodes[1]))
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes),
@@ -104,9 +104,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		run, pgName, firstReplacement := prepareGatedPlacement(
 			ctx, "placement-pod-recreate", nodes[1], []string{nodes[0]}, 90*time.Second)
 		defer deleteRun(ctx, run.Name)
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
 		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
 			context.TODO(), firstReplacement.Name, metav1.DeleteOptions{})).To(Succeed())
@@ -126,20 +126,20 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			},
 		})
 		Expect(hasSchedulingGate(secondReplacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
-		Eventually(func() repackv1alpha1.PodNomination {
-			return getRun(ctx, run.Name).Status.Nominations[0]
+		Eventually(func() repackv1alpha1.PodRelocationStatus {
+			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("ReplacementPodName", secondReplacement.Name),
 			HaveField("ReplacementPodUID", secondReplacement.UID),
-			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 		waitPodEventReasons(ctx, secondReplacement, "RepackPlacementRecovered", "RepackReplacementGated")
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(got.Status.Nominations[0].ReplacementPodName).To(Equal(secondReplacement.Name))
-		Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(nodes[1]))
+		Expect(got.Status.Relocations[0].Placement.ReplacementPodName).To(Equal(secondReplacement.Name))
+		Expect(got.Status.Relocations[0].Placement.ActualNodeName).To(Equal(nodes[1]))
 		assertPlacementLeaseReleased(ctx, pgName)
 	})
 
@@ -154,9 +154,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		run, pgName, replacement := prepareGatedPlacement(
 			ctx, "placement-controller-recover", nodes[1], []string{nodes[0]}, 90*time.Second)
 		defer deleteRun(ctx, run.Name)
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
 		restoreController := pauseRepackControllerManager(ctx)
 		defer restoreController()
@@ -178,16 +178,16 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 				!hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
 		}, repackTimeout, repackPoll).Should(BeTrue(),
 			"a restarted nominator must patch nominatedNodeName, open the gate, and observe binding")
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
 		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementPlaced))
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
-		Expect(got.Status.Nominations[0].SelectedNodeName).To(Equal(nodes[1]))
-		Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(nodes[1]))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
+		Expect(got.Status.Relocations[0].Placement.SelectedNodeName).To(Equal(nodes[1]))
+		Expect(got.Status.Relocations[0].Placement.ActualNodeName).To(Equal(nodes[1]))
 		assertPlacementLeaseReleased(ctx, pgName)
 	})
 
@@ -312,7 +312,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			return latest.Status.Phase == repackv1alpha1.RepackRunning &&
 				latest.Status.Plan != nil && len(latest.Status.Plan.Moves) == 1 &&
 				latest.Status.Plan.Moves[0].PodGroupName == originalPodGroupName &&
-				len(latest.Status.Nominations) == 2
+				len(latest.Status.Relocations) == 2
 		}, repackTimeout, repackPoll).Should(BeTrue(),
 			"the real Engine must plan and prepare both original Pod evictions")
 
@@ -361,19 +361,19 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
 		Expect(got.Status.Plan.FreedNodes).To(Equal([]string{nodes[0]}))
 		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes))
-		Expect(got.Status.Nominations).To(HaveLen(2))
-		for index := range got.Status.Nominations {
-			nomination := &got.Status.Nominations[index]
+		Expect(got.Status.Relocations).To(HaveLen(2))
+		for index := range got.Status.Relocations {
+			nomination := &got.Status.Relocations[index]
 			Expect(nomination.PodGroupName).To(Equal(originalPodGroupName))
 			Expect(nomination.ReplacementPodGroupName).To(Equal(replacementPodGroupName))
-			Expect(nomination.ReplacementPodName).To(HavePrefix("placement-cascade-replacement-"))
+			Expect(nomination.Placement.ReplacementPodName).To(HavePrefix("placement-cascade-replacement-"))
 			Expect(nomination.SchedulingRequirementsHash).NotTo(BeEmpty(),
 				"the real Engine must persist scheduling requirements for a SubGroup-enabled PodGroup")
-			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
-			Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
+			Expect(nomination.Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			Expect(nomination.Placement.ActualNodeName).To(Equal(nodes[1]))
 		}
 		assertPlacementLeaseReleased(ctx, replacementPodGroupName)
 	})
@@ -441,12 +441,11 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 				}},
 			},
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
-			Nominations: []repackv1alpha1.PodNomination{{
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, VictimPodName: victimPodName,
 				SchedulingRequirementsHash: schedulingRequirementsHash,
-				NodeName:                   nodes[1],
-				ExpirationTime:             &expires,
-				Phase:                      repackv1alpha1.PodPlacementPrepared,
+				PlannedNodeName:            nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires,
+					Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		}
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
@@ -524,19 +523,19 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		})
 		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
 
-		Eventually(func() repackv1alpha1.PodNomination {
-			return getRun(ctx, run.Name).Status.Nominations[0]
+		Eventually(func() repackv1alpha1.PodRelocationStatus {
+			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("ReplacementPodGroupName", newPodGroupName),
-			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(got.Status.Nominations[0].ReplacementPodGroupName).To(Equal(newPodGroupName))
-		Expect(got.Status.Nominations[0].SchedulingRequirementsHash).To(Equal(schedulingRequirementsHash))
-		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+		Expect(got.Status.Relocations[0].ReplacementPodGroupName).To(Equal(newPodGroupName))
+		Expect(got.Status.Relocations[0].SchedulingRequirementsHash).To(Equal(schedulingRequirementsHash))
+		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 		Expect(got.Status.Message).To(ContainSubstring(
 			ctx.Namespace + "/" + oldPodGroupName + " -> " + ctx.Namespace + "/" + newPodGroupName))
 		assertPlacementLeaseReleased(ctx, newPodGroupName)
@@ -579,9 +578,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 				}},
 			},
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
-			Nominations: []repackv1alpha1.PodNomination{{
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-				NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+				PlannedNodeName: nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		}
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(
@@ -636,12 +635,12 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		}
 
 		firstPodGroupName, firstPod := createGeneration("v1")
-		Eventually(func() repackv1alpha1.PodNomination {
-			return getRun(ctx, run.Name).Status.Nominations[0]
+		Eventually(func() repackv1alpha1.PodRelocationStatus {
+			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("ReplacementPodGroupName", firstPodGroupName),
 			HaveField("ReplacementPodName", firstPod.Name),
-			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
@@ -656,21 +655,21 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		waitPodGroupDeleted(ctx, ctx.Namespace, firstPodGroupName)
 
 		secondPodGroupName, secondPod := createGeneration("v2")
-		Eventually(func() repackv1alpha1.PodNomination {
-			return getRun(ctx, run.Name).Status.Nominations[0]
+		Eventually(func() repackv1alpha1.PodRelocationStatus {
+			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("PodGroupName", originalPodGroupName),
 			HaveField("ReplacementPodGroupName", secondPodGroupName),
 			HaveField("ReplacementPodName", secondPod.Name),
 			HaveField("ReplacementPodUID", secondPod.UID),
-			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(got.Status.Nominations[0].ReplacementPodGroupName).To(Equal(secondPodGroupName))
-		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+		Expect(got.Status.Relocations[0].ReplacementPodGroupName).To(Equal(secondPodGroupName))
+		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 		Expect(got.Status.Message).To(ContainSubstring(
 			ctx.Namespace + "/" + originalPodGroupName + " -> " + ctx.Namespace + "/" + secondPodGroupName))
 		assertPlacementLeaseReleased(ctx, secondPodGroupName)
@@ -748,14 +747,14 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 				},
 			},
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 4},
-			Nominations: []repackv1alpha1.PodNomination{
+			Relocations: []repackv1alpha1.PodRelocationStatus{
 				{
 					Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-					NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+					PlannedNodeName: nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 				},
 				{
 					Namespace: peerNamespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-					NodeName: nodes[2], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+					PlannedNodeName: nodes[2], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 				},
 			},
 		}
@@ -827,36 +826,36 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 
 		Eventually(func() bool {
 			latest := getRun(ctx, run.Name)
-			if len(latest.Status.Nominations) != 2 {
+			if len(latest.Status.Relocations) != 2 {
 				return false
 			}
 			seenNamespaces := map[string]bool{}
-			for index := range latest.Status.Nominations {
-				nomination := &latest.Status.Nominations[index]
+			for index := range latest.Status.Relocations {
+				nomination := &latest.Status.Relocations[index]
 				replacement := replacements[nomination.Namespace]
 				if replacement == nil ||
 					nomination.PodGroupName != originalPodGroupName ||
 					nomination.ReplacementPodGroupName != replacementPodGroupName ||
-					nomination.ReplacementPodName != replacement.Name ||
-					nomination.ReplacementPodUID != replacement.UID ||
-					nomination.Phase != repackv1alpha1.PodPlacementGated {
+					nomination.Placement.ReplacementPodName != replacement.Name ||
+					nomination.Placement.ReplacementPodUID != replacement.UID ||
+					nomination.Placement.Phase != repackv1alpha1.PodPlacementWaitingForNodeSelection {
 					return false
 				}
 				seenNamespaces[nomination.Namespace] = true
 			}
 			return seenNamespaces[ctx.Namespace] && seenNamespaces[peerNamespace]
 		}, repackTimeout, repackPoll).Should(BeTrue(),
-			"same-named PodGroups and Pods must claim only nominations from their own namespaces")
+			"same-named PodGroups and Pods must claim only relocations from their own namespaces")
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(got.Status.Nominations).To(HaveLen(2))
-		for index := range got.Status.Nominations {
-			nomination := &got.Status.Nominations[index]
+		Expect(got.Status.Relocations).To(HaveLen(2))
+		for index := range got.Status.Relocations {
+			nomination := &got.Status.Relocations[index]
 			Expect(nomination.ReplacementPodGroupName).To(Equal(replacementPodGroupName))
-			Expect(nomination.ReplacementPodName).To(Equal(replacementPodName))
-			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			Expect(nomination.Placement.ReplacementPodName).To(Equal(replacementPodName))
+			Expect(nomination.Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 			assertPlacementLeaseReleasedInNamespace(ctx, nomination.Namespace, replacementPodGroupName)
 		}
 	})
@@ -924,23 +923,23 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		occupy(ctx, "placement-fallback-receiver-blocker", nodes[2], npuPerNode)
 		// Allow an Engine restart to finish informer cache synchronization before the
 		// deadline. The assertion below is specifically about the observable
-		// AwaitingCapacity state, not merely the terminal expiration.
+		// WaitingForNodeSelection state, not merely the terminal expiration.
 		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-expire", nodes[1], []string{nodes[0]}, time.Minute)
 		defer deleteRun(ctx, run.Name)
 		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
 
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
 		restoreEngine()
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementAwaitingCapacity), "gate must remain while no immediately idle receiver exists")
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection), "gate must remain while no immediately idle receiver exists")
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("PlacementExpired"))
-		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementExpired))
+		Expect(completeReason(got)).To(Equal("PlacementTimedOut"))
+		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementTimedOut))
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
 		Expect(got.Status.Result.FreedNodes).To(BeEmpty())
@@ -953,45 +952,45 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 	})
 
 	// A selected receiver can disappear after selection but before the scheduler
-	// binds the Pod. The controller records the actual node as Degraded, but the
+	// binds the Pod. The controller records the actual node as Placed, but the
 	// Run still succeeds when the replacement binds and the exact planned source
 	// node is verified free. The explicit selection here models that short
 	// concurrent-change window while the Engine is paused at the durable checkpoint.
-	It("reports placement drift without failing a realized node-freeing plan", func() {
+	It("reports alternative placement without failing a realized node-freeing plan", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
 		occupy(ctx, "placement-drift-blocker", nodes[1], npuPerNode)
 		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-drift", nodes[1], []string{nodes[0]}, 90*time.Second)
 		defer deleteRun(ctx, run.Name)
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
 		setPlacementSelection(ctx, run.Name, nodes[1])
 		Eventually(func() string {
 			latest := getRun(ctx, run.Name)
-			if len(latest.Status.Nominations) != 1 {
+			if len(latest.Status.Relocations) != 1 {
 				return ""
 			}
-			nomination := latest.Status.Nominations[0]
-			if nomination.Phase != repackv1alpha1.PodPlacementDegraded {
+			nomination := latest.Status.Relocations[0]
+			if nomination.Placement.Phase != repackv1alpha1.PodPlacementPlaced {
 				return ""
 			}
-			return nomination.ActualNodeName
+			return nomination.Placement.ActualNodeName
 		}, repackTimeout, repackPoll).ShouldNot(BeEmpty(), "scheduler must bind on a feasible node and controller must expose the drift")
 
 		restoreEngine()
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("ExecutedWithPlacementDrift"))
-		Expect(got.Status.Nominations[0].SelectedNodeName).To(Equal(nodes[1]))
-		Expect(got.Status.Nominations[0].ActualNodeName).NotTo(BeEmpty())
-		Expect(got.Status.Nominations[0].ActualNodeName).NotTo(Equal(nodes[1]))
+		Expect(completeReason(got)).To(Equal("ExecutionCompletedWithAlternativePlacement"))
+		Expect(got.Status.Relocations[0].Placement.SelectedNodeName).To(Equal(nodes[1]))
+		Expect(got.Status.Relocations[0].Placement.ActualNodeName).NotTo(BeEmpty())
+		Expect(got.Status.Relocations[0].Placement.ActualNodeName).NotTo(Equal(nodes[1]))
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 		Expect(got.Status.Result.FreedNodes).To(Equal(got.Status.Plan.FreedNodes),
-			"placement drift is non-fatal only when the exact planned node set is free")
+			"alternative placement is non-fatal only when the exact planned node set is free")
 		assertPlacementLeaseReleased(ctx, pgName)
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -1009,9 +1008,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		run, pgName, replacement := prepareGatedPlacement(
 			ctx, "placement-benefit-missed", nodes[1], []string{nodes[0]}, 90*time.Second)
 		defer deleteRun(ctx, run.Name)
-		Eventually(func() repackv1alpha1.PodNominationPhase {
-			return getRun(ctx, run.Name).Status.Nominations[0].Phase
-		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+		Eventually(func() repackv1alpha1.PodPlacementPhase {
+			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
 		occupy(ctx, "placement-benefit-blocker", nodes[0], 1)
 		restoreEngine()
@@ -1019,7 +1018,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
 		Expect(completeReason(got)).To(Equal("BenefitNotRealized"))
-		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced),
+		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced),
 			"replacement health alone must not turn an unrealized plan into success")
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
@@ -1122,9 +1121,9 @@ func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, f
 			}},
 		},
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
-		Nominations: []repackv1alpha1.PodNomination{{
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: pgName, VictimPodName: podName,
-			NodeName: plannedNode, ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+			PlannedNodeName: plannedNode, Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 		}},
 	}
 	run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
@@ -1179,17 +1178,17 @@ func verifyNativeReplacementPlacement(ctx *e2eutil.TestContext, nodes []string, 
 			replacement.Annotations[schedulingv1beta1.KubeGroupNameAnnotationKey] == workload.podGroup
 	}, repackTimeout, repackPoll).Should(BeTrue(), "native controller replacement must remain gated after pg-controller associates its automatic PodGroup")
 
-	Eventually(func() repackv1alpha1.PodNominationPhase {
-		return getRun(ctx, run.Name).Status.Nominations[0].Phase
-	}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated), "controller must report the concrete gated replacement")
+	Eventually(func() repackv1alpha1.PodPlacementPhase {
+		return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
+	}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection), "controller must report the concrete gated replacement")
 
 	restoreEngine()
 	got := waitTerminal(ctx, run.Name)
 	Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-	Expect(got.Status.Nominations).To(HaveLen(1))
-	Expect(got.Status.Nominations[0].SelectedNodeName).NotTo(BeEmpty())
-	Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(got.Status.Nominations[0].SelectedNodeName))
-	Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(got.Status.Nominations[0].SelectedNodeName))
+	Expect(got.Status.Relocations).To(HaveLen(1))
+	Expect(got.Status.Relocations[0].Placement.SelectedNodeName).NotTo(BeEmpty())
+	Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(got.Status.Relocations[0].Placement.SelectedNodeName))
+	Expect(got.Status.Relocations[0].Placement.ActualNodeName).To(Equal(got.Status.Relocations[0].Placement.SelectedNodeName))
 	Expect(got.Status.Result).NotTo(BeNil())
 	Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 	waitPodEventReasons(ctx, replacement,
@@ -1221,9 +1220,9 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 			}},
 		},
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
-		Nominations: []repackv1alpha1.PodNomination{{
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: workload.podGroup, VictimPodName: workload.podName,
-			NodeName: plannedNode, ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+			PlannedNodeName: plannedNode, Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 		}},
 	}
 	run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
@@ -1269,8 +1268,8 @@ func assertPlacementLeaseReleasedInNamespace(ctx *e2eutil.TestContext, namespace
 
 func setPlacementSelection(ctx *e2eutil.TestContext, runName, selectedNode string) {
 	run := getRun(ctx, runName)
-	Expect(run.Status.Nominations).To(HaveLen(1))
-	run.Status.Nominations[0].SelectedNodeName = selectedNode
+	Expect(run.Status.Relocations).To(HaveLen(1))
+	run.Status.Relocations[0].Placement.SelectedNodeName = selectedNode
 	_, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "persist selected receiver")
 }

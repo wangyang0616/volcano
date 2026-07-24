@@ -111,11 +111,11 @@ flowchart TB
     START --> MODE{spec.mode?}
 
     MODE -->|DryRun| D1[engine 在内存里模拟整理]
-    D1 --> D2[写 status.report]
+    D1 --> D2[写 status.plan]
     D2 --> D3([用户读报告，决定是否 Execute])
 
     MODE -->|Execute| E1{能执行吗?<br/>K=1 · cooldown}
-    E1 -->|排队| E2[status: Queued]
+    E1 -->|排队| E2[phase: Pending<br/>Progressing=False]
     E2 --> E1
     E1 -->|可以| E3[engine 持久化 placement lease 后 Evict victim Pod]
     E3 --> E4[webhook 为替身 Pod 注入 schedulingGate]
@@ -123,7 +123,7 @@ flowchart TB
     E5 --> E6[engine 用实时 Session 重算 receiver]
     E6 --> E7[controller 写 nominatedNodeName 并解除 gate]
     E7 --> E8[scheduler allocate 重建 Pod]
-    E8 --> END([Succeeded / Degraded])
+    E8 --> END([Succeeded / Failed])
 
     D3 --> EXEC[用户再 CREATE Execute Run]
     EXEC --> MODE
@@ -137,9 +137,9 @@ flowchart TB
 | 步骤 | 谁做 | 做什么 |
 |:----:|------|--------|
 | 1 | 用户 | `kubectl create` RepackRun |
-| 2 | API | CEL 校验（spec 不可改、Execute 必须带 scope） |
+| 2 | API | CEL 校验（spec 不可改；scope 省略时表示全集群） |
 | 3 | **engine** | DryRun 出报告，或 Execute 驱逐 |
-| 4 | **webhook + controller** | webhook 给有 placement lease 的替身打 gate；controller 上报替身、写 nomination 并只移除该 gate |
+| 4 | **webhook + controller** | webhook 给有 placement lease 的替身打 gate；controller 更新 relocation、写 nominatedNodeName 并只移除该 gate |
 | 5 | **engine** | 以新的 scheduler Session 计算当前可行 receiver；无可行节点则重试至 deadline |
 | 6 | **scheduler** | gate 解除后给替身选 Node；controller 核验实际绑定是否与 selected receiver 一致 |
 
@@ -151,11 +151,11 @@ PDB 约束；未来 PDB 的预检和被阻塞后的处理策略统一演进到 `
 
 普通 `nominatedNodeName` 只是软提示；在 victim 仍处于 Terminating 时，装箱评分可能把刚创建的替身立即调回待腾空节点。Execute 在驱逐前给相关 PodGroup 写入带 RepackRun UID 的 placement lease。Pod mutating webhook 仅对持有该 lease 的替身注入 `repack.volcano.sh/placement` scheduling gate，并同时在 Pod 写入同值的 `repack.volcano.sh/placement-gate-owner`。后者是 gate 的精确归属记录，因此不会识别或依赖任何原生工作负载类型。
 
-替身出现后，controller 根据 Pod 上的 gate owner 只读取对应的 RepackRun，记录具体 Pod 的 name/UID 和 `Gated` 状态，不扫描或猜测其它 Run。Engine 再使用最新 scheduler Session 重算 receiver：排除本次要腾空的节点，要求当前 `Idle` 已足够，并通过完整 predicate 模拟验证；原计划 receiver 仍是首选。选点持久化为 `selectedNodeName` 后，controller 才写 `nominatedNodeName` 并解除 gate，但保留 owner 直到实际绑定被观察；绑定完成后回写 `Placed` 或 `Degraded`，再清除 owner。
+替身出现后，controller 根据 Pod 上的 gate owner 只读取对应的 RepackRun，记录具体 Pod 的 name/UID，并把 placement 置为 `WaitingForNodeSelection`，不扫描或猜测其它 Run。Engine 再使用最新 scheduler Session 重算 receiver：排除本次要腾空的节点，要求当前 `Idle` 已足够，并通过完整 predicate 模拟验证；原计划 receiver 仍是首选。选点持久化为 `selectedNodeName` 后，controller 才写 `nominatedNodeName` 并解除 gate，但保留 owner 直到实际绑定被观察；绑定完成后统一回写 `Placed` 和 `actualNodeName`，再清除 owner。是否发生替代放置由 `selectedNodeName != actualNodeName` 推导，不增加独立状态。
 
-这不是 scheduler 的永久硬约束，也不保留节点。若并发任务抢占了可行容量，gate 会在 nomination deadline 前保持并定期重算；到期将 nomination 标记为 `Expired`，controller 据此只移除本机制添加的 gate，让 Pod 恢复正常调度，同时 Run 标记为 `Failed` / `PlacementExpired`。原生负载在此窗口扩容时，新 Pod 可能短暂带 gate；对 Deployment 这类无单 Pod 稳定 identity 的负载，扩容 Pod 与替身在旧 victim 仍 Terminating 时不可区分，必须保持 gate 至 victim 消失后完成匹配、已有 nomination 被其它 Pod 认领，或 Run 终态统一放行。
+这不是 scheduler 的永久硬约束，也不保留节点。若并发任务抢占了可行容量，gate 会在 placement deadline 前保持并定期重算；到期将 relocation 的 placement 标记为 `TimedOut`，controller 据此只移除本机制添加的 gate，让 Pod 恢复正常调度，同时 Run 标记为 `Failed` / `PlacementTimedOut`。原生负载在此窗口扩容时，新 Pod 可能短暂带 gate；对 Deployment 这类无单 Pod 稳定 identity 的负载，扩容 Pod 与替身在旧 victim 仍 Terminating 时不可区分，必须保持 gate 至 victim 消失后完成匹配、已有 relocation 被其它 Pod 认领，或 Run 终态统一放行。
 
-Execute 的成功判据以计划收益为准：所有替身必须在 deadline 内完成绑定，且终态 scheduler 一致快照中 `status.result.freedNodes` 必须与 `status.plan.freedNodes` 集合完全一致。仅比较数量不够，任何计划节点仍被目标资源占用都会以 `Failed` / `BenefitNotRealized` 结束；无法取得可信终态快照则为 `Failed` / `MetricsUnverified`。替身没有落到 Repack 选定 receiver 只记为 placement drift；如果替身已经成功调度且完整计划节点集合确实腾空，Run 仍以 `Succeeded` / `ExecutedWithPlacementDrift` 结束。
+Execute 的成功判据以计划收益为准：所有替身必须在 deadline 内完成绑定，且终态 scheduler 一致快照中 `status.result.freedNodes` 必须与 `status.plan.freedNodes` 集合完全一致。仅比较数量不够，任何计划节点仍被目标资源占用都会以 `Failed` / `BenefitNotRealized` 结束；无法取得可信终态快照则为 `Failed` / `ResultVerificationFailed`。替身没有落到 Repack 选定 receiver 只表示发生替代放置；如果替身已经成功调度且完整计划节点集合确实腾空，Run 仍以 `Succeeded` / `ExecutionCompletedWithAlternativePlacement` 结束。
 
 职责边界固定为：engine 创建、校验并回收 PodGroup lease，controller 独占 Pod gate/owner 的认领、放行与异常清理。Run 终态或被删除时，controller 通过 owner 索引唤醒所有相关 Pod；controller 重启时，Pod informer 的初始 Add 事件也会重新清理孤儿 gate。Webhook 只对配置给 Volcano scheduler 的 Pod 生效，并在 lease 对应 Run 不存在、UID 不一致或已终态时忽略 stale lease。下一 Run 仍会在写 lease 时回收残留值。
 
@@ -175,8 +175,11 @@ spec（创建后不能改）
 status（组件写，用户读）
   report   DryRun 结果：建议动哪些、能腾出多少
   result   Execute 结果：实际动了哪些
-  nominations[].selectedNodeName / actualNodeName
-           运行时选定的 receiver 与实际绑定节点；phase 为 Gated、AwaitingCapacity、Nominated、Placed、Degraded 或 Expired
+  relocations[].eviction
+           每个计划 victim 的驱逐阶段：Pending、InProgress、Accepted、IndirectlyRemoved 或 Rejected
+  relocations[].placement
+           替身放置阶段：WaitingForReplacement、WaitingForNodeSelection、Nominated、Placed 或 TimedOut；
+           selectedNodeName / actualNodeName 分别是运行时选定 receiver 与实际绑定节点
   phase    Pending → Running → Succeeded / Failed
 ```
 

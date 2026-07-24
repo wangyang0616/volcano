@@ -41,7 +41,7 @@ import (
 )
 
 // process plans and acts on a cleared run (the gate already passed). Execute is
-// deliberately two-phase: persist the complete plan and nomination intents
+// deliberately two-phase: persist the complete plan and relocation journal
 // first, then issue evictions. This closes the replacement-pod race and ensures
 // a crash never performs an eviction whose intent was not durably recorded.
 func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) error {
@@ -73,7 +73,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		// --repack-default-resource is unset. Measuring fragmentation on the empty
 		// resource would count every node as empty and silently report
 		// NoFragmentation, so fail fast with an actionable reason instead.
-		return e.fail(ctx, run, generation, "NoTargetResource",
+		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 			fmt.Errorf("no target accelerator resource: set spec.goals[0].resource or the engine flag --repack-default-resource"))
 	}
 	if !supportedTarget(targetResource) {
@@ -83,11 +83,11 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		// Scalar() reads 0 for them and the run would be a silent no-op reporting
 		// NoFragmentation. CEL rejects this on spec.goals, but the --repack-default-
 		// resource fallback bypasses CEL, so guard it here too.
-		return e.fail(ctx, run, generation, "UnsupportedResource",
+		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", targetResource))
 	}
 	if _, ok := engineframework.GetCore(e.config.Core); !ok {
-		return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
+		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 			fmt.Errorf("unknown repack core %q (registered: %v)", e.config.Core, engineframework.CoreNames()))
 	}
 	actions := e.config.Actions
@@ -96,13 +96,13 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	}
 	for _, name := range actions {
 		if _, ok := engineframework.GetAction(name); !ok {
-			return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
+			return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 				fmt.Errorf("unknown repack action %q (registered: %v)", name, engineframework.ActionNames()))
 		}
 	}
 	for _, name := range e.config.Plugins {
 		if _, ok := engineframework.GetPlugin(name); !ok {
-			return e.fail(ctx, run, generation, "InvalidEngineConfiguration",
+			return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 				fmt.Errorf("unknown repack plugin %q", name))
 		}
 	}
@@ -110,25 +110,18 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		"run", run.Name, "mode", run.Spec.Mode, "resource", targetResource,
 		"core", e.config.Core, "actions", actions, "plugins", e.config.Plugins)
 
-	reason := state.ReasonSimulating
-	if run.Spec.Mode == repackv1alpha1.RepackModeExecute {
-		reason = state.ReasonEvicting
-	}
 	progressMessage := fmt.Sprintf(
 		"Planning cluster-wide fragmentation for %s in %s mode.",
 		displayResource(targetResource), run.Spec.Mode)
-	state.SetCondition(&run.Status.Conditions, state.CondQueued, metav1.ConditionFalse,
-		state.ReasonSlotAcquired, "Execution slot acquired; planning has started.", generation)
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue, reason, progressMessage, generation)
-	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	state.MarkRunning(run, state.ReasonPlanning, progressMessage)
 	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist Running status: %w", err)
 	}
-	klog.V(4).InfoS("repack: run status persisted as Running", "run", run.Name, "reason", reason)
+	klog.V(4).InfoS("repack: run status persisted as Running", "run", run.Name, "reason", state.ReasonPlanning)
 
 	scope, err := engineframework.NewScopeMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
 	if err != nil {
-		return e.fail(ctx, run, generation, "ScopeError", err)
+		return e.fail(ctx, run, generation, state.ReasonScopeResolutionFailed, err)
 	}
 
 	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
@@ -178,21 +171,20 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	applyPlan(run, report, plan, targetResource, moveOwners, resolvedScope)
 	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonPlanComputed, plannedBenefitEventMessage(run))
 	if execute && worthwhile {
-		if err := prepareExecuteNominations(run, plan, nominationTTL, snapshot); err != nil {
+		if err := prepareExecuteRelocations(run, plan, nominationTTL, snapshot); err != nil {
 			markExecuteNotPerformed(run)
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-				fmt.Errorf("prepare replacement placement intents: %w", err))
+			return e.fail(ctx, run, generation, state.ReasonExecutionPreparationFailed,
+				fmt.Errorf("prepare per-Pod relocation records: %w", err))
 		}
-		// This is the prepare barrier. In particular, nominations must be visible
+		// This is the prepare barrier. In particular, relocations must be visible
 		// before an eviction can cause a replacement pod to appear. PodGroup
 		// placement leases are the second half of that barrier: the admission
 		// webhook can then gate every replacement before the scheduler observes it.
 		executionMessage := fmt.Sprintf(
 			"Executing repack for %s: evicting %d Pods from %d PodGroups and moving %d cards to free %d nodes.",
-			displayResource(targetResource), len(run.Status.Nominations), len(run.Status.Plan.Moves),
+			displayResource(targetResource), len(run.Status.Relocations), len(run.Status.Plan.Moves),
 			run.Status.Plan.Summary.MovedCardCount, run.Status.Plan.Summary.FreedNodeCount)
-		state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
-			state.ReasonEvicting, executionMessage, generation)
+		state.MarkRunning(run, state.ReasonEvicting, executionMessage)
 		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist prepared Execute plan: %w", err)
 		}
@@ -200,24 +192,24 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		if err := e.preparePlacementLeases(ctx, run); err != nil {
 			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
 			markExecuteNotPerformed(run)
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, fmt.Errorf("prepare placement leases: %w", err))
+			return e.fail(ctx, run, generation, state.ReasonExecutionPreparationFailed, fmt.Errorf("prepare placement leases: %w", err))
 		}
-		// Publish the admission lookup index only after the complete nomination
-		// set and every original PodGroup lease are durable. From this point a
+		// Publish the admission lookup index only after the complete relocation
+		// journal and every original PodGroup lease are durable. From this point a
 		// workload-level recreation may safely be recognized by the PodGroup
 		// webhook before its first replacement Pod is created.
 		if err := e.setPlacementActive(ctx, run, true); err != nil {
 			e.releasePlacementLeases(ctx, run, preparedPlacementGroups)
 			markExecuteNotPerformed(run)
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+			return e.fail(ctx, run, generation, state.ReasonExecutionPreparationFailed,
 				fmt.Errorf("publish placement discovery: %w", err))
 		}
 		e.recordRunEvent(run, v1.EventTypeNormal, eventReasonExecutePrepared,
 			fmt.Sprintf("Prepared %d replacement placement intents across %d PodGroups before eviction.",
-				len(run.Status.Nominations), len(preparedPlacementGroups)))
+				len(run.Status.Relocations), len(preparedPlacementGroups)))
 		klog.V(3).InfoS("repack: Execute plan prepared before eviction",
 			"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
-			"nominationCount", len(run.Status.Nominations), "nominationTTL", nominationTTL)
+			"relocationCount", len(run.Status.Relocations), "nominationTTL", nominationTTL)
 
 		// Once eviction can begin, keep the K=1 slot across transient failures. A
 		// retry resumes the durable per-Pod journal instead of replanning or letting
@@ -234,19 +226,16 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	var done string
 	switch {
 	case !worthwhile && report.FragmentationRateBefore > 0:
-		done = state.ReasonBelowGoalThreshold
+		done = state.ReasonInsufficientImprovement
 	case !worthwhile:
 		done = state.ReasonNoFragmentation
 	case execute:
-		done = state.ReasonExecuted
+		done = state.ReasonExecutionCompleted
 	default:
 		done = state.ReasonRepackRecommended
 	}
 	msg := completionStatusMessage(run, targetResource, done)
-	run.Status.Message = msg
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, done, msg, generation)
-	state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, done, msg, generation)
-	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	state.MarkSucceeded(run, done, msg)
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
 		return err
 	}

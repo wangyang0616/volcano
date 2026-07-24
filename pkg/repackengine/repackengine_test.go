@@ -57,11 +57,11 @@ func TestPlacementCleanupCandidateRetainsLabelOnlyFailure(t *testing.T) {
 		},
 	}
 	if !isPlacementCleanupCandidate(run) {
-		t.Fatal("terminal Execute with placement-active label must retry cleanup even when nominations were cleared")
+		t.Fatal("terminal Execute with placement-active label must retry cleanup even when relocations were cleared")
 	}
 	delete(run.Labels, repackv1alpha1.PlacementActiveLabel)
 	if isPlacementCleanupCandidate(run) {
-		t.Fatal("terminal Execute without nominations or active label needs no placement cleanup")
+		t.Fatal("terminal Execute without relocations or active label needs no placement cleanup")
 	}
 }
 

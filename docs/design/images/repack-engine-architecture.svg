@@ -73,7 +73,7 @@
   <text x="607" y="208" text-anchor="middle" font-size="9.5" fill="#fff">simulate (P1)</text>
 
   <rect x="440" y="234" width="220" height="46" rx="7" class="card"/>
-  <text x="550" y="250" text-anchor="middle" font-size="9" class="s">写 status.report / result / nominations / phase</text>
+  <text x="550" y="250" text-anchor="middle" font-size="9" class="s">写 status.plan / result / relocations / phase</text>
   <text x="550" y="266" text-anchor="middle" font-size="9" class="s">无 Bind · 无预留 · 空间交还排队队列</text>
 
   <rect x="440" y="294" width="220" height="34" rx="6" class="amb"/>

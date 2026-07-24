@@ -120,8 +120,8 @@ var _ = Describe("Repack defragmentation scenarios (DryRun consolidation)", Seri
 				Expect(occupied).To(HaveKey(freedNode), "a freed node must have hosted a gang")
 			}
 
-			// DryRun is read-only: no eviction, no nominations.
-			Expect(got.Status.Nominations).To(BeEmpty(), "DryRun must not nominate")
+			// DryRun is read-only: no eviction, no relocations.
+			Expect(got.Status.Relocations).To(BeEmpty(), "DryRun must not nominate")
 			Expect(runningPodCount(ctx)).To(Equal(runningBefore), "DryRun must not evict pods")
 		})
 	}

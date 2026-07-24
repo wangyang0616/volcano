@@ -58,11 +58,11 @@ func TestPlacementReceiversExcludeFreedNodesAndRequireImmediateIdleCapacity(t *t
 
 func TestPlacementCandidatesRequireConcreteGatedReplacement(t *testing.T) {
 	run := &repackv1alpha1.RepackRun{}
-	run.Status.Nominations = []repackv1alpha1.PodNomination{
-		{Namespace: "ns", PodGroupName: "g", VictimPodName: "prepared", NodeName: "n1", Phase: repackv1alpha1.PodPlacementPrepared},
-		{Namespace: "ns", PodGroupName: "g", VictimPodName: "selected", NodeName: "n1", ReplacementPodName: "p-selected", ReplacementPodUID: "uid", SelectedNodeName: "n2", Phase: repackv1alpha1.PodPlacementGated},
-		{Namespace: "ns", PodGroupName: "g", VictimPodName: "awaiting", NodeName: "n1", ReplacementPodName: "p-awaiting", ReplacementPodUID: "uid", Phase: repackv1alpha1.PodPlacementAwaitingCapacity},
-		{Namespace: "ns", PodGroupName: "g", VictimPodName: "gated", NodeName: "n1", ReplacementPodName: "p-gated", ReplacementPodUID: "uid", Phase: repackv1alpha1.PodPlacementGated},
+	run.Status.Relocations = []repackv1alpha1.PodRelocationStatus{
+		{Namespace: "ns", PodGroupName: "g", VictimPodName: "prepared", PlannedNodeName: "n1", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement}},
+		{Namespace: "ns", PodGroupName: "g", VictimPodName: "selected", PlannedNodeName: "n1", Placement: repackv1alpha1.PodPlacementStatus{ReplacementPodName: "p-selected", ReplacementPodUID: "uid", SelectedNodeName: "n2", Phase: repackv1alpha1.PodPlacementWaitingForNodeSelection}},
+		{Namespace: "ns", PodGroupName: "g", VictimPodName: "awaiting", PlannedNodeName: "n1", Placement: repackv1alpha1.PodPlacementStatus{ReplacementPodName: "p-awaiting", ReplacementPodUID: "uid", Phase: repackv1alpha1.PodPlacementWaitingForNodeSelection}},
+		{Namespace: "ns", PodGroupName: "g", VictimPodName: "gated", PlannedNodeName: "n1", Placement: repackv1alpha1.PodPlacementStatus{ReplacementPodName: "p-gated", ReplacementPodUID: "uid", Phase: repackv1alpha1.PodPlacementWaitingForNodeSelection}},
 	}
 
 	candidates := placementCandidates(run)
@@ -80,13 +80,13 @@ func TestPreparePlacementLeaseReclaimsTerminalLease(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase:       repackv1alpha1.RepackFailed,
-			Nominations: []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "pg", Phase: repackv1alpha1.PodPlacementExpired}},
+			Relocations: []repackv1alpha1.PodRelocationStatus{{Namespace: "ns", PodGroupName: "pg", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementTimedOut}}},
 		},
 	}
 	newRun := &repackv1alpha1.RepackRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "new", UID: types.UID("new-uid")},
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
-		Status:     repackv1alpha1.RepackRunStatus{Nominations: []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "pg", Phase: repackv1alpha1.PodPlacementPrepared}}},
+		Status:     repackv1alpha1.RepackRunStatus{Relocations: []repackv1alpha1.PodRelocationStatus{{Namespace: "ns", PodGroupName: "pg", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement}}}},
 	}
 	pg := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pg", Annotations: map[string]string{
 		repackv1alpha1.PlacementLeaseAnnotation: "old/old-uid",
@@ -202,8 +202,8 @@ func TestRecreatedPodGroupLeaseRepairIsIndependentlyRateLimited(t *testing.T) {
 					APIVersion: "serving.example/v1", Kind: "Serving", Name: "model",
 				},
 			}}},
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "old", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -260,8 +260,8 @@ func TestRecreatedPodGroupLeaseRepairSkipsCompletedWorkloads(t *testing.T) {
 				Namespace: "ns", PodGroupName: "old",
 				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "workload"},
 			}}},
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPlaced,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "old", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementPlaced},
 			}},
 		},
 	}
@@ -284,16 +284,15 @@ func TestPlacementBindingsVisible(t *testing.T) {
 			"replacement-uid": {UID: "replacement-uid"},
 		},
 	}}
-	nominations := []repackv1alpha1.PodNomination{{
-		ReplacementPodUID: "replacement-uid",
-		ActualNodeName:    "n1",
-		Phase:             repackv1alpha1.PodPlacementPlaced,
+	relocations := []repackv1alpha1.PodRelocationStatus{{Placement: repackv1alpha1.PodPlacementStatus{ReplacementPodUID: "replacement-uid",
+		ActualNodeName: "n1",
+		Phase:          repackv1alpha1.PodPlacementPlaced},
 	}}
-	if !placementBindingsVisible(nodes, nominations) {
+	if !placementBindingsVisible(nodes, relocations) {
 		t.Fatal("expected replacement binding to be visible")
 	}
-	nominations[0].ActualNodeName = "n2"
-	if placementBindingsVisible(nodes, nominations) {
+	relocations[0].Placement.ActualNodeName = "n2"
+	if placementBindingsVisible(nodes, relocations) {
 		t.Fatal("binding on a different node must not be treated as visible")
 	}
 }
@@ -301,7 +300,9 @@ func TestPlacementBindingsVisible(t *testing.T) {
 func TestPlacementObservationDeadlinePassed(t *testing.T) {
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
-		Nominations: []repackv1alpha1.PodNomination{{ExpirationTime: &deadline}},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline},
+		}},
 	}}
 	if placementObservationDeadlinePassed(run, time.Unix(99, 0)) {
 		t.Fatal("deadline must not pass early")
@@ -318,10 +319,9 @@ func TestExpirePlacementsIncludesNominatedReplacement(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", NodeName: "n2",
-				SelectedNodeName: "n2", ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
-				ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{SelectedNodeName: "n2", ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
+					ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
 			}},
 		},
 	}
@@ -342,8 +342,8 @@ func TestExpirePlacementsIncludesNominatedReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if phase := updated.Status.Nominations[0].Phase; phase != repackv1alpha1.PodPlacementExpired {
-		t.Fatalf("nomination phase = %q, want Expired", phase)
+	if phase := updated.Status.Relocations[0].Placement.Phase; phase != repackv1alpha1.PodPlacementTimedOut {
+		t.Fatalf("placement phase = %q, want TimedOut", phase)
 	}
 }
 
@@ -351,14 +351,13 @@ func TestExpirePlacementsDoesNotOverwriteConcurrentPlacementResult(t *testing.T)
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	staleRun := &repackv1alpha1.RepackRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
-		Status: repackv1alpha1.RepackRunStatus{Nominations: []repackv1alpha1.PodNomination{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", NodeName: "n2",
-			ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated,
+		Status: repackv1alpha1.RepackRunStatus{Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
 		}},
 		},
 	}
 	latestRun := staleRun.DeepCopy()
-	latestRun.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
+	latestRun.Status.Relocations[0].Placement.Phase = repackv1alpha1.PodPlacementPlaced
 	client := vcfake.NewSimpleClientset(latestRun)
 	engine := &Engine{
 		volcanoClient: client,
@@ -376,8 +375,8 @@ func TestExpirePlacementsDoesNotOverwriteConcurrentPlacementResult(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if phase := updated.Status.Nominations[0].Phase; phase != repackv1alpha1.PodPlacementPlaced {
-		t.Fatalf("nomination phase = %q, want Placed", phase)
+	if phase := updated.Status.Relocations[0].Placement.Phase; phase != repackv1alpha1.PodPlacementPlaced {
+		t.Fatalf("placement phase = %q, want Placed", phase)
 	}
 }
 
@@ -409,8 +408,8 @@ func TestUpdateActualExecuteResult(t *testing.T) {
 			}},
 		},
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
-		Nominations: []repackv1alpha1.PodNomination{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", NodeName: "receiver",
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "receiver",
 		}},
 	}}
 	updateActualExecuteResult(run, nodes, resource)
@@ -447,9 +446,8 @@ func TestUpdateActualExecuteResultDoesNotClaimOccupiedPlannedNode(t *testing.T) 
 			}},
 		},
 		Result: &repackv1alpha1.RepackResult{},
-		Nominations: []repackv1alpha1.PodNomination{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", NodeName: "receiver",
-			Phase: repackv1alpha1.PodPlacementPlaced,
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "receiver", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementPlaced},
 		}},
 	}}
 
@@ -468,36 +466,38 @@ func TestUpdateActualExecuteResultDoesNotClaimOccupiedPlannedNode(t *testing.T) 
 
 func TestEvaluatePlacementTerminal(t *testing.T) {
 	tests := []struct {
-		name              string
-		nominationPhases  []repackv1alpha1.PodNominationPhase
-		plannedNodes      []string
-		actualNodes       []string
-		metricsVerified   bool
-		metricsUnverified bool
-		wantSucceeded     bool
-		wantReason        string
-		wantMissing       []string
-		wantUnexpected    []string
+		name                      string
+		placementPhases           []repackv1alpha1.PodPlacementPhase
+		plannedNodes              []string
+		actualNodes               []string
+		metricsVerified           bool
+		resultSnapshotUnavailable bool
+		alternativeNode           bool
+		wantSucceeded             bool
+		wantReason                string
+		wantMissing               []string
+		wantUnexpected            []string
 	}{
 		{
 			name: "exact planned node set",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
 				repackv1alpha1.PodPlacementPlaced,
 			},
 			plannedNodes: []string{"node-b", "node-a"}, actualNodes: []string{"node-a", "node-b"},
-			metricsVerified: true, wantSucceeded: true, wantReason: state.ReasonExecuted,
+			metricsVerified: true, wantSucceeded: true, wantReason: state.ReasonExecutionCompleted,
 		},
 		{
-			name: "placement drift is diagnostic when benefit is realized",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
-				repackv1alpha1.PodPlacementDegraded,
+			name: "alternative node is diagnostic when benefit is realized",
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
+				repackv1alpha1.PodPlacementPlaced,
 			},
 			plannedNodes: []string{"node-a"}, actualNodes: []string{"node-a"},
-			metricsVerified: true, wantSucceeded: true, wantReason: state.ReasonExecutedWithPlacementDrift,
+			metricsVerified: true, alternativeNode: true,
+			wantSucceeded: true, wantReason: state.ReasonExecutionCompletedWithAlternativePlacement,
 		},
 		{
 			name: "same count but different node set",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
 				repackv1alpha1.PodPlacementPlaced,
 			},
 			plannedNodes: []string{"node-a"}, actualNodes: []string{"node-b"},
@@ -506,7 +506,7 @@ func TestEvaluatePlacementTerminal(t *testing.T) {
 		},
 		{
 			name: "planned node remains occupied",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
 				repackv1alpha1.PodPlacementPlaced,
 			},
 			plannedNodes: []string{"node-a", "node-b"}, actualNodes: []string{"node-a"},
@@ -514,36 +514,43 @@ func TestEvaluatePlacementTerminal(t *testing.T) {
 			wantMissing: []string{"node-b"},
 		},
 		{
-			name: "replacement placement expired",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
-				repackv1alpha1.PodPlacementExpired,
+			name: "replacement placement timed out",
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
+				repackv1alpha1.PodPlacementTimedOut,
 			},
 			plannedNodes: []string{"node-a"}, actualNodes: nil,
-			wantReason: state.ReasonPlacementExpired, wantMissing: []string{"node-a"},
+			wantReason: state.ReasonPlacementTimedOut, wantMissing: []string{"node-a"},
 		},
 		{
 			name: "terminal scheduler metrics unverified",
-			nominationPhases: []repackv1alpha1.PodNominationPhase{
+			placementPhases: []repackv1alpha1.PodPlacementPhase{
 				repackv1alpha1.PodPlacementPlaced,
 			},
 			plannedNodes: []string{"node-a"}, actualNodes: nil,
-			metricsUnverified: true, wantReason: state.ReasonMetricsUnverified,
+			resultSnapshotUnavailable: true, wantReason: state.ReasonResultVerificationFailed,
 			wantMissing: []string{"node-a"},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			nominations := make([]repackv1alpha1.PodNomination, len(test.nominationPhases))
-			for index, phase := range test.nominationPhases {
-				nominations[index].Phase = phase
+			relocations := make([]repackv1alpha1.PodRelocationStatus, len(test.placementPhases))
+			for index, phase := range test.placementPhases {
+				relocations[index].Placement.Phase = phase
+				if phase == repackv1alpha1.PodPlacementPlaced {
+					relocations[index].Placement.SelectedNodeName = "selected"
+					relocations[index].Placement.ActualNodeName = "selected"
+					if test.alternativeNode {
+						relocations[index].Placement.ActualNodeName = "alternative"
+					}
+				}
 			}
 			run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
 				Plan:        &repackv1alpha1.RepackPlan{FreedNodes: test.plannedNodes},
 				Result:      &repackv1alpha1.RepackResult{FreedNodes: test.actualNodes, MetricsVerified: test.metricsVerified},
-				Nominations: nominations,
+				Relocations: relocations,
 			}}
-			got := evaluatePlacementTerminal(run, test.metricsUnverified)
+			got := evaluatePlacementTerminal(run, test.resultSnapshotUnavailable)
 			if got.Succeeded != test.wantSucceeded || got.Reason != test.wantReason {
 				t.Fatalf("decision=%+v, want succeeded=%t reason=%s", got, test.wantSucceeded, test.wantReason)
 			}
@@ -563,12 +570,16 @@ func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
 		Plan: &repackv1alpha1.RepackPlan{Summary: &repackv1alpha1.RepackSummary{
 			FragBeforePercent: 50,
 		}},
-		Nominations: []repackv1alpha1.PodNomination{
+		Relocations: []repackv1alpha1.PodRelocationStatus{
 			{
 				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
-				Phase: repackv1alpha1.PodPlacementPlaced,
+				Placement: repackv1alpha1.PodPlacementStatus{
+					Phase: repackv1alpha1.PodPlacementPlaced, SelectedNodeName: "node-a", ActualNodeName: "node-a",
+				},
 			},
-			{Phase: repackv1alpha1.PodPlacementDegraded},
+			{Placement: repackv1alpha1.PodPlacementStatus{
+				Phase: repackv1alpha1.PodPlacementPlaced, SelectedNodeName: "node-a", ActualNodeName: "node-b",
+			}},
 		},
 	}}
 	decision := placementTerminalDecision{
@@ -586,7 +597,7 @@ func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
 		"node-a, node-b",
 		"node-b",
 		"2 replacement Pods were scheduled",
-		"1 placement drift",
+		"1 alternative placement",
 		"inspect target-resource usage",
 		"ns/old -> ns/new",
 	} {

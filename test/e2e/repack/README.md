@@ -51,16 +51,16 @@ cleanup:
 RepackRun Events describe the global lifecycle:
 
 `PlanComputed` → `ExecutePrepared` → `EvictionsIssued` →
-`AwaitingPlacement` → `PlacementSelected` / `PlacementAwaitingCapacity` →
-terminal condition reason. `PlacementExpired`, `MetricsUnverified`, and
-`BenefitNotRealized` are Warnings. `ExecutedWithPlacementDrift` is successful
+`ReconcilingPlacements` → `PlacementSelected` / `WaitingForNodeSelection` →
+terminal condition reason. `PlacementTimedOut`, `ResultVerificationFailed`, and
+`BenefitNotRealized` are Warnings. `ExecutionCompletedWithAlternativePlacement` is successful
 when every replacement is scheduled and the exact planned freed-node set is
 verified.
 
 Replacement Pod Events describe the concrete placement:
 
 `RepackReplacementGated` → `RepackPlacementNominated` →
-`RepackPlacementSucceeded`, or `RepackPlacementDrifted` /
+`RepackPlacementSucceeded`, or `RepackAlternativePlacement` /
 `RepackPlacementReleased`. `RepackPlacementRecovered` reports that a new Pod
 took over a stale claim from a deleted replacement; `RepackPlacementNotMatched`
 reports that an unrelated scale-out Pod was released with a single event.

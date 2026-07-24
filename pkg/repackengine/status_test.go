@@ -329,7 +329,7 @@ func TestMarkExecuteNotPerformedPreservesPlanAndClearsExecutionState(t *testing.
 			FreedNodes: []string{"n0"},
 		},
 		Result:      &repackv1alpha1.RepackResult{FragAfterPercent: 30, FreedNodeCount: 1, MovedCardCount: 4},
-		Nominations: []repackv1alpha1.PodNomination{{VictimPodName: "pod"}},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{VictimPodName: "pod"}},
 	}}
 	markExecuteNotPerformed(run)
 	summary := run.Status.Plan.Summary
@@ -339,13 +339,13 @@ func TestMarkExecuteNotPerformedPreservesPlanAndClearsExecutionState(t *testing.
 	if len(run.Status.Plan.Moves) != 1 || len(run.Status.Plan.FreedNodes) != 1 {
 		t.Fatalf("complete plan was not preserved: %+v", run.Status.Plan)
 	}
-	if run.Status.Result != nil || len(run.Status.Nominations) != 0 {
+	if run.Status.Result != nil || len(run.Status.Relocations) != 0 {
 		t.Fatalf("execution state was not cleared: %+v", run.Status)
 	}
 }
 
-func TestNominationsOf(t *testing.T) {
-	if nominations, err := buildPodNominations(nil, time.Minute, nil); err != nil || nominations != nil {
+func TestBuildPodRelocations(t *testing.T) {
+	if relocations, err := buildPodRelocations(nil, time.Minute, nil); err != nil || relocations != nil {
 		t.Error("nil plan -> nil")
 	}
 	pod := &v1.Pod{Spec: v1.PodSpec{NodeSelector: map[string]string{"accelerator": "npu"}}}
@@ -358,30 +358,30 @@ func TestNominationsOf(t *testing.T) {
 			From: "n0", To: "n2",
 		},
 	}}
-	noms, err := buildPodNominations(plan, time.Hour, testPodGroupPlacementPolicies{
+	relocations, err := buildPodRelocations(plan, time.Hour, testPodGroupPlacementPolicies{
 		"ns/g": true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(noms) != 1 {
-		t.Fatalf("got %d nominations, want 1", len(noms))
+	if len(relocations) != 1 {
+		t.Fatalf("got %d relocations, want 1", len(relocations))
 	}
-	n := noms[0]
-	if n.Namespace != "ns" || n.PodGroupName != "g" || n.VictimPodName != "w-0" || n.NodeName != "n2" {
-		t.Errorf("nomination=%+v", n)
+	relocation := relocations[0]
+	if relocation.Namespace != "ns" || relocation.PodGroupName != "g" || relocation.VictimPodName != "w-0" || relocation.PlannedNodeName != "n2" {
+		t.Errorf("relocation=%+v", relocation)
 	}
-	if n.Phase != repackv1alpha1.PodPlacementPrepared {
-		t.Errorf("phase=%q, want Prepared", n.Phase)
+	if relocation.Placement.Phase != repackv1alpha1.PodPlacementWaitingForReplacement {
+		t.Errorf("phase=%q, want WaitingForReplacement", relocation.Placement.Phase)
 	}
-	if n.SchedulingRequirementsHash == "" {
+	if relocation.SchedulingRequirementsHash == "" {
 		t.Error("SubGroup-enabled PodGroup must record schedulingRequirementsHash")
 	}
-	if n.ExpirationTime == nil || !n.ExpirationTime.After(time.Now()) {
-		t.Errorf("expirationTime not set in the future: %v", n.ExpirationTime)
+	if relocation.Placement.ExpirationTime == nil || !relocation.Placement.ExpirationTime.After(time.Now()) {
+		t.Errorf("expirationTime not set in the future: %v", relocation.Placement.ExpirationTime)
 	}
 
-	homogeneous, err := buildPodNominations(plan, time.Hour, testPodGroupPlacementPolicies{
+	homogeneous, err := buildPodRelocations(plan, time.Hour, testPodGroupPlacementPolicies{
 		"ns/g": false,
 	})
 	if err != nil {
@@ -395,7 +395,7 @@ func TestNominationsOf(t *testing.T) {
 		Task: &schedapi.TaskInfo{Name: "missing", Namespace: "ns", Job: "ns/g"},
 		From: "n0", To: "n2",
 	}}}
-	if _, err := buildPodNominations(missingVictimPod, time.Hour, testPodGroupPlacementPolicies{
+	if _, err := buildPodRelocations(missingVictimPod, time.Hour, testPodGroupPlacementPolicies{
 		"ns/g": true,
 	}); err == nil {
 		t.Fatal("SubGroup placement without a victim Pod must fail before eviction")
@@ -409,7 +409,7 @@ func TestApplyPlan(t *testing.T) {
 	}
 	report := engineframework.Report{FragmentationRateBefore: 0.5, FragmentationRateAfter: 0.25, NodesFreed: 1}
 
-	// DryRun: plan populated, no nominations.
+	// DryRun: plan populated, no relocation execution records.
 	dry := &repackv1alpha1.RepackRun{}
 	resolved := &repackv1alpha1.ResolvedScope{NodeCount: 3, PodGroupCount: 1}
 	applyPlan(dry, report, plan, gpuResource, nil, resolved)
@@ -419,8 +419,8 @@ func TestApplyPlan(t *testing.T) {
 	if dry.Status.Plan.Summary.MovedCardCount != 3 {
 		t.Errorf("movedCardCount=%d, want 3", dry.Status.Plan.Summary.MovedCardCount)
 	}
-	if len(dry.Status.Plan.FreedNodes) != 1 || dry.Status.Nominations != nil {
-		t.Errorf("DryRun should have freedNodes and no nominations")
+	if len(dry.Status.Plan.FreedNodes) != 1 || dry.Status.Relocations != nil {
+		t.Errorf("DryRun should have freedNodes and no relocations")
 	}
 	if dry.Status.Plan.Summary.ResolvedScope == nil ||
 		dry.Status.Plan.Summary.ResolvedScope.NodeCount != 3 ||
@@ -431,11 +431,11 @@ func TestApplyPlan(t *testing.T) {
 	// Execute preparation is explicit and does not alter the plan.
 	exec := &repackv1alpha1.RepackRun{}
 	applyPlan(exec, report, plan, gpuResource, nil, resolved)
-	if err := prepareExecuteNominations(exec, plan, time.Minute, testPodGroupPlacementPolicies{}); err != nil {
+	if err := prepareExecuteRelocations(exec, plan, time.Minute, testPodGroupPlacementPolicies{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(exec.Status.Nominations) != 1 {
-		t.Errorf("Execute should populate nominations, got %d", len(exec.Status.Nominations))
+	if len(exec.Status.Relocations) != 1 {
+		t.Errorf("Execute should populate relocations, got %d", len(exec.Status.Relocations))
 	}
 }
 
@@ -453,9 +453,9 @@ func TestRealizedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
 				}},
 			},
 		},
-		Nominations: []repackv1alpha1.PodNomination{
-			{Namespace: "ns", PodGroupName: "a", VictimPodName: "a-0", NodeName: "n2"},
-			{Namespace: "ns", PodGroupName: "b", VictimPodName: "b-0", NodeName: "n2"},
+		Relocations: []repackv1alpha1.PodRelocationStatus{
+			{Namespace: "ns", PodGroupName: "a", VictimPodName: "a-0", PlannedNodeName: "n2"},
+			{Namespace: "ns", PodGroupName: "b", VictimPodName: "b-0", PlannedNodeName: "n2"},
 		},
 	}}
 	got := realizedFreedNodeNames(run)
@@ -470,7 +470,7 @@ func TestTerminalOutcome(t *testing.T) {
 		r.Status.Conditions = []metav1.Condition{{Type: condType, Status: metav1.ConditionTrue, Reason: reason}}
 		return r
 	}
-	if got := terminalOutcome(mk(state.CondComplete, state.ReasonExecuted)); got != state.ReasonExecuted {
+	if got := terminalOutcome(mk(state.CondComplete, state.ReasonExecutionCompleted)); got != state.ReasonExecutionCompleted {
 		t.Errorf("complete outcome=%q, want Executed", got)
 	}
 	if got := terminalOutcome(mk(state.CondFailed, "ExecuteFailed")); got != "ExecuteFailed" {
@@ -481,30 +481,29 @@ func TestTerminalOutcome(t *testing.T) {
 	}
 }
 
-func TestMergeNominationPhasesPreservesControllerOwnedPlacementPhase(t *testing.T) {
-	desired := []repackv1alpha1.PodNomination{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodNominationPending}}
-	latest := []repackv1alpha1.PodNomination{{
-		Namespace: "ns", PodGroupName: "g", VictimPodName: "p", NodeName: "n", Phase: repackv1alpha1.PodPlacementGated,
-		ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
+func TestMergeRelocationProgressPreservesControllerOwnedPlacementPhase(t *testing.T) {
+	desired := []repackv1alpha1.PodRelocationStatus{{Namespace: "ns", PodGroupName: "g", VictimPodName: "p", PlannedNodeName: "n", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement}}}
+	latest := []repackv1alpha1.PodRelocationStatus{{
+		Namespace: "ns", PodGroupName: "g", VictimPodName: "p", PlannedNodeName: "n", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForNodeSelection,
+			ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid"},
 	}}
-	mergeNominationPhases(desired, latest)
-	if desired[0].Phase != repackv1alpha1.PodPlacementGated {
-		t.Fatalf("phase=%q, want Gated", desired[0].Phase)
+	mergeRelocationProgress(desired, latest)
+	if desired[0].Placement.Phase != repackv1alpha1.PodPlacementWaitingForNodeSelection {
+		t.Fatalf("phase=%q, want Gated", desired[0].Placement.Phase)
 	}
-	if desired[0].ReplacementPodName != "replacement" || desired[0].ReplacementPodUID != "replacement-uid" {
-		t.Fatalf("replacement identity=%q/%q, want replacement/replacement-uid", desired[0].ReplacementPodName, desired[0].ReplacementPodUID)
+	if desired[0].Placement.ReplacementPodName != "replacement" || desired[0].Placement.ReplacementPodUID != "replacement-uid" {
+		t.Fatalf("replacement identity=%q/%q, want replacement/replacement-uid", desired[0].Placement.ReplacementPodName, desired[0].Placement.ReplacementPodUID)
 	}
 }
 
-func TestMergeNominationPhasesPreservesPreparedPodGroupReplacement(t *testing.T) {
-	desired := []repackv1alpha1.PodNomination{{
-		Namespace: "ns", PodGroupName: "old", VictimPodName: "pod", NodeName: "node",
-		Phase: repackv1alpha1.PodPlacementPrepared,
+func TestMergeRelocationProgressPreservesPodGroupReplacement(t *testing.T) {
+	desired := []repackv1alpha1.PodRelocationStatus{{
+		Namespace: "ns", PodGroupName: "old", VictimPodName: "pod", PlannedNodeName: "node", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 	}}
-	latest := append([]repackv1alpha1.PodNomination(nil), desired...)
+	latest := append([]repackv1alpha1.PodRelocationStatus(nil), desired...)
 	latest[0].ReplacementPodGroupName = "new"
 
-	mergeNominationPhases(desired, latest)
+	mergeRelocationProgress(desired, latest)
 	if desired[0].ReplacementPodGroupName != "new" {
 		t.Fatalf("replacementPodGroupName = %q, want new", desired[0].ReplacementPodGroupName)
 	}
@@ -514,8 +513,8 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	run := &repackv1alpha1.RepackRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "status-conflict"},
 		Status: repackv1alpha1.RepackRunStatus{
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1", Phase: repackv1alpha1.PodNominationBound,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", PlannedNodeName: "n1", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementPlaced},
 			}},
 		},
 	}
@@ -535,7 +534,7 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	})
 
 	desired := run.Status.DeepCopy()
-	desired.Nominations[0].Phase = repackv1alpha1.PodNominationPending // engine's stale view must not undo Bound.
+	desired.Relocations[0].Placement.Phase = repackv1alpha1.PodPlacementWaitingForReplacement // engine's stale view must not undo Placed.
 	desired.Phase = repackv1alpha1.RepackSucceeded
 	engine := &Engine{volcanoClient: volcanoClient}
 	if err := engine.writeStatus(context.Background(), run.Name, desired); err != nil {
@@ -551,8 +550,8 @@ func TestWriteStatusRetriesConflictAndPreservesBoundNomination(t *testing.T) {
 	if updated.Status.Phase != repackv1alpha1.RepackSucceeded {
 		t.Errorf("phase = %q, want Succeeded", updated.Status.Phase)
 	}
-	if updated.Status.Nominations[0].Phase != repackv1alpha1.PodNominationBound {
-		t.Errorf("nomination phase = %q, want controller-owned Bound", updated.Status.Nominations[0].Phase)
+	if updated.Status.Relocations[0].Placement.Phase != repackv1alpha1.PodPlacementPlaced {
+		t.Errorf("placement phase = %q, want controller-owned Placed", updated.Status.Relocations[0].Placement.Phase)
 	}
 }
 

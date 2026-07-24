@@ -167,10 +167,14 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationrepackv1alpha1.EvictionPolicyApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("MaxPerRun"):
 		return &applyconfigurationrepackv1alpha1.MaxPerRunApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("PodEvictionStatus"):
+		return &applyconfigurationrepackv1alpha1.PodEvictionStatusApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("PodMove"):
 		return &applyconfigurationrepackv1alpha1.PodMoveApplyConfiguration{}
-	case repackv1alpha1.SchemeGroupVersion.WithKind("PodNomination"):
-		return &applyconfigurationrepackv1alpha1.PodNominationApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("PodPlacementStatus"):
+		return &applyconfigurationrepackv1alpha1.PodPlacementStatusApplyConfiguration{}
+	case repackv1alpha1.SchemeGroupVersion.WithKind("PodRelocationStatus"):
+		return &applyconfigurationrepackv1alpha1.PodRelocationStatusApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackGoal"):
 		return &applyconfigurationrepackv1alpha1.RepackGoalApplyConfiguration{}
 	case repackv1alpha1.SchemeGroupVersion.WithKind("RepackMove"):

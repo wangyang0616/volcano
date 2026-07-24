@@ -117,8 +117,8 @@ func placementPodGroups(run *repackv1alpha1.RepackRun) map[types.NamespacedName]
 	if run == nil {
 		return groups
 	}
-	for i := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[i]
+	for i := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[i]
 		if nomination.Namespace != "" && nomination.PodGroupName != "" {
 			groups[types.NamespacedName{Namespace: nomination.Namespace, Name: nomination.PodGroupName}] = struct{}{}
 		}
@@ -274,7 +274,7 @@ func (e *Engine) ownedPlacementLeaseGroups(
 
 // setPlacementActive maintains the metadata index used by the PodGroup webhook.
 // The label is not authoritative: webhooks still validate phase, Run UID, owner,
-// creation time, and unfinished nominations.
+// creation time, and unfinished relocations.
 func (e *Engine) setPlacementActive(ctx context.Context, run *repackv1alpha1.RepackRun, active bool) error {
 	if run == nil || e.volcanoClient == nil {
 		return nil
@@ -421,10 +421,12 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 	if run == nil {
 		return nil
 	}
-	placed, drifted, expiredCount := placementOutcomeCounts(run)
+	selectedNodePlacements, alternativeNodePlacements, timedOutPlacements := placementOutcomeCounts(run)
 	klog.V(4).InfoS("repack: reconciling replacement placement",
-		"run", run.Name, "nominationCount", len(run.Status.Nominations),
-		"placedCount", placed, "driftedCount", drifted, "expiredCount", expiredCount)
+		"run", run.Name, "relocationCount", len(run.Status.Relocations),
+		"selectedNodePlacementCount", selectedNodePlacements,
+		"alternativeNodePlacementCount", alternativeNodePlacements,
+		"timedOutPlacementCount", timedOutPlacements)
 	if err := e.repairRecreatedPodGroupLeasesIfDue(ctx, run); err != nil {
 		return fmt.Errorf("reconcile recreated PodGroup leases: %w", err)
 	}
@@ -462,37 +464,37 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		"excludedFreedNodes", excludedFreedNodes)
 	committed := make([]*engineapi.Move, 0, len(pending))
 	selected := make(map[placementIdentity]string, len(pending))
-	for _, nomination := range pending {
-		pod, err := e.schedulerCache.Client().CoreV1().Pods(nomination.Namespace).Get(ctx, nomination.ReplacementPodName, metav1.GetOptions{})
+	for _, relocation := range pending {
+		pod, err := e.schedulerCache.Client().CoreV1().Pods(relocation.Namespace).Get(ctx, relocation.Placement.ReplacementPodName, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
 			return err
 		}
-		if pod.UID != nomination.ReplacementPodUID || pod.Spec.NodeName != "" {
+		if pod.UID != relocation.Placement.ReplacementPodUID || pod.Spec.NodeName != "" {
 			continue
 		}
 		// The replacement is a live Pod and has not been bound yet; constructing a
 		// scheduler TaskInfo from it preserves its current resource requests and
 		// scheduling constraints for the full predicate simulation below.
 		task := schedapi.NewTaskInfo(pod)
-		receivers := placementReceivers(snapshot.Nodes(), excludedFreedNodes, nomination.NodeName, task)
+		receivers := placementReceivers(snapshot.Nodes(), excludedFreedNodes, relocation.PlannedNodeName, task)
 		klog.V(4).InfoS("repack: replacement receiver candidates evaluated",
-			"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
-			"plannedNode", nomination.NodeName, "receiverCount", len(receivers))
+			"run", run.Name, "pod", relocation.Namespace+"/"+relocation.Placement.ReplacementPodName,
+			"plannedNode", relocation.PlannedNodeName, "receiverCount", len(receivers))
 		placements, fit := snapshot.FeasibleRelocation(committed, []*schedapi.TaskInfo{task}, receivers)
 		if !fit || len(placements) != 1 {
-			klog.V(3).InfoS("repack: replacement is awaiting receiver capacity",
-				"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
-				"plannedNode", nomination.NodeName, "receiverCount", len(receivers))
-			return e.markAwaitingPlacement(ctx, run.Name, pending)
+			klog.V(3).InfoS("repack: replacement is waiting for a feasible receiver node",
+				"run", run.Name, "pod", relocation.Namespace+"/"+relocation.Placement.ReplacementPodName,
+				"plannedNode", relocation.PlannedNodeName, "receiverCount", len(receivers))
+			return e.markWaitingForNodeSelection(ctx, run.Name, pending)
 		}
 		committed = append(committed, placements[0])
-		selected[placementIdentityForNomination(nomination)] = placements[0].To
+		selected[placementIdentityForRelocation(relocation)] = placements[0].To
 		klog.V(4).InfoS("repack: replacement receiver selected in scheduler simulation",
-			"run", run.Name, "pod", nomination.Namespace+"/"+nomination.ReplacementPodName,
-			"plannedNode", nomination.NodeName, "selectedNode", placements[0].To)
+			"run", run.Name, "pod", relocation.Namespace+"/"+relocation.Placement.ReplacementPodName,
+			"plannedNode", relocation.PlannedNodeName, "selectedNode", placements[0].To)
 	}
 	if len(selected) == 0 {
 		e.workQueue.AddAfter(run.Name, placementRetryInterval)
@@ -501,19 +503,19 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 	return e.writePlacementSelection(ctx, run.Name, selected)
 }
 
-func placementCandidates(run *repackv1alpha1.RepackRun) []*repackv1alpha1.PodNomination {
-	result := make([]*repackv1alpha1.PodNomination, 0)
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
-		if nomination.ReplacementPodName == "" || nomination.ReplacementPodUID == "" || nomination.SelectedNodeName != "" {
+func placementCandidates(run *repackv1alpha1.RepackRun) []*repackv1alpha1.PodRelocationStatus {
+	result := make([]*repackv1alpha1.PodRelocationStatus, 0)
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if relocation.Placement.ReplacementPodName == "" || relocation.Placement.ReplacementPodUID == "" || relocation.Placement.SelectedNodeName != "" {
 			continue
 		}
-		if nomination.Phase == repackv1alpha1.PodPlacementGated || nomination.Phase == repackv1alpha1.PodPlacementAwaitingCapacity {
-			result = append(result, nomination)
+		if relocation.Placement.Phase == repackv1alpha1.PodPlacementWaitingForNodeSelection {
+			result = append(result, relocation)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
-		return placementIdentityForNomination(result[i]).less(placementIdentityForNomination(result[j]))
+		return placementIdentityForRelocation(result[i]).less(placementIdentityForRelocation(result[j]))
 	})
 	return result
 }
@@ -565,10 +567,10 @@ func (e *Engine) writePlacementSelection(
 			return err
 		}
 		changed := false
-		for index := range run.Status.Nominations {
-			nomination := &run.Status.Nominations[index]
-			if node, found := selected[placementIdentityForNomination(nomination)]; found && nomination.SelectedNodeName == "" {
-				nomination.SelectedNodeName = node
+		for index := range run.Status.Relocations {
+			relocation := &run.Status.Relocations[index]
+			if node, found := selected[placementIdentityForRelocation(relocation)]; found && relocation.Placement.SelectedNodeName == "" {
+				relocation.Placement.SelectedNodeName = node
 				changed = true
 			}
 		}
@@ -588,10 +590,10 @@ func (e *Engine) writePlacementSelection(
 	return nil
 }
 
-func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nominations []*repackv1alpha1.PodNomination) error {
-	keys := make(map[placementIdentity]struct{}, len(nominations))
-	for _, nomination := range nominations {
-		keys[placementIdentityForNomination(nomination)] = struct{}{}
+func (e *Engine) markWaitingForNodeSelection(ctx context.Context, runName string, relocations []*repackv1alpha1.PodRelocationStatus) error {
+	keys := make(map[placementIdentity]struct{}, len(relocations))
+	for _, relocation := range relocations {
+		keys[placementIdentityForRelocation(relocation)] = struct{}{}
 	}
 	var updatedRun *repackv1alpha1.RepackRun
 	placementStateChanged := false
@@ -601,22 +603,16 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 			return err
 		}
 		changed := false
-		for index := range run.Status.Nominations {
-			nomination := &run.Status.Nominations[index]
-			if _, found := keys[placementIdentityForNomination(nomination)]; found && nomination.SelectedNodeName == "" && nomination.Phase != repackv1alpha1.PodPlacementAwaitingCapacity {
-				nomination.Phase = repackv1alpha1.PodPlacementAwaitingCapacity
+		for index := range run.Status.Relocations {
+			relocation := &run.Status.Relocations[index]
+			if _, found := keys[placementIdentityForRelocation(relocation)]; found && relocation.Placement.SelectedNodeName == "" && relocation.Placement.Phase != repackv1alpha1.PodPlacementWaitingForNodeSelection {
+				relocation.Placement.Phase = repackv1alpha1.PodPlacementWaitingForNodeSelection
 				changed = true
 				placementStateChanged = true
 			}
 		}
-		if state.SetCondition(
-			&run.Status.Conditions,
-			state.CondProgressing,
-			metav1.ConditionTrue,
-			state.ReasonAwaitingPlacement,
-			placementProgressMessage(run, e.resolveResource(run)),
-			run.Generation,
-		) {
+		if state.MarkRunning(run, state.ReasonReconcilingPlacements,
+			placementProgressMessage(run, e.resolveResource(run))) {
 			changed = true
 		}
 		if !changed {
@@ -630,20 +626,20 @@ func (e *Engine) markAwaitingPlacement(ctx context.Context, runName string, nomi
 	}
 	if err == nil && placementStateChanged && updatedRun != nil {
 		message := placementProgressMessage(updatedRun, e.resolveResource(updatedRun))
-		klog.V(3).InfoS("repack: replacement placement waiting for capacity",
-			"run", runName, "pendingCount", len(nominations), "retryAfter", placementRetryInterval)
-		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementAwaitingCapacity, message)
+		klog.V(3).InfoS("repack: replacement placement waiting for node selection",
+			"run", runName, "pendingCount", len(relocations), "retryAfter", placementRetryInterval)
+		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonWaitingForNodeSelection, message)
 	}
 	return err
 }
 
 func placementsComplete(run *repackv1alpha1.RepackRun) bool {
-	if len(run.Status.Nominations) == 0 {
+	if len(run.Status.Relocations) == 0 {
 		return false
 	}
-	for index := range run.Status.Nominations {
-		switch run.Status.Nominations[index].Phase {
-		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementDegraded, repackv1alpha1.PodPlacementExpired:
+	for index := range run.Status.Relocations {
+		switch run.Status.Relocations[index].Placement.Phase {
+		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementTimedOut:
 		default:
 			return false
 		}
@@ -652,23 +648,23 @@ func placementsComplete(run *repackv1alpha1.RepackRun) bool {
 }
 
 func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
-	expired := false
-	metricsUnverified := false
-	for index := range run.Status.Nominations {
-		if run.Status.Nominations[index].Phase == repackv1alpha1.PodPlacementExpired {
-			expired = true
+	placementTimedOut := false
+	resultSnapshotUnavailable := false
+	for index := range run.Status.Relocations {
+		if run.Status.Relocations[index].Placement.Phase == repackv1alpha1.PodPlacementTimedOut {
+			placementTimedOut = true
 		}
 	}
 	targetResource := e.resolveResource(run)
-	if expired {
-		// An expired replacement has been released to normal scheduling but has
+	if placementTimedOut {
+		// A timed-out replacement has been released to normal scheduling but has
 		// not produced a trustworthy terminal binding. Do not claim the optimistic
 		// plan benefit while workload demand may be temporarily absent.
 		markExecuteBenefitUnverified(run)
 	} else {
 		schedulerSession := schedframework.OpenSession(e.schedulerCache, e.tiers, e.configurations)
 		nodes := adapter.NewSessionSnapshot(schedulerSession, targetResource, nil).Nodes()
-		visible := placementBindingsVisible(nodes, run.Status.Nominations)
+		visible := placementBindingsVisible(nodes, run.Status.Relocations)
 		if !visible {
 			schedframework.CloseSessionReadOnly(schedulerSession)
 			// The nomination controller may observe Pod binding just before the
@@ -678,7 +674,7 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 				e.workQueue.AddAfter(run.Name, placementRetryInterval)
 				return nil
 			}
-			metricsUnverified = true
+			resultSnapshotUnavailable = true
 			markExecuteBenefitUnverified(run)
 		} else {
 			updateActualExecuteResult(run, nodes, targetResource)
@@ -686,15 +682,17 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		}
 	}
 
-	decision := evaluatePlacementTerminal(run, metricsUnverified)
+	decision := evaluatePlacementTerminal(run, resultSnapshotUnavailable)
 	message := placementStatusMessage(run, targetResource, decision)
 	result := run.Status.Result
 	resultMetrics := runResult(run)
-	placedCount, driftedCount, expiredPlacementCount := placementOutcomeCounts(run)
+	selectedNodePlacementCount, alternativeNodePlacementCount, timedOutPlacementCount := placementOutcomeCounts(run)
 	klog.V(3).InfoS("repack: replacement placement terminal result evaluated",
 		"run", run.Name, "succeeded", decision.Succeeded, "reason", decision.Reason,
-		"metricsUnverified", metricsUnverified,
-		"placedCount", placedCount, "driftedCount", driftedCount, "expiredCount", expiredPlacementCount,
+		"resultSnapshotUnavailable", resultSnapshotUnavailable,
+		"selectedNodePlacementCount", selectedNodePlacementCount,
+		"alternativeNodePlacementCount", alternativeNodePlacementCount,
+		"timedOutPlacementCount", timedOutPlacementCount,
 		"plannedFreedNodeCount", len(decision.Nodes.Planned), "actualFreedNodeCount", len(decision.Nodes.Actual),
 		"missingFreedNodeCount", len(decision.Nodes.Missing), "missingFreedNodes", formatNodeNames(decision.Nodes.Missing),
 		"unexpectedFreedNodeCount", len(decision.Nodes.Unexpected),
@@ -704,14 +702,11 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		"actualFreedNodes", decision.Nodes.Actual, "missingFreedNodes", decision.Nodes.Missing,
 		"unexpectedFreedNodes", decision.Nodes.Unexpected, "setsEqual", decision.Nodes.Equal,
 		"result", result)
-	run.Status.Message = message
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, decision.Reason, message, run.Generation)
 	if decision.Succeeded {
-		state.SetCondition(&run.Status.Conditions, state.CondComplete, metav1.ConditionTrue, decision.Reason, message, run.Generation)
+		state.MarkSucceeded(run, decision.Reason, message)
 	} else {
-		state.SetCondition(&run.Status.Conditions, state.CondFailed, metav1.ConditionTrue, decision.Reason, message, run.Generation)
+		state.MarkFailed(run, decision.Reason, message)
 	}
-	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
 		return err
 	}
@@ -741,20 +736,20 @@ type placementTerminalDecision struct {
 	Nodes     freedNodeSetComparison
 }
 
-func evaluatePlacementTerminal(run *repackv1alpha1.RepackRun, metricsUnverified bool) placementTerminalDecision {
-	_, drifted, expired := placementOutcomeCounts(run)
+func evaluatePlacementTerminal(run *repackv1alpha1.RepackRun, resultSnapshotUnavailable bool) placementTerminalDecision {
+	_, alternativeNodePlacements, timedOut := placementOutcomeCounts(run)
 	nodes := compareFreedNodeSets(run)
 	switch {
-	case expired > 0:
-		return placementTerminalDecision{Reason: state.ReasonPlacementExpired, Nodes: nodes}
-	case metricsUnverified || run == nil || run.Status.Result == nil || !run.Status.Result.MetricsVerified:
-		return placementTerminalDecision{Reason: state.ReasonMetricsUnverified, Nodes: nodes}
+	case timedOut > 0:
+		return placementTerminalDecision{Reason: state.ReasonPlacementTimedOut, Nodes: nodes}
+	case resultSnapshotUnavailable || run == nil || run.Status.Result == nil || !run.Status.Result.MetricsVerified:
+		return placementTerminalDecision{Reason: state.ReasonResultVerificationFailed, Nodes: nodes}
 	case !nodes.Equal:
 		return placementTerminalDecision{Reason: state.ReasonBenefitNotRealized, Nodes: nodes}
-	case drifted > 0:
-		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecutedWithPlacementDrift, Nodes: nodes}
+	case alternativeNodePlacements > 0:
+		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecutionCompletedWithAlternativePlacement, Nodes: nodes}
 	default:
-		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecuted, Nodes: nodes}
+		return placementTerminalDecision{Succeeded: true, Reason: state.ReasonExecutionCompleted, Nodes: nodes}
 	}
 }
 
@@ -808,12 +803,12 @@ func sortedUniqueNodeNames(nodeNames []string) []string {
 }
 
 func placementObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.Time) bool {
-	if run == nil || len(run.Status.Nominations) == 0 {
+	if run == nil || len(run.Status.Relocations) == 0 {
 		return false
 	}
 	var latest time.Time
-	for index := range run.Status.Nominations {
-		expirationTime := run.Status.Nominations[index].ExpirationTime
+	for index := range run.Status.Relocations {
+		expirationTime := run.Status.Relocations[index].Placement.ExpirationTime
 		if expirationTime == nil {
 			return false
 		}
@@ -824,16 +819,16 @@ func placementObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.
 	return !latest.IsZero() && !now.Before(latest)
 }
 
-func placementBindingsVisible(nodes []*schedapi.NodeInfo, nominations []repackv1alpha1.PodNomination) bool {
+func placementBindingsVisible(nodes []*schedapi.NodeInfo, relocations []repackv1alpha1.PodRelocationStatus) bool {
 	expected := make(map[string]string)
-	for index := range nominations {
-		nomination := &nominations[index]
-		switch nomination.Phase {
-		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementDegraded:
-			if nomination.ReplacementPodUID == "" || nomination.ActualNodeName == "" {
+	for index := range relocations {
+		relocation := &relocations[index]
+		switch relocation.Placement.Phase {
+		case repackv1alpha1.PodPlacementPlaced:
+			if relocation.Placement.ReplacementPodUID == "" || relocation.Placement.ActualNodeName == "" {
 				return false
 			}
-			expected[string(nomination.ReplacementPodUID)] = nomination.ActualNodeName
+			expected[string(relocation.Placement.ReplacementPodUID)] = relocation.Placement.ActualNodeName
 		}
 	}
 	if len(expected) == 0 {
@@ -938,22 +933,22 @@ func markExecuteBenefitUnverified(run *repackv1alpha1.RepackRun) {
 // expirePlacements is the liveness escape hatch. A scheduling gate deliberately
 // fails closed while the engine is deciding a receiver, but it must never leave
 // a workload unavailable forever when concurrent work consumed every viable
-// receiver. At the durable nomination deadline, release only our gate and let
+// receiver. At the durable relocation deadline, release only our gate and let
 // normal scheduling restore the Pod; the Run then ends Failed with explicit
 // placement status instead of silently claiming defragmentation success.
 func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.RepackRun) (bool, error) {
 	keys := map[placementIdentity]struct{}{}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
-		if placementCanExpire(nomination, e.now()) {
-			keys[placementIdentityForNomination(nomination)] = struct{}{}
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if placementCanExpire(relocation, e.now()) {
+			keys[placementIdentityForRelocation(relocation)] = struct{}{}
 		}
 	}
 	if len(keys) == 0 {
 		return false, nil
 	}
 	klog.V(3).InfoS("repack: replacement placement deadline reached",
-		"run", run.Name, "expiringNominationCount", len(keys))
+		"run", run.Name, "expiringRelocationCount", len(keys))
 	var updatedRun *repackv1alpha1.RepackRun
 	expiredCount := 0
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -963,12 +958,12 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		}
 		changed := false
 		expiredCount = 0
-		for index := range latest.Status.Nominations {
-			nomination := &latest.Status.Nominations[index]
-			if _, found := keys[placementIdentityForNomination(nomination)]; !found || !placementCanExpire(nomination, e.now()) {
+		for index := range latest.Status.Relocations {
+			relocation := &latest.Status.Relocations[index]
+			if _, found := keys[placementIdentityForRelocation(relocation)]; !found || !placementCanExpire(relocation, e.now()) {
 				continue
 			}
-			nomination.Phase = repackv1alpha1.PodPlacementExpired
+			relocation.Placement.Phase = repackv1alpha1.PodPlacementTimedOut
 			changed = true
 			expiredCount++
 		}
@@ -982,20 +977,20 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		return false, err
 	}
 	if updatedRun != nil {
-		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementExpired,
+		e.recordRunEvent(updatedRun, v1.EventTypeWarning, eventReasonPlacementTimedOut,
 			fmt.Sprintf("%d replacement placement intents expired; scheduling gates will be released.", expiredCount))
 		return true, nil
 	}
 	return false, nil
 }
 
-func placementCanExpire(nomination *repackv1alpha1.PodNomination, now time.Time) bool {
-	if nomination == nil || nomination.ExpirationTime == nil || now.Before(nomination.ExpirationTime.Time) {
+func placementCanExpire(nomination *repackv1alpha1.PodRelocationStatus, now time.Time) bool {
+	if nomination == nil || nomination.Placement.ExpirationTime == nil || now.Before(nomination.Placement.ExpirationTime.Time) {
 		return false
 	}
-	switch nomination.Phase {
-	case repackv1alpha1.PodPlacementPrepared, repackv1alpha1.PodPlacementGated,
-		repackv1alpha1.PodPlacementAwaitingCapacity, repackv1alpha1.PodPlacementNominated:
+	switch nomination.Placement.Phase {
+	case repackv1alpha1.PodPlacementWaitingForReplacement, repackv1alpha1.PodPlacementWaitingForNodeSelection,
+		repackv1alpha1.PodPlacementNominated:
 		return true
 	default:
 		return false

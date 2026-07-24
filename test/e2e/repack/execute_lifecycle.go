@@ -52,8 +52,8 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		}
 	})
 
-	// C6: Execute actually commits — it evicts and writes durable nominations.
-	It("Execute evicts and records nominations", func() {
+	// C6: Execute actually commits — it evicts and writes durable relocations.
+	It("Execute evicts and records relocations", func() {
 		moving := occupyNativeDeployment(ctx, "exec-moving", nodes[0], "move", 4)
 		staying := occupyNativeDeployment(ctx, "exec-staying", nodes[1], "stay", 2)
 		defer deleteNativeWorkloads(ctx, moving, staying)
@@ -64,7 +64,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
 		Expect(got.Status.Plan).NotTo(BeNil())
 		Expect(got.Status.Plan.Summary).NotTo(BeNil())
 		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
@@ -78,9 +78,9 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 			"successful Execute must verify the exact planned freed-node set, not only the count")
 		Expect(got.Status.Result.FragAfterPercent).To(BeNumerically("<=", got.Status.Plan.Summary.FragBeforePercent),
 			"Execute terminal status must report the remeasured cluster fragmentation")
-		Expect(got.Status.Nominations).NotTo(BeEmpty(), "Execute must record placement nominations")
+		Expect(got.Status.Relocations).NotTo(BeEmpty(), "Execute must record placement relocations")
 		waitRunEventReasons(ctx, got,
-			"PlanComputed", "ExecutePrepared", "EvictionsIssued", "AwaitingPlacement", "Executed")
+			"PlanComputed", "ExecutePrepared", "EvictionsIssued", "ReconcilingPlacements", "ExecutionCompleted")
 	})
 
 	It("executes the replacement protocol for a real vcjob", func() {
@@ -93,12 +93,12 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
-		Expect(got.Status.Nominations).NotTo(BeEmpty())
-		for _, nomination := range got.Status.Nominations {
-			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
-			Expect(nomination.ReplacementPodName).NotTo(BeEmpty())
-			Expect(nomination.ActualNodeName).To(Equal(nomination.SelectedNodeName))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
+		Expect(got.Status.Relocations).NotTo(BeEmpty())
+		for _, nomination := range got.Status.Relocations {
+			Expect(nomination.Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
+			Expect(nomination.Placement.ReplacementPodName).NotTo(BeEmpty())
+			Expect(nomination.Placement.ActualNodeName).To(Equal(nomination.Placement.SelectedNodeName))
 		}
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
@@ -121,7 +121,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		Expect(got.Status.Result.FreedNodeCount).To(BeEquivalentTo(0))
 		Expect(got.Status.Result.FragAfterPercent).To(Equal(got.Status.Plan.Summary.FragBeforePercent))
 		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
-		Expect(got.Status.Nominations).To(BeEmpty())
+		Expect(got.Status.Relocations).To(BeEmpty())
 	})
 
 	// C8: after an Execute finishes, a second Execute within the cooldown window is
@@ -185,7 +185,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		Expect(got.Status.Result).NotTo(BeNil())
 		Expect(got.Status.Result.MovedCardCount).To(BeEquivalentTo(0))
 		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
-		Expect(got.Status.Nominations).To(BeEmpty(), "rejected evictions must not retain placement intents")
+		Expect(got.Status.Relocations).To(BeEmpty(), "rejected evictions must not retain placement intents")
 	})
 
 	It("preserves the full plan and reports only accepted disruption after a partial PDB rejection", func() {
@@ -233,7 +233,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		Expect(got.Status.Result.MovedCardCount).To(BeEquivalentTo(2),
 			"result must count only the eviction accepted by the API")
 		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
-		Expect(got.Status.Nominations).To(HaveLen(1),
+		Expect(got.Status.Relocations).To(HaveLen(1),
 			"only the accepted eviction may retain a replacement placement intent")
 	})
 
@@ -339,17 +339,17 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("Executed"))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
 		Expect(got.Status.Plan.Moves).NotTo(BeEmpty())
 		for _, move := range got.Status.Plan.Moves {
 			Expect(move.PodGroupName).To(Equal(moving.podGroup), "only the selector-matched native PodGroup may move")
 		}
-		Expect(got.Status.Nominations).To(HaveLen(1), "one relocated native replica needs one nomination")
-		nomination := got.Status.Nominations[0]
+		Expect(got.Status.Relocations).To(HaveLen(1), "one relocated native replica needs one nomination")
+		nomination := got.Status.Relocations[0]
 		Expect(nomination.PodGroupName).To(Equal(moving.podGroup))
-		Expect(nomination.SelectedNodeName).NotTo(BeEmpty(), "engine must persist its live receiver selection")
-		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.SelectedNodeName), "engine must not select a node this run frees")
-		Expect(nomination.ActualNodeName).To(Equal(nomination.SelectedNodeName), "controller must record the actual placement")
+		Expect(nomination.Placement.SelectedNodeName).NotTo(BeEmpty(), "engine must persist its live receiver selection")
+		Expect(got.Status.Plan.FreedNodes).NotTo(ContainElement(nomination.Placement.SelectedNodeName), "engine must not select a node this run frees")
+		Expect(nomination.Placement.ActualNodeName).To(Equal(nomination.Placement.SelectedNodeName), "controller must record the actual placement")
 		Eventually(func() bool {
 			pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
 				LabelSelector: nativeWorkloadLabel + "=" + moving.deployment.Name,
@@ -360,7 +360,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 			replacement := pods.Items[0]
 			return replacement.Name != moving.podName &&
 				replacement.Annotations["scheduling.k8s.io/group-name"] == moving.podGroup &&
-				replacement.Spec.NodeName == nomination.SelectedNodeName
+				replacement.Spec.NodeName == nomination.Placement.SelectedNodeName
 		}, repackTimeout, repackPoll).Should(BeTrue(), "Deployment replacement must retain its ReplicaSet-derived PodGroup")
 	})
 
@@ -397,7 +397,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		defer deleteRun(ctx, blocked.Name)
 		blockedRun := waitTerminal(ctx, blocked.Name)
 		Expect(blockedRun.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(blockedRun)).To(Equal("BelowGoalThreshold"))
+		Expect(completeReason(blockedRun)).To(Equal("InsufficientImprovement"))
 		Expect(blockedRun.Status.Plan.Moves).To(BeEmpty())
 
 		admitted, err := newRun("resource-cap-admitted", repackv1alpha1.RepackModeDryRun).goal(npuResource).

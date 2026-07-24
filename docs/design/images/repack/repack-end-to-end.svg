@@ -1,6 +1,6 @@
 <svg viewBox="0 0 1170 662" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
   <title>Repack 端到端使用与模块交互</title>
-  <desc>用户创建 RepackRun 或 RepackPolicy(P1)，经 volcano-admission 校验落库；repack-engine 事件驱动规划：DryRun 出报告、Execute 驱逐并写 nominations；各负载各自的控制器重建替身 pod，repack-controller 打 nominatedNodeName，volcano-scheduler 把替身与排队作业调度进腾出的空位；用户取回结果，repack-controller 按 TTL 回收。</desc>
+  <desc>用户创建 RepackRun 或 RepackPolicy(P1)，经 volcano-admission 校验落库；repack-engine 事件驱动规划：DryRun 出计划、Execute 驱逐并写 relocations；各负载各自的控制器重建替身 pod，repack-controller 打 nominatedNodeName，volcano-scheduler 把替身与排队作业调度进腾出的空位；用户取回结果，repack-controller 按 TTL 回收。</desc>
   <style>
     .t{fill:#111827;} .s{fill:#5b6472;}
     .m{font-family:ui-monospace,Menlo,monospace;}
@@ -51,7 +51,7 @@
   <text x="240" y="286" font-size="9" class="s m">mode(DryRun/Execute)·scope·goals</text>
   <text x="222" y="308" font-size="9" class="s">status:</text>
   <text x="240" y="324" font-size="9" class="s m">phase · report(DryRun)</text>
-  <text x="240" y="338" font-size="9" class="s m">result · nominations(Execute)</text>
+  <text x="240" y="338" font-size="9" class="s m">result · relocations(Execute)</text>
   <text x="304" y="360" text-anchor="middle" font-size="8.5" class="s">共享状态中枢(大家读/写)</text>
 
   <!-- repack-engine -->
@@ -62,9 +62,9 @@
   <text x="460" y="288" font-size="9.5" class="s">· 门控 K=1 + 冷静期(自串行)</text>
   <text x="460" y="306" font-size="9.5" class="s">· 规划 Core=drain</text>
   <line x1="460" y1="318" x2="660" y2="318" stroke="#2f9e44" opacity="0.35"/>
-  <text x="460" y="336" font-size="9.5" class="t"><tspan fill="#1c7ed6" font-weight="700">DryRun</tspan> → 写 status.report</text>
+  <text x="460" y="336" font-size="9.5" class="t"><tspan fill="#1c7ed6" font-weight="700">DryRun</tspan> → 写 status.plan</text>
   <text x="460" y="356" font-size="9.5" class="t"><tspan fill="#2f9e44" font-weight="700">Execute</tspan> → Evict + result</text>
-  <text x="474" y="374" font-size="9.5" class="t">+ status.nominations[]</text>
+  <text x="474" y="374" font-size="9.5" class="t">+ status.relocations[]</text>
 
   <!-- controller-manager (ONLY repack-controller + policy) -->
   <rect x="712" y="34" width="256" height="204" rx="10" class="usr"/>
@@ -75,7 +75,7 @@
   <rect x="726" y="118" width="228" height="104" rx="7" class="mod"/>
   <text x="840" y="137" text-anchor="middle" font-size="12.5" font-weight="700" class="t">repack-controller</text>
   <text x="738" y="158" font-size="9" class="s">提名 reconciler:</text>
-  <text x="746" y="174" font-size="8.5" class="s">读 status.nominations →</text>
+  <text x="746" y="174" font-size="8.5" class="s">读 status.relocations →</text>
   <text x="746" y="188" font-size="8.5" class="s">patch 替身 pod nominatedNodeName</text>
   <text x="738" y="209" font-size="9" class="s">TTL 回收终态 RepackRun</text>
 
@@ -150,7 +150,7 @@
   <circle cx="820" cy="360" r="9" fill="#1c7ed6"/><text x="820" y="361" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">5</text>
   <text x="820" y="378" text-anchor="middle" font-size="8" class="s">patch nominatedNodeName</text>
   <path d="M726,150 C560,150 470,205 402,320" class="ap" marker-end="url(#p)"/>
-  <text x="470" y="176" text-anchor="middle" font-size="8" class="s">读 status.nominations</text>
+  <text x="470" y="176" text-anchor="middle" font-size="8" class="s">读 status.relocations</text>
   <path d="M900,342 C900,410 880,450 850,470" class="ag" marker-end="url(#g)"/>
   <circle cx="884" cy="410" r="9" fill="#2f9e44"/><text x="884" y="411" text-anchor="middle" font-size="10" font-weight="700" fill="#fff">6</text>
   <text x="884" y="428" text-anchor="middle" font-size="8" class="s">调度落位</text>

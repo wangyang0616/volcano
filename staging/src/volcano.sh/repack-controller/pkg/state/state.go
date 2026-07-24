@@ -33,58 +33,48 @@ import (
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 )
 
-// Condition types (Job-style; §4.6.1). Admission is enforced at the apiserver
-// (CEL on the CRD), so there is no controller-side Admitted condition.
+// Condition types (Job-style; §4.6.1). Progressing describes both active work
+// and why a Pending run is not progressing. Complete and Failed are terminal.
 const (
-	CondQueued      = "Queued"
 	CondProgressing = "Progressing"
 	CondComplete    = "Complete"
 	CondFailed      = "Failed"
-	CondCancelled   = "Cancelled"
 )
 
 // Condition reasons (§4.6.1).
 const (
-	// ReasonSlotAcquired clears Queued once the K=1/cooldown gate admits the run.
-	ReasonSlotAcquired = "SlotAcquired"
-	// Queued reasons — only Execute is gated; DryRun never queues.
-	ReasonAnotherRunActive   = "AnotherRunActive"   // K=1 occupied
-	ReasonExecuteCoolingDown = "ExecuteCoolingDown" // cooldown not elapsed
-	ReasonWaitingForLeader   = "WaitingForLeader"
+	// Pending reasons. Only Execute is serialized and subject to cooldown.
+	ReasonAnotherRunActive      = "AnotherRunActive"
+	ReasonExecuteCooldownActive = "ExecuteCooldownActive"
 	// Progressing sub-reasons.
-	ReasonSimulating = "Simulating" // DryRun
-	ReasonEvicting   = "Evicting"   // Execute
-	// ReasonAwaitingPlacement means eviction succeeded and replacement Pods are
-	// held by placement gates until their actual bindings are observed.
-	ReasonAwaitingPlacement = "AwaitingPlacement"
+	ReasonPlanning = "Planning"
+	ReasonEvicting = "Evicting"
+	// ReasonReconcilingPlacements means eviction succeeded and replacement Pods
+	// are being identified, assigned receiver nodes, and observed after binding.
+	ReasonReconcilingPlacements = "ReconcilingPlacements"
 	// Terminal Complete reasons. These double as the "worth repacking?" verdict
 	// (proposal §5.2.2), so there is no separate status.plan.summary.verdict.
-	ReasonRepackRecommended  = "RepackRecommended"  // DryRun found a worthwhile plan
-	ReasonExecuted           = "Executed"           // Execute performed the repack
-	ReasonNoFragmentation    = "NoFragmentation"    // clean: nothing to defragment
-	ReasonBelowGoalThreshold = "BelowGoalThreshold" // fragmented but below the benefit gate
-	ReasonCancelledByUser    = "CancelledByUser"
-	// ReasonExecuteFailed is terminal-Failed: a worthwhile plan was found but every
-	// eviction was rejected (e.g. by PDBs), so the repack achieved nothing.
-	ReasonExecuteFailed = "ExecuteFailed"
-	// ReasonExecutedWithPlacementDrift is terminal-Complete: every replacement
-	// Pod was scheduled and the complete planned node-freeing benefit was
-	// realized, although one or more Pods bound to a node other than the
-	// Repack-selected receiver.
-	ReasonExecutedWithPlacementDrift = "ExecutedWithPlacementDrift"
+	ReasonRepackRecommended                          = "RepackRecommended"
+	ReasonExecutionCompleted                         = "ExecutionCompleted"
+	ReasonExecutionCompletedWithAlternativePlacement = "ExecutionCompletedWithAlternativePlacement"
+	ReasonNoFragmentation                            = "NoFragmentation"
+	ReasonInsufficientImprovement                    = "InsufficientImprovement"
 	// Terminal-Failed Execute result reasons.
-	ReasonBenefitNotRealized = "BenefitNotRealized"
-	ReasonPlacementExpired   = "PlacementExpired"
-	ReasonMetricsUnverified  = "MetricsUnverified"
+	ReasonInvalidConfiguration       = "InvalidConfiguration"
+	ReasonScopeResolutionFailed      = "ScopeResolutionFailed"
+	ReasonExecutionPreparationFailed = "ExecutionPreparationFailed"
+	ReasonEvictionFailed             = "EvictionFailed"
+	ReasonPlacementTimedOut          = "PlacementTimedOut"
+	ReasonResultVerificationFailed   = "ResultVerificationFailed"
+	ReasonBenefitNotRealized         = "BenefitNotRealized"
+	ReasonExecutionInterrupted       = "ExecutionInterrupted"
+	ReasonReconcileFailed            = "ReconcileFailed"
 )
 
 // DerivePhase projects conditions onto the coarse phase (§4.6.1). Precedence:
-// Cancelled > Failed > Complete(=Succeeded) > Progressing(=Running) > Pending.
-// Admitted/Queued never advance the phase past Pending.
+// Failed > Complete(=Succeeded) > Progressing(=Running) > Pending.
 func DerivePhase(conds []metav1.Condition) repackv1alpha1.RepackPhase {
 	switch {
-	case meta.IsStatusConditionTrue(conds, CondCancelled):
-		return repackv1alpha1.RepackCancelled
 	case meta.IsStatusConditionTrue(conds, CondFailed):
 		return repackv1alpha1.RepackFailed
 	case meta.IsStatusConditionTrue(conds, CondComplete):
@@ -100,8 +90,7 @@ func DerivePhase(conds []metav1.Condition) repackv1alpha1.RepackPhase {
 func IsTerminal(p repackv1alpha1.RepackPhase) bool {
 	switch p {
 	case repackv1alpha1.RepackSucceeded,
-		repackv1alpha1.RepackFailed,
-		repackv1alpha1.RepackCancelled:
+		repackv1alpha1.RepackFailed:
 		return true
 	default:
 		return false
@@ -119,6 +108,75 @@ func SetCondition(conds *[]metav1.Condition, condType string, status metav1.Cond
 		Message:            message,
 		ObservedGeneration: observedGeneration,
 	})
+}
+
+// MarkPending records why a run has not started. Pending is represented by a
+// false Progressing condition rather than a separate Queued condition.
+func MarkPending(run *repackv1alpha1.RepackRun, reason, message string) bool {
+	if run == nil {
+		return false
+	}
+	changed := meta.RemoveStatusCondition(&run.Status.Conditions, CondComplete)
+	changed = meta.RemoveStatusCondition(&run.Status.Conditions, CondFailed) || changed
+	changed = SetCondition(&run.Status.Conditions, CondProgressing, metav1.ConditionFalse,
+		reason, message, run.Generation) || changed
+	changed = run.Status.Message != message || changed
+	run.Status.Message = message
+	previousPhase := run.Status.Phase
+	run.Status.Phase = DerivePhase(run.Status.Conditions)
+	return changed || previousPhase != run.Status.Phase
+}
+
+// MarkRunning records the current active reconciliation stage.
+func MarkRunning(run *repackv1alpha1.RepackRun, reason, message string) bool {
+	if run == nil {
+		return false
+	}
+	changed := meta.RemoveStatusCondition(&run.Status.Conditions, CondComplete)
+	changed = meta.RemoveStatusCondition(&run.Status.Conditions, CondFailed) || changed
+	changed = SetCondition(&run.Status.Conditions, CondProgressing, metav1.ConditionTrue,
+		reason, message, run.Generation) || changed
+	changed = run.Status.Message != message || changed
+	run.Status.Message = message
+	previousPhase := run.Status.Phase
+	run.Status.Phase = DerivePhase(run.Status.Conditions)
+	return changed || previousPhase != run.Status.Phase
+}
+
+// MarkSucceeded records a successful terminal result and clears any stale
+// failure observation.
+func MarkSucceeded(run *repackv1alpha1.RepackRun, reason, message string) bool {
+	if run == nil {
+		return false
+	}
+	changed := meta.RemoveStatusCondition(&run.Status.Conditions, CondFailed)
+	changed = SetCondition(&run.Status.Conditions, CondProgressing, metav1.ConditionFalse,
+		reason, message, run.Generation) || changed
+	changed = SetCondition(&run.Status.Conditions, CondComplete, metav1.ConditionTrue,
+		reason, message, run.Generation) || changed
+	changed = run.Status.Message != message || changed
+	run.Status.Message = message
+	previousPhase := run.Status.Phase
+	run.Status.Phase = DerivePhase(run.Status.Conditions)
+	return changed || previousPhase != run.Status.Phase
+}
+
+// MarkFailed records a failed terminal result and clears any stale successful
+// completion observation.
+func MarkFailed(run *repackv1alpha1.RepackRun, reason, message string) bool {
+	if run == nil {
+		return false
+	}
+	changed := meta.RemoveStatusCondition(&run.Status.Conditions, CondComplete)
+	changed = SetCondition(&run.Status.Conditions, CondProgressing, metav1.ConditionFalse,
+		reason, message, run.Generation) || changed
+	changed = SetCondition(&run.Status.Conditions, CondFailed, metav1.ConditionTrue,
+		reason, message, run.Generation) || changed
+	changed = run.Status.Message != message || changed
+	run.Status.Message = message
+	previousPhase := run.Status.Phase
+	run.Status.Phase = DerivePhase(run.Status.Conditions)
+	return changed || previousPhase != run.Status.Phase
 }
 
 // Admission is enforced at the apiserver via CEL/markers on the CRD (mode enum,
@@ -145,7 +203,7 @@ type GateInputs struct {
 // GateDecision is the outcome of EvaluateGate.
 type GateDecision struct {
 	Admit  bool   // may claim a slot and proceed to Running
-	Reason string // when !Admit, the Queued condition reason
+	Reason string // when !Admit, the Progressing=False condition reason
 	// RequeueAfter, when >0 and !Admit, is how long until the cooldown elapses
 	// (the controller can requeue precisely instead of polling).
 	RequeueAfter time.Duration
@@ -163,7 +221,7 @@ func EvaluateGate(in GateInputs) GateDecision {
 	if in.Cooldown > 0 && !in.LastExecuteFinish.IsZero() {
 		ready := in.LastExecuteFinish.Add(in.Cooldown)
 		if in.Now.Before(ready) {
-			return GateDecision{Admit: false, Reason: ReasonExecuteCoolingDown, RequeueAfter: ready.Sub(in.Now)}
+			return GateDecision{Admit: false, Reason: ReasonExecuteCooldownActive, RequeueAfter: ready.Sub(in.Now)}
 		}
 	}
 	return GateDecision{Admit: true}

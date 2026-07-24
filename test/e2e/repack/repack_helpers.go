@@ -424,7 +424,7 @@ func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackR
 			lastGetError = nil
 			last = r
 			switch r.Status.Phase {
-			case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed, repackv1alpha1.RepackCancelled:
+			case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed:
 				return true, nil
 			}
 			return false, nil
@@ -507,8 +507,8 @@ func recordRepackDiagnostics(ctx *e2eutil.TestContext, runName string, cause err
 		if run == nil {
 			return
 		}
-		for index := range run.Status.Nominations {
-			namespace := run.Status.Nominations[index].Namespace
+		for index := range run.Status.Relocations {
+			namespace := run.Status.Relocations[index].Namespace
 			if namespace != "" {
 				diagnosticNamespaces[namespace] = struct{}{}
 			}

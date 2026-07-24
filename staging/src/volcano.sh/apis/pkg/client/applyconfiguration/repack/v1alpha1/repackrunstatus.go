@@ -29,17 +29,19 @@ import (
 // ---------- status ----------
 // RepackRunStatus reports lifecycle and business output. Conditions are
 // authoritative; phase is derived. "Worth repacking?" is folded into the
-// terminal Complete condition's reason (RepackRecommended / Executed /
-// NoFragmentation / BelowGoalThreshold), not a summary field.
+// terminal Complete condition's reason (RepackRecommended /
+// ExecutionCompleted / NoFragmentation / InsufficientImprovement), not a
+// summary field.
 type RepackRunStatusApplyConfiguration struct {
 	// Phase is a derived projection of conditions.
 	Phase *repackv1alpha1.RepackPhase `json:"phase,omitempty"`
-	// Conditions are the authoritative facts (Job-style: Queued/
-	// Progressing/Complete/Failed/Cancelled). Admission is CEL-only, so there is
-	// no Admitted condition. The Complete condition's reason also encodes whether
-	// repacking was worthwhile.
+	// Conditions are the authoritative facts (Job-style:
+	// Progressing/Complete/Failed). Admission is CEL-only, so there is no
+	// Admitted condition. Progressing=False explains why a Pending run is
+	// waiting. The Complete condition's reason also encodes whether repacking
+	// was worthwhile.
 	Conditions []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
-	// Message is a one-line human summary written at terminal state.
+	// Message is the current one-line operator summary.
 	Message *string `json:"message,omitempty"`
 	// StartTime is when the run first entered Running.
 	StartTime *metav1.Time `json:"startTime,omitempty"`
@@ -47,17 +49,18 @@ type RepackRunStatusApplyConfiguration struct {
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Plan is the immutable plan-time decision in both modes. DryRun reports what
 	// would be done; Execute preserves the complete pre-eviction plan so rejected
-	// or degraded actions remain auditable. Actual Execute metrics live in Result.
+	// or alternatively placed actions remain auditable. Actual Execute metrics
+	// live in Result.
 	Plan *RepackPlanApplyConfiguration `json:"plan,omitempty"`
 	// Result is the Execute-only observed outcome. It is absent for DryRun and
 	// when Execute failed before any eviction was attempted.
 	Result *RepackResultApplyConfiguration `json:"result,omitempty"`
-	// Nominations are the durable placement-steering intents produced by Execute:
-	// one entry per relocated pod, consumed by the nomination reconciler per the
+	// Relocations are the durable per-Pod execution records produced by Execute:
+	// one entry per relocated Pod, consumed by the placement reconciler per the
 	// replacement matching contract (victimPodName exact match ->
 	// schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
 	// design proposal §5.2.2.
-	Nominations []PodNominationApplyConfiguration `json:"nominations,omitempty"`
+	Relocations []PodRelocationStatusApplyConfiguration `json:"relocations,omitempty"`
 }
 
 // RepackRunStatusApplyConfiguration constructs a declarative configuration of the RepackRunStatus type for use with
@@ -127,15 +130,15 @@ func (b *RepackRunStatusApplyConfiguration) WithResult(value *RepackResultApplyC
 	return b
 }
 
-// WithNominations adds the given value to the Nominations field in the declarative configuration
+// WithRelocations adds the given value to the Relocations field in the declarative configuration
 // and returns the receiver, so that objects can be build by chaining "With" function invocations.
-// If called multiple times, values provided by each call will be appended to the Nominations field.
-func (b *RepackRunStatusApplyConfiguration) WithNominations(values ...*PodNominationApplyConfiguration) *RepackRunStatusApplyConfiguration {
+// If called multiple times, values provided by each call will be appended to the Relocations field.
+func (b *RepackRunStatusApplyConfiguration) WithRelocations(values ...*PodRelocationStatusApplyConfiguration) *RepackRunStatusApplyConfiguration {
 	for i := range values {
 		if values[i] == nil {
-			panic("nil value passed to WithNominations")
+			panic("nil value passed to WithRelocations")
 		}
-		b.Nominations = append(b.Nominations, *values[i])
+		b.Relocations = append(b.Relocations, *values[i])
 	}
 	return b
 }

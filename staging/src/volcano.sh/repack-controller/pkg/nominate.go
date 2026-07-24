@@ -55,14 +55,14 @@ const (
 )
 
 // Nominator is the placement-steering reconciler: it watches Pods and, for a not-
-// yet-scheduled replacement pod, looks up a matching PodNomination in some
-// RepackRun.status.nominations[] and writes pod.status.nominatedNodeName so the
+// yet-scheduled replacement pod, looks up a matching PodRelocationStatus in some
+// RepackRun.status.relocations[] and writes pod.status.nominatedNodeName so the
 // scheduler prefers the repack-recommended node. It is best-effort and soft — a
 // nomination is only a hint; if the node has since filled, the scheduler is free
 // to place the pod elsewhere (no reservation; §4.7.1.2).
 //
 // Why here and not the PodGroup controller: the injector must cover every gang
-// kind (vcjob/Deployment/StatefulSet/RawPod), must own the status.nominations[]
+// kind (vcjob/Deployment/StatefulSet/RawPod), must own the status.relocations[]
 // lifecycle, and is conceptually part of the repack control loop — so it lives
 // with the RepackRun controller, decoupled from any single workload controller.
 type Nominator struct {
@@ -88,15 +88,15 @@ type Nominator struct {
 const nominationWorkerCount = 1
 
 const (
-	eventReasonReplacementGated    = "RepackReplacementGated"
-	eventReasonPlacementNominated  = "RepackPlacementNominated"
-	eventReasonPlacementSucceeded  = "RepackPlacementSucceeded"
-	eventReasonPlacementDrifted    = "RepackPlacementDrifted"
-	eventReasonPlacementGateOpened = "RepackPlacementGateOpened"
-	eventReasonPlacementReleased   = "RepackPlacementReleased"
-	eventReasonPlacementNotMatched = "RepackPlacementNotMatched"
-	eventReasonPlacementRecovered  = "RepackPlacementRecovered"
-	eventReasonPodGroupRecreated   = "RepackPodGroupRecreated"
+	eventReasonReplacementGated     = "RepackReplacementGated"
+	eventReasonPlacementNominated   = "RepackPlacementNominated"
+	eventReasonPlacementSucceeded   = "RepackPlacementSucceeded"
+	eventReasonAlternativePlacement = "RepackAlternativePlacement"
+	eventReasonPlacementGateOpened  = "RepackPlacementGateOpened"
+	eventReasonPlacementReleased    = "RepackPlacementReleased"
+	eventReasonPlacementNotMatched  = "RepackPlacementNotMatched"
+	eventReasonPlacementRecovered   = "RepackPlacementRecovered"
+	eventReasonPodGroupRecreated    = "RepackPodGroupRecreated"
 )
 
 type nominationMatchMethod string
@@ -110,7 +110,8 @@ const (
 
 // NewEventRecorder creates a Pod event recorder for the placement protocol.
 // Pod events complement RepackRun events: operators can diagnose why a concrete
-// replacement Pod is gated, nominated, drifted, or released from kubectl describe.
+// replacement Pod is gated, nominated, placed on an alternative node, or
+// released from kubectl describe.
 func NewEventRecorder(kubernetesClient kubernetes.Interface, component string) record.EventRecorder {
 	if kubernetesClient == nil {
 		return nil
@@ -255,9 +256,9 @@ func nominationVictimIndex(obj interface{}) ([]string, error) {
 	if !ok {
 		return nil, nil
 	}
-	keys := make([]string, 0, len(run.Status.Nominations))
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	keys := make([]string, 0, len(run.Status.Relocations))
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nominationUnavailableForClaim(nomination) || nomination.VictimPodName == "" {
 			continue
 		}
@@ -297,8 +298,8 @@ func (n *Nominator) enqueuePendingForRun(obj interface{}) {
 	}
 	podGroups := map[string]bool{}
 	namespaces := map[string]bool{}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if !nominationUnavailableForClaim(nomination) {
 			namespaces[nomination.Namespace] = true
 			if nomination.PodGroupName != "" {
@@ -415,8 +416,8 @@ func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 		return
 	}
 	for _, run := range runs {
-		for index := range run.Status.Nominations {
-			nomination := &run.Status.Nominations[index]
+		for index := range run.Status.Relocations {
+			nomination := &run.Status.Relocations[index]
 			if nomination.Namespace == pod.Namespace && nomination.VictimPodName == pod.Name &&
 				!nominationUnavailableForClaim(nomination) {
 				n.enqueuePendingForRun(run)
@@ -515,11 +516,9 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	// Nominated -> gate-open transition must be resumed rather than forgotten.
 	nomination := nominationForReplacement(run, pod)
 	if nomination != nil {
-		switch nomination.Phase {
+		switch nomination.Placement.Phase {
 		case repackv1alpha1.PodPlacementPlaced,
-			repackv1alpha1.PodPlacementDegraded,
-			repackv1alpha1.PodPlacementExpired,
-			repackv1alpha1.PodNominationBound:
+			repackv1alpha1.PodPlacementTimedOut:
 			return n.clearPlacementGate(ctx, pod)
 		}
 	}
@@ -584,17 +583,17 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	}
 	klog.V(4).InfoS("repack nominator: matched replacement Pod to placement intent",
 		"pod", key, "run", run.Name, "podGroup", nomination.PodGroupName,
-		"victimPod", nomination.VictimPodName, "plannedNode", nomination.NodeName,
-		"selectedNode", nomination.SelectedNodeName, "matchMethod", matchMethod,
+		"victimPod", nomination.VictimPodName, "plannedNode", nomination.PlannedNodeName,
+		"selectedNode", nomination.Placement.SelectedNodeName, "matchMethod", matchMethod,
 		"schedulingRequirementsHash", nomination.SchedulingRequirementsHash)
-	if nomination.SelectedNodeName == "" {
+	if nomination.Placement.SelectedNodeName == "" {
 		// The admission webhook has stopped the scheduler. Hand the placement
 		// decision to the engine, which owns the scheduler session and can choose
 		// a current receiver without duplicating predicate logic here.
 		return n.markPlacementGated(ctx, run.Name, pod, candidateSchedulingRequirementsHash)
 	}
 
-	selectedNode := nomination.SelectedNodeName
+	selectedNode := nomination.Placement.SelectedNodeName
 	// Persist the concrete association and selected receiver before mutating the
 	// Pod. Every following operation is then recoverable from Run status after a
 	// conflict, process restart, or partial API failure.
@@ -618,14 +617,14 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 // nominationForReplacement returns the durable placement record already claimed
 // by this concrete replacement. Unlike generic matching, it intentionally sees
 // Nominated records so an interrupted status-patch/gate-open sequence can resume.
-func nominationForReplacement(run *repackv1alpha1.RepackRun, pod *corev1.Pod) *repackv1alpha1.PodNomination {
+func nominationForReplacement(run *repackv1alpha1.RepackRun, pod *corev1.Pod) *repackv1alpha1.PodRelocationStatus {
 	if run == nil || pod == nil || pod.UID == "" {
 		return nil
 	}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
-		if nomination.Namespace == pod.Namespace && nomination.ReplacementPodName == pod.Name &&
-			nomination.ReplacementPodUID == pod.UID {
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
+		if nomination.Namespace == pod.Namespace && nomination.Placement.ReplacementPodName == pod.Name &&
+			nomination.Placement.ReplacementPodUID == pod.UID {
 			return nomination
 		}
 	}
@@ -665,26 +664,26 @@ func (n *Nominator) recoverStalePlacementClaim(
 			return nil
 		}
 		now := n.now()
-		for index := range latest.Status.Nominations {
-			nomination := &latest.Status.Nominations[index]
+		for index := range latest.Status.Relocations {
+			nomination := &latest.Status.Relocations[index]
 			if !placementClaimCanBeRecoveredForPod(
 				nomination, candidate, candidateSchedulingRequirementsHash, now) {
 				continue
 			}
 			replacement, getErr := n.kubernetesClient.CoreV1().Pods(nomination.Namespace).Get(
-				ctx, nomination.ReplacementPodName, metav1.GetOptions{})
+				ctx, nomination.Placement.ReplacementPodName, metav1.GetOptions{})
 			switch {
 			case apierrors.IsNotFound(getErr):
 				// The claimed replacement disappeared before placement completed.
 			case getErr != nil:
 				return getErr
-			case replacement.UID == nomination.ReplacementPodUID &&
+			case replacement.UID == nomination.Placement.ReplacementPodUID &&
 				replacement.DeletionTimestamp == nil:
 				// The claim is still held by a live Pod.
 				continue
 			}
 
-			recoveredReplacementPodName = nomination.ReplacementPodName
+			recoveredReplacementPodName = nomination.Placement.ReplacementPodName
 			resetReplacementPlacement(nomination)
 			updatedRun, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(
 				ctx, latest, metav1.UpdateOptions{})
@@ -704,9 +703,9 @@ func hasRecoverablePlacementClaimForPod(
 	if !placementRunActive(run) {
 		return false
 	}
-	for index := range run.Status.Nominations {
+	for index := range run.Status.Relocations {
 		if placementClaimCanBeRecoveredForPod(
-			&run.Status.Nominations[index], candidate, candidateSchedulingRequirementsHash, now) {
+			&run.Status.Relocations[index], candidate, candidateSchedulingRequirementsHash, now) {
 			return true
 		}
 	}
@@ -714,28 +713,27 @@ func hasRecoverablePlacementClaimForPod(
 }
 
 func placementClaimCanBeRecoveredForPod(
-	nomination *repackv1alpha1.PodNomination,
+	nomination *repackv1alpha1.PodRelocationStatus,
 	candidate *corev1.Pod,
 	candidateSchedulingRequirementsHash string,
 	now time.Time,
 ) bool {
 	if nomination == nil || candidate == nil ||
 		!placement.EvictionAllowsPlacement(nomination) ||
-		nomination.ReplacementPodName == "" || nomination.ReplacementPodUID == "" ||
+		nomination.Placement.ReplacementPodName == "" || nomination.Placement.ReplacementPodUID == "" ||
 		nomination.Namespace != candidate.Namespace ||
-		!placement.NominationUsesPodGroup(nomination, placement.PodGroupName(candidate)) ||
-		(nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time)) {
+		!placement.RelocationUsesPodGroup(nomination, placement.PodGroupName(candidate)) ||
+		(nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time)) {
 		return false
 	}
-	switch nomination.Phase {
-	case repackv1alpha1.PodPlacementGated,
-		repackv1alpha1.PodPlacementAwaitingCapacity,
+	switch nomination.Placement.Phase {
+	case repackv1alpha1.PodPlacementWaitingForNodeSelection,
 		repackv1alpha1.PodPlacementNominated:
 	default:
 		return false
 	}
-	if nomination.ReplacementPodName == candidate.Name &&
-		nomination.ReplacementPodUID == candidate.UID {
+	if nomination.Placement.ReplacementPodName == candidate.Name &&
+		nomination.Placement.ReplacementPodUID == candidate.UID {
 		return false
 	}
 	return nomination.SchedulingRequirementsHash == "" ||
@@ -744,8 +742,8 @@ func placementClaimCanBeRecoveredForPod(
 
 // hasPotentialNominationForPod reports whether a currently unmatched gated Pod
 // may become claimable after victim deletion or PodGroup recreation mapping.
-// Hash-bearing nominations require exact scheduling-requirements equality;
-// hashless nominations retain the documented homogeneous-PodGroup fallback.
+// Hash-bearing relocations require exact scheduling-requirements equality;
+// hashless relocations retain the documented homogeneous-PodGroup fallback.
 // This narrow test prevents an unrelated concurrent scale-out Pod from waiting
 // behind every unfinished placement in the workload.
 func (n *Nominator) hasPotentialNominationForPod(
@@ -799,9 +797,9 @@ func hasClaimableNominationForPodGroup(
 	now time.Time,
 ) bool {
 	return hasClaimableNomination(run, candidateSchedulingRequirementsHash, now,
-		func(nomination *repackv1alpha1.PodNomination) bool {
+		func(nomination *repackv1alpha1.PodRelocationStatus) bool {
 			return nomination.Namespace == namespace &&
-				placement.NominationUsesPodGroup(nomination, podGroupName)
+				placement.RelocationUsesPodGroup(nomination, podGroupName)
 		})
 }
 
@@ -817,7 +815,7 @@ func hasClaimableNominationForSourcePodGroups(
 		names[name] = struct{}{}
 	}
 	return hasClaimableNomination(run, candidateSchedulingRequirementsHash, now,
-		func(nomination *repackv1alpha1.PodNomination) bool {
+		func(nomination *repackv1alpha1.PodRelocationStatus) bool {
 			_, found := names[nomination.PodGroupName]
 			return nomination.Namespace == namespace && found
 		})
@@ -827,15 +825,15 @@ func hasClaimableNomination(
 	run *repackv1alpha1.RepackRun,
 	candidateSchedulingRequirementsHash string,
 	now time.Time,
-	inCandidateGroup func(*repackv1alpha1.PodNomination) bool,
+	inCandidateGroup func(*repackv1alpha1.PodRelocationStatus) bool,
 ) bool {
 	if !placementRunActive(run) || inCandidateGroup == nil {
 		return false
 	}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nominationUnavailableForClaim(nomination) ||
-			(nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time)) {
+			(nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time)) {
 			continue
 		}
 		if inCandidateGroup(nomination) && (nomination.SchedulingRequirementsHash == "" ||
@@ -872,19 +870,19 @@ func (n *Nominator) matchNomination(
 	run *repackv1alpha1.RepackRun,
 	pod *corev1.Pod,
 	candidateSchedulingRequirementsHash string,
-) (*repackv1alpha1.PodNomination, nominationMatchMethod) {
+) (*repackv1alpha1.PodRelocationStatus, nominationMatchMethod) {
 	if pod == nil || !placementRunActive(run) {
 		return nil, ""
 	}
 	now := n.now()
 	podGroupName := placement.PodGroupName(pod)
-	var homogeneousNomination *repackv1alpha1.PodNomination
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	var homogeneousNomination *repackv1alpha1.PodRelocationStatus
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nominationUnavailableForClaim(nomination) {
 			continue
 		}
-		if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
+		if nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time) {
 			continue
 		}
 		// 1. An exact victim name has the strongest Pod identity, but it
@@ -893,12 +891,12 @@ func (n *Nominator) matchNomination(
 		// ambiguous scale-out group from claiming the placement.
 		if nomination.VictimPodName != "" && nomination.Namespace == pod.Namespace &&
 			nomination.VictimPodName == pod.Name &&
-			placement.NominationUsesPodGroup(nomination, podGroupName) {
+			placement.RelocationUsesPodGroup(nomination, podGroupName) {
 			return nomination, nominationMatchedByVictimName
 		}
 		// Hash and homogeneous matching require the same namespace and the
 		// original or durably recorded replacement PodGroup.
-		if nomination.Namespace != pod.Namespace || !placement.NominationUsesPodGroup(nomination, podGroupName) {
+		if nomination.Namespace != pod.Namespace || !placement.RelocationUsesPodGroup(nomination, podGroupName) {
 			continue
 		}
 		if nomination.SchedulingRequirementsHash != "" {
@@ -910,7 +908,7 @@ func (n *Nominator) matchNomination(
 		}
 		// 3. Homogeneous PodGroup: first pending record for this group.
 		// Do not consume it while the original victim still exists: prepared
-		// nominations are persisted before eviction, and a failed eviction must
+		// relocations are persisted before eviction, and a failed eviction must
 		// not redirect an unrelated Pending gang member.
 		if !n.victimGone(nomination) {
 			continue
@@ -993,7 +991,7 @@ func (n *Nominator) ensureReplacementPodGroup(
 			"sourcePodGroup", pod.Namespace+"/"+sourcePodGroupName,
 			"previousPodGroup", pod.Namespace+"/"+previousPodGroupName,
 			"replacementPodGroup", pod.Namespace+"/"+podGroupName,
-			"nominationCount", updatedCount)
+			"relocationCount", updatedCount)
 		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPodGroupRecreated,
 			fmt.Sprintf("RepackRun %s recognized PodGroup %s as the replacement for current PodGroup %s (original %s).",
 				run.Name, podGroupName, previousPodGroupName, sourcePodGroupName))
@@ -1008,8 +1006,8 @@ func sourcePodGroupForReplacement(
 	if run == nil || namespace == "" || replacementPodGroupName == "" {
 		return "", false
 	}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nomination.Namespace == namespace &&
 			nomination.ReplacementPodGroupName == replacementPodGroupName {
 			return nomination.PodGroupName, true
@@ -1072,10 +1070,10 @@ func (n *Nominator) recordReplacementPodGroupMapping(
 			updatedRun = latest
 			return nil
 		}
-		for index := range latest.Status.Nominations {
-			nomination := &latest.Status.Nominations[index]
+		for index := range latest.Status.Relocations {
+			nomination := &latest.Status.Relocations[index]
 			if nomination.Namespace != namespace || nomination.PodGroupName != sourcePodGroupName ||
-				nomination.Phase == repackv1alpha1.PodPlacementExpired ||
+				nomination.Placement.Phase == repackv1alpha1.PodPlacementTimedOut ||
 				effectivePodGroupName(nomination) != expectedCurrentPodGroupName {
 				continue
 			}
@@ -1107,10 +1105,10 @@ func currentPodGroupForRecoverablePlacement(
 	}
 	currentPodGroupName := ""
 	recoverable := false
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nomination.Namespace != namespace || nomination.PodGroupName != sourcePodGroupName ||
-			nomination.Phase == repackv1alpha1.PodPlacementExpired {
+			nomination.Placement.Phase == repackv1alpha1.PodPlacementTimedOut {
 			continue
 		}
 		effectiveName := effectivePodGroupName(nomination)
@@ -1127,7 +1125,7 @@ func currentPodGroupForRecoverablePlacement(
 	return currentPodGroupName, recoverable && currentPodGroupName != ""
 }
 
-func effectivePodGroupName(nomination *repackv1alpha1.PodNomination) string {
+func effectivePodGroupName(nomination *repackv1alpha1.PodRelocationStatus) string {
 	if nomination == nil {
 		return ""
 	}
@@ -1139,15 +1137,15 @@ func effectivePodGroupName(nomination *repackv1alpha1.PodNomination) string {
 
 // resetReplacementPlacement preserves the original plan and PodGroup lineage
 // while making the intent claimable by the next replacement Pod.
-func resetReplacementPlacement(nomination *repackv1alpha1.PodNomination) {
+func resetReplacementPlacement(nomination *repackv1alpha1.PodRelocationStatus) {
 	if nomination == nil {
 		return
 	}
-	nomination.SelectedNodeName = ""
-	nomination.ReplacementPodName = ""
-	nomination.ReplacementPodUID = ""
-	nomination.ActualNodeName = ""
-	nomination.Phase = repackv1alpha1.PodPlacementPrepared
+	nomination.Placement.SelectedNodeName = ""
+	nomination.Placement.ReplacementPodName = ""
+	nomination.Placement.ReplacementPodUID = ""
+	nomination.Placement.ActualNodeName = ""
+	nomination.Placement.Phase = repackv1alpha1.PodPlacementWaitingForReplacement
 }
 
 // placementRunForPod reads only the Run recorded by the gate owner annotation.
@@ -1179,17 +1177,17 @@ func placementAwaitingBinding(run *repackv1alpha1.RepackRun, pod *corev1.Pod) bo
 	if run == nil || pod == nil {
 		return false
 	}
-	for i := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[i]
-		if nomination.Namespace == pod.Namespace && nomination.ReplacementPodName == pod.Name &&
-			nomination.ReplacementPodUID == pod.UID && nomination.Phase == repackv1alpha1.PodPlacementNominated {
+	for i := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[i]
+		if nomination.Namespace == pod.Namespace && nomination.Placement.ReplacementPodName == pod.Name &&
+			nomination.Placement.ReplacementPodUID == pod.UID && nomination.Placement.Phase == repackv1alpha1.PodPlacementNominated {
 			return true
 		}
 	}
 	return false
 }
 
-func (n *Nominator) victimGone(nomination *repackv1alpha1.PodNomination) bool {
+func (n *Nominator) victimGone(nomination *repackv1alpha1.PodRelocationStatus) bool {
 	if nomination == nil || nomination.VictimPodName == "" || n.podLister == nil {
 		return true
 	}
@@ -1310,7 +1308,7 @@ func hasPlacementGate(pod *corev1.Pod) bool {
 // markPlacementNominated records the concrete replacement before opening its
 // gate. This makes the later bound-node observation unambiguous even for
 // homogeneous PodGroups whose Pods are intentionally interchangeable.
-func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, nomination *repackv1alpha1.PodNomination, pod *corev1.Pod, selectedNode string) error {
+func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, nomination *repackv1alpha1.PodRelocationStatus, pod *corev1.Pod, selectedNode string) error {
 	if runName == "" || nomination == nil || pod == nil {
 		return fmt.Errorf("cannot persist replacement nomination without Run, placement, and Pod identity")
 	}
@@ -1323,31 +1321,29 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 			// status persistence. A fresh reconcile will release stale metadata.
 			return err
 		}
-		for index := range run.Status.Nominations {
-			current := &run.Status.Nominations[index]
+		for index := range run.Status.Relocations {
+			current := &run.Status.Relocations[index]
 			if nominationStatusKey(current) != key {
 				continue
 			}
-			if current.ReplacementPodName != "" &&
-				(current.ReplacementPodName != pod.Name || current.ReplacementPodUID != pod.UID) {
+			if current.Placement.ReplacementPodName != "" &&
+				(current.Placement.ReplacementPodName != pod.Name || current.Placement.ReplacementPodUID != pod.UID) {
 				return nil
 			}
-			switch current.Phase {
+			switch current.Placement.Phase {
 			case repackv1alpha1.PodPlacementNominated:
 				durable =
-					current.SelectedNodeName == selectedNode &&
-						current.ReplacementPodName == pod.Name && current.ReplacementPodUID == pod.UID
+					current.Placement.SelectedNodeName == selectedNode &&
+						current.Placement.ReplacementPodName == pod.Name && current.Placement.ReplacementPodUID == pod.UID
 				return nil
 			case repackv1alpha1.PodPlacementPlaced,
-				repackv1alpha1.PodPlacementDegraded,
-				repackv1alpha1.PodPlacementExpired,
-				repackv1alpha1.PodNominationBound:
+				repackv1alpha1.PodPlacementTimedOut:
 				return nil
 			}
-			current.SelectedNodeName = selectedNode
-			current.ReplacementPodName = pod.Name
-			current.ReplacementPodUID = pod.UID
-			current.Phase = repackv1alpha1.PodPlacementNominated
+			current.Placement.SelectedNodeName = selectedNode
+			current.Placement.ReplacementPodName = pod.Name
+			current.Placement.ReplacementPodUID = pod.UID
+			current.Placement.Phase = repackv1alpha1.PodPlacementNominated
 			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 			durable = err == nil
 			return err
@@ -1379,8 +1375,7 @@ func (n *Nominator) markPlacementGated(
 			return ignoreNotFound(err)
 		}
 		current := nominationForReplacement(run, pod)
-		if current != nil && (current.Phase == repackv1alpha1.PodPlacementGated ||
-			current.Phase == repackv1alpha1.PodPlacementAwaitingCapacity) {
+		if current != nil && current.Placement.Phase == repackv1alpha1.PodPlacementWaitingForNodeSelection {
 			updated = true
 			return nil
 		}
@@ -1388,9 +1383,9 @@ func (n *Nominator) markPlacementGated(
 		if current == nil {
 			return nil
 		}
-		current.ReplacementPodName = pod.Name
-		current.ReplacementPodUID = pod.UID
-		current.Phase = repackv1alpha1.PodPlacementGated
+		current.Placement.ReplacementPodName = pod.Name
+		current.Placement.ReplacementPodUID = pod.UID
+		current.Placement.Phase = repackv1alpha1.PodPlacementWaitingForNodeSelection
 		_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 		updated = err == nil
 		return err
@@ -1402,13 +1397,13 @@ func (n *Nominator) markPlacementGated(
 		"run", runName, "pod", pod.Namespace+"/"+pod.Name,
 		"podGroup", placement.PodGroupName(pod), "podUID", pod.UID)
 	n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonReplacementGated,
-		fmt.Sprintf("RepackRun %s is holding this replacement Pod while selecting live receiver capacity.", runName))
+		fmt.Sprintf("RepackRun %s is holding this replacement Pod while selecting a feasible receiver node.", runName))
 	return nil
 }
 
 // observePlacement records the scheduler's actual binding. A selected node is a
-// soft preference by design; if the scheduler has to choose elsewhere the run
-// remains live and the drift is surfaced as Degraded rather than pinning the Pod.
+// soft preference by design; an alternative binding remains Placed and is
+// visible by comparing SelectedNodeName with ActualNodeName.
 func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error {
 	if pod == nil || pod.Spec.NodeName == "" {
 		return nil
@@ -1420,55 +1415,61 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 	if cachedRun == nil {
 		return nil
 	}
-	observedPhase := repackv1alpha1.PodNominationPhase("")
+	placementRecorded := false
 	selectedNode := ""
+	usedAlternativeNode := false
 	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		run, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(ctx, cachedRun.Name, metav1.GetOptions{})
 		if err != nil {
 			return ignoreNotFound(err)
 		}
-		for index := range run.Status.Nominations {
-			nomination := &run.Status.Nominations[index]
-			if nomination.Namespace != pod.Namespace || nomination.ReplacementPodName != pod.Name || nomination.ReplacementPodUID != pod.UID {
+		for index := range run.Status.Relocations {
+			nomination := &run.Status.Relocations[index]
+			if nomination.Namespace != pod.Namespace || nomination.Placement.ReplacementPodName != pod.Name || nomination.Placement.ReplacementPodUID != pod.UID {
 				continue
 			}
-			nomination.ActualNodeName = pod.Spec.NodeName
-			selectedNode = nomination.SelectedNodeName
-			switch nomination.Phase {
+			nomination.Placement.ActualNodeName = pod.Spec.NodeName
+			selectedNode = nomination.Placement.SelectedNodeName
+			switch nomination.Placement.Phase {
 			case repackv1alpha1.PodPlacementNominated:
-				if nomination.SelectedNodeName == pod.Spec.NodeName {
-					nomination.Phase = repackv1alpha1.PodPlacementPlaced
-				} else {
-					nomination.Phase = repackv1alpha1.PodPlacementDegraded
-				}
-			case repackv1alpha1.PodPlacementGated, repackv1alpha1.PodPlacementAwaitingCapacity:
+				usedAlternativeNode = nomination.Placement.SelectedNodeName != pod.Spec.NodeName
+				nomination.Placement.Phase = repackv1alpha1.PodPlacementPlaced
+			case repackv1alpha1.PodPlacementWaitingForNodeSelection:
 				// Another actor bypassed the gate before the engine selected a
-				// receiver. Record the actual node but never claim controlled
-				// placement success.
-				nomination.Phase = repackv1alpha1.PodPlacementDegraded
+				// receiver. The placement still completed, while empty
+				// SelectedNodeName makes the bypass visible in status.
+				usedAlternativeNode = true
+				nomination.Placement.Phase = repackv1alpha1.PodPlacementPlaced
 			default:
 				return nil
 			}
-			observedPhase = nomination.Phase
+			placementRecorded = true
 			_, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 			return err
 		}
 		return nil
 	})
-	if err != nil || observedPhase == "" {
+	if err != nil || !placementRecorded {
 		return err
 	}
-	if observedPhase == repackv1alpha1.PodPlacementPlaced {
+	if !usedAlternativeNode {
 		klog.V(3).InfoS("repack nominator: replacement Pod reached selected receiver",
 			"run", cachedRun.Name, "pod", pod.Namespace+"/"+pod.Name, "node", pod.Spec.NodeName)
 		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementSucceeded,
 			fmt.Sprintf("Replacement Pod reached Repack-selected node %s.", pod.Spec.NodeName))
 	} else {
-		klog.V(3).InfoS("repack nominator: replacement Pod placement drift detected",
+		klog.V(3).InfoS("repack nominator: replacement Pod used an alternative node",
 			"run", cachedRun.Name, "pod", pod.Namespace+"/"+pod.Name,
-			"selectedNode", selectedNode, "actualNode", pod.Spec.NodeName, "phase", observedPhase)
-		n.recordPodEvent(pod, corev1.EventTypeWarning, eventReasonPlacementDrifted,
-			fmt.Sprintf("Replacement Pod bound to %s instead of Repack-selected node %s.", pod.Spec.NodeName, selectedNode))
+			"selectedNode", selectedNode, "actualNode", pod.Spec.NodeName)
+		eventMessage := fmt.Sprintf(
+			"Replacement Pod bound to %s instead of Repack-selected node %s.",
+			pod.Spec.NodeName, selectedNode)
+		if selectedNode == "" {
+			eventMessage = fmt.Sprintf(
+				"Replacement Pod bound to %s before Repack selected a receiver node.",
+				pod.Spec.NodeName)
+		}
+		n.recordPodEvent(pod, corev1.EventTypeWarning, eventReasonAlternativePlacement, eventMessage)
 	}
 	return nil
 }
@@ -1476,17 +1477,16 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 // nominationUnavailableForClaim reports that this intent is already associated
 // with a concrete replacement Pod or has reached a terminal phase. A non-terminal
 // association may first be reset when its Pod or PodGroup generation disappears.
-func nominationUnavailableForClaim(nomination *repackv1alpha1.PodNomination) bool {
+func nominationUnavailableForClaim(nomination *repackv1alpha1.PodRelocationStatus) bool {
 	if nomination == nil || !placement.EvictionAllowsPlacement(nomination) {
 		return true
 	}
-	if nomination.ReplacementPodName != "" || nomination.ReplacementPodUID != "" {
+	if nomination.Placement.ReplacementPodName != "" || nomination.Placement.ReplacementPodUID != "" {
 		return true
 	}
-	switch nomination.Phase {
+	switch nomination.Placement.Phase {
 	case repackv1alpha1.PodPlacementNominated, repackv1alpha1.PodPlacementPlaced,
-		repackv1alpha1.PodPlacementDegraded, repackv1alpha1.PodPlacementExpired,
-		repackv1alpha1.PodNominationBound:
+		repackv1alpha1.PodPlacementTimedOut:
 		return true
 	default:
 		return false
@@ -1505,12 +1505,12 @@ func (identity nominationStatusIdentity) String() string {
 		identity.Namespace, identity.PodGroupName, identity.VictimPodName, identity.TargetNode)
 }
 
-func nominationStatusKey(nomination *repackv1alpha1.PodNomination) nominationStatusIdentity {
+func nominationStatusKey(nomination *repackv1alpha1.PodRelocationStatus) nominationStatusIdentity {
 	if nomination == nil {
 		return nominationStatusIdentity{}
 	}
 	return nominationStatusIdentity{
 		Namespace: nomination.Namespace, PodGroupName: nomination.PodGroupName,
-		VictimPodName: nomination.VictimPodName, TargetNode: nomination.NodeName,
+		VictimPodName: nomination.VictimPodName, TargetNode: nomination.PlannedNodeName,
 	}
 }

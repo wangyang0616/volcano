@@ -62,13 +62,13 @@
   <text x="766" y="431" text-anchor="middle" font-size="10" font-weight="700" class="t m">if Execute:</text>
   <text x="766" y="450" text-anchor="middle" font-size="9.8" class="t m">CommitPlan(plan, Hooks)</text>
   <text x="766" y="470" text-anchor="middle" font-size="8.6" class="s">Evict victim（尊重 PDB）</text>
-  <text x="766" y="485" text-anchor="middle" font-size="8.6" class="s">nominations → status，交 controller</text>
+  <text x="766" y="485" text-anchor="middle" font-size="8.6" class="s">relocations → status，交 controller</text>
 
   <path d="M470,502 L470,524" class="aw" marker-end="url(#a)"/>
 
   <rect x="210" y="524" width="520" height="44" rx="9" class="eng"/>
   <text x="470" y="542" text-anchor="middle" font-size="11" font-weight="700" class="t">engine 写回 RepackRun.status</text>
-  <text x="470" y="558" text-anchor="middle" font-size="8.6" class="s">DryRun→report · Execute→result+nominations · phase/conditions · CloseSession</text>
+  <text x="470" y="558" text-anchor="middle" font-size="8.6" class="s">DryRun→plan · Execute→result+relocations · phase/conditions · CloseSession</text>
 
   <text x="470" y="592" text-anchor="middle" font-size="9" class="s">要点：core 只认 esn（Snapshot + 各 plugin 注册的回调），与调度器/CRD 解耦；两层 Session — 外层看集群，内层是引擎自己的扩展点框架。</text>
 </svg>

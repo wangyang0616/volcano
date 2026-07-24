@@ -112,7 +112,7 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", Se
 	// ignored (the old bug) this would wrongly recommend a move that bounces back.
 	// Pods must be Running BEFORE tainting: NoSchedule blocks new placements onto
 	// the node, but already-running pods stay put.
-	It("does not relocate onto a tainted node (BelowGoalThreshold)", func() {
+	It("does not relocate onto a tainted node (InsufficientImprovement)", func() {
 		occupy(ctx, "taint-a", nodes[0], 4)
 		occupy(ctx, "taint-b", nodes[1], 4)
 		taintNode(ctx, nodes[0])
@@ -125,7 +125,7 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", Se
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("BelowGoalThreshold"), "tainted receivers => no feasible consolidation")
+		Expect(completeReason(got)).To(Equal("InsufficientImprovement"), "tainted receivers => no feasible consolidation")
 		Expect(got.Status.Plan.Summary.FragBeforePercent).To(BeNumerically(">", 0))
 		Expect(got.Status.Plan.Moves).To(BeEmpty())
 	})
@@ -156,7 +156,7 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", Se
 
 	// Required node affinity is honored: with each gang pinned to its own host by
 	// affinity, neither can move, so a fragmented cluster yields no plan.
-	It("honors required node affinity (BelowGoalThreshold when pinned)", func() {
+	It("honors required node affinity (InsufficientImprovement when pinned)", func() {
 		occupyPinnedToHost(ctx, "aff-a", nodes[0], 4)
 		occupyPinnedToHost(ctx, "aff-b", nodes[1], 4)
 
@@ -165,7 +165,7 @@ var _ = Describe("Repack scheduler-faithful feasibility & receiver ordering", Se
 		defer deleteRun(ctx, run.Name)
 
 		got := waitTerminal(ctx, run.Name)
-		Expect(completeReason(got)).To(Equal("BelowGoalThreshold"), "host-pinned gangs cannot relocate")
+		Expect(completeReason(got)).To(Equal("InsufficientImprovement"), "host-pinned gangs cannot relocate")
 		Expect(got.Status.Plan.Moves).To(BeEmpty())
 	})
 

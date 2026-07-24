@@ -73,16 +73,14 @@ func ActiveForPodGroup(run *repackv1alpha1.RepackRun, namespace, podGroupName st
 	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute || run.Status.Phase != repackv1alpha1.RepackRunning {
 		return false
 	}
-	for i := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[i]
-		if nomination.Namespace != namespace || !NominationUsesPodGroup(nomination, podGroupName) {
+	for i := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[i]
+		if relocation.Namespace != namespace || !RelocationUsesPodGroup(relocation, podGroupName) {
 			continue
 		}
-		switch nomination.Phase {
+		switch relocation.Placement.Phase {
 		case repackv1alpha1.PodPlacementPlaced,
-			repackv1alpha1.PodPlacementDegraded,
-			repackv1alpha1.PodPlacementExpired,
-			repackv1alpha1.PodNominationBound:
+			repackv1alpha1.PodPlacementTimedOut:
 			continue
 		default:
 			return true
@@ -91,28 +89,26 @@ func ActiveForPodGroup(run *repackv1alpha1.RepackRun, namespace, podGroupName st
 	return false
 }
 
-// NominationUsesPodGroup reports whether podGroupName is either the immutable
+// RelocationUsesPodGroup reports whether podGroupName is either the immutable
 // plan-time group or the group that recreated the replacement Pod.
-func NominationUsesPodGroup(nomination *repackv1alpha1.PodNomination, podGroupName string) bool {
-	if nomination == nil || podGroupName == "" {
+func RelocationUsesPodGroup(relocation *repackv1alpha1.PodRelocationStatus, podGroupName string) bool {
+	if relocation == nil || podGroupName == "" {
 		return false
 	}
-	return nomination.PodGroupName == podGroupName ||
-		nomination.ReplacementPodGroupName == podGroupName
+	return relocation.PodGroupName == podGroupName ||
+		relocation.ReplacementPodGroupName == podGroupName
 }
 
-// EvictionAllowsPlacement reports whether a durable intent is ready to claim a
-// replacement Pod. Empty preserves compatibility with Runs created before the
-// eviction journal was introduced. Pending/InProgress/Rejected records continue
-// to keep the admission lease active, but cannot steer a Pod.
-func EvictionAllowsPlacement(nomination *repackv1alpha1.PodNomination) bool {
-	if nomination == nil {
+// EvictionAllowsPlacement reports whether a durable relocation is ready to
+// claim a replacement Pod. Pending/InProgress/Rejected records continue to
+// keep the admission lease active, but cannot steer a Pod.
+func EvictionAllowsPlacement(relocation *repackv1alpha1.PodRelocationStatus) bool {
+	if relocation == nil {
 		return false
 	}
-	switch nomination.EvictionPhase {
-	case "",
-		repackv1alpha1.PodEvictionAccepted,
-		repackv1alpha1.PodEvictionCascadeDeleted:
+	switch relocation.Eviction.Phase {
+	case repackv1alpha1.PodEvictionAccepted,
+		repackv1alpha1.PodEvictionIndirectlyRemoved:
 		return true
 	default:
 		return false
@@ -193,8 +189,8 @@ func HasPendingPlacementsForWorkload(run *repackv1alpha1.RepackRun, workload Wor
 	for _, source := range sources {
 		sourceSet[source] = struct{}{}
 	}
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
 		if nomination.Namespace != workload.Namespace || PlacementReachedTerminalPhase(nomination) {
 			continue
 		}
@@ -207,7 +203,7 @@ func HasPendingPlacementsForWorkload(run *repackv1alpha1.RepackRun, workload Wor
 
 // PlacementAppliesToPodGroup reports whether the active Run covers a PodGroup.
 // Callers validate or inject the lease separately. A newly
-// recreated PodGroup is accepted by workload owner while unfinished nominations
+// recreated PodGroup is accepted by workload owner while unfinished relocations
 // remain, closing the admission window before ReplacementPodGroupName is durable.
 func PlacementAppliesToPodGroup(run *repackv1alpha1.RepackRun, podGroup *schedulingv1beta1.PodGroup) bool {
 	if run == nil || podGroup == nil ||
@@ -228,15 +224,13 @@ func PlacementAppliesToPodGroup(run *repackv1alpha1.RepackRun, podGroup *schedul
 // PlacementReachedTerminalPhase is intentionally different from the
 // nominator's nominationUnavailableForClaim predicate: Nominated has claimed a
 // concrete Pod but is not terminal until the scheduler's binding is observed.
-func PlacementReachedTerminalPhase(nomination *repackv1alpha1.PodNomination) bool {
+func PlacementReachedTerminalPhase(nomination *repackv1alpha1.PodRelocationStatus) bool {
 	if nomination == nil {
 		return true
 	}
-	switch nomination.Phase {
+	switch nomination.Placement.Phase {
 	case repackv1alpha1.PodPlacementPlaced,
-		repackv1alpha1.PodPlacementDegraded,
-		repackv1alpha1.PodPlacementExpired,
-		repackv1alpha1.PodNominationBound:
+		repackv1alpha1.PodPlacementTimedOut:
 		return true
 	default:
 		return false

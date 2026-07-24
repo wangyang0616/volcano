@@ -30,6 +30,7 @@ limitations under the License.
 package drain
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -114,6 +115,11 @@ type candidate struct {
 	key                string
 }
 
+type scoredCandidate struct {
+	candidate candidate
+	score     framework.CandidateDisruptionScore
+}
+
 // drainState is the running state of one drain pass. Feasibility (which victims
 // can relocate where) is delegated to the snapshot's scheduler-faithful feasibility check
 // (Snapshot.FeasibleRelocation); this struct only tracks the greedy pass progress
@@ -178,11 +184,13 @@ func drainGreedy(
 		}
 		klog.V(4).InfoS("repack drain: step evaluated units", "step", step,
 			"totalUnits", len(units), "feasibleThisStep", len(feasible), "nodesFreedSoFar", len(s.freedNodes))
-		if len(feasible) == 0 {
+		scoredCandidates := s.scoreCandidates(feasible)
+		s.logCandidateRanking(step, scoredCandidates)
+		if len(scoredCandidates) == 0 {
 			break
 		}
 		// 2. Pick the least-disruptive one and 3. commit it.
-		chosen := s.chooseLeastDisruptive(feasible)
+		chosen := leastDisruptiveCandidate(scoredCandidates)
 		klog.V(4).InfoS("repack drain: committing unit", "step", step, "unit", chosen.key,
 			"freesNodes", chosen.unit.Nodes, "moves", len(chosen.placed), "movedResource", chosen.additionalResource)
 		s.commit(chosen)
@@ -404,21 +412,114 @@ func (s *drainState) staying(n *schedapi.NodeInfo) bool {
 	return !api.EvaluateNodeFreeability(n, api.NodeFreeabilityState{}, s.movable, s.resource).Freeable || !s.snapshot.NodeInScope(n) || s.provenStuck[n.Name]
 }
 
-// chooseLeastDisruptive orders the feasible candidates deterministically (higher
-// benefit first, then by unit key) and returns the least-disruptive one over the
-// whole prospective plan (already-committed moves + the candidate's).
-func (s *drainState) chooseLeastDisruptive(feasible []candidate) candidate {
-	sort.SliceStable(feasible, func(i, j int) bool {
-		if feasible[i].unit.Weight != feasible[j].unit.Weight {
-			return feasible[i].unit.Weight > feasible[j].unit.Weight
+// scoreCandidates orders feasible candidates by the deterministic tie-breakers,
+// then evaluates their disruption scores. Keeping this order means a linear
+// minimum scan selects higher unit benefit and lexical unit key when scores tie.
+func (s *drainState) scoreCandidates(feasible []candidate) []scoredCandidate {
+	orderedCandidates := append([]candidate(nil), feasible...)
+	sort.SliceStable(orderedCandidates, func(i, j int) bool {
+		if orderedCandidates[i].unit.Weight != orderedCandidates[j].unit.Weight {
+			return orderedCandidates[i].unit.Weight > orderedCandidates[j].unit.Weight
 		}
-		return feasible[i].key < feasible[j].key
+		return orderedCandidates[i].key < orderedCandidates[j].key
 	})
-	candidatePlans := make([]*api.CandidatePlan, len(feasible))
-	for i, c := range feasible {
-		candidatePlans[i] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: c.placed}
+	candidatePlans := make([]*api.CandidatePlan, len(orderedCandidates))
+	for index, candidate := range orderedCandidates {
+		candidatePlans[index] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: candidate.placed}
 	}
-	return feasible[s.ssn.LeastDisruptive(candidatePlans)]
+	scores := s.ssn.DisruptionScores(candidatePlans)
+	scored := make([]scoredCandidate, len(orderedCandidates))
+	for index := range orderedCandidates {
+		scored[index] = scoredCandidate{candidate: orderedCandidates[index], score: scores[index]}
+	}
+	return scored
+}
+
+func leastDisruptiveCandidate(scored []scoredCandidate) candidate {
+	if len(scored) == 0 {
+		return candidate{}
+	}
+	best := 0
+	for index := 1; index < len(scored); index++ {
+		if scored[index].score.Total < scored[best].score.Total {
+			best = index
+		}
+	}
+	return scored[best].candidate
+}
+
+func rankScoredCandidates(scored []scoredCandidate) []scoredCandidate {
+	ranked := append([]scoredCandidate(nil), scored...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return ranked[i].score.Total < ranked[j].score.Total
+	})
+	return ranked
+}
+
+func (s *drainState) logCandidateRanking(step int, scored []scoredCandidate) {
+	if !klog.V(3).Enabled() {
+		return
+	}
+	ranked := rankScoredCandidates(scored)
+	klog.V(3).InfoS("repack drain: drain target ranking for planning step",
+		"run", runName(s.ssn),
+		"step", step,
+		"resource", s.resource,
+		"feasibleCandidateCount", len(ranked),
+		"orderingRule", "lower weighted normalized disruption score first; ties prefer higher freeable-unit benefit weight, then lexical unit key",
+		"normalizationRule", "each enabled disruption term is min-max normalized across this step's feasible candidates",
+		"rankedTargets", formatRankedCandidates(ranked))
+}
+
+const candidateRankingEdgeCount = 3
+
+// formatRankedCandidates keeps the ranking useful on large clusters: show the
+// complete order for up to six candidates, otherwise retain the three best and
+// three worst candidates with an explicit omitted-count marker between them.
+func formatRankedCandidates(ranked []scoredCandidate) []string {
+	if len(ranked) == 0 {
+		return nil
+	}
+	formatAt := func(index int) string {
+		candidate := ranked[index]
+		terms := make([]string, 0, len(candidate.score.Terms))
+		for _, term := range candidate.score.Terms {
+			terms = append(terms, fmt.Sprintf(
+				"%s(raw=%.3f,weight=%.3f,normalized=%.3f,contribution=%.3f)",
+				term.Name, term.Raw, term.Weight, term.Normalized, term.Contribution))
+		}
+		return fmt.Sprintf(
+			"#%d unit=%s level=%s nodes=[%s] benefitWeight=%.3f disruptionScore=%.3f terms=[%s]",
+			index+1, candidate.candidate.key, candidate.candidate.unit.Level,
+			summarizeNames(candidate.candidate.unit.Nodes), candidate.candidate.unit.Weight,
+			candidate.score.Total, strings.Join(terms, ","))
+	}
+	if len(ranked) <= candidateRankingEdgeCount*2 {
+		result := make([]string, 0, len(ranked))
+		for index := range ranked {
+			result = append(result, formatAt(index))
+		}
+		return result
+	}
+	result := make([]string, 0, candidateRankingEdgeCount*2+1)
+	for index := 0; index < candidateRankingEdgeCount; index++ {
+		result = append(result, formatAt(index))
+	}
+	result = append(result, fmt.Sprintf("... %d candidates omitted ...", len(ranked)-candidateRankingEdgeCount*2))
+	for index := len(ranked) - candidateRankingEdgeCount; index < len(ranked); index++ {
+		result = append(result, formatAt(index))
+	}
+	return result
+}
+
+func summarizeNames(names []string) string {
+	if len(names) <= candidateRankingEdgeCount*2 {
+		return strings.Join(names, ",")
+	}
+	return fmt.Sprintf("%s,... %d omitted ...,%s",
+		strings.Join(names[:candidateRankingEdgeCount], ","),
+		len(names)-candidateRankingEdgeCount*2,
+		strings.Join(names[len(names)-candidateRankingEdgeCount:], ","))
 }
 
 // commit applies the chosen candidate to the pass state: mark receivers filled and

@@ -54,10 +54,9 @@ type MoveOutcome struct {
 
 // CommitResult is what the commit attempted — raw material for status.result.
 type CommitResult struct {
-	Evicted        []MoveOutcome
-	CascadeDeleted []MoveOutcome
-	Failed         []MoveOutcome
-	Nominated      []Nomination
+	Evicted   []MoveOutcome
+	Failed    []MoveOutcome
+	Nominated []Nomination
 }
 
 // ErrVictimNotFound preserves the semantic reason of a Kubernetes NotFound

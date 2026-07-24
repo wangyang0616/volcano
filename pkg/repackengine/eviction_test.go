@@ -69,11 +69,10 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 					}},
 				}},
 			},
-			Nominations: []repackv1alpha1.PodNomination{{
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: namespace, PodGroupName: podGroupName,
 				VictimPodName: podName, VictimPodUID: podUID,
-				NodeName: "node-b", Phase: repackv1alpha1.PodPlacementPrepared,
-				EvictionPhase: repackv1alpha1.PodEvictionPending,
+				PlannedNodeName: "node-b", Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionPending}, Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}
@@ -93,7 +92,7 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 		statusUpdates++
 		updated := action.(k8stesting.UpdateAction).GetObject().(*repackv1alpha1.RepackRun)
 		if failAcceptedStatusOnce &&
-			updated.Status.Nominations[0].EvictionPhase == repackv1alpha1.PodEvictionAccepted {
+			updated.Status.Relocations[0].Eviction.Phase == repackv1alpha1.PodEvictionAccepted {
 			failAcceptedStatusOnce = false
 			return true, nil, apierrors.NewForbidden(
 				schema.GroupResource{Group: repackv1alpha1.GroupName, Resource: "repackruns"},
@@ -146,7 +145,7 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := persisted.Status.Nominations[0].EvictionPhase; got != repackv1alpha1.PodEvictionInProgress {
+	if got := persisted.Status.Relocations[0].Eviction.Phase; got != repackv1alpha1.PodEvictionInProgress {
 		t.Fatalf("phase after failed accepted write = %q, want InProgress", got)
 	}
 
@@ -163,14 +162,14 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := updated.Status.Nominations[0].EvictionPhase; got != repackv1alpha1.PodEvictionAccepted {
+	if got := updated.Status.Relocations[0].Eviction.Phase; got != repackv1alpha1.PodEvictionAccepted {
 		t.Fatalf("recovered eviction phase = %q, want Accepted", got)
 	}
 	if updated.Status.Result == nil || updated.Status.Result.MovedCardCount != 2 {
 		t.Fatalf("result = %#v, want movedCardCount=2", updated.Status.Result)
 	}
-	if !hasProgressingReason(updated, state.ReasonAwaitingPlacement) {
-		t.Fatalf("conditions = %#v, want AwaitingPlacement", updated.Status.Conditions)
+	if !hasProgressingReason(updated, state.ReasonReconcilingPlacements) {
+		t.Fatalf("conditions = %#v, want ReconcilingPlacements", updated.Status.Conditions)
 	}
 	if statusUpdates < 4 {
 		t.Fatalf("status updates = %d, want durable intent, outcome, result and placement barriers", statusUpdates)
@@ -178,18 +177,21 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 }
 
 func TestClassifyMissingVictimsRequiresAcceptedSibling(t *testing.T) {
-	nominations := []repackv1alpha1.PodNomination{
-		{Namespace: "ns", PodGroupName: "group-a", EvictionPhase: repackv1alpha1.PodEvictionAccepted},
-		{Namespace: "ns", PodGroupName: "group-a", EvictionPhase: repackv1alpha1.PodEvictionVictimNotFound},
-		{Namespace: "ns", PodGroupName: "group-b", EvictionPhase: repackv1alpha1.PodEvictionVictimNotFound},
+	relocations := []repackv1alpha1.PodRelocationStatus{
+		{Namespace: "ns", PodGroupName: "group-a", Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted}},
+		{Namespace: "ns", PodGroupName: "group-a"},
+		{Namespace: "ns", PodGroupName: "group-b"},
 	}
-	if !classifyMissingVictims(nominations) {
+	if !classifyMissingVictims(relocations, map[int]string{
+		1: "Victim Pod was not found.",
+		2: "Victim Pod was not found.",
+	}) {
 		t.Fatal("classification unexpectedly reported no change")
 	}
-	if got := nominations[1].EvictionPhase; got != repackv1alpha1.PodEvictionCascadeDeleted {
-		t.Fatalf("accepted sibling phase = %q, want CascadeDeleted", got)
+	if got := relocations[1].Eviction.Phase; got != repackv1alpha1.PodEvictionIndirectlyRemoved {
+		t.Fatalf("accepted sibling phase = %q, want IndirectlyRemoved", got)
 	}
-	if got := nominations[2].EvictionPhase; got != repackv1alpha1.PodEvictionRejected {
+	if got := relocations[2].Eviction.Phase; got != repackv1alpha1.PodEvictionRejected {
 		t.Fatalf("unrelated missing victim phase = %q, want Rejected", got)
 	}
 }

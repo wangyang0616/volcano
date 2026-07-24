@@ -71,7 +71,7 @@ var _ = Describe("Repack DryRun & admission", Serial, func() {
 		Expect(got.Status.Plan.Summary.ResolvedScope.PodGroupCount).To(BeNumerically(">=", 2))
 		Expect(len(got.Status.Plan.Moves)).To(BeNumerically(">=", 1))
 		// DryRun must not evict or nominate.
-		Expect(got.Status.Nominations).To(BeEmpty())
+		Expect(got.Status.Relocations).To(BeEmpty())
 		Expect(runningPodCount(ctx)).To(Equal(before), "DryRun must not evict pods")
 		// Moves carry per-pod from/to and cards.
 		mv := got.Status.Plan.Moves[0]
@@ -98,9 +98,9 @@ var _ = Describe("Repack DryRun & admission", Serial, func() {
 		Expect(got.Status.Plan.Moves).To(BeEmpty())
 	})
 
-	// B5: fragmented but nothing in scope is movable -> BelowGoalThreshold (the
+	// B5: fragmented but nothing in scope is movable -> InsufficientImprovement (the
 	// "fragmented but no worthwhile plan" case), with before==after > 0.
-	It("reports BelowGoalThreshold when fragmented but nothing is movable", func() {
+	It("reports InsufficientImprovement when fragmented but nothing is movable", func() {
 		occupy(ctx, "stuck-a", nodes[0], 4)
 		occupy(ctx, "stuck-b", nodes[1], 2)
 
@@ -116,7 +116,7 @@ var _ = Describe("Repack DryRun & admission", Serial, func() {
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("BelowGoalThreshold"))
+		Expect(completeReason(got)).To(Equal("InsufficientImprovement"))
 		Expect(got.Status.Plan.Summary.FragBeforePercent).To(BeNumerically(">", 0))
 		Expect(got.Status.Plan.Summary.FragAfterPercent).To(Equal(got.Status.Plan.Summary.FragBeforePercent))
 		Expect(got.Status.Plan.Summary.ResolvedScope).NotTo(BeNil())
@@ -182,7 +182,7 @@ var _ = Describe("Repack DryRun & admission", Serial, func() {
 		defer deleteRun(ctx, reject.Name)
 		rejected := waitTerminal(ctx, reject.Name)
 		Expect(rejected.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(rejected)).To(Equal("BelowGoalThreshold"))
+		Expect(completeReason(rejected)).To(Equal("InsufficientImprovement"))
 		Expect(rejected.Status.Plan.Moves).To(BeEmpty())
 	})
 

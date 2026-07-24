@@ -41,7 +41,7 @@ import (
 // plannedVictim is the minimum immutable data needed to resume an eviction
 // without reopening a scheduler planning session.
 type plannedVictim struct {
-	nominationIndex int
+	relocationIndex int
 	namespace       string
 	podGroupName    string
 	podName         string
@@ -51,9 +51,9 @@ type plannedVictim struct {
 }
 
 type evictionSummary struct {
-	accepted       int
-	cascadeDeleted int
-	rejected       int
+	accepted          int
+	indirectlyRemoved int
+	rejected          int
 }
 
 // executePreparedEvictions advances the durable per-Pod eviction journal. Every
@@ -83,60 +83,59 @@ func (e *Engine) executePreparedEvictionsWithClient(
 	preparedPlacementGroups := plannedPodGroups(run)
 	victims := plannedVictims(run)
 	if len(victims) == 0 {
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-			fmt.Errorf("resume evictions: durable plan contains no matching nomination"))
+		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
+			fmt.Errorf("resume evictions: durable plan contains no matching relocation"))
 	}
 
 	evictionHook := hooksFor(run, kubernetesClient).Evict
 	if evictionHook == nil {
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
 			fmt.Errorf("resume evictions: eviction hook is not configured"))
 	}
 
+	missingVictims := make(map[int]string)
 	for _, victim := range victims {
-		nomination := &run.Status.Nominations[victim.nominationIndex]
-		if evictionOutcomeIsFinal(nomination.EvictionPhase) {
+		relocation := &run.Status.Relocations[victim.relocationIndex]
+		if evictionOutcomeIsFinal(relocation.Eviction.Phase) {
 			continue
 		}
 
 		pod, err := kubernetesClient.CoreV1().Pods(victim.namespace).Get(ctx, victim.podName, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
-			phase := repackv1alpha1.PodEvictionVictimNotFound
-			message := "Victim Pod was absent before this eviction attempt."
-			if nomination.EvictionPhase == repackv1alpha1.PodEvictionInProgress {
-				phase = repackv1alpha1.PodEvictionAccepted
-				message = "Victim Pod disappeared after the durable eviction intent; treating the request as accepted during recovery."
-			}
-			if err := e.persistEvictionOutcome(ctx, run, nomination, phase, message); err != nil {
-				return err
+			if relocation.Eviction.Phase == repackv1alpha1.PodEvictionInProgress {
+				if err := e.persistEvictionOutcome(ctx, run, relocation, repackv1alpha1.PodEvictionAccepted,
+					"Victim Pod disappeared after the durable eviction intent; treating the request as accepted during recovery."); err != nil {
+					return err
+				}
+			} else {
+				missingVictims[victim.relocationIndex] = "Victim Pod was absent before this eviction attempt."
 			}
 			continue
 		case err != nil:
 			return fmt.Errorf("observe victim Pod %s/%s before eviction: %w", victim.namespace, victim.podName, err)
 		}
 
-		originalInstanceGone := nomination.VictimPodUID != "" && pod.UID != nomination.VictimPodUID
+		originalInstanceGone := relocation.VictimPodUID != "" && pod.UID != relocation.VictimPodUID
 		originalInstanceTerminating := pod.DeletionTimestamp != nil &&
-			(nomination.VictimPodUID == "" || pod.UID == nomination.VictimPodUID)
+			(relocation.VictimPodUID == "" || pod.UID == relocation.VictimPodUID)
 		if originalInstanceGone || originalInstanceTerminating {
-			phase := repackv1alpha1.PodEvictionVictimNotFound
-			message := "The planned victim is already terminating or has been replaced before this eviction attempt."
-			if nomination.EvictionPhase == repackv1alpha1.PodEvictionInProgress {
-				phase = repackv1alpha1.PodEvictionAccepted
-				message = "The original victim is terminating or gone after the durable eviction intent; treating the request as accepted during recovery."
-			}
-			if err := e.persistEvictionOutcome(ctx, run, nomination, phase, message); err != nil {
-				return err
+			if relocation.Eviction.Phase == repackv1alpha1.PodEvictionInProgress {
+				if err := e.persistEvictionOutcome(ctx, run, relocation, repackv1alpha1.PodEvictionAccepted,
+					"The original victim is terminating or gone after the durable eviction intent; treating the request as accepted during recovery."); err != nil {
+					return err
+				}
+			} else {
+				missingVictims[victim.relocationIndex] = "The planned victim was already terminating or had been replaced before this eviction attempt."
 			}
 			continue
 		}
 
-		if nomination.VictimPodUID == "" {
-			nomination.VictimPodUID = pod.UID
+		if relocation.VictimPodUID == "" {
+			relocation.VictimPodUID = pod.UID
 		}
-		nomination.EvictionPhase = repackv1alpha1.PodEvictionInProgress
-		nomination.EvictionMessage = "Eviction intent is durable; the Eviction API request may now be issued."
+		relocation.Eviction.Phase = repackv1alpha1.PodEvictionInProgress
+		relocation.Eviction.Message = "Eviction intent is durable; the Eviction API request may now be issued."
 		if err := e.updateStatus(ctx, run); err != nil {
 			return fmt.Errorf("persist eviction intent for Pod %s/%s: %w", victim.namespace, victim.podName, err)
 		}
@@ -151,41 +150,43 @@ func (e *Engine) executePreparedEvictionsWithClient(
 			phase = repackv1alpha1.PodEvictionRejected
 			message = evictionErr.Error()
 			if errors.Is(evictionErr, engineframework.ErrVictimNotFound) {
-				phase = repackv1alpha1.PodEvictionVictimNotFound
+				missingVictims[victim.relocationIndex] = "The Eviction API reported that the planned victim Pod was not found."
+				continue
 			}
 		}
-		if err := e.persistEvictionOutcome(ctx, run, nomination, phase, message); err != nil {
+		if err := e.persistEvictionOutcome(ctx, run, relocation, phase, message); err != nil {
 			return err
 		}
 		klog.V(4).InfoS("repack: durable eviction outcome recorded",
 			"run", run.Name, "pod", victim.namespace+"/"+victim.podName,
-			"victimPodUID", nomination.VictimPodUID, "phase", phase,
+			"victimPodUID", relocation.VictimPodUID, "phase", phase,
 			"fromNode", victim.sourceNode, "plannedNode", victim.targetNode,
 			"message", message)
 	}
 
-	// A workload-level recreation may remove the remaining siblings after one
-	// accepted eviction. Classify those NotFound observations only after every
-	// planned victim has been visited, making the result independent of Pod order.
-	if classifyMissingVictims(run.Status.Nominations) {
+	// A workload-level recreation may indirectly remove remaining siblings after
+	// one accepted eviction. Missing is an in-memory observation, not a public
+	// phase. Persist only the final outcome after every victim has been visited so
+	// classification is deterministic regardless of Pod order.
+	if classifyMissingVictims(run.Status.Relocations, missingVictims) {
 		if err := e.updateStatus(ctx, run); err != nil {
-			return fmt.Errorf("persist workload cascade classification: %w", err)
+			return fmt.Errorf("persist indirect victim removal classification: %w", err)
 		}
 	}
 
-	summary := summarizeEvictions(run.Status.Nominations)
+	summary := summarizeEvictions(run.Status.Relocations)
 	plannedVictimCount := plannedVictimCount(run)
-	if classifiedCount := summary.accepted + summary.cascadeDeleted + summary.rejected; classifiedCount < plannedVictimCount {
-		// Rejected nominations are removed after the durable result barrier. If a
-		// later AwaitingPlacement write is retried, recover their count from the
+	if classifiedCount := summary.accepted + summary.indirectlyRemoved + summary.rejected; classifiedCount < plannedVictimCount {
+		// Rejected relocations are removed after the durable result barrier. If a
+		// later placement-reconciliation write is retried, recover their count from the
 		// immutable plan instead of losing it from operator output.
 		summary.rejected += plannedVictimCount - classifiedCount
 	}
 	klog.V(3).InfoS("repack: durable eviction journal completed",
 		"run", run.Name, "acceptedCount", summary.accepted,
-		"cascadeDeletedCount", summary.cascadeDeleted, "rejectedCount", summary.rejected)
+		"indirectlyRemovedCount", summary.indirectlyRemoved, "rejectedCount", summary.rejected)
 
-	retainSuccessfulEvictionNominations(run)
+	retainSuccessfulRelocations(run)
 	initializeExecuteResultFromStatus(run)
 	groupsToRelease := placementGroupsDifference(preparedPlacementGroups, placementPodGroups(run))
 
@@ -197,95 +198,96 @@ func (e *Engine) executePreparedEvictionsWithClient(
 	}
 	if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
 		markExecuteBenefitUnverified(run)
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
+		return e.fail(ctx, run, generation, state.ReasonEvictionFailed, err)
 	}
 
 	realizedFreedNodes := realizedFreedNodeNames(run)
 	if summary.accepted == 0 {
 		e.observeEvictionSummary(run, summary)
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
 			fmt.Errorf("all %d planned evictions were rejected; no Pods were moved", summary.rejected))
 	}
 	if len(realizedFreedNodes) == 0 {
 		e.observeEvictionSummary(run, summary)
-		return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
 			fmt.Errorf("Eviction API accepted %d Pods and workload recreation removed %d additional planned Pods, but no planned node was fully vacated (%d requests rejected)",
-				summary.accepted, summary.cascadeDeleted, summary.rejected))
+				summary.accepted, summary.indirectlyRemoved, summary.rejected))
 	}
 
-	state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
-		state.ReasonAwaitingPlacement, placementProgressMessage(run, targetResource), generation)
-	run.Status.Phase = state.DerivePhase(run.Status.Conditions)
+	state.MarkRunning(run, state.ReasonReconcilingPlacements, placementProgressMessage(run, targetResource))
 	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist awaiting placement status: %w", err)
 	}
-	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonAwaitingPlacement,
+	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonReconcilingPlacements,
 		placementProgressMessage(run, targetResource))
 	e.observeEvictionSummary(run, summary)
 	klog.V(3).InfoS("repack: accepted evictions are awaiting replacement placement",
 		"run", run.Name, "acceptedCount", summary.accepted,
-		"cascadeDeletedCount", summary.cascadeDeleted,
+		"indirectlyRemovedCount", summary.indirectlyRemoved,
 		"rejectedCount", summary.rejected, "realizedFreedNodes", realizedFreedNodes,
-		"nominationCount", len(run.Status.Nominations))
+		"relocationCount", len(run.Status.Relocations))
 	e.workQueue.AddAfter(run.Name, placementRetryInterval)
 	return nil
 }
 
 func (e *Engine) observeEvictionSummary(run *repackv1alpha1.RepackRun, summary evictionSummary) {
 	metrics.ObserveEvictions(summary.accepted, summary.rejected)
-	metrics.ObserveCascadeDeletions(summary.cascadeDeleted)
+	metrics.ObserveIndirectRemovals(summary.indirectlyRemoved)
 	eventType := v1.EventTypeNormal
 	if summary.rejected > 0 {
 		eventType = v1.EventTypeWarning
 	}
 	e.recordRunEvent(run, eventType, eventReasonEvictionsIssued,
-		fmt.Sprintf("Eviction API accepted %d Pods; workload recreation removed %d additional planned Pods; %d requests were rejected.",
-			summary.accepted, summary.cascadeDeleted, summary.rejected))
-	if summary.cascadeDeleted > 0 {
-		e.recordRunEvent(run, v1.EventTypeNormal, eventReasonCascadeDeletionObserved,
-			fmt.Sprintf("Retained %d replacement placement intents for Pods removed by workload-level recreation.",
-				summary.cascadeDeleted))
+		fmt.Sprintf("Eviction API accepted %d Pods; %d additional planned Pods were indirectly removed; %d requests were rejected.",
+			summary.accepted, summary.indirectlyRemoved, summary.rejected))
+	if summary.indirectlyRemoved > 0 {
+		e.recordRunEvent(run, v1.EventTypeNormal, eventReasonIndirectRemovalObserved,
+			fmt.Sprintf("Retained %d replacement placements after their original Pods were indirectly removed.",
+				summary.indirectlyRemoved))
 	}
 }
 
-func classifyMissingVictims(nominations []repackv1alpha1.PodNomination) bool {
+func classifyMissingVictims(relocations []repackv1alpha1.PodRelocationStatus, missingVictims map[int]string) bool {
+	if len(missingVictims) == 0 {
+		return false
+	}
 	acceptedPodGroups := map[string]struct{}{}
-	for index := range nominations {
-		nomination := &nominations[index]
-		if nomination.EvictionPhase == repackv1alpha1.PodEvictionAccepted {
-			acceptedPodGroups[nomination.Namespace+"/"+nomination.PodGroupName] = struct{}{}
+	for index := range relocations {
+		relocation := &relocations[index]
+		if relocation.Eviction.Phase == repackv1alpha1.PodEvictionAccepted {
+			acceptedPodGroups[relocation.Namespace+"/"+relocation.PodGroupName] = struct{}{}
 		}
 	}
-	changed := false
-	for index := range nominations {
-		nomination := &nominations[index]
-		if nomination.EvictionPhase != repackv1alpha1.PodEvictionVictimNotFound {
+	for index, observation := range missingVictims {
+		if index < 0 || index >= len(relocations) {
 			continue
 		}
-		if _, found := acceptedPodGroups[nomination.Namespace+"/"+nomination.PodGroupName]; found {
-			nomination.EvictionPhase = repackv1alpha1.PodEvictionCascadeDeleted
-			nomination.EvictionMessage = "A sibling eviction caused the workload to recreate this PodGroup; replacement placement remains required."
+		relocation := &relocations[index]
+		if _, found := acceptedPodGroups[relocation.Namespace+"/"+relocation.PodGroupName]; found {
+			relocation.Eviction.Phase = repackv1alpha1.PodEvictionIndirectlyRemoved
+			relocation.Eviction.Message = observation +
+				" Another eviction in the same PodGroup was accepted, so Repack is treating this victim as indirectly removed and retaining replacement placement."
 		} else {
-			nomination.EvictionPhase = repackv1alpha1.PodEvictionRejected
-			nomination.EvictionMessage = "Victim Pod was not found and no accepted sibling eviction proves a workload-level cascade."
+			relocation.Eviction.Phase = repackv1alpha1.PodEvictionRejected
+			relocation.Eviction.Message = observation +
+				" No accepted eviction in the same PodGroup supports an indirect removal, so replacement placement will not be attempted."
 		}
-		changed = true
 	}
-	return changed
+	return true
 }
 
 func (e *Engine) persistEvictionOutcome(
 	ctx context.Context,
 	run *repackv1alpha1.RepackRun,
-	nomination *repackv1alpha1.PodNomination,
+	relocation *repackv1alpha1.PodRelocationStatus,
 	phase repackv1alpha1.PodEvictionPhase,
 	message string,
 ) error {
-	nomination.EvictionPhase = phase
-	nomination.EvictionMessage = message
+	relocation.Eviction.Phase = phase
+	relocation.Eviction.Message = message
 	if err := e.updateStatus(ctx, run); err != nil {
 		return fmt.Errorf("persist eviction outcome %s for Pod %s/%s: %w",
-			phase, nomination.Namespace, nomination.VictimPodName, err)
+			phase, relocation.Namespace, relocation.VictimPodName, err)
 	}
 	return nil
 }
@@ -294,9 +296,9 @@ func plannedVictims(run *repackv1alpha1.RepackRun) []plannedVictim {
 	if run == nil || run.Status.Plan == nil {
 		return nil
 	}
-	nominationIndexes := make(map[placementIdentity]int, len(run.Status.Nominations))
-	for index := range run.Status.Nominations {
-		nominationIndexes[placementIdentityForNomination(&run.Status.Nominations[index])] = index
+	relocationIndexes := make(map[placementIdentity]int, len(run.Status.Relocations))
+	for index := range run.Status.Relocations {
+		relocationIndexes[placementIdentityForRelocation(&run.Status.Relocations[index])] = index
 	}
 	freedNodes := make(map[string]struct{}, len(run.Status.Plan.FreedNodes))
 	for _, nodeName := range run.Status.Plan.FreedNodes {
@@ -308,13 +310,13 @@ func plannedVictims(run *repackv1alpha1.RepackRun) []plannedVictim {
 		for podIndex := range move.Pods {
 			pod := &move.Pods[podIndex]
 			identity := placementIdentityForMove(move.Namespace, move.PodGroupName, pod.Name, pod.ToNode)
-			nominationIndex, found := nominationIndexes[identity]
+			relocationIndex, found := relocationIndexes[identity]
 			if !found {
 				continue
 			}
 			_, freesNode := freedNodes[pod.FromNode]
 			victims = append(victims, plannedVictim{
-				nominationIndex: nominationIndex,
+				relocationIndex: relocationIndex,
 				namespace:       move.Namespace,
 				podGroupName:    move.PodGroupName,
 				podName:         pod.Name,
@@ -364,7 +366,7 @@ func plannedVictimCount(run *repackv1alpha1.RepackRun) int {
 func evictionOutcomeIsFinal(phase repackv1alpha1.PodEvictionPhase) bool {
 	switch phase {
 	case repackv1alpha1.PodEvictionAccepted,
-		repackv1alpha1.PodEvictionCascadeDeleted,
+		repackv1alpha1.PodEvictionIndirectlyRemoved,
 		repackv1alpha1.PodEvictionRejected:
 		return true
 	default:
@@ -372,14 +374,14 @@ func evictionOutcomeIsFinal(phase repackv1alpha1.PodEvictionPhase) bool {
 	}
 }
 
-func summarizeEvictions(nominations []repackv1alpha1.PodNomination) evictionSummary {
+func summarizeEvictions(relocations []repackv1alpha1.PodRelocationStatus) evictionSummary {
 	var summary evictionSummary
-	for index := range nominations {
-		switch nominations[index].EvictionPhase {
+	for index := range relocations {
+		switch relocations[index].Eviction.Phase {
 		case repackv1alpha1.PodEvictionAccepted:
 			summary.accepted++
-		case repackv1alpha1.PodEvictionCascadeDeleted:
-			summary.cascadeDeleted++
+		case repackv1alpha1.PodEvictionIndirectlyRemoved:
+			summary.indirectlyRemoved++
 		case repackv1alpha1.PodEvictionRejected:
 			summary.rejected++
 		}
@@ -387,27 +389,27 @@ func summarizeEvictions(nominations []repackv1alpha1.PodNomination) evictionSumm
 	return summary
 }
 
-func retainSuccessfulEvictionNominations(run *repackv1alpha1.RepackRun) {
-	retained := make([]repackv1alpha1.PodNomination, 0, len(run.Status.Nominations))
-	for index := range run.Status.Nominations {
-		nomination := run.Status.Nominations[index]
-		if nomination.EvictionPhase == repackv1alpha1.PodEvictionAccepted ||
-			nomination.EvictionPhase == repackv1alpha1.PodEvictionCascadeDeleted {
-			retained = append(retained, nomination)
+func retainSuccessfulRelocations(run *repackv1alpha1.RepackRun) {
+	retained := make([]repackv1alpha1.PodRelocationStatus, 0, len(run.Status.Relocations))
+	for index := range run.Status.Relocations {
+		relocation := run.Status.Relocations[index]
+		if relocation.Eviction.Phase == repackv1alpha1.PodEvictionAccepted ||
+			relocation.Eviction.Phase == repackv1alpha1.PodEvictionIndirectlyRemoved {
+			retained = append(retained, relocation)
 		}
 	}
-	run.Status.Nominations = retained
+	run.Status.Relocations = retained
 }
 
 func initializeExecuteResultFromStatus(run *repackv1alpha1.RepackRun) {
 	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
 		return
 	}
-	accepted := make(map[placementIdentity]struct{}, len(run.Status.Nominations))
-	for index := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[index]
-		if nomination.EvictionPhase == repackv1alpha1.PodEvictionAccepted {
-			accepted[placementIdentityForNomination(nomination)] = struct{}{}
+	accepted := make(map[placementIdentity]struct{}, len(run.Status.Relocations))
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if relocation.Eviction.Phase == repackv1alpha1.PodEvictionAccepted {
+			accepted[placementIdentityForRelocation(relocation)] = struct{}{}
 		}
 	}
 	var movedCards int64

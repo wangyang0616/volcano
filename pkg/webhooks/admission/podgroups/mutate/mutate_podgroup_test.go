@@ -155,8 +155,8 @@ func TestCreateRepackPlacementLeasePatch(t *testing.T) {
 				Namespace: "ns", PodGroupName: "old",
 				Owner: &repackv1alpha1.WorkloadRef{APIVersion: "serving.example/v1", Kind: "Serving", Name: "model"},
 			}}},
-			Nominations: []repackv1alpha1.PodNomination{{
-				Namespace: "ns", PodGroupName: "old", Phase: repackv1alpha1.PodPlacementPrepared,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "old", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		},
 	}

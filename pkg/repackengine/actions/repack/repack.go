@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package repack is the planning action: run the selected core to produce a plan
 // and render the report. Execute side effects deliberately live in the engine
-// driver, after the plan and nomination intents have been durably persisted.
+// driver, after the plan and relocation journal have been durably persisted.
 // Future planning actions (relief, simulate) compose after it in the pipeline.
 package repack
 
