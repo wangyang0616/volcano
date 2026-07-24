@@ -31,9 +31,7 @@ type PodGroupView struct {
 	Footprint    int64 // gang's total accelerator cards (whole-gang blast radius)
 }
 
-// PodGroupViewer supplies per-PodGroup facts (MinAvailable/Running/Priority/
-// Footprint) to the scoring strategies. framework.Snapshot satisfies it, so the
-// engine Session just hands its snapshot in — no lookup closure to thread through.
+// PodGroupViewer supplies disruption-scoring facts.
 type PodGroupViewer interface {
 	PodGroupView(id api.JobID) PodGroupView
 }

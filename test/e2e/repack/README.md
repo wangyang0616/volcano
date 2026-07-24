@@ -20,7 +20,7 @@ The Repack suite mutates node capacity, node taints, and the singleton
 
 Unit tests remain the primary coverage for deterministic failure injection:
 API conflicts/retries, panic recovery, active Execute serialization, stale lease
-ownership, exact/identity/fungible matching, eviction grace periods, and planner
+ownership, exact/hash/homogeneous-PodGroup matching, eviction grace periods, and planner
 performance bounds.
 
 The suite intentionally does not claim coverage for real accelerator device
@@ -61,7 +61,9 @@ Replacement Pod Events describe the concrete placement:
 
 `RepackReplacementGated` → `RepackPlacementNominated` →
 `RepackPlacementSucceeded`, or `RepackPlacementDrifted` /
-`RepackPlacementReleased`.
+`RepackPlacementReleased`. `RepackPlacementRecovered` reports that a new Pod
+took over a stale claim from a deleted replacement; `RepackPlacementNotMatched`
+reports that an unrelated scale-out Pod was released with a single event.
 
 Log levels follow this contract:
 

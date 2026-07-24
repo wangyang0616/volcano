@@ -31,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	"volcano.sh/repack-controller/pkg/placement"
 	state "volcano.sh/repack-controller/pkg/state"
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
@@ -293,11 +294,25 @@ func markExecuteNotPerformed(run *repackv1alpha1.RepackRun) {
 // prepareExecuteNominations records the complete set of placement intents before
 // the eviction barrier. A later commit filters this set to Pods that actually
 // require replacement: accepted evictions plus confirmed group cascades.
-func prepareExecuteNominations(run *repackv1alpha1.RepackRun, plan *engineapi.RepackPlan, nominationTTL time.Duration) {
+type podGroupPlacementPolicyReader interface {
+	PodGroupUsesSubGroupPolicy(schedapi.JobID) bool
+}
+
+func prepareExecuteNominations(
+	run *repackv1alpha1.RepackRun,
+	plan *engineapi.RepackPlan,
+	nominationTTL time.Duration,
+	policyReader podGroupPlacementPolicyReader,
+) error {
 	if run == nil {
-		return
+		return nil
 	}
-	run.Status.Nominations = buildPodNominations(plan, nominationTTL)
+	nominations, err := buildPodNominations(plan, nominationTTL, policyReader)
+	if err != nil {
+		return err
+	}
+	run.Status.Nominations = nominations
+	return nil
 }
 
 // retainRealizedNominations keeps only intents whose Pods were removed by an
@@ -306,22 +321,29 @@ func prepareExecuteNominations(run *repackv1alpha1.RepackRun, plan *engineapi.Re
 func retainRealizedNominations(
 	existing []repackv1alpha1.PodNomination,
 	realizedPlan *engineapi.RepackPlan,
-	nominationTTL time.Duration,
 ) []repackv1alpha1.PodNomination {
-	realized := buildPodNominations(realizedPlan, nominationTTL)
+	if realizedPlan == nil {
+		return nil
+	}
+	realized := make(map[placementIdentity]struct{}, len(realizedPlan.Moves))
+	for _, move := range realizedPlan.Moves {
+		if move == nil || move.Task == nil || move.To == move.From {
+			continue
+		}
+		_, podGroupName := splitPodGroupID(string(move.Task.Job))
+		realized[placementIdentityForMove(
+			move.Task.Namespace, podGroupName, move.Task.Name, move.To)] = struct{}{}
+	}
 	if len(realized) == 0 {
 		return nil
 	}
-	existingByKey := make(map[placementIdentity]repackv1alpha1.PodNomination, len(existing))
+	retained := make([]repackv1alpha1.PodNomination, 0, len(realized))
 	for index := range existing {
-		existingByKey[placementIdentityForNomination(&existing[index])] = existing[index]
-	}
-	for index := range realized {
-		if record, found := existingByKey[placementIdentityForNomination(&realized[index])]; found {
-			realized[index] = record
+		if _, found := realized[placementIdentityForNomination(&existing[index])]; found {
+			retained = append(retained, existing[index])
 		}
 	}
-	return realized
+	return retained
 }
 
 // initializeExecuteResult publishes the accepted disruption amount immediately
@@ -533,28 +555,56 @@ func percentagePoints(fraction float64) int32 {
 	return percentage
 }
 
-// buildPodNominations renders per-pod placement-steering intents (Execute-only). Claiming
-// follows the placement identity contract (proposal §5.2.2): victimPodName exact
-// match, then identityLabels (label-superset match), then fungible. IdentityLabels
-// are resolved from the victim pod's own well-known labels by the framework.
-func buildPodNominations(plan *engineapi.RepackPlan, nominationTTL time.Duration) []repackv1alpha1.PodNomination {
+// buildPodNominations renders per-Pod placement-steering intents. PodGroups
+// without SubGroup policies are explicitly treated as homogeneous, so they do
+// not pay the API-size cost of storing a hash on every nomination. A SubGroup
+// policy opts the PodGroup into hash-based matching for renamed heterogeneous
+// replacements.
+func buildPodNominations(
+	plan *engineapi.RepackPlan,
+	nominationTTL time.Duration,
+	policyReader podGroupPlacementPolicyReader,
+) ([]repackv1alpha1.PodNomination, error) {
 	if plan == nil {
-		return nil
+		return nil, nil
+	}
+	if policyReader == nil {
+		return nil, fmt.Errorf("PodGroup placement policy reader is required")
 	}
 	expirationTime := metav1.NewTime(time.Now().Add(nominationTTL))
-	intents := engineframework.NominationIntents(plan)
-	nominations := make([]repackv1alpha1.PodNomination, 0, len(intents))
-	for _, intent := range intents {
-		_, podGroupName := splitPodGroupID(string(intent.Gang))
+	nominations := make([]repackv1alpha1.PodNomination, 0, len(plan.Moves))
+	for _, move := range plan.Moves {
+		if move == nil || move.Task == nil || move.To == move.From {
+			continue
+		}
+		task := move.Task
+		_, podGroupName := splitPodGroupID(string(task.Job))
+		schedulingRequirementsHash := ""
+		if policyReader.PodGroupUsesSubGroupPolicy(task.Job) {
+			var err error
+			schedulingRequirementsHash, err = placement.SchedulingRequirementsHash(task.Pod)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"derive scheduling requirements for SubGroup victim Pod %s/%s in PodGroup %s: %w",
+					task.Namespace, task.Name, task.Job, err)
+			}
+			klog.V(4).InfoS("repack: recorded scheduling requirements for SubGroup replacement matching",
+				"pod", task.Namespace+"/"+task.Name, "podGroup", task.Job,
+				"schedulingRequirementsHash", schedulingRequirementsHash)
+		}
 		nominations = append(nominations, repackv1alpha1.PodNomination{
-			Namespace:      intent.Namespace,
-			PodGroupName:   podGroupName,
-			VictimPodName:  intent.PodName,
-			IdentityLabels: intent.IdentityLabels,
-			NodeName:       intent.Node,
-			Phase:          repackv1alpha1.PodPlacementPrepared,
-			ExpirationTime: &expirationTime,
+			Namespace:                  task.Namespace,
+			PodGroupName:               podGroupName,
+			VictimPodName:              task.Name,
+			SchedulingRequirementsHash: schedulingRequirementsHash,
+			NodeName:                   move.To,
+			Phase:                      repackv1alpha1.PodPlacementPrepared,
+			ExpirationTime:             &expirationTime,
 		})
 	}
-	return nominations
+	sort.Slice(nominations, func(left, right int) bool {
+		return placementIdentityForNomination(&nominations[left]).less(
+			placementIdentityForNomination(&nominations[right]))
+	})
+	return nominations, nil
 }

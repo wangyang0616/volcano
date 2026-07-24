@@ -63,7 +63,22 @@ func TestNominatorSerializesRepackRunStatusWrites(t *testing.T) {
 
 func matchNomination(n *Nominator, pod *corev1.Pod) (*repackv1alpha1.PodNomination, string) {
 	runs, _ := n.repackRunLister.List(labels.Everything())
-	return n.matchNominationInRuns(pod, runs)
+	candidateHash := testSchedulingRequirementsHash(pod)
+	for _, run := range runs {
+		nomination, _ := n.matchNomination(run, pod, candidateHash)
+		if nomination != nil {
+			return nomination, run.Name
+		}
+	}
+	return nil, ""
+}
+
+func testSchedulingRequirementsHash(pod *corev1.Pod) string {
+	hash, err := placement.SchedulingRequirementsHash(pod)
+	if err != nil {
+		panic(err)
+	}
+	return hash
 }
 
 func runWithNoms(name string, noms ...repackv1alpha1.PodNomination) *repackv1alpha1.RepackRun {
@@ -121,22 +136,6 @@ func TestNeedsNomination(t *testing.T) {
 	}
 }
 
-func TestLabelsMatch(t *testing.T) {
-	pod := map[string]string{"a": "1", "b": "2", "c": "3"}
-	if !labelsMatch(pod, map[string]string{"a": "1", "b": "2"}) {
-		t.Error("superset should match")
-	}
-	if !labelsMatch(pod, nil) {
-		t.Error("empty want matches anything")
-	}
-	if labelsMatch(pod, map[string]string{"a": "9"}) {
-		t.Error("value mismatch should not match")
-	}
-	if labelsMatch(pod, map[string]string{"z": "1"}) {
-		t.Error("missing key should not match")
-	}
-}
-
 func TestMatchNomination(t *testing.T) {
 	future := metav1.NewTime(time.Unix(5000, 0)) // > now (1000)
 	past := metav1.NewTime(time.Unix(500, 0))    // < now
@@ -161,24 +160,44 @@ func TestMatchNomination(t *testing.T) {
 		}
 	})
 
-	t.Run("identityLabels superset match", func(t *testing.T) {
+	t.Run("scheduling requirements hash match", func(t *testing.T) {
+		pod := pendingPod("ns", "renamed-xyz", "g", nil)
+		pod.Spec.NodeSelector = map[string]string{"accelerator": "npu"}
 		n := nominatorWith(runWithNoms("r1",
-			repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", IdentityLabels: map[string]string{"apps.kubernetes.io/pod-index": "3"}, NodeName: "n5", ExpirationTime: &future},
+			repackv1alpha1.PodNomination{
+				Namespace: "ns", PodGroupName: "g",
+				SchedulingRequirementsHash: testSchedulingRequirementsHash(pod),
+				NodeName:                   "n5", ExpirationTime: &future,
+			},
 		))
-		pod := pendingPod("ns", "renamed-xyz", "g", map[string]string{"apps.kubernetes.io/pod-index": "3", "other": "x"})
 		rec, owner := matchNomination(n, pod)
 		if rec == nil || owner != "r1" || rec.NodeName != "n5" {
-			t.Fatalf("identity match failed: rec=%+v", rec)
+			t.Fatalf("scheduling requirements match failed: rec=%+v", rec)
 		}
 	})
 
-	t.Run("fungible when identityLabels empty", func(t *testing.T) {
+	t.Run("homogeneous PodGroup when scheduling requirements hash is empty", func(t *testing.T) {
 		n := nominatorWith(runWithNoms("r1",
 			repackv1alpha1.PodNomination{Namespace: "ns", PodGroupName: "g", NodeName: "n1", ExpirationTime: &future},
 		))
 		rec, owner := matchNomination(n, pendingPod("ns", "any-pod", "g", nil))
 		if rec == nil || owner != "r1" || rec.NodeName != "n1" {
-			t.Fatalf("fungible match failed: rec=%+v", rec)
+			t.Fatalf("homogeneous PodGroup match failed: rec=%+v", rec)
+		}
+	})
+
+	t.Run("different scheduling requirements do not match", func(t *testing.T) {
+		victim := pendingPod("ns", "old", "g", nil)
+		victim.Spec.NodeSelector = map[string]string{"accelerator": "npu"}
+		replacement := pendingPod("ns", "new", "g", nil)
+		replacement.Spec.NodeSelector = map[string]string{"accelerator": "gpu"}
+		n := nominatorWith(runWithNoms("r1", repackv1alpha1.PodNomination{
+			Namespace: "ns", PodGroupName: "g", VictimPodName: victim.Name,
+			SchedulingRequirementsHash: testSchedulingRequirementsHash(victim),
+			NodeName:                   "n5", ExpirationTime: &future,
+		}))
+		if rec, _ := matchNomination(n, replacement); rec != nil {
+			t.Fatalf("different scheduling requirements must not match: %+v", rec)
 		}
 	})
 
@@ -194,7 +213,7 @@ func TestMatchNomination(t *testing.T) {
 	})
 }
 
-func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
+func TestHomogeneousNominationWaitsForVictimDeletion(t *testing.T) {
 	future := metav1.NewTime(time.Unix(5000, 0))
 	n := nominatorWith(runWithNoms("r1", repackv1alpha1.PodNomination{
 		Namespace: "ns", PodGroupName: "g", VictimPodName: "old", NodeName: "n2", ExpirationTime: &future,
@@ -218,8 +237,10 @@ func TestFungibleNominationWaitsForVictimDeletion(t *testing.T) {
 	}
 }
 
-func TestMatchNominationUsesRecordedReplacementPodGroupForEveryIdentityStrategy(t *testing.T) {
+func TestMatchNominationUsesRecordedReplacementPodGroupForEveryMatchingStrategy(t *testing.T) {
 	future := metav1.NewTime(time.Unix(5000, 0))
+	hashMatchedPod := pendingPod("ns", "new-worker", "new", nil)
+	hashMatchedPod.Spec.NodeSelector = map[string]string{"accelerator": "npu"}
 	tests := []struct {
 		name       string
 		nomination repackv1alpha1.PodNomination
@@ -234,16 +255,16 @@ func TestMatchNominationUsesRecordedReplacementPodGroupForEveryIdentityStrategy(
 			pod: pendingPod("ns", "worker-0", "new", nil),
 		},
 		{
-			name: "identity label",
+			name: "scheduling requirements hash",
 			nomination: repackv1alpha1.PodNomination{
 				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
 				VictimPodName: "old-worker", NodeName: "node-a", ExpirationTime: &future,
-				IdentityLabels: map[string]string{"apps.kubernetes.io/pod-index": "1"},
+				SchedulingRequirementsHash: testSchedulingRequirementsHash(hashMatchedPod),
 			},
-			pod: pendingPod("ns", "new-worker", "new", map[string]string{"apps.kubernetes.io/pod-index": "1"}),
+			pod: hashMatchedPod,
 		},
 		{
-			name: "fungible Pod",
+			name: "homogeneous PodGroup",
 			nomination: repackv1alpha1.PodNomination{
 				Namespace: "ns", PodGroupName: "old", ReplacementPodGroupName: "new",
 				VictimPodName: "old-random", NodeName: "node-a", ExpirationTime: &future,
@@ -289,24 +310,35 @@ func TestRemovePlacementGateRemovesOwnerMarker(t *testing.T) {
 	t.Fatal("expected Pod patch")
 }
 
-func TestPendingPlacementForPodGroup(t *testing.T) {
-	pod := pendingPod("ns", "scale-out", "group", nil)
+func TestHasClaimableNominationForPodGroup(t *testing.T) {
 	future := metav1.NewTime(time.Unix(5000, 0))
 	run := runWithNoms("run", repackv1alpha1.PodNomination{
 		Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", Phase: repackv1alpha1.PodPlacementPrepared, ExpirationTime: &future,
 	})
-	run.Spec.Mode = repackv1alpha1.RepackModeExecute
-	run.Status.Phase = repackv1alpha1.RepackRunning
-	if !pendingPlacementForPodGroup(run, pod, time.Unix(1000, 0)) {
-		t.Fatal("unconsumed placement in the same PodGroup must hold an ambiguous Pod")
+	if !hasClaimableNominationForPodGroup(run, "ns", "group", "", time.Unix(1000, 0)) {
+		t.Fatal("homogeneous pending placement in the same PodGroup must remain a potential match")
+	}
+	run.Status.Nominations[0].SchedulingRequirementsHash = "hash-a"
+	if hasClaimableNominationForPodGroup(run, "ns", "group", "hash-b", time.Unix(1000, 0)) {
+		t.Fatal("a different scheduling requirements hash must not hold an unrelated Pod")
+	}
+	if !hasClaimableNominationForPodGroup(run, "ns", "group", "hash-a", time.Unix(1000, 0)) {
+		t.Fatal("the same scheduling requirements hash must remain a potential match")
 	}
 	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
-	if pendingPlacementForPodGroup(run, pod, time.Unix(1000, 0)) {
+	if hasClaimableNominationForPodGroup(run, "ns", "group", "hash-a", time.Unix(1000, 0)) {
 		t.Fatal("placed nomination must not hold an unrelated Pod")
+	}
+
+	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementGated
+	run.Status.Nominations[0].ReplacementPodName = "claimed"
+	run.Status.Nominations[0].ReplacementPodUID = "claimed-uid"
+	if hasClaimableNominationForPodGroup(run, "ns", "group", "hash-a", time.Unix(1000, 0)) {
+		t.Fatal("a placement claimed by another gated Pod must not hold an unrelated Pod")
 	}
 }
 
-func TestPendingPlacementForLeasedWorkloadProtectsUnmappedPodGroup(t *testing.T) {
+func TestPotentialNominationProtectsOnlyCompatiblePodInUnmappedPodGroup(t *testing.T) {
 	controller := true
 	run := runWithNoms("run", repackv1alpha1.PodNomination{
 		Namespace: "ns", PodGroupName: "old", VictimPodName: "old-0",
@@ -325,9 +357,12 @@ func TestPendingPlacementForLeasedWorkloadProtectsUnmappedPodGroup(t *testing.T)
 			APIVersion: "serving.example/v1", Kind: "Serving", Name: "model", Controller: &controller,
 		}},
 	}}
-	nominator := &Nominator{volcanoClient: vcfake.NewSimpleClientset(podGroup)}
-	pending, err := nominator.pendingPlacementForLeasedWorkload(
-		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil))
+	nominator := &Nominator{
+		volcanoClient: vcfake.NewSimpleClientset(podGroup),
+		now:           func() time.Time { return time.Unix(1000, 0) },
+	}
+	pending, err := nominator.hasPotentialNominationForPod(
+		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,8 +371,8 @@ func TestPendingPlacementForLeasedWorkloadProtectsUnmappedPodGroup(t *testing.T)
 	}
 
 	run.Status.Nominations[0].Phase = repackv1alpha1.PodPlacementPlaced
-	pending, err = nominator.pendingPlacementForLeasedWorkload(
-		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil))
+	pending, err = nominator.hasPotentialNominationForPod(
+		context.Background(), run, pendingPod("ns", "candidate-0", "candidate", nil), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,10 +783,10 @@ func TestMarkPlacementGatedClaimsFreshUnassignedNomination(t *testing.T) {
 	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
 	nominator := &Nominator{volcanoClient: volcanoClient, now: time.Now}
 
-	if err := nominator.markPlacementGated(context.Background(), run.Name, first); err != nil {
+	if err := nominator.markPlacementGated(context.Background(), run.Name, first, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := nominator.markPlacementGated(context.Background(), run.Name, second); err != nil {
+	if err := nominator.markPlacementGated(context.Background(), run.Name, second, ""); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
@@ -768,6 +803,100 @@ func TestMarkPlacementGatedClaimsFreshUnassignedNomination(t *testing.T) {
 	}
 	if !got[first.Name] || !got[second.Name] {
 		t.Fatalf("replacement claims = %v, want both Pods", got)
+	}
+}
+
+func TestReconcileRecoversDeletedReplacementInSamePodGroup(t *testing.T) {
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1",
+		ReplacementPodName: "deleted-replacement", ReplacementPodUID: "deleted-uid",
+		Phase: repackv1alpha1.PodPlacementGated,
+	})
+	replacement := pendingPod("ns", "new-replacement", "group", nil)
+	replacement.UID = "new-uid"
+	replacement.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+	replacement.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] =
+		placement.OwnerValue(run.Name, run.UID)
+
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := pods.Add(replacement); err != nil {
+		t.Fatal(err)
+	}
+	recorder := record.NewFakeRecorder(10)
+	nominator := &Nominator{
+		kubernetesClient: k8sfake.NewSimpleClientset(replacement.DeepCopy()),
+		volcanoClient:    vcfake.NewSimpleClientset(run.DeepCopy()),
+		podLister:        corelisters.NewPodLister(pods),
+		recorder:         recorder,
+		now:              func() time.Time { return time.Unix(1000, 0) },
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/new-replacement"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := nominator.volcanoClient.RepackV1alpha1().RepackRuns().Get(
+		context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nomination := updated.Status.Nominations[0]
+	if nomination.Phase != repackv1alpha1.PodPlacementGated ||
+		nomination.ReplacementPodName != replacement.Name ||
+		nomination.ReplacementPodUID != replacement.UID {
+		t.Fatalf("replacement did not take over the recovered placement: %+v", nomination)
+	}
+	expectRecorderEvent(t, recorder, eventReasonPlacementRecovered)
+}
+
+func TestReconcileReleasesScaleOutPodWhenPlacementAlreadyClaimed(t *testing.T) {
+	run := runWithNoms("run", repackv1alpha1.PodNomination{
+		Namespace: "ns", PodGroupName: "group", VictimPodName: "victim", NodeName: "n1",
+		ReplacementPodName: "claimed", ReplacementPodUID: "claimed-uid",
+		Phase: repackv1alpha1.PodPlacementGated,
+	})
+	claimed := pendingPod("ns", "claimed", "group", nil)
+	claimed.UID = "claimed-uid"
+	scaleOut := pendingPod("ns", "scale-out", "group", nil)
+	scaleOut.UID = "scale-out-uid"
+	scaleOut.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+	scaleOut.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] =
+		placement.OwnerValue(run.Name, run.UID)
+
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, pod := range []*corev1.Pod{claimed, scaleOut} {
+		if err := pods.Add(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorder := record.NewFakeRecorder(10)
+	kubernetesClient := k8sfake.NewSimpleClientset(claimed.DeepCopy(), scaleOut.DeepCopy())
+	nominator := &Nominator{
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    vcfake.NewSimpleClientset(run.DeepCopy()),
+		podLister:        corelisters.NewPodLister(pods),
+		recorder:         recorder,
+		now:              func() time.Time { return time.Unix(1000, 0) },
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/scale-out"); err != nil {
+		t.Fatal(err)
+	}
+	updatedScaleOut, err := kubernetesClient.CoreV1().Pods("ns").Get(
+		context.Background(), scaleOut.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasPlacementGate(updatedScaleOut) ||
+		updatedScaleOut.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] != "" {
+		t.Fatalf("unrelated scale-out Pod remained gated: %+v", updatedScaleOut)
+	}
+	expectRecorderEvent(t, recorder, eventReasonPlacementNotMatched)
+	select {
+	case event := <-recorder.Events:
+		if strings.Contains(event, eventReasonPlacementReleased) {
+			t.Fatalf("gate release emitted a redundant event: %s", event)
+		}
+	default:
 	}
 }
 
@@ -888,7 +1017,8 @@ func TestEnsureReplacementPodGroupAdvancesAfterRepeatedRecreation(t *testing.T) 
 			t.Fatalf("nomination[%d] was not reset for the next PodGroup generation: %+v", index, nomination)
 		}
 	}
-	if nomination, _ := nominator.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{updated}); nomination == nil {
+	if nomination, _ := nominator.matchNomination(
+		updated, pod, testSchedulingRequirementsHash(pod)); nomination == nil {
 		t.Fatal("same-name Pod in replacement-v2 did not match the advanced PodGroup mapping")
 	}
 }

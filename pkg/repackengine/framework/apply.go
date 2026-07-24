@@ -30,24 +30,7 @@ import (
 	"fmt"
 	"sort"
 
-	corev1 "k8s.io/api/core/v1"
-
-	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
-	schedapi "volcano.sh/volcano/pkg/scheduler/api"
-
 	"volcano.sh/volcano/pkg/repackengine/api"
-)
-
-// Placement identity contract well-known label keys (§5.2.2). resolveIdentityLabels
-// reads only these standard keys off the pod itself — no per-workload label scheme
-// is hardcoded.
-const (
-	// labelPodIdentity is the declarative Tier-1 identity (workload-provided).
-	labelPodIdentity = repackv1alpha1.PodIdentityLabel
-	// labelStatefulSetPodIndex / labelJobCompletionIndex are the standard K8s
-	// per-pod index labels used as native-adapter identities.
-	labelStatefulSetPodIndex = "apps.kubernetes.io/pod-index"
-	labelJobCompletionIndex  = "batch.kubernetes.io/job-completion-index"
 )
 
 // Nomination is a placement hint written on a concrete pending pod
@@ -56,78 +39,6 @@ const (
 type Nomination struct {
 	PodRef string // "namespace/name"
 	Node   string
-}
-
-// NominationIntent is the durable steering record for ONE relocated pod: after
-// the victim is evicted, its replacement should be nominated to Node. Carries the
-// keys the reconciler matches the replacement by, per the placement identity
-// contract (§5.2.2): exact PodName (same-name rebuild), else IdentityLabels
-// (label-superset match), else fungible (any pod in the gang). Role is retained
-// for audit/debug only.
-type NominationIntent struct {
-	Namespace      string
-	PodName        string
-	Gang           schedapi.JobID
-	Role           string
-	IdentityLabels map[string]string
-	Node           string
-}
-
-// NominationIntents derives one intent per relocated pod (To != From) in
-// deterministic order (namespace, gang, podName, node).
-func NominationIntents(plan *api.RepackPlan) []NominationIntent {
-	if plan == nil {
-		return nil
-	}
-	out := make([]NominationIntent, 0, len(plan.Moves))
-	for _, m := range orderedMoves(plan) {
-		t := m.Task
-		out = append(out, NominationIntent{
-			Namespace:      t.Namespace,
-			PodName:        t.Name,
-			Gang:           t.Job,
-			Role:           t.TaskRole,
-			IdentityLabels: resolveIdentityLabels(t.Pod),
-			Node:           m.To,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		switch {
-		case a.Namespace != b.Namespace:
-			return a.Namespace < b.Namespace
-		case a.Gang != b.Gang:
-			return a.Gang < b.Gang
-		case a.PodName != b.PodName:
-			return a.PodName < b.PodName
-		default:
-			return a.Node < b.Node
-		}
-	})
-	return out
-}
-
-// resolveIdentityLabels returns the labels that identify a pod's replacement
-// across reconstruction, per the placement identity contract (§5.2.2), reading only
-// the pod's own well-known labels in priority order:
-//  1. Tier 1: the declarative repack.volcano.sh/pod-identity label (workloads opt in);
-//  2. native adapters: the standard StatefulSet pod-index / Indexed Job
-//     completion-index labels (already present on those pods);
-//  3. fungible: nil (any pending pod in the PodGroup).
-//
-// The result is self-describing (the label key+value are visible in status) and
-// the reconciler matches whatever key is recorded — no per-workload scheme is
-// hardcoded. Empty/nil = fungible.
-func resolveIdentityLabels(pod *corev1.Pod) map[string]string {
-	if pod == nil {
-		return nil
-	}
-	for _, key := range []string{labelPodIdentity, labelStatefulSetPodIndex, labelJobCompletionIndex} {
-		if v, ok := pod.Labels[key]; ok && v != "" {
-			return map[string]string{key: v}
-		}
-	}
-	return nil
 }
 
 // MoveOutcome records one move's commit result (engine-internal).
@@ -225,7 +136,7 @@ func orderedMoves(plan *api.RepackPlan) []*api.Move {
 
 // pendingNominations: placement hints for pods Pending at commit time (relief, added later).
 // Empty for consolidation (replacement pods don't exist yet → steered async by
-// the nomination reconciler over NominationIntents).
+// the nomination reconciler from RepackRun status).
 func pendingNominations(_ *api.RepackPlan) []Nomination { return nil }
 
 func taskName(m *api.Move) string {

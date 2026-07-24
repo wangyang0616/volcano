@@ -33,6 +33,7 @@ import (
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"volcano.sh/repack-controller/pkg/placement"
 
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
@@ -90,6 +91,55 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
 			return err == nil && pod.Spec.NodeName == nodes[1] && !hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
 		}, repackTimeout, repackPoll).Should(BeTrue(), "controller must open only the repack gate after persisting selection")
+		assertPlacementLeaseReleased(ctx, pgName)
+	})
+
+	// A workload controller may recreate only the Pod while retaining the same
+	// PodGroup. The old concrete claim must not strand the new Pod behind its
+	// admission gate.
+	It("recovers a deleted gated replacement inside the same PodGroup", func() {
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+
+		run, pgName, firstReplacement := prepareGatedPlacement(
+			ctx, "placement-pod-recreate", nodes[1], []string{nodes[0]}, 90*time.Second)
+		defer deleteRun(ctx, run.Name)
+		Eventually(func() repackv1alpha1.PodNominationPhase {
+			return getRun(ctx, run.Name).Status.Nominations[0].Phase
+		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementGated))
+
+		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
+			context.TODO(), firstReplacement.Name, metav1.DeleteOptions{})).To(Succeed())
+		Eventually(func() bool {
+			_, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), firstReplacement.Name, metav1.GetOptions{})
+			return apierrors.IsNotFound(err)
+		}, fixtureTimeout, repackPoll).Should(BeTrue())
+
+		quantity := resource.MustParse("2")
+		resources := v1.ResourceList{npuResource: quantity}
+		secondReplacement := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
+			Name: run.Name + "-replacement-v2", SchedulerName: e2eutil.SchedulerName,
+			RestartPolicy: v1.RestartPolicyNever, Req: resources, Limit: resources,
+			Annotations: map[string]string{
+				schedulingv1beta1.KubeGroupNameAnnotationKey: pgName,
+			},
+		})
+		Expect(hasSchedulingGate(secondReplacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
+		Eventually(func() repackv1alpha1.PodNomination {
+			return getRun(ctx, run.Name).Status.Nominations[0]
+		}, repackTimeout, repackPoll).Should(And(
+			HaveField("ReplacementPodName", secondReplacement.Name),
+			HaveField("ReplacementPodUID", secondReplacement.UID),
+			HaveField("Phase", repackv1alpha1.PodPlacementGated),
+		))
+		waitPodEventReasons(ctx, secondReplacement, "RepackPlacementRecovered", "RepackReplacementGated")
+
+		restoreEngine()
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(got.Status.Nominations[0].ReplacementPodName).To(Equal(secondReplacement.Name))
+		Expect(got.Status.Nominations[0].ActualNodeName).To(Equal(nodes[1]))
 		assertPlacementLeaseReleased(ctx, pgName)
 	})
 
@@ -182,7 +232,10 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 					Name: originalPodGroupName, Namespace: ctx.Namespace,
 					OwnerReferences: []metav1.OwnerReference{ownerReference},
 				},
-				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 2},
+				Spec: schedulingv1beta1.PodGroupSpec{
+					MinMember:      2,
+					SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{{Name: "workers"}},
+				},
 			}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -287,7 +340,10 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 					Name: replacementPodGroupName, Namespace: ctx.Namespace,
 					OwnerReferences: []metav1.OwnerReference{ownerReference},
 				},
-				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 2},
+				Spec: schedulingv1beta1.PodGroupSpec{
+					MinMember:      2,
+					SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{{Name: "workers"}},
+				},
 			}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(replacementPodGroup.Annotations).To(HaveKeyWithValue(
@@ -314,6 +370,8 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Expect(nomination.PodGroupName).To(Equal(originalPodGroupName))
 			Expect(nomination.ReplacementPodGroupName).To(Equal(replacementPodGroupName))
 			Expect(nomination.ReplacementPodName).To(HavePrefix("placement-cascade-replacement-"))
+			Expect(nomination.SchedulingRequirementsHash).NotTo(BeEmpty(),
+				"the real Engine must persist scheduling requirements for a SubGroup-enabled PodGroup")
 			Expect(nomination.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 			Expect(nomination.ActualNodeName).To(Equal(nodes[1]))
 		}
@@ -345,6 +403,29 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		replacementPodName := run.Name + "-replacement"
 		expires := metav1.NewTime(time.Now().Add(90 * time.Second))
 		started := metav1.Now()
+		quantity := resource.MustParse("2")
+		replacementResources := v1.ResourceRequirements{
+			Requests: v1.ResourceList{npuResource: quantity},
+			Limits:   v1.ResourceList{npuResource: quantity},
+		}
+		// Ask the API server to apply the same Pod defaults and admission
+		// mutations as the later replacement. Production hashes are likewise
+		// derived from admitted victim Pods in the scheduler snapshot.
+		hashTemplate, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Create(
+			context.TODO(), &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: run.Name + "-hash-template", Namespace: ctx.Namespace},
+				Spec: v1.PodSpec{
+					SchedulerName: e2eutil.SchedulerName,
+					RestartPolicy: v1.RestartPolicyNever,
+					Containers: []v1.Container{{
+						Name: "replacement", Image: e2eutil.DefaultNginxImage,
+						Resources: replacementResources,
+					}},
+				},
+			}, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+		Expect(err).NotTo(HaveOccurred())
+		schedulingRequirementsHash, err := placement.SchedulingRequirementsHash(hashTemplate)
+		Expect(err).NotTo(HaveOccurred())
 		run.Status = repackv1alpha1.RepackRunStatus{
 			Phase:     repackv1alpha1.RepackRunning,
 			StartTime: &started,
@@ -362,7 +443,10 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 			Nominations: []repackv1alpha1.PodNomination{{
 				Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, VictimPodName: victimPodName,
-				NodeName: nodes[1], ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementPrepared,
+				SchedulingRequirementsHash: schedulingRequirementsHash,
+				NodeName:                   nodes[1],
+				ExpirationTime:             &expires,
+				Phase:                      repackv1alpha1.PodPlacementPrepared,
 			}},
 		}
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
@@ -378,7 +462,10 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name: oldPodGroupName, Namespace: ctx.Namespace, OwnerReferences: []metav1.OwnerReference{ownerReference},
 			},
-			Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+			Spec: schedulingv1beta1.PodGroupSpec{
+				MinMember:      1,
+				SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{{Name: "workers"}},
+			},
 		}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Delete(
@@ -394,14 +481,42 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: newPodGroupName, Namespace: ctx.Namespace, OwnerReferences: []metav1.OwnerReference{ownerReference},
 				},
-				Spec: schedulingv1beta1.PodGroupSpec{MinMember: 1},
+				Spec: schedulingv1beta1.PodGroupSpec{
+					MinMember:      1,
+					SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{{Name: "workers"}},
+				},
 			}, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(newPodGroup.Annotations).To(HaveKeyWithValue(
 			repackv1alpha1.PlacementLeaseAnnotation, run.Name+"/"+string(run.UID)),
 			"PodGroup CREATE webhook must atomically inject the active placement lease")
 
-		quantity := resource.MustParse("2")
+		// A concurrently scaled Pod in the same leased PodGroup must not consume
+		// placement intent for a different scheduling-equivalence class.
+		scaleOutQuantity := resource.MustParse("1")
+		scaleOut := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
+			Name: run.Name + "-scale-out", SchedulerName: e2eutil.SchedulerName, RestartPolicy: v1.RestartPolicyNever,
+			Req: v1.ResourceList{npuResource: scaleOutQuantity}, Limit: v1.ResourceList{npuResource: scaleOutQuantity},
+			Annotations: map[string]string{schedulingv1beta1.KubeGroupNameAnnotationKey: newPodGroupName},
+		})
+		Expect(hasSchedulingGate(scaleOut, repackv1alpha1.PlacementGateName)).To(BeTrue(),
+			"the admission webhook must initially protect every Pod in a leased PodGroup")
+		Eventually(func() bool {
+			pod, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), scaleOut.Name, metav1.GetOptions{})
+			return getErr == nil && !hasSchedulingGate(pod, repackv1alpha1.PlacementGateName) &&
+				pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == ""
+		}, repackTimeout, repackPoll).Should(BeTrue(),
+			"a Pod with different scheduling requirements must be released as unrelated scale-out")
+		waitPodEventReasons(ctx, scaleOut, "RepackPlacementNotMatched")
+		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
+			context.TODO(), scaleOut.Name, metav1.DeleteOptions{})).To(Succeed())
+		Eventually(func() bool {
+			_, getErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
+				context.TODO(), scaleOut.Name, metav1.GetOptions{})
+			return apierrors.IsNotFound(getErr)
+		}, fixtureTimeout, repackPoll).Should(BeTrue())
+
 		replacement := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
 			Name: replacementPodName, SchedulerName: e2eutil.SchedulerName, RestartPolicy: v1.RestartPolicyNever,
 			Req: v1.ResourceList{npuResource: quantity}, Limit: v1.ResourceList{npuResource: quantity},
@@ -420,6 +535,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
 		Expect(got.Status.Nominations[0].ReplacementPodGroupName).To(Equal(newPodGroupName))
+		Expect(got.Status.Nominations[0].SchedulingRequirementsHash).To(Equal(schedulingRequirementsHash))
 		Expect(got.Status.Nominations[0].Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 		Expect(got.Status.Message).To(ContainSubstring(
 			ctx.Namespace + "/" + oldPodGroupName + " -> " + ctx.Namespace + "/" + newPodGroupName))

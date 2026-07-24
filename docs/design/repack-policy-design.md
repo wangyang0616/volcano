@@ -820,7 +820,9 @@ status (RepackRunStatus)
 │   ├── movedCardCount         int64   已接受驱逐对应卡数
 │   └── metricsVerified        bool    指标是否来自一致快照
 └── nominations[]             Execute 独有，仅保留已接受驱逐
-        PodNomination{namespace, podGroupName, victimPodName, identityLabels, nodeName, expirationTime, phase}
+        PodNomination{namespace, podGroupName, replacementPodGroupName, victimPodName,
+                      schedulingRequirementsHash, nodeName, selectedNodeName,
+                      replacementPodName/UID, actualNodeName, expirationTime, phase}
 ```
 
 **设计约束（便于解析）**：
@@ -922,8 +924,7 @@ status:
     - namespace: ml
       podGroupName: train-a
       victimPodName: train-a-worker-3
-      identityLabels:                 # §5.2.2：自解释身份标签（vcjob=<task>-<index>）
-        repack.volcano.sh/pod-identity: worker-3
+      schedulingRequirementsHash: Gx4...Qw # §5.2.2：仅显式使用 SubGroup 时记录
       nodeName: node-7
       expirationTime: "2026-06-09T10:18:42Z"
       phase: Bound
@@ -1040,7 +1041,7 @@ repack 是 **advisory steering**，不是强约束。**但要分清两件事**�
 - **可行性（硬，§4.14.2 INV-RESCHED）**：模拟必须确认 relief 与**所有 victim 都能落下** —— 这是**驱逐前的硬门槛**，放不下就不驱逐。
 - **落点引导（软，本节）**：在「能落下」的前提下，用 nomination **尽量**让真实 allocate 落到模拟期望的节点；落点漂移可接受，可行性不可让步。
 
-1. **提名是主引导（驱逐后 patch 替身 pod）**：repack-engine 驱逐 victim 后，**提名 reconciler** watch 该 gang 的**替身新 pod**，按 `NominationIntents`（gang→目标节点多重集）**patch 新 pod 的 `pod.status.NominatedNodeName`=建议节点**，告诉 volcano-scheduler「尽量往这放」。详见 §4.7.1.2 问题1。
+1. **提名是主引导（驱逐后 patch 替身 pod）**：repack-engine 在驱逐前把每个 Pod move 持久化为 `RepackRun.status.nominations[]`；驱逐后，**提名 reconciler** watch 该 gang 的**替身新 pod**，认领对应记录并 **patch 新 pod 的 `pod.status.NominatedNodeName`=建议节点**，告诉 volcano-scheduler「尽量往这放」。详见 §4.7.1.2 问题1。
    - 注：对**已存在的 pending 目标**（relief 场景），可"提名先于驱逐"（先 patch 已在的 pending pod 再驱逐）；但**整理场景里被搬的就是 victim 自己**，旧 pod 随驱逐消亡，必须 patch **替身新 pod**，故走 reconciler。
 2. **自稳定方案 = 兜底（非主路径）**：模拟时**偏好 volcano-scheduler allocate 也会复现的 plan**（目标本就是 binpack 最优落点），即便提名一时未命中也大概率落对；**提名为主、自稳定兜底**。腾出的空间**不保留**，交还调度器排队队列填充（§4.7.1.2 问题2）。
 3. **repack 只 own 自己写的提名，不与调度器对抗**：调度器回退时会 `invalidateSubJobNomination` 清掉 `NominatedNodeName`（`allocate.go` L693-694）——这是系统在说「plan 已不可行」。repack **不重写、不进循环**，本轮 Run 据实收尾、报漂移，下一轮重新模拟。
@@ -1052,7 +1053,7 @@ repack 是 **advisory steering**，不是强约束。**但要分清两件事**�
 |------|------|
 | **最坏情况** | nominate 校验不过 → 静默回退正常分配，**不劣于现网自由重排**，不误伤无关 job |
 | **诚实代价** | 开环下可能**白付驱逐代价**：空位被抢/plan 失效时，victim 已重启却无收益。由 `maxPerRun`（封顶规模）+ `executeCooldown`（防抖动）约束 |
-| **victim 重建身份** | 新 pod `status` 为空、与旧 pod 无链接。**P0：提名 reconciler 按 gang/role 意图 patch 替身新 pod 的 `NominatedNodeName`**（§4.7.1.2 问题1，主引导）；自稳定兜底。逐 role 索引精修列 P1 |
+| **victim 重建身份** | 新 pod `status` 为空、与旧 pod 无直接链接。**P0：提名 reconciler 按 replacement UID / victim 名称 / `schedulingRequirementsHash` / 同构 PodGroup 的顺序认领持久化 nomination，并 patch 替身 Pod 的 `NominatedNodeName`**（§4.7.1.2 问题1，主引导）；自稳定兜底 |
 | **明确不做** | Reservation / 占位 / 改 allocate 全局资源视图 |
 
 ##### Execute 落子链（更新）
@@ -1102,13 +1103,14 @@ func CommitPlan(plan *RepackPlan, h CommitHooks) (CommitResult, error)
   | 场景 | 重建后的 pod 名 | 匹配方式 | 适用 |
   |---|---|---|---|
   | **同名重建（主路径）** | **与被驱逐的完全同名** | reconciler 按 **`namespace/name` 精确匹配**替身，直接 patch | **Volcano vcjob**(`<job>-<task>-<index>`，`MakePodName` 确定性命名)、**StatefulSet**(`<sts>-<ordinal>`)——即 gang/AI 主场景 |
-  | **随机名重建（兜底）** | 新随机名（带 hash 后缀） | reconciler 按 **`PodGroup(group-name) + role(volcano.sh/task-spec)` 匹配**任一新 pending pod，消费一条意图（同 role pod 可互换） | Deployment/RS/裸 Job |
+  | **随机名重建（同构 PodGroup）** | 新随机名（带 hash 后缀） | reconciler 在原组或已记录的 replacement PodGroup 中消费下一条未认领记录 | Deployment/RS/裸 Job |
+  | **随机名重建（SubGroup PodGroup）** | 新随机名（带 hash 后缀） | reconciler 按归一化的 **`schedulingRequirementsHash`** 等值匹配，不依赖 workload 类型或私有 role 标签 | 显式使用 SubGroup 的异构 PodGroup |
 
   > 对**主场景（Volcano gang 作业）这一步是确定的、无歧义的**：被驱逐的 `train-worker-3` 重建后仍叫 `train-worker-3`，reconciler 一看到同名 pending pod 立刻 patch `NominatedNodeName=计划节点`。随机名控制器才退化到 gang+role 的"可互换"匹配。
 
-- **提名意图（durable，每个被搬 pod 一条）**：`RepackRun.status.nominations[]`，代码 `NominationIntents(plan)` 产出 `{Namespace, PodName, Gang, Role, Node}`——`PodName` 供同名精确匹配、`Gang+Role` 供兜底匹配、`Node` 是目标。**持久化**(不放内存)以跨引擎重启/优雅删除窗口；带 `nominationTTL`，超时未命中即放弃记漂移。
+- **提名意图（durable，每个被搬 pod 一条）**：Execute 直接把 plan move 转换为 `RepackRun.status.nominations[]`。`victimPodName` 供同名精确匹配；显式使用 SubGroup 时记录 `schedulingRequirementsHash` 供改名后的等价调度需求匹配；空 hash 明确表示同构 PodGroup；`nodeName` 是计划目标。状态持久化而不只放内存，以跨引擎重启和优雅删除窗口；带 `nominationTTL`，超时未完成则进入到期终态。
 
-- **reconciler 流程**：watch 受影响 namespace/gang 的 **Pending 且未绑定** pod → 先按 `namespace/name` 命中、否则按 `gang+role` 命中一条未消费意图 → `patch status.NominatedNodeName=Node` → 标记消费 → 重申至绑定或 TTL。
+- **reconciler 流程**：watch 受影响 namespace/gang 的 **Pending 且未绑定** pod → 按“已有 replacement UID → victim 名称 → schedulingRequirementsHash → 同构 PodGroup”匹配一条未认领记录 → 持久化具体替身 → 等引擎基于实时容量选择 receiver → `patch status.NominatedNodeName` 并解除 SchedulerGate → 重申至绑定或 TTL。替身在绑定前被删除时，先持久化释放旧认领，再允许新 Pod 接续。
 
 - **自稳定 = 兜底**：整理目标本就是 binpack 友好落点，提名偶有未命中也大概率落对；但**主引导是上面的同名/gang+role 提名**。
 
@@ -1127,7 +1129,7 @@ func CommitPlan(plan *RepackPlan, h CommitHooks) (CommitResult, error)
 
 | 问题 | P0 | P1 | 不做 |
 |---|---|---|---|
-| 重建 pod 谁打提名 | **提名 reconciler(gang/role 意图 + watch 替身 pending pod → patch `nominatedNodeName` → 重申)= 主引导**；自稳定兜底 | reconciler 精细化(role 索引、重申退避) | — |
+| 重建 pod 谁打提名 | **提名 reconciler（持久化 nomination + watch/gate 替身 pending pod → 实时选择 receiver → patch `nominatedNodeName` → 重申）= 主引导**；自稳定兜底 | 重申退避与更多调度等价字段演进 | — |
 | 腾出的空间归谁 | **归调度器的排队作业**（这就是整理目的）；repack 不保留、不 cordon | — | **不**对腾空节点做任何 hold/taint/Reservation |
 | 替身没落到目标 | binpack 落别处 + 记漂移 + 下轮重规划；`maxPerRun`/cooldown 封顶 | 提名命中率精修 | — |
 | 长优雅期作业 | 可选 `maxGracePeriodForRepack` 挑 victim 时规避 | — | — |
@@ -1139,7 +1141,7 @@ func CommitPlan(plan *RepackPlan, h CommitHooks) (CommitResult, error)
 | 能力 | 阶段 |
 |------|------|
 | `CommitPlan` 编排（腾空源优先序、开环部分失败、结果汇总；**不 hold/不 taint**） | **P0**（已落地+单测） |
-| **提名 reconciler（gang/role 意图 `NominationIntents` + watch 替身 pending pod → patch `nominatedNodeName`=目标 → 重申，`nominationTTL`）= 主引导** | **P0**（§4.7.1.2 问题1；`NominationIntents` 已落地+单测，watch/patch 边缘待接） |
+| **提名 reconciler（持久化 `status.nominations[]` + watch/gate 替身 pending pod → 实时选择 receiver → patch `nominatedNodeName` → 重申，`nominationTTL`）= 主引导** | **P0**（§4.7.1.2 问题1；已落地并覆盖冲突重试、替身删除恢复和 PodGroup 重建） |
 | 自稳定落点（模拟偏好 binpack 可复现的 plan）= **兜底** | **P0** |
 | 腾出空间交还调度器排队队列（不保留、不 cordon） | **P0**（即整理目的，调度器原生完成） |
 | 落点核对 + 漂移上报 `status.plan` | **P0** |
@@ -2373,7 +2375,7 @@ A≈O(N²)，B（朴素）≈O(N³)，B/A 每翻倍再 ×2。
 
 #### 4.18.5 测试策略
 
-- **基础功能单测**:碎片度量(`MeasureResource`/`OptimalNodes`,含暴力最优交叉校验)、可行性求解(`Feasible`,含暴力交叉校验)、drain 核心(10+ 场景)、scope 解析、状态机(`DerivePhase`/`IsTerminal`/`EvaluateGate`/`CooldownRetained`/`TTLExpired`)、约束闸(`PlanAdmissible`)、状态渲染(`movesOf`/`summaryOf`/`nominationsOf`/`applyPlan`/`pct`/`terminalOutcome`)、spec 翻译(`resolveResource`/`maxPerRun`/`minFragImprovement`)、提名匹配(`matchNomination`/`needsNomination`/`labelsMatch` 覆盖 victimPodName/identityLabels/fungible/过期/已绑定/跨 ns 各分支)、扰动评分。
+- **基础功能单测**:碎片度量(`MeasureResource`/`OptimalNodes`,含暴力最优交叉校验)、可行性求解(`Feasible`,含暴力交叉校验)、drain 核心(10+ 场景)、scope 解析、状态机(`DerivePhase`/`IsTerminal`/`EvaluateGate`/`CooldownRetained`/`TTLExpired`)、约束闸(`PlanAdmissible`)、状态渲染(`movesOf`/`summaryOf`/`nominationsOf`/`applyPlan`/`pct`/`terminalOutcome`)、spec 翻译(`resolveResource`/`maxPerRun`/`minFragImprovement`)、调度需求摘要归一化，以及提名匹配（已有 replacement UID、`victimPodName`、`schedulingRequirementsHash`、同构 PodGroup 兜底、过期/已绑定/跨 namespace 等分支）、扰动评分。
 - **边界场景**:nil/空 plan、多 pod 分散跨节点的 gang、`pct` 越界钳制、系统 DaemonSet pod 不阻塞腾空、frozen 节点、预算封顶、非同构容量、无目标资源快速失败。
 - **可靠性/并发**:K=1 gate 内存态并发压测(`TestExecuteGateState_ConcurrentAccess`,配 `-race`)、饥饿唤醒(`requeueGatedRuns`)、构造/启动不 panic(含 nil `ServerOpts`)。
 - **性能(核心算法基准)**:`BenchmarkOptimalNodes`(碎片打包界)、`BenchmarkFeasible`(INV-RESCHED 回溯求解)、`BenchmarkDrain`(端到端,25/100/250 节点规模)。
@@ -3214,10 +3216,11 @@ type RepackRunStatus struct {
     Plan           *RepackPlan        `json:"plan,omitempty"`           // DryRun/Execute 均为不可变完整计划
     Result         *RepackResult      `json:"result,omitempty"`         // Execute 独有：实际接受量与复测结果
     Nominations    []PodNomination    `json:"nominations,omitempty"`    // Execute 独有：落点提名意图（结构见 proposal §5.2）
-    // PodNomination{namespace, podGroupName, victimPodName, identityLabels map[string]string, nodeName, expirationTime, phase(Pending|Bound|Expired)}
-    // 替身认领按「落点身份契约」（proposal §5.2.2）：victimPodName 精确 → identityLabels 标签超集匹配
-    //（键=用到的身份 label 如 repack.volcano.sh/pod-identity / 原生 apps.kubernetes.io/pod-index）→ fungible。
-    // identityLabels 自解释（键值可见），reconciler 记哪个键就匹哪个键，新增身份来源零改代码。
+    // PodNomination{namespace, podGroupName, replacementPodGroupName, victimPodName,
+    // schedulingRequirementsHash, nodeName, selectedNodeName, replacementPodName/UID,
+    // actualNodeName, expirationTime, phase}
+    // 替身认领按 proposal §5.2.2：已有 replacement UID → victimPodName 精确 →
+    // schedulingRequirementsHash（仅显式使用 SubGroup）→ 同构 PodGroup 兜底。
 }
 // 删 observedGeneration（spec 被 CEL 冻结、generation 永不变）/mode（spec 不可变、恒可读，
 // printer 用 spec.mode）/triggerReason（P0 恒为 Manual，区分度要等 RepackPolicy/P1）。
@@ -3264,6 +3267,8 @@ type RepackRunStatus struct {
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v11.2** | 2026-07-24 | **替身认领恢复与实现收敛**：已认领的 `Gated` / `AwaitingCapacity` / `Nominated` 替身在绑定前被删除或以新 UID 重建时，提名 reconciler 先通过冲突重试把旧 concrete claim 重置为 `Prepared`，再允许同一 PodGroup 内匹配调度等价类的新 Pod 接续；仍存活的认领者保持独占，并发扩容 Pod 不再因已占用 nomination 长时间持有 SchedulerGate。匹配入口收敛为 gate owner 指向的单个 RepackRun，potential-match 拆为明确的 PodGroup/workload-source 查询；未匹配 gate 仅在 patch 成功后产生一条原因事件。Execute 直接从 plan move 生成 nomination，SubGroup policy 查询从 disruption view 分离，victim Pod 缺失或 hash 生成失败在驱逐前终止；commit 后仅按 placement identity 过滤原 nomination，不重复生成 hash/TTL。补充同 PodGroup 替身删除恢复、并发扩容释放、SubGroup fail-closed、真实 SubGroup Execute hash 生产等 UT/E2E。 |
+| **v11.1** | 2026-07-24 | **PodGroup/Pod 改名后的替身匹配收敛为调度等价契约**：删除 `repack.volcano.sh/pod-identity`、原生 pod-index/completion-index 适配及 `nominations[].identityLabels`，Repack 不再要求外部 workload controller 感知专用身份协议。`PodNomination` 新增 `schedulingRequirementsHash`：只对显式使用 SubGroup policy 的非同构 PodGroup 记录归一化 PodSpec 调度需求摘要；未配置 SubGroup 的 PodGroup 明确按组内同构、Pod 可互换处理。匹配顺序为已有 replacement Pod UID（幂等恢复）→ victimPodName（同名快路径）→ schedulingRequirementsHash（非同构等价类）→ 同构 PodGroup 兜底。保留 workload owner 映射、replacementPodGroupName、placement lease、SchedulerGate 和软 nomination；并发扩容 Pod 仅在与未完成 nomination 哈希兼容时保留 gate，其他 Pod 立即释放。 |
 | **v11.0** | 2026-07-10 | **架构 pivot 定稿：可行性从 `Statement` 沙箱改为克隆式 `SimulatePredicateFn` 可行性检查**。早期设计想复用 gangpreempt 的 `framework.Statement`(Evict/Pipeline/Commit/Discard)做沙箱模拟,但 `Statement.unPipeline` 会把 `task.NodeName` 置空——对同一 pod evict+pipeline+discard 会污染真实状态,不能用于 repack。**实际落地**改为:`Snapshot.FeasibleRelocation` **克隆** node 副本 + cycle-state 副本,用调度器**完整过滤栈** `ssn.SimulatePredicateFn`(收编了原 preempt 精简版 `SimulatePredicateFn`,现跑全量 filter)逐个模拟重落,丢弃克隆即回滚。`schedulability_engine.go`(`ValidatePlan`/`EngineFit`)已成空壳(待 `git rm`);`api/schedulability.go` 的 `Domain.Feasible` 降为**仅单测 fake 复用的参考求解器**,不在生产路径。**同步刷新**:§4.7.0 复用表、§4.14 全段(沙箱心智模型/三原语/INV-RESCHED/端到端流程/victim 映射/与 gangpreempt 对照)、全文路径 `pkg/scheduler/repack`→`pkg/repackengine`、`session/`→`adapter/`、`orchestrator.go`→`core/drain/drain.go`,并纠正**算法 B(集中度/`consolidate.go`)"已实现"为事实错误→改标未实现(仅设计、`core/concentration` 留槽,P1)**。proposal(`repack-runtime-defragmentation.md`)机制段同批对齐。**§4.16/§4.17/§5 结构性对齐**:§4.16.4.1 按真实 `Action.Execute(ssn *Session)`+`CommitHooks` 重写(替换旧 `ActionContext`/`EngineParams`/`Apply`);§4.16.5(集中度权重)、§4.16.6(旧 `PlanRun`+双 planner 注册表)各加"实际落地为单 `Core`+`RunActions`、方案 B 未实现"的免责存档;§4.17.0 四图加统一免责(现 drain 为单趟动态出唯一 plan、可行性走克隆 `FeasibleRelocation`、落子走 Eviction+提名,`BuildPlan`/`EngineFit`/`Statement`/`Domain.Feasible`/`pickBest` 均旧标签,权威流程见 §4.14.3);§5 依赖图/时序图(§5.4/§5.7)与 §10 对照表的 `ValidatePlan`/`Statement.Save` 标签改为 `FeasibleRelocation`/克隆丢弃。**命名整改**:代码与文档去除 "oracle/预言机"(→"可行性检查")与 "reschedule" 标识符——接口方法 `FeasibleReschedule`→`FeasibleRelocation`(跨 9 文件),仅保留正文"不绑定 Volcano `rescheduling` 插件"一处正确引用。**遗留(P1 存档,不影响正确性)**:§4.17.0 四张 Mermaid 与 §4.16.6 双 planner 伪码块内部未逐字重画,已由各节顶部免责说明覆盖 |
 | **v10.12** | 2026-07-08 | **移除「Execute 必须带非空 scope」CEL 约束**：原规则要求 `mode=Execute` 时 `scope.podGroups.include` 或 `scope.nodes.include` 至少一条非空(禁止全集群 Execute)。经评审,该约束与"空=全部"的统一语义相冲突、并造成 DryRun→Execute 转换摩擦(spec 不可变,需新建 CR 时被迫补 scope);而迁移规模本就由引擎计划兜底(`maxPerRun`/cooldown/K=1/PDB)。**决定直接去掉**:两种 mode 下 scope 均可省略=全集群。改动:①删 `RepackRunSpec` 的 XValidation marker;②从 4 份生成 CRD yaml(config + helm 的 repackruns/repackpolicies)剔除该 CEL,并清理 RepackPolicy 模板下遗留的空 `x-kubernetes-validations`;③同步 `state.go`/applyconfiguration/design 文档(§CEL 块 + 两处散文)注释。仅 `self==oldSelf` 不可变规则保留。**待用户本地 `make manifests` 复核生成一致** |
 | **v10.11** | 2026-07-08 | **命名风格对齐 + 消除魔鬼数字**：① **魔鬼数字→具名常量**:扰动评分权重(`weightAffectedPodGroups/MovedResource/MovedPods=1.0/0.3/0.1`、`weightGangBreaches/DamagedGPU=0.8/0.6`)、drain 接收方偏好层(`preferDrainable=1`/`preferStaying=2`)、`defaultNominationTTL=10m`、cmd 侧 `defaultHealthzAddress/MetricsAddress/ExecuteCooldown/NominationTTL/ResyncPeriod`。② **命名对齐 Volcano/云原生风格**:引擎会话 `esn`→`engineSsn`(与 Volcano `ssn` 对齐,和调度器会话 `sched` 区分);布尔谓词 `candidate()`→`isCandidate()`(Go `is/has` 惯例)。`ssn`/短 receiver 等本就符合 Volcano 约定,保留;`supportedTarget` 保留(与既有单测一致)。评分权重加注释说明 P0 默认值语义(P1 由 disruptionPolicy 覆盖) |

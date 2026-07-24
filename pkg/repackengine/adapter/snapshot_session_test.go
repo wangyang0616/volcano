@@ -22,6 +22,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	schedulingapi "volcano.sh/apis/pkg/apis/scheduling"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 
@@ -40,17 +41,28 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 		Priority:        10,
 		Tasks:           tasks,
 		TaskStatusIndex: map[schedapi.TaskStatus]schedapi.TasksMap{schedapi.Running: tasks},
+		PodGroup: &schedapi.PodGroup{PodGroup: schedulingapi.PodGroup{Spec: schedulingapi.PodGroupSpec{
+			SubGroupPolicy: []schedulingapi.SubGroupPolicySpec{{Name: "workers"}},
+		}}},
 	}
 	ssn := &schedframework.Session{Jobs: map[schedapi.JobID]*schedapi.JobInfo{"ns/big": ji}}
 	snap := NewSessionSnapshot(ssn, gpu, nil)
 
 	got := snap.PodGroupView("ns/big")
-	want := api.PodGroupView{MinAvailable: 2, Running: 2, Priority: 10, Footprint: 8}
+	want := api.PodGroupView{
+		MinAvailable: 2, Running: 2, Priority: 10, Footprint: 8,
+	}
 	if got != want {
 		t.Errorf("view=%+v want %+v", got, want)
 	}
+	if !snap.PodGroupUsesSubGroupPolicy("ns/big") {
+		t.Error("PodGroupUsesSubGroupPolicy() = false, want true")
+	}
 	if z := snap.PodGroupView("ns/unknown"); z != (api.PodGroupView{}) {
 		t.Errorf("unknown gang should yield zero view, got %+v", z)
+	}
+	if snap.PodGroupUsesSubGroupPolicy("ns/unknown") {
+		t.Error("unknown PodGroup must not use SubGroup policy")
 	}
 }
 

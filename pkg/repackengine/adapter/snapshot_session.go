@@ -257,7 +257,7 @@ func (s *SessionSnapshot) victimsLargestFirst(victims []*schedapi.TaskInfo) []*s
 	return ordered
 }
 
-// PodGroupView reads MinAvailable/Running/Priority/Footprint off the JobInfo.
+// PodGroupView reads disruption-scoring facts off JobInfo.
 func (s *SessionSnapshot) PodGroupView(id schedapi.JobID) api.PodGroupView {
 	ji, ok := s.ssn.Jobs[id]
 	if !ok || ji == nil {
@@ -279,6 +279,13 @@ func (s *SessionSnapshot) PodGroupView(id schedapi.JobID) api.PodGroupView {
 		Priority:     ji.Priority,
 		Footprint:    footprint,
 	}
+}
+
+// PodGroupUsesSubGroupPolicy reports whether replacement Pods require
+// scheduling-requirements matching instead of homogeneous PodGroup matching.
+func (s *SessionSnapshot) PodGroupUsesSubGroupPolicy(id schedapi.JobID) bool {
+	job := s.ssn.Jobs[id]
+	return job != nil && job.ContainsSubJobPolicy()
 }
 
 // scalar returns the count of a single scalar resource on r (local copy so this

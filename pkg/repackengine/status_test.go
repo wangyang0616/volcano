@@ -45,6 +45,12 @@ import (
 
 const gpuResource = v1.ResourceName("nvidia.com/gpu")
 
+type testPodGroupPlacementPolicies map[schedapi.JobID]bool
+
+func (policies testPodGroupPlacementPolicies) PodGroupUsesSubGroupPolicy(id schedapi.JobID) bool {
+	return policies[id]
+}
+
 func mkMove(name, job string, cards float64, from, to string) *engineapi.Move {
 	return &engineapi.Move{
 		Task: &schedapi.TaskInfo{
@@ -339,19 +345,25 @@ func TestMarkExecuteNotPerformedPreservesPlanAndClearsExecutionState(t *testing.
 }
 
 func TestNominationsOf(t *testing.T) {
-	if buildPodNominations(nil, time.Minute) != nil {
+	if nominations, err := buildPodNominations(nil, time.Minute, nil); err != nil || nominations != nil {
 		t.Error("nil plan -> nil")
 	}
+	pod := &v1.Pod{Spec: v1.PodSpec{NodeSelector: map[string]string{"accelerator": "npu"}}}
 	plan := &engineapi.RepackPlan{Moves: []*engineapi.Move{
 		{
 			Task: &schedapi.TaskInfo{
 				Name: "w-0", Namespace: "ns", Job: "ns/g",
-				Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"apps.kubernetes.io/pod-index": "0"}}},
+				Pod: pod,
 			},
 			From: "n0", To: "n2",
 		},
 	}}
-	noms := buildPodNominations(plan, time.Hour)
+	noms, err := buildPodNominations(plan, time.Hour, testPodGroupPlacementPolicies{
+		"ns/g": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(noms) != 1 {
 		t.Fatalf("got %d nominations, want 1", len(noms))
 	}
@@ -362,11 +374,31 @@ func TestNominationsOf(t *testing.T) {
 	if n.Phase != repackv1alpha1.PodPlacementPrepared {
 		t.Errorf("phase=%q, want Prepared", n.Phase)
 	}
-	if n.IdentityLabels["apps.kubernetes.io/pod-index"] != "0" {
-		t.Errorf("identityLabels=%v, want pod-index=0", n.IdentityLabels)
+	if n.SchedulingRequirementsHash == "" {
+		t.Error("SubGroup-enabled PodGroup must record schedulingRequirementsHash")
 	}
 	if n.ExpirationTime == nil || !n.ExpirationTime.After(time.Now()) {
 		t.Errorf("expirationTime not set in the future: %v", n.ExpirationTime)
+	}
+
+	homogeneous, err := buildPodNominations(plan, time.Hour, testPodGroupPlacementPolicies{
+		"ns/g": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if homogeneous[0].SchedulingRequirementsHash != "" {
+		t.Errorf("homogeneous PodGroup hash = %q, want empty", homogeneous[0].SchedulingRequirementsHash)
+	}
+
+	missingVictimPod := &engineapi.RepackPlan{Moves: []*engineapi.Move{{
+		Task: &schedapi.TaskInfo{Name: "missing", Namespace: "ns", Job: "ns/g"},
+		From: "n0", To: "n2",
+	}}}
+	if _, err := buildPodNominations(missingVictimPod, time.Hour, testPodGroupPlacementPolicies{
+		"ns/g": true,
+	}); err == nil {
+		t.Fatal("SubGroup placement without a victim Pod must fail before eviction")
 	}
 }
 
@@ -399,7 +431,9 @@ func TestApplyPlan(t *testing.T) {
 	// Execute preparation is explicit and does not alter the plan.
 	exec := &repackv1alpha1.RepackRun{}
 	applyPlan(exec, report, plan, gpuResource, nil, resolved)
-	prepareExecuteNominations(exec, plan, time.Minute)
+	if err := prepareExecuteNominations(exec, plan, time.Minute, testPodGroupPlacementPolicies{}); err != nil {
+		t.Fatal(err)
+	}
 	if len(exec.Status.Nominations) != 1 {
 		t.Errorf("Execute should populate nominations, got %d", len(exec.Status.Nominations))
 	}
@@ -411,10 +445,14 @@ func TestRetainRealizedNominationsPreservesDeadlineAndFiltersRejected(t *testing
 	rejectedMove := mkMove("rejected", "ns/g", 2, "n1", "n2")
 	rejectedMove.Task.Namespace = "ns"
 	fullPlan := &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove, rejectedMove}}
-	existing := buildPodNominations(fullPlan, time.Hour)
+	existing, err := buildPodNominations(fullPlan, time.Hour, testPodGroupPlacementPolicies{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := existing[0].ExpirationTime.DeepCopy()
 
-	got := retainRealizedNominations(existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}}, time.Minute)
+	got := retainRealizedNominations(
+		existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}})
 	if len(got) != 1 || got[0].VictimPodName != "accepted" {
 		t.Fatalf("accepted nominations = %+v, want accepted only", got)
 	}

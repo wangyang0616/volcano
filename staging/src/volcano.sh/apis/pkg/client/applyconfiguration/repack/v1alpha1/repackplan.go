@@ -20,10 +20,9 @@ package v1alpha1
 // RepackPlanApplyConfiguration represents a declarative configuration of the RepackPlan type for use
 // with apply.
 //
-// RepackPlan is the terminal output, populated in BOTH modes with the same
-// shape: DryRun = predicted plan; Execute = executed plan. Three progressive
-// layers (summary + moves + freedNodes), capped by maxItems. Schema evolves with
-// the CRD apiVersion (no internal formatVersion).
+// RepackPlan is the immutable plan-time output in both modes. Three progressive
+// layers (summary + moves + freedNodes), capped by maxItems. Execute never
+// rewrites it with the accepted subset or actual placement result.
 type RepackPlanApplyConfiguration struct {
 	// Summary is the flat, at-a-glance layer (UI lists / alerts / printers read this).
 	Summary *RepackSummaryApplyConfiguration `json:"summary,omitempty"`

@@ -494,15 +494,16 @@ spec:
                 description: |-
                   Nominations are the durable placement-steering intents produced by Execute:
                   one entry per relocated pod, consumed by the nomination reconciler per the
-                  placement identity contract (victimPodName exact match -> identityLabels ->
-                  fungible). See the design proposal §5.2.2.
+                  replacement matching contract (victimPodName exact match ->
+                  schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
+                  design proposal §5.2.2.
                 items:
                   description: |-
                     PodNomination records one relocated pod's replacement placement
                     (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
-                    the replacement per the placement identity contract (proposal §5.2.2):
-                    victimPodName exact match -> identityLabels (label match) -> fungible (any
-                    pending pod in the PodGroup).
+                    the replacement per the placement matching contract (proposal §5.2.2):
+                    victimPodName exact match in the active PodGroup -> schedulingRequirementsHash
+                    equality -> homogeneous PodGroup fallback.
                   properties:
                     actualNodeName:
                       description: |-
@@ -514,17 +515,6 @@ spec:
                         nomination is Expired.
                       format: date-time
                       type: string
-                    identityLabels:
-                      additionalProperties:
-                        type: string
-                      description: |-
-                        IdentityLabels are the labels that identify the replacement pod across
-                        reconstruction (key = the identity label the contract used, e.g.
-                        repack.volcano.sh/pod-identity, or a native-kind label such as
-                        apps.kubernetes.io/pod-index; value = its value). The reconciler claims a
-                        pending pod whose labels are a superset. Empty = fungible (any pod in the
-                        PodGroup). Self-describing: which label + value is visible in status.
-                      type: object
                     namespace:
                       description: Namespace of the target pod (PodGroup shares this
                         namespace).
@@ -553,8 +543,10 @@ spec:
                     replacementPodGroupName:
                       description: |-
                         ReplacementPodGroupName is the latest PodGroup generation that recreates
-                        this nomination's replacement Pod. PodGroupName remains the immutable
-                        plan-time identity.
+                        this nomination's replacement Pod. It remains empty when the workload reuses
+                        the original PodGroup name. The placement controller owns this runtime field
+                        and may advance it after another full-group recreation; PodGroupName remains
+                        the immutable plan-time identity for audit.
                       type: string
                     replacementPodName:
                       description: |-
@@ -566,6 +558,13 @@ spec:
                         UID is a type that holds unique ID values, including UUIDs.  Because we
                         don't ONLY use UUIDs, this is an alias to string.  Being a type captures
                         intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    schedulingRequirementsHash:
+                      description: |-
+                        SchedulingRequirementsHash is an opaque hash of normalized scheduling
+                        requirements from the victim Pod. It is populated only when the PodGroup
+                        defines SubGroup policies and is compared only for equality when matching a
+                        renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
                       type: string
                     selectedNodeName:
                       description: |-
@@ -677,17 +676,15 @@ spec:
                       / alerts / printers read this).
                     properties:
                       fragAfterPercent:
-                        description: Predicted cluster-wide fragmentation after
-                          the complete plan.
                         format: int32
                         maximum: 100
                         minimum: 0
                         type: integer
                       fragBeforePercent:
                         description: |-
-                          Cluster-wide fragmentation before the run for the target resource, in
-                          percentage points (0-100). Only nodes providing that resource participate;
-                          scope limits actions, not this cluster health metric.
+                          Cluster-wide fragmentation before the run and predicted after the complete
+                          plan, in percentage points (0-100). Only nodes providing the target resource
+                          participate; scope limits actions, not this cluster health metric.
                         format: int32
                         maximum: 100
                         minimum: 0
@@ -708,16 +705,16 @@ spec:
                           It does not change the cluster-wide fragmentation metric's denominator.
                         properties:
                           nodeCount:
-                            description: NodeCount is the number of in-scope nodes
-                              providing the target resource and eligible to be selected
-                              as drain targets.
+                            description: |-
+                              NodeCount is the number of in-scope nodes providing the target resource and
+                              eligible to be selected as drain targets.
                             format: int32
                             type: integer
                           podGroupCount:
-                            description: PodGroupCount is the number of PodGroups
-                              selected by podGroup scope that currently consume the
-                              target resource. Later feasibility and disruption checks
-                              may still prevent them from moving.
+                            description: |-
+                              PodGroupCount is the number of PodGroups selected by podGroup scope that
+                              currently consume the target resource. Later feasibility and disruption
+                              checks may still prevent them from moving.
                             format: int32
                             type: integer
                         required:

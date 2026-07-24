@@ -218,7 +218,7 @@ spec:
 - **不支持资源预留 / 占位（Reservation）**：腾出的空间交还调度器排队队列，不为某个未来 Pod 锁定容量
 - **不支持新作业的拓扑放置**：由现有 `networkTopology` / gang 调度负责，repack 不改其行为
 - **不支持跨资源联合整理**（一个 Run 同时整理 GPU+NPU 并跨资源合成收益）：P2+ 预留，schema 的 `goals[]` 形状已留，放开 `maxItems` 即可，本提案不展开
-- **不迁移 DaemonSet pod**：DaemonSet pod 节点固定（每节点一个），搬走会立刻被重建回原节点，无整理意义；落点身份契约（§5.2.2）中 DaemonSet 直接列为非迁移目标
+- **不迁移 DaemonSet pod**：DaemonSet pod 节点固定（每节点一个），搬走会立刻被重建回原节点，无整理意义
 
 ## 5. 方案（Proposal）
 
@@ -370,16 +370,21 @@ type RepackRunStatus struct {
 
 // PodNomination 引导一个被搬 pod 的替身落到目标节点（Execute 独有；每搬一个 pod 一条），
 // 供提名 reconciler 消费（patch pod.status.nominatedNodeName）；durable 跨引擎重启。
-// 替身认领按「落点身份契约」（§5.2.2）：victimPodName 精确快路径 → identityLabels 标签匹配 → fungible。
+// 替身认领按「替身匹配契约」（§5.2.2）：已有 replacementPodUID → victimPodName
+// 精确快路径 → schedulingRequirementsHash → 同构 PodGroup 兜底。
 type PodNomination struct {
-    Namespace      string            `json:"namespace"`                // 命名空间（PodGroup / victim pod 同此 ns）
-    PodGroupName   string            `json:"podGroupName,omitempty"`   // 计划时的原 PodGroup，执行中不改写
+    Namespace      string            `json:"namespace"`                      // 命名空间（PodGroup / victim pod 同此 ns）
+    PodGroupName   string            `json:"podGroupName,omitempty"`         // 计划时的原 PodGroup，执行中不改写
     ReplacementPodGroupName string   `json:"replacementPodGroupName,omitempty"` // workload 整组重建后当前承接替身 Pod 的最新 PodGroup
-    VictimPodName  string            `json:"victimPodName,omitempty"`  // 被驱逐的旧 pod 名：审计 + 同名重建时的精确快路径
-    IdentityLabels map[string]string `json:"identityLabels,omitempty"` // 匹配替身的身份标签（键=用到的身份 label，值=其值；如 {repack.volcano.sh/pod-identity: worker-3}）；自解释；空=fungible
-    NodeName       string            `json:"nodeName"`                 // 提名的目标节点（对齐 pod.spec.nodeName 词汇）
+    VictimPodName  string            `json:"victimPodName,omitempty"`        // 被驱逐的旧 pod 名：审计 + 同名重建时的精确快路径
+    SchedulingRequirementsHash string `json:"schedulingRequirementsHash,omitempty"` // 仅显式使用 SubGroup 时记录；归一化调度需求的等价性摘要
+    NodeName       string            `json:"nodeName"`                       // 计划时目标节点（审计字段）
+    SelectedNodeName string          `json:"selectedNodeName,omitempty"`     // 执行时基于最新快照选择的接收节点
+    ReplacementPodName string        `json:"replacementPodName,omitempty"`   // 已认领替身 Pod 名
+    ReplacementPodUID types.UID      `json:"replacementPodUID,omitempty"`    // 已认领替身 Pod UID，支持幂等恢复
+    ActualNodeName string            `json:"actualNodeName,omitempty"`       // 替身最终绑定节点
     ExpirationTime *metav1.Time `json:"expirationTime,omitempty"` // 重申截止，到期即 Expired（对齐 *Time 命名惯例）
-    Phase          string       `json:"phase,omitempty"`          // Pending | Bound | Expired（重建 pod 是否已按提名落定）
+    Phase          string       `json:"phase,omitempty"`          // Prepared/Gated/AwaitingCapacity/Nominated/Placed/Degraded/Expired
 }
 // ---- status 子结构 ----
 // RepackPlan：DryRun 与 Execute 同一结构，始终是完整、不可变的计划时快照。
@@ -589,37 +594,26 @@ status:
 
 **兼容与时序**：这是共享 pg-controller 的元数据同步行为。升级后，Pod 在下一次 reconcile 时会更新其自动 PodGroup 的标签；kthena 等自建 PodGroup 的控制器仍需自行保持标签同步。
 
-#### 5.2.2 落点身份契约（landing-identity contract，P0）
+#### 5.2.2 替身匹配契约（replacement matching contract，P0）
 
-Execute 驱逐 victim pod 后，工作负载控制器会重建一个替身 pod；提名 reconciler 要把 `nominatedNodeName` patch 到**正确的那个替身**上。难点：替身的 `metadata.name` 未必等于 victim（如 kthena 的 role 级滚动更新会给 pod 名加随机后缀），而各家负载的身份标签各不相同。为避免 repack 去硬编码每种负载的 label scheme，定义一套**统一契约**：repack 只认识**一个声明式 label + 一小组 K8s 标准索引 label**，负载来对齐。
+Execute 驱逐 victim Pod 后，工作负载控制器可能同时重建 PodGroup 和 Pod，且名称都发生变化。Repack 不识别 Deployment、StatefulSet、kthena 等具体负载类型，也不要求上层 controller 写入 Repack 专用 Pod identity。匹配只依赖 PodGroup、Pod 本身的调度需求和 RepackRun 中的持久状态。
 
-**身份解析规则（按序）：**
+**匹配顺序（由强到弱）：**
 
-身份**以 label 键值对的形式**记进 `nominations[].identityLabels`（自解释：一眼看到用哪个 label、值是什么），reconciler 按它对 pending pod 做 label 超集匹配。
+1. **已认领替身 UID**：`replacementPodName + replacementPodUID` 是控制器写入的最强关联，用于 API 冲突、进程重启等中断后的严格幂等恢复。
+2. **victimPodName 精确匹配**：在原 PodGroup 或已持久化的最新 replacement PodGroup 内匹配同名 Pod，覆盖 vcjob、StatefulSet 等确定性命名场景。
+3. **SchedulingRequirementsHash 等值匹配**：只对**显式配置 SubGroup policy** 的 PodGroup 记录。摘要由资源请求、亲和性、容忍、拓扑分布、调度器、优先级、RuntimeClass、ResourceClaim、HostPort 等稳定调度字段归一化计算；不包含 Pod 名称、UID、PodGroup 注解、SchedulerGate 等重建或协议元数据。它表达调度等价类，不表达业务身份。
+4. **同构 PodGroup 兜底**：未配置 SubGroup policy 时，约定一个 PodGroup 内的 Pod 同构且可互换，因此不写哈希，任一未认领的 Pending 替身可以消费下一条可用 nomination。
 
-1. **Tier 1 — 声明式身份 label（主契约）**：pod 若带 `repack.volcano.sh/pod-identity`，则记 `identityLabels: {repack.volcano.sh/pod-identity: <值>}`。约束：该值须**在所属 PodGroup 内唯一、且跨重建稳定**。名称可能变化的自定义负载走这条；例如 kthena 使用 `<group>-<role>-<role-id>-<workerIndex>`（如 `sample-0-decode-0-0`，把当前是 env 的 workerIndex 也纳入）。vcjob 的 Pod 名为稳定的 `<job>-<task>-<index>`，由 `victimPodName` 精确快路径覆盖，无需额外标签。
-2. **原生负载自动适配**：pod 未带上述 label 时，repack **直接读 pod 自身的标准索引 label**（K8s 官方既有约定，非猜测，无需查 ownerRef），命中即记入 `identityLabels`：
+哈希只解决“新 Pod 应消费哪一类旧 placement intent”，不是节点预留或可行性证明。`nominatedNodeName` 仍是软引导，Volcano Scheduler 会用当前资源和完整过滤条件校验；目标节点不可用时可选择其他可行节点并在 status 中记录漂移。扩缩容并发时，带哈希的 nomination 只保留相同哈希的候选 Pod gate；哈希不同的新副本会立即释放 gate，避免正常扩容被碎片整理阻塞。
 
-   | 原生负载 | 读取并记录的 label | 说明 |
-   |----------|--------------------|------|
-   | StatefulSet | `{apps.kubernetes.io/pod-index: <序号>}` | 也同名重建，victimPodName 快路径通常先命中 |
-   | Indexed Job | `{batch.kubernetes.io/job-completion-index: <idx>}` | 完成索引稳定 |
-   | Deployment / ReplicaSet / 裸 Job | 空（fungible） | 无索引 label、单角色、pod 可互换，按 PG 内任一 pending pod 命中 |
-   | DaemonSet | —（**非迁移目标**，见 §4 非目标；根本不产生 nomination） | 节点固定，搬走即被重建回原节点，无意义 |
-
-3. **兜底**：既不带 label、又非上述已知 kind 的未知自定义负载 → `identityLabels` 留空，退化为 fungible（PG 内任一 pending pod），best-effort。
-
-**匹配策略（reconciler）**：对某条 nomination，先按 `namespace + victimPodName` 精确命中（同名重建的快路径）；不中则在 `namespace + podGroupName` 内命中 label 是 `identityLabels` 超集的 pending pod；`identityLabels` 为空（fungible）时命中该 PG 内任一未消费的 pending pod。**记的是哪个 label 就匹哪个，新增身份来源零改 reconciler 代码。** 全程 **soft nomination**：不预留、`expirationTime` 到期即弃，不追求逐一精确。
-
-**workload 级 PodGroup 重建**：某些 workload controller 在驱逐一个 Pod 后会删除原 PodGroup 及其全部 Pod，再创建名称完全不同的新 PodGroup 与 Pod。Repack 不要求上层 controller 适配专用标签，而是以 `moves[].namespace + moves[].owner.{apiVersion,kind,name}` 识别同一 workload。当前约束同一 workload 下多个 PodGroup 必须是等价调度单元；当前组删除后，controller 按稳定顺序把新组映射到仍未完成的原组，并将最新组名写入每条 nomination 的 `replacementPodGroupName`。若最新 replacement PodGroup 在整理完成前再次被删除，controller 会在确认旧一代消失后推进映射，清除失效的具体 Pod/节点观测，并让下一代 Pod 重新认领同一批 durable placement intent。所有映射均以 `namespace + PodGroupName` 标识对象；同名 Pod、identity label 与 fungible 匹配也只能在原组或已记录的最新组内发生。
+**workload 级 PodGroup 重建**：某些 workload controller 在驱逐一个 Pod 后会删除原 PodGroup 及其全部 Pod，再创建名称完全不同的新 PodGroup 与 Pod。Repack 以 `moves[].namespace + moves[].owner.{apiVersion,kind,name}` 识别同一 workload。当前约束同一 workload 下多个 PodGroup 必须是等价调度单元；当前组删除后，controller 按稳定顺序把新组映射到仍未完成的原组，并将最新组名写入每条 nomination 的 `replacementPodGroupName`。若最新 replacement PodGroup 在整理完成前再次被删除，controller 会在确认旧一代消失后推进映射，清除失效的具体 Pod/节点观测，并让下一代 Pod 重新认领同一批 durable placement intent。匹配只能在原组或已记录的最新组内发生。
 
 为关闭新 PodGroup 创建到异步 reconcile 之间的调度窗口，PodGroup CREATE webhook 在对象落库前原子注入 `repack.volcano.sh/placement-lease`；随后 Pod webhook 读取该 lease 并给替身 Pod 注入 SchedulerGate。Webhook 只修改 admission 中的对象，不更新 RepackRun status；旧组到新组的 durable 映射仍由单 worker nomination reconciler 串行写入。Engine 仅在存在未完成 workload placement 时执行漏注入 lease 的兜底修复，并以独立 30 秒周期限制 namespace 级 PodGroup 扫描；终态按 Run owner 扫描并清理原组、替换组及未被认领的扩容候选组。
 
 当前 P0 不使用 workload owner UID。因而不支持在 Execute 期间删除 workload 对象后以相同 namespace、apiVersion、kind、name 重建；这种新对象可能被视为原 workload 的延续。PodGroup/Pod 在同一 workload 生命周期内的删除重建属于支持范围。
 
-**为何这样能统一管理**：repack **只认识 `repack.volcano.sh/pod-identity` + 两个标准索引 label（`apps.kubernetes.io/pod-index`、`batch.kubernetes.io/job-completion-index`）这几个固定 key**，且都直接读 pod 自身的 label、不查 ownerRef、不认识任何具体负载的私有 label scheme；vcjob 走稳定名称的精确快路径，StatefulSet/Indexed Job 由标准 label 自动兜住，其余自定义负载想精确就打这一个 label——**契约由 Volcano 定、负载来对齐**，新增负载类型 repack 一行不用改。
-
-**配套 P0 落地状态**：vcjob 使用稳定 Pod 名走 `victimPodName` 精确匹配，不需要额外 identity label。kthena 仍需在其独立控制器中写入 `repack.volcano.sh/pod-identity=<group>-<role>-<role-id>-<worker-index>`（其中 workerIndex 必须来自稳定的逻辑副本编号），这是跨项目对齐项。
+**为何这样能统一管理**：Repack 只识别通用 PodGroup 关联、SubGroup policy 和 Kubernetes PodSpec 调度字段，不查 ownerRef 链、不硬编码 workload kind，也不依赖任何框架的私有 label scheme。新增负载类型只要遵守“未配置 SubGroup 即组内同构；非同构时显式配置 SubGroup”的约束即可接入。
 
 #### 5.2.3 全字段参考示例（必选 / 可选标注）
 
@@ -720,19 +714,23 @@ status:
   nominations:                                # 可选（Execute 独有）：落点提名意图，reconciler 消费
     - namespace: ml                           # 必选（nomination 内）
       podGroupName: train-a                   # 可选：所属 PodGroup
-      victimPodName: train-a-worker-3         # 可选：旧 pod 名（审计 + 同名重建快路径；fungible 负载可空）
-      identityLabels:                         # 可选：匹配替身的身份标签（自解释；fungible 负载留空）
-        repack.volcano.sh/pod-identity: worker-3   # §5.2.2：键=用到的身份 label，值=其值
-      nodeName: node-7                        # 必选（nomination 内）：提名目标节点
+      replacementPodGroupName: train-a-v2     # 可选：整组重建后最新承接替身的 PodGroup
+      victimPodName: train-a-worker-3         # 可选：旧 pod 名（审计 + 同名重建快路径）
+      schedulingRequirementsHash: Gx4...Qw    # 可选：仅显式使用 SubGroup 时记录
+      nodeName: node-7                        # 必选：计划时目标节点
+      selectedNodeName: node-8                # 可选：执行时最新快照选择的节点
+      replacementPodName: train-a-v2-8fcd     # 可选：已认领替身 Pod
+      replacementPodUID: 4ca3...              # 可选：替身 UID，用于幂等恢复
+      actualNodeName: node-8                  # 可选：最终绑定节点
       expirationTime: "2026-07-04T10:18:42Z"  # 可选：重申截止，到期即 Expired
-      phase: Bound                            # 可选：Pending | Bound | Expired
+      phase: Placed                           # 可选：Prepared/Gated/AwaitingCapacity/Nominated/Placed/Degraded/Expired
 ```
 
 > **DryRun 与 Execute 的差异**：两者 `plan` 都是完整预测计划；DryRun **无 `result` / `nominations`**。Execute 的 `result` 记录实际接受量和复测收益；`nominations` 保留 Eviction API 已接受的 Pod，以及同组首次驱逐成功后由 workload controller 级联删除、仍需等待替身的计划 Pod。
 
 #### 5.2.4 外部负载接入指导（llm-d / kubeflow 等自定义 operator 的推荐做法）
 
-任何外部框架/operator 想让自己的负载被 repack 整理，需满足下面 **4 条**（repack **不感知具体负载类型**，全靠这几个通用契约点对齐）：
+任何外部框架/operator 想让自己的负载被 repack 整理，需满足下面 **4 条**（repack **不感知具体负载类型**，全靠通用 PodGroup 契约对齐）：
 
 **① 有 PodGroup（gang 调度单元）。** 两种接法：
 - **A. 依赖 Volcano 通用 pg-controller 自动建**：pod 用 `schedulerName: volcano` + 带 `scheduling.k8s.io/group-name` 注解，pg-controller 自动建 PG（一个 controller-owner 一个 PG）。最省，但**业务标签继承依赖 §5.2.1 增强合入**。
@@ -742,24 +740,24 @@ status:
 - 自建 PG（接法 B）→ 把负载自身的业务标签**拷到 `PodGroup.Labels`**（vcjob 即 `pg.Labels = job.Labels`）。
 - 依赖 pg-controller（接法 A）→ 把业务标签打在 **pod 模板**上，§5.2.1 合入后自动继承。
 
-**③ pod 带 `repack.volcano.sh/pod-identity`**（落点身份契约 §5.2.2，供驱逐后引导替身）。值须 **PG 内唯一 + 跨重建稳定**。
-- **同名重建**的负载（StatefulSet 序号 / vcjob / kthena ordinal）→ 可省（`victimPodName` 精确快路径覆盖）；
-- **随机名重建**的负载（Deployment 系、role 级滚动更新会加随机后缀）→ **务必打**，否则只能退化到 PodGroup 粒度 fungible 匹配；
-- 也可复用 **K8s 标准索引 label**（StatefulSet `apps.kubernetes.io/pod-index`、Indexed Job `batch.kubernetes.io/job-completion-index`），repack 自动识别、无需额外打。
+**③ 明确 PodGroup 是否同构。**
+- 未配置 SubGroup policy → Repack 认为组内 Pod 同构且可互换，不需要专用身份 label；
+- 显式配置 SubGroup policy → Repack 自动为每条 nomination 记录 `schedulingRequirementsHash`，按 PodSpec 调度需求等价类匹配改名后的替身；
+- 外部 controller 不需要感知 Repack，也不需要生成稳定 ordinal 或 `repack.volcano.sh/pod-identity`。
 
 **④ pod 可被追溯到其 PodGroup**：pod 带 `scheduling.k8s.io/group-name` 注解（pg-controller 会打；自建 PG 的 operator 需自己打），提名 reconciler 靠它把重建 pod 归到对应 PG。
 
 **常见框架映射（供参考）：**
 
-| 框架 | PG 由谁建 | 业务标签继承 | 角色/身份标签 | 接入建议 |
+| 框架 | PG 由谁建 | 业务标签继承 | Pod 同构约束 | 接入建议 |
 |------|-----------|--------------|----------------|----------|
-| **vcjob** | vcjob 控制器 | ✓ `job.Labels` | `volcano.sh/task-spec`；稳定 Pod 名 `<job>-<task>-<index>` | 已完备（exact-name） |
-| **kthena** | ModelServing 控制器（自建） | 需补继承 ModelServing 标签 | `modelserving.volcano.sh/{role,role-id}`；打 `pod-identity`=`<group>-<role>-<roleId>-<workerIndex>` | 自建路径，补 ② ③ |
-| **kubeflow**（training-operator） | operator（自建 PG，已有 Volcano 集成） | 把 `training.kubeflow.org/*` 或用户业务标签拷到 PG | 角色 `training.kubeflow.org/replica-type`(chief/worker/ps)、`replica-index`；`pod-identity`=`<replica-type>-<replica-index>` | 自建路径，补 ② ③ |
-| **llm-d**（P/D 分离） | 多为按 role 分独立 Deployment → 走 pg-controller | 业务标签打 pod 模板（靠 §5.2.1）；或 operator 聚合成 gang PG 时自拷 | 角色 `llm-d.ai/role`(prefill/decode)；随机名 → **务必打 `pod-identity`**=`<role>-<ordinal>` | 单角色 Deployment 走 fungible 即可；多角色同 PG 建议自建 PG + 打身份标签 |
-| **通用 Deployment/RS/裸 Job** | 通用 pg-controller | 靠 §5.2.1 | 单角色，通常无需身份标签（fungible） | 打业务标签在 pod 模板即可 |
+| **vcjob** | vcjob 控制器 | ✓ `job.Labels` | 稳定 Pod 名优先精确匹配；非同构组应配置 SubGroup | 已完备 |
+| **kthena** | ModelServing 控制器（自建） | 需继承 ModelServing 标签 | 同一 workload 下多个 PG 等价；组内非同构时配置 SubGroup | 无需 Repack 专用身份逻辑 |
+| **kubeflow**（training-operator） | operator（自建 PG，已有 Volcano 集成） | 把 `training.kubeflow.org/*` 或用户业务标签拷到 PG | 多角色放入同一 PG 时配置 SubGroup | 自建路径补 ② |
+| **llm-d**（P/D 分离） | 多为按 role 分独立 Deployment → 走 pg-controller | 业务标签打 pod 模板（靠 §5.2.1）；或 operator 聚合成 gang PG 时自拷 | 单角色 PG 默认同构；多角色同 PG 配置 SubGroup | 无需私有身份适配 |
+| **通用 Deployment/RS/裸 Job** | 通用 pg-controller | 靠 §5.2.1 | 默认同构 | 打业务标签在 pod 模板即可 |
 
-**一句话**：**vcjob 开箱即用；自建 CRD 的框架（kthena/kubeflow/llm-d-operator）按接法 B 补「PG 继承业务标签 + pod 打 `pod-identity`」两步；纯 Deployment 类走通用 pg-controller（依赖 §5.2.1）**。repack 侧不为任何框架写死代码，全靠这套通用契约。
+**一句话**：**vcjob 开箱即用；自建 CRD 的框架保证 PG 继承业务标签，并在组内非同构时使用 SubGroup；纯 Deployment 类走通用 pg-controller。** Repack 不为任何框架写死负载类型或身份标签。
 
 ### 5.3 扩展点：能力插件 / 动作 / 核心算法
 
@@ -1169,14 +1167,16 @@ flowchart TD
 | 场景 | 替身 Pod 名 | 匹配方式 |
 |---|---|---|
 | **同名重建（主路径）** | 与被驱逐者**完全同名** | 按 `namespace/name` 精确匹配后 patch。适用 Volcano vcjob（`<job>-<task>-<index>`，确定性命名）、StatefulSet（`<sts>-<ordinal>`）——即 gang/AI 主场景 |
-| **随机名重建（兜底）** | 新随机名 | 按 `PodGroup(group-name) + role(volcano.sh/task-spec)` 匹配任一新 Pending Pod，消费一条意图（同 role 可互换）。适用 Deployment/RS/裸 Job |
+| **随机名重建（同构 PG）** | 新随机名 | 在原组或 replacement PodGroup 中消费下一条未认领意图。适用 Deployment/RS/裸 Job |
+| **随机名重建（SubGroup PG）** | 新随机名 | 按 `schedulingRequirementsHash` 等值匹配旧 placement intent；无需识别 workload 类型或私有角色标签 |
 
-**注入由谁做、在哪做**：注入动作放在 **repack-engine（提名 reconciler）**，**不放 PodGroup/workload controller**。原因：(1) 覆盖面——原生 Deployment/StatefulSet/Job 的替身 Pod 由 kube 控制器创建、改不了，repack-engine 用 watch+patch 对所有 workload 一视同仁；(2) 解耦——repack 是可选 add-on，不应把读取整理意图、注入提名的逻辑焊进核心 controller；(3) `nominatedNodeName` 是 `pod.status` 字段（非创建期 spec），即便由 controller 创建也得另发一次 status patch，并不省事；(4) repack-engine 本就持有意图、且复用了 informer，加这个控制环顺手。
+**注入由谁做、在哪做**：注入动作放在 **repack-controller 的提名 reconciler**，**不放 PodGroup/workload controller**。原因：(1) 覆盖面——原生 Deployment/StatefulSet/Job 的替身 Pod 由 kube 控制器创建、改不了，统一的 Pod informer + status patch 对所有 workload 一视同仁；(2) 解耦——repack 是可选能力，不应把读取整理意图、注入提名的逻辑焊进各类 workload controller；(3) `nominatedNodeName` 是 `pod.status` 字段（非创建期 spec），即便由 workload controller 创建也得另发一次 status patch，并不省事；(4) 提名 reconciler 统一维护 `status.nominations[]` 的替身认领、冲突重试和 SchedulerGate 生命周期。
 
 流程：
 
-1. Execute 产出 `NominationIntents` → 持久化到 **`RepackRun.status.nominations[]`**（每搬一个 Pod 一条：`{namespace, podGroupName, victimPodName, identityLabels, nodeName, expirationTime, phase}`，durable，跨引擎重启/优雅删除窗口）。
-2. repack-engine 的**提名 reconciler** informer 监听受影响 gang 的 **Pending 且未绑定** Pod → 按**落点身份契约（§5.2.2）**认领替身：先按 `namespace/victimPodName` 精确命中（同名重建快路径）、否则在 `namespace+podGroupName` 内按 `identityLabels` 标签超集命中、`identityLabels` 为空（fungible）则命中 PG 内任一未消费意图 → `patch pod.status.nominatedNodeName = nodeName` → 标记 `phase: Bound`、重申至绑定或 `expirationTime` 到期（`phase: Expired`）。
+1. Execute 直接把已接受 plan 中每个 Pod move 转换并持久化到 **`RepackRun.status.nominations[]`**（每搬一个 Pod 一条；显式使用 SubGroup 的组额外写 `schedulingRequirementsHash`，durable 跨引擎重启和优雅删除窗口）。SubGroup victim 缺失或摘要生成失败时必须在驱逐前终止，不能静默退化为同构匹配。
+2. repack-controller 的**提名 reconciler** informer 监听受影响 gang 的 **Pending 且未绑定** Pod → 按**替身匹配契约（§5.2.2）**认领替身：已有 replacement Pod UID → `victimPodName` → `schedulingRequirementsHash` → 同构 PG 兜底。先把替身 UID 和执行时选择节点持久化到 RepackRun，再 patch `pod.status.nominatedNodeName` 并移除 SchedulerGate；任一步失败均由 reconcile 幂等恢复，直至绑定、降级或到期。
+3. 若已认领的替身 Pod 在绑定前被删除，reconciler 会先持久化释放旧 `replacementPodName/UID`，再允许同一 PodGroup 内符合匹配契约的新 Pod 接续；仍存活的认领者不会被并发扩容 Pod 抢占。
 
 提名是**软引导**：替身 Pod 刚 Pending 到被 patch 之间有极短竞态，调度器可能先调度它 → 记漂移、下轮重规划（用 informer 事件即时 patch 把窗口压到最小）。若要把竞态压到 0，可加 pod CREATE 的 mutating webhook 打 annotation + 调度侧识别（P1 可选，因 `nominatedNodeName` 是 status、webhook 创建期写不了它）。
 

@@ -19,54 +19,53 @@ package v1alpha1
 
 import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	types "k8s.io/apimachinery/pkg/types"
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 )
 
 // PodNominationApplyConfiguration represents a declarative configuration of the PodNomination type for use
 // with apply.
 //
-// PodNomination steers one relocated pod's replacement onto a target node
-// (Execute-only). The reconciler patches pod.status.nominatedNodeName, claiming
-// the replacement per the placement identity contract (proposal §5.2.2):
-// victimPodName exact match -> identityLabels (label match) -> fungible (any
-// pending pod in the PodGroup).
+// PodNomination records one relocated pod's replacement placement
+// (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
+// the replacement per the placement matching contract (proposal §5.2.2):
+// victimPodName exact match in the active PodGroup -> schedulingRequirementsHash
+// equality -> homogeneous PodGroup fallback.
 type PodNominationApplyConfiguration struct {
 	// Namespace of the target pod (PodGroup shares this namespace).
 	Namespace *string `json:"namespace,omitempty"`
 	// PodGroupName the pod belongs to.
 	PodGroupName *string `json:"podGroupName,omitempty"`
-	// ReplacementPodGroupName is the PodGroup that actually recreated this
-	// nomination's replacement Pod.
+	// ReplacementPodGroupName is the latest PodGroup generation that recreates
+	// this nomination's replacement Pod. It remains empty when the workload reuses
+	// the original PodGroup name. The placement controller owns this runtime field
+	// and may advance it after another full-group recreation; PodGroupName remains
+	// the immutable plan-time identity for audit.
 	ReplacementPodGroupName *string `json:"replacementPodGroupName,omitempty"`
 	// VictimPodName is the evicted pod's name: audit + exact fast-path when the
 	// controller recreates the replacement with the same name.
 	VictimPodName *string `json:"victimPodName,omitempty"`
-	// IdentityLabels are the labels that identify the replacement pod across
-	// reconstruction (key = the identity label the contract used, e.g.
-	// repack.volcano.sh/pod-identity, or a native-kind label such as
-	// apps.kubernetes.io/pod-index; value = its value). The reconciler claims a
-	// pending pod whose labels are a superset. Empty = fungible (any pod in the
-	// PodGroup). Self-describing: which label + value is visible in status.
-	IdentityLabels map[string]string `json:"identityLabels,omitempty"`
-	// NodeName is the node selected by the original repack plan. The engine may
-	// dynamically select another receiver before removing the placement gate.
+	// SchedulingRequirementsHash is an opaque hash of normalized scheduling
+	// requirements from the victim Pod. It is populated only when the PodGroup
+	// defines SubGroup policies and is compared only for equality when matching a
+	// renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
+	SchedulingRequirementsHash *string `json:"schedulingRequirementsHash,omitempty"`
+	// NodeName is the immutable plan-time target node. It is retained for audit even
+	// if a later placement reconciliation selects another receiver.
 	NodeName *string `json:"nodeName,omitempty"`
-	// SelectedNodeName is the current receiver selected from a fresh scheduler
+	// SelectedNodeName is the current receiver selected from the live scheduler
 	// snapshot. It is written before the placement gate is removed.
 	SelectedNodeName *string `json:"selectedNodeName,omitempty"`
-	// ReplacementPodName is the concrete replacement held or observed by the
-	// placement workflow.
-	ReplacementPodName *string `json:"replacementPodName,omitempty"`
-	// ReplacementPodUID prevents a recreated Pod with the same name being
-	// mistaken for the original replacement.
-	ReplacementPodUID *types.UID `json:"replacementPodUID,omitempty"`
-	// ActualNodeName is the node that ultimately bound the replacement Pod.
+	// ReplacementPodName and ReplacementPodUID identify the concrete Pod held by
+	// the placement gate. They are controller-owned status fields.
+	ReplacementPodName *string    `json:"replacementPodName,omitempty"`
+	ReplacementPodUID  *types.UID `json:"replacementPodUID,omitempty"`
+	// ActualNodeName is populated after the replacement is bound. It makes drift
+	// visible without overwriting the plan-time or selected target.
 	ActualNodeName *string `json:"actualNodeName,omitempty"`
 	// ExpirationTime bounds re-assertion; after it the nomination is Expired.
 	ExpirationTime *v1.Time `json:"expirationTime,omitempty"`
-	// Phase: Pending (not yet matched) / Bound (patched onto a replacement) /
-	// Expired (elapsed without a match).
+	// Phase is the controller-owned placement lifecycle.
 	Phase *repackv1alpha1.PodNominationPhase `json:"phase,omitempty"`
 }
 
@@ -92,9 +91,9 @@ func (b *PodNominationApplyConfiguration) WithPodGroupName(value string) *PodNom
 	return b
 }
 
-// WithReplacementPodGroupName sets the ReplacementPodGroupName field in the declarative configuration
-// to the given value and returns the receiver. If called multiple times, the field is set to the
-// value of the last call.
+// WithReplacementPodGroupName sets the ReplacementPodGroupName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ReplacementPodGroupName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithReplacementPodGroupName(value string) *PodNominationApplyConfiguration {
 	b.ReplacementPodGroupName = &value
 	return b
@@ -108,17 +107,11 @@ func (b *PodNominationApplyConfiguration) WithVictimPodName(value string) *PodNo
 	return b
 }
 
-// WithIdentityLabels puts the entries into the IdentityLabels field in the declarative configuration
-// and returns the receiver, so that objects can be build by chaining "With" function invocations.
-// If called multiple times, the entries provided by each call will be put on the IdentityLabels field,
-// overwriting an existing map entries in IdentityLabels field with the same key.
-func (b *PodNominationApplyConfiguration) WithIdentityLabels(entries map[string]string) *PodNominationApplyConfiguration {
-	if b.IdentityLabels == nil && len(entries) > 0 {
-		b.IdentityLabels = make(map[string]string, len(entries))
-	}
-	for k, v := range entries {
-		b.IdentityLabels[k] = v
-	}
+// WithSchedulingRequirementsHash sets the SchedulingRequirementsHash field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SchedulingRequirementsHash field is set to the value of the last call.
+func (b *PodNominationApplyConfiguration) WithSchedulingRequirementsHash(value string) *PodNominationApplyConfiguration {
+	b.SchedulingRequirementsHash = &value
 	return b
 }
 
@@ -132,6 +125,7 @@ func (b *PodNominationApplyConfiguration) WithNodeName(value string) *PodNominat
 
 // WithSelectedNodeName sets the SelectedNodeName field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SelectedNodeName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithSelectedNodeName(value string) *PodNominationApplyConfiguration {
 	b.SelectedNodeName = &value
 	return b
@@ -139,6 +133,7 @@ func (b *PodNominationApplyConfiguration) WithSelectedNodeName(value string) *Po
 
 // WithReplacementPodName sets the ReplacementPodName field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ReplacementPodName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithReplacementPodName(value string) *PodNominationApplyConfiguration {
 	b.ReplacementPodName = &value
 	return b
@@ -146,6 +141,7 @@ func (b *PodNominationApplyConfiguration) WithReplacementPodName(value string) *
 
 // WithReplacementPodUID sets the ReplacementPodUID field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ReplacementPodUID field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithReplacementPodUID(value types.UID) *PodNominationApplyConfiguration {
 	b.ReplacementPodUID = &value
 	return b
@@ -153,6 +149,7 @@ func (b *PodNominationApplyConfiguration) WithReplacementPodUID(value types.UID)
 
 // WithActualNodeName sets the ActualNodeName field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ActualNodeName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithActualNodeName(value string) *PodNominationApplyConfiguration {
 	b.ActualNodeName = &value
 	return b

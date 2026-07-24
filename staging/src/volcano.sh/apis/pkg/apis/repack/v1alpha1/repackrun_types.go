@@ -23,11 +23,6 @@ import (
 )
 
 const (
-	// PodIdentityLabel identifies a logical workload replica across Pod
-	// reconstruction. A value must be unique within its PodGroup and stable when
-	// the workload controller recreates the Pod. Repack records this label in a
-	// nomination to steer the replacement Pod to its planned placement node.
-	PodIdentityLabel = "repack.volcano.sh/pod-identity"
 	// PlacementGateName is injected only into replacement Pods belonging to an
 	// active RepackRun placement lease.
 	PlacementGateName = "repack.volcano.sh/placement"
@@ -260,8 +255,9 @@ type RepackRunStatus struct {
 
 	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
-	// placement identity contract (victimPodName exact match -> identityLabels ->
-	// fungible). See the design proposal §5.2.2.
+	// replacement matching contract (victimPodName exact match ->
+	// schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
+	// design proposal §5.2.2.
 	// +optional
 	// +kubebuilder:validation:MaxItems=4096
 	Nominations []PodNomination `json:"nominations,omitempty"`
@@ -269,9 +265,9 @@ type RepackRunStatus struct {
 
 // PodNomination records one relocated pod's replacement placement
 // (Execute-only). The placement controller patches pod.status.nominatedNodeName, claiming
-// the replacement per the placement identity contract (proposal §5.2.2):
-// victimPodName exact match in the active PodGroup -> identityLabels (label
-// match) -> fungible (any pending pod in the active PodGroup).
+// the replacement per the placement matching contract (proposal §5.2.2):
+// victimPodName exact match in the active PodGroup -> schedulingRequirementsHash
+// equality -> homogeneous PodGroup fallback.
 type PodNomination struct {
 	// Namespace of the target pod (PodGroup shares this namespace).
 	// +kubebuilder:validation:Required
@@ -290,14 +286,12 @@ type PodNomination struct {
 	// controller recreates the replacement with the same name.
 	// +optional
 	VictimPodName string `json:"victimPodName,omitempty"`
-	// IdentityLabels are the labels that identify the replacement pod across
-	// reconstruction (key = the identity label the contract used, e.g.
-	// repack.volcano.sh/pod-identity, or a native-kind label such as
-	// apps.kubernetes.io/pod-index; value = its value). The reconciler claims a
-	// pending pod whose labels are a superset. Empty = fungible (any pod in the
-	// PodGroup). Self-describing: which label + value is visible in status.
+	// SchedulingRequirementsHash is an opaque hash of normalized scheduling
+	// requirements from the victim Pod. It is populated only when the PodGroup
+	// defines SubGroup policies and is compared only for equality when matching a
+	// renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
 	// +optional
-	IdentityLabels map[string]string `json:"identityLabels,omitempty"`
+	SchedulingRequirementsHash string `json:"schedulingRequirementsHash,omitempty"`
 	// NodeName is the immutable plan-time target node. It is retained for audit even
 	// if a later placement reconciliation selects another receiver.
 	// +kubebuilder:validation:Required

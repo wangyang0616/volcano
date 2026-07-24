@@ -54,8 +54,9 @@ type RepackRunStatusApplyConfiguration struct {
 	Result *RepackResultApplyConfiguration `json:"result,omitempty"`
 	// Nominations are the durable placement-steering intents produced by Execute:
 	// one entry per relocated pod, consumed by the nomination reconciler per the
-	// placement identity contract (victimPodName exact match -> identityLabels ->
-	// fungible). See the design proposal §5.2.2.
+	// replacement matching contract (victimPodName exact match ->
+	// schedulingRequirementsHash -> homogeneous PodGroup fallback). See the
+	// design proposal §5.2.2.
 	Nominations []PodNominationApplyConfiguration `json:"nominations,omitempty"`
 }
 

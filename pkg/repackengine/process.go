@@ -179,7 +179,11 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	applyPlan(run, report, plan, targetResource, moveOwners, resolvedScope)
 	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonPlanComputed, plannedBenefitEventMessage(run))
 	if execute && worthwhile {
-		prepareExecuteNominations(run, plan, nominationTTL)
+		if err := prepareExecuteNominations(run, plan, nominationTTL, snapshot); err != nil {
+			markExecuteNotPerformed(run)
+			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
+				fmt.Errorf("prepare replacement placement intents: %w", err))
+		}
 		// This is the prepare barrier. In particular, nominations must be visible
 		// before an eviction can cause a replacement pod to appear. PodGroup
 		// placement leases are the second half of that barrier: the admission
@@ -271,7 +275,8 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		evictionAcceptedPlan := planAcceptedByEvictionAPI(plan, commitResult)
 		replacementPlacementPlan := planRequiringReplacementPlacement(plan, commitResult)
 		realizedReport := engineframework.RenderReport(replacementPlacementPlan)
-		run.Status.Nominations = retainRealizedNominations(run.Status.Nominations, replacementPlacementPlan, nominationTTL)
+		run.Status.Nominations = retainRealizedNominations(
+			run.Status.Nominations, replacementPlacementPlan)
 		// MovedCardCount intentionally remains the amount accepted by the Eviction
 		// API. Cascade-deleted Pods participate in replacement completion and
 		// freed-node verification without silently changing that public metric.

@@ -94,7 +94,18 @@ const (
 	eventReasonPlacementDrifted    = "RepackPlacementDrifted"
 	eventReasonPlacementGateOpened = "RepackPlacementGateOpened"
 	eventReasonPlacementReleased   = "RepackPlacementReleased"
+	eventReasonPlacementNotMatched = "RepackPlacementNotMatched"
+	eventReasonPlacementRecovered  = "RepackPlacementRecovered"
 	eventReasonPodGroupRecreated   = "RepackPodGroupRecreated"
+)
+
+type nominationMatchMethod string
+
+const (
+	nominationMatchedByReplacementPodUID      nominationMatchMethod = "ReplacementPodUID"
+	nominationMatchedByVictimName             nominationMatchMethod = "VictimPodName"
+	nominationMatchedBySchedulingRequirements nominationMatchMethod = "SchedulingRequirementsHash"
+	nominationMatchedByHomogeneousPodGroup    nominationMatchMethod = "HomogeneousPodGroup"
 )
 
 // NewEventRecorder creates a Pod event recorder for the placement protocol.
@@ -372,8 +383,8 @@ func (n *Nominator) enqueueGatedPodsForOwner(owner string) {
 	}
 }
 
-// enqueueAfterVictimDeleted wakes a renamed/fungible replacement that was held
-// back while the original victim still existed. Exact-name replacements are
+// enqueueAfterVictimDeleted wakes a renamed replacement that was held back
+// while the original victim still existed. Exact-name replacements are
 // naturally handled by their own Add event.
 func (n *Nominator) enqueueAfterVictimDeleted(obj interface{}) {
 	pod, ok := obj.(*corev1.Pod)
@@ -520,45 +531,74 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 		return n.clearPlacementGate(ctx, pod)
 	}
 
-	owningRunName := run.Name
-	if nomination == nil {
-		nomination, owningRunName = n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+	candidateSchedulingRequirementsHash, err := placement.SchedulingRequirementsHash(pod)
+	if err != nil {
+		return fmt.Errorf("derive scheduling requirements for candidate Pod %s: %w", key, err)
+	}
+	run, staleReplacementPodName, err := n.recoverStalePlacementClaim(
+		ctx, run, pod, candidateSchedulingRequirementsHash)
+	if err != nil {
+		return err
+	}
+	if staleReplacementPodName != "" {
+		klog.V(3).InfoS("repack nominator: recovered placement from a stale replacement Pod claim",
+			"run", run.Name, "staleReplacementPod", pod.Namespace+"/"+staleReplacementPodName,
+			"newReplacementPod", key, "podGroup", placement.PodGroupName(pod))
+		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementRecovered,
+			fmt.Sprintf("RepackRun %s released the stale claim previously held by replacement Pod %s and will retry placement with this Pod.",
+				run.Name, staleReplacementPodName))
+	}
+
+	// Re-read the concrete association after stale-claim recovery. A repeated
+	// reconcile of the same Pod resumes its durable state; a newly-created Pod
+	// proceeds through normal matching below.
+	nomination = nominationForReplacement(run, pod)
+	matchMethod := nominationMatchMethod("")
+	if nomination != nil {
+		matchMethod = nominationMatchedByReplacementPodUID
 	}
 	if nomination == nil {
-		workloadPending, err := n.pendingPlacementForLeasedWorkload(ctx, run, pod)
+		nomination, matchMethod = n.matchNomination(run, pod, candidateSchedulingRequirementsHash)
+	}
+	if nomination == nil {
+		potentialMatch, err := n.hasPotentialNominationForPod(
+			ctx, run, pod, candidateSchedulingRequirementsHash)
 		if err != nil {
 			return err
 		}
-		if pendingPlacementForPodGroup(run, pod, n.now()) || workloadPending {
-			// Deployment/ReplicaSet can create its replacement while the victim
-			// remains Terminating. At this point it is indistinguishable from a
-			// concurrent scale-out Pod. A recreated PodGroup adds the same
-			// ambiguity at workload scope, so retain the owner-marked gate until
-			// mapping becomes durable or every placement finishes.
-			klog.V(4).InfoS("repack nominator: retaining ambiguous placement gate while workload has pending placements",
-				"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod))
+		if potentialMatch {
+			// The candidate has the same scheduling requirements as unfinished
+			// replacement work, but may still be waiting for victim deletion or
+			// durable PodGroup recreation mapping. Keep only this potentially
+			// matching Pod gated; an unrelated scale-out Pod is released below.
+			klog.V(4).InfoS("repack nominator: retaining placement gate for a potential replacement Pod",
+				"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod),
+				"schedulingRequirementsHash", candidateSchedulingRequirementsHash)
 			return nil
 		}
-		klog.V(4).InfoS("repack nominator: no active nomination matches Pod; releasing placement gate",
-			"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod))
-		return n.clearPlacementGate(ctx, pod)
+		klog.V(3).InfoS("repack nominator: releasing unmatched placement gate from concurrent or unrelated Pod",
+			"pod", key, "run", run.Name, "podGroup", placement.PodGroupName(pod),
+			"schedulingRequirementsHash", candidateSchedulingRequirementsHash)
+		return n.clearPlacementGateWithReason(ctx, pod, eventReasonPlacementNotMatched,
+			fmt.Sprintf("No unfinished placement in RepackRun %s matched this Pod; its placement gate was removed.", run.Name))
 	}
 	klog.V(4).InfoS("repack nominator: matched replacement Pod to placement intent",
-		"pod", key, "run", owningRunName, "podGroup", nomination.PodGroupName,
+		"pod", key, "run", run.Name, "podGroup", nomination.PodGroupName,
 		"victimPod", nomination.VictimPodName, "plannedNode", nomination.NodeName,
-		"selectedNode", nomination.SelectedNodeName, "identityLabels", nomination.IdentityLabels)
+		"selectedNode", nomination.SelectedNodeName, "matchMethod", matchMethod,
+		"schedulingRequirementsHash", nomination.SchedulingRequirementsHash)
 	if nomination.SelectedNodeName == "" {
 		// The admission webhook has stopped the scheduler. Hand the placement
 		// decision to the engine, which owns the scheduler session and can choose
 		// a current receiver without duplicating predicate logic here.
-		return n.markPlacementGated(ctx, owningRunName, pod)
+		return n.markPlacementGated(ctx, run.Name, pod, candidateSchedulingRequirementsHash)
 	}
 
 	selectedNode := nomination.SelectedNodeName
 	// Persist the concrete association and selected receiver before mutating the
 	// Pod. Every following operation is then recoverable from Run status after a
 	// conflict, process restart, or partial API failure.
-	if err := n.markPlacementNominated(ctx, owningRunName, nomination, pod, selectedNode); err != nil {
+	if err := n.markPlacementNominated(ctx, run.Name, nomination, pod, selectedNode); err != nil {
 		return err
 	}
 	if pod.Status.NominatedNodeName != selectedNode {
@@ -569,9 +609,9 @@ func (n *Nominator) reconcile(ctx context.Context, key string) error {
 	if err := n.openPlacementGate(ctx, pod); err != nil {
 		return err
 	}
-	klog.V(3).InfoS("repack placement nominated replacement pod", "pod", key, "node", selectedNode, "repackRun", owningRunName)
+	klog.V(3).InfoS("repack placement nominated replacement pod", "pod", key, "node", selectedNode, "repackRun", run.Name)
 	n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementNominated,
-		fmt.Sprintf("RepackRun %s selected node %s for this replacement Pod.", owningRunName, selectedNode))
+		fmt.Sprintf("RepackRun %s selected node %s for this replacement Pod.", run.Name, selectedNode))
 	return nil
 }
 
@@ -592,28 +632,126 @@ func nominationForReplacement(run *repackv1alpha1.RepackRun, pod *corev1.Pod) *r
 	return nil
 }
 
-func pendingPlacementForPodGroup(run *repackv1alpha1.RepackRun, pod *corev1.Pod, now time.Time) bool {
-	if !placementRunActive(run) || pod == nil {
+// recoverStalePlacementClaim releases one non-terminal placement whose
+// previously-associated replacement Pod no longer exists. This covers a
+// controller recreating a Pod inside the same PodGroup, where PodGroup
+// generation recovery cannot reset the concrete Pod identity for us.
+//
+// The reset is persisted before the candidate can claim it, so retries after a
+// conflict or process restart always resume from a durable state.
+func (n *Nominator) recoverStalePlacementClaim(
+	ctx context.Context,
+	run *repackv1alpha1.RepackRun,
+	candidate *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
+) (*repackv1alpha1.RepackRun, string, error) {
+	if n.volcanoClient == nil || n.kubernetesClient == nil || run == nil || candidate == nil {
+		return run, "", nil
+	}
+	if !hasRecoverablePlacementClaimForPod(
+		run, candidate, candidateSchedulingRequirementsHash, n.now()) {
+		return run, "", nil
+	}
+	var updatedRun *repackv1alpha1.RepackRun
+	recoveredReplacementPodName := ""
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest, err := n.volcanoClient.RepackV1alpha1().RepackRuns().Get(
+			ctx, run.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		updatedRun = latest
+		if !placementRunActive(latest) {
+			return nil
+		}
+		now := n.now()
+		for index := range latest.Status.Nominations {
+			nomination := &latest.Status.Nominations[index]
+			if !placementClaimCanBeRecoveredForPod(
+				nomination, candidate, candidateSchedulingRequirementsHash, now) {
+				continue
+			}
+			replacement, getErr := n.kubernetesClient.CoreV1().Pods(nomination.Namespace).Get(
+				ctx, nomination.ReplacementPodName, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(getErr):
+				// The claimed replacement disappeared before placement completed.
+			case getErr != nil:
+				return getErr
+			case replacement.UID == nomination.ReplacementPodUID &&
+				replacement.DeletionTimestamp == nil:
+				// The claim is still held by a live Pod.
+				continue
+			}
+
+			recoveredReplacementPodName = nomination.ReplacementPodName
+			resetReplacementPlacement(nomination)
+			updatedRun, err = n.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(
+				ctx, latest, metav1.UpdateOptions{})
+			return err
+		}
+		return nil
+	})
+	return updatedRun, recoveredReplacementPodName, err
+}
+
+func hasRecoverablePlacementClaimForPod(
+	run *repackv1alpha1.RepackRun,
+	candidate *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+) bool {
+	if !placementRunActive(run) {
 		return false
 	}
-	podGroupName := placement.PodGroupName(pod)
-	for i := range run.Status.Nominations {
-		nomination := &run.Status.Nominations[i]
-		if nomination.Namespace != pod.Namespace || !placement.NominationUsesPodGroup(nomination, podGroupName) ||
-			nominationUnavailableForClaim(nomination) {
-			continue
-		}
-		if nomination.ExpirationTime == nil || !now.After(nomination.ExpirationTime.Time) {
+	for index := range run.Status.Nominations {
+		if placementClaimCanBeRecoveredForPod(
+			&run.Status.Nominations[index], candidate, candidateSchedulingRequirementsHash, now) {
 			return true
 		}
 	}
 	return false
 }
 
-func (n *Nominator) pendingPlacementForLeasedWorkload(
+func placementClaimCanBeRecoveredForPod(
+	nomination *repackv1alpha1.PodNomination,
+	candidate *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+) bool {
+	if nomination == nil || candidate == nil ||
+		nomination.ReplacementPodName == "" || nomination.ReplacementPodUID == "" ||
+		nomination.Namespace != candidate.Namespace ||
+		!placement.NominationUsesPodGroup(nomination, placement.PodGroupName(candidate)) ||
+		(nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time)) {
+		return false
+	}
+	switch nomination.Phase {
+	case repackv1alpha1.PodPlacementGated,
+		repackv1alpha1.PodPlacementAwaitingCapacity,
+		repackv1alpha1.PodPlacementNominated:
+	default:
+		return false
+	}
+	if nomination.ReplacementPodName == candidate.Name &&
+		nomination.ReplacementPodUID == candidate.UID {
+		return false
+	}
+	return nomination.SchedulingRequirementsHash == "" ||
+		nomination.SchedulingRequirementsHash == candidateSchedulingRequirementsHash
+}
+
+// hasPotentialNominationForPod reports whether a currently unmatched gated Pod
+// may become claimable after victim deletion or PodGroup recreation mapping.
+// Hash-bearing nominations require exact scheduling-requirements equality;
+// hashless nominations retain the documented homogeneous-PodGroup fallback.
+// This narrow test prevents an unrelated concurrent scale-out Pod from waiting
+// behind every unfinished placement in the workload.
+func (n *Nominator) hasPotentialNominationForPod(
 	ctx context.Context,
 	run *repackv1alpha1.RepackRun,
 	pod *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
 ) (bool, error) {
 	if n.volcanoClient == nil || run == nil || pod == nil {
 		return false, nil
@@ -622,6 +760,12 @@ func (n *Nominator) pendingPlacementForLeasedWorkload(
 	if podGroupName == "" {
 		return false, nil
 	}
+	now := n.now()
+	if hasClaimableNominationForPodGroup(
+		run, pod.Namespace, podGroupName, candidateSchedulingRequirementsHash, now) {
+		return true, nil
+	}
+
 	podGroup, err := n.volcanoClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(
 		ctx, podGroupName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -634,7 +778,71 @@ func (n *Nominator) pendingPlacementForLeasedWorkload(
 		placement.OwnerValue(run.Name, run.UID) {
 		return false, nil
 	}
-	return placement.PlacementAppliesToPodGroup(run, podGroup), nil
+	if !placement.PlacementAppliesToPodGroup(run, podGroup) {
+		return false, nil
+	}
+
+	workload := placement.WorkloadKeyForPodGroup(podGroup)
+	sourcePodGroups := placement.SourcePodGroupsByWorkload(run)[workload]
+	if len(sourcePodGroups) == 0 {
+		return false, nil
+	}
+	return hasClaimableNominationForSourcePodGroups(
+		run, pod.Namespace, sourcePodGroups, candidateSchedulingRequirementsHash, now), nil
+}
+
+func hasClaimableNominationForPodGroup(
+	run *repackv1alpha1.RepackRun,
+	namespace, podGroupName string,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+) bool {
+	return hasClaimableNomination(run, candidateSchedulingRequirementsHash, now,
+		func(nomination *repackv1alpha1.PodNomination) bool {
+			return nomination.Namespace == namespace &&
+				placement.NominationUsesPodGroup(nomination, podGroupName)
+		})
+}
+
+func hasClaimableNominationForSourcePodGroups(
+	run *repackv1alpha1.RepackRun,
+	namespace string,
+	sourcePodGroups []string,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+) bool {
+	names := make(map[string]struct{}, len(sourcePodGroups))
+	for _, name := range sourcePodGroups {
+		names[name] = struct{}{}
+	}
+	return hasClaimableNomination(run, candidateSchedulingRequirementsHash, now,
+		func(nomination *repackv1alpha1.PodNomination) bool {
+			_, found := names[nomination.PodGroupName]
+			return nomination.Namespace == namespace && found
+		})
+}
+
+func hasClaimableNomination(
+	run *repackv1alpha1.RepackRun,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+	inCandidateGroup func(*repackv1alpha1.PodNomination) bool,
+) bool {
+	if !placementRunActive(run) || inCandidateGroup == nil {
+		return false
+	}
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nominationUnavailableForClaim(nomination) ||
+			(nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time)) {
+			continue
+		}
+		if inCandidateGroup(nomination) && (nomination.SchedulingRequirementsHash == "" ||
+			nomination.SchedulingRequirementsHash == candidateSchedulingRequirementsHash) {
+			return true
+		}
+	}
+	return false
 }
 
 func placementRunActive(run *repackv1alpha1.RepackRun) bool {
@@ -651,72 +859,69 @@ func needsNomination(pod *corev1.Pod) bool {
 		pod.DeletionTimestamp == nil
 }
 
-// Match precedence — the placement identity contract (§5.2.2):
+// Match precedence — the replacement matching contract (§5.2.2):
 //  1. victimPodName exact: nomination.VictimPodName equals the pod's name in the
 //     original or durably-recorded replacement PodGroup (same-name rebuild —
-//     vcjob/StatefulSet/kthena ordinals);
-//  2. identityLabels: same namespace+PodGroup and the pod's labels are a superset
-//     of nomination.IdentityLabels (renamed replacement; the recorded label key+value
-//     say exactly how to match — e.g. repack.volcano.sh/pod-identity=worker-3);
-//  3. fungible: nomination.IdentityLabels empty — any pending pod in the same PodGroup
-//     (single-role Deployment/ReplicaSet/Job).
-func (n *Nominator) matchNominationInRuns(pod *corev1.Pod, runs []*repackv1alpha1.RepackRun) (*repackv1alpha1.PodNomination, string) {
-	if pod == nil {
+//     vcjob/StatefulSet ordinals);
+//  2. schedulingRequirementsHash: a renamed Pod in a SubGroup-enabled PodGroup
+//     claims an intent with equivalent normalized scheduling requirements;
+//  3. homogeneous PodGroup fallback: an empty hash explicitly means any pending
+//     Pod in the same PodGroup can claim the next available intent.
+func (n *Nominator) matchNomination(
+	run *repackv1alpha1.RepackRun,
+	pod *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
+) (*repackv1alpha1.PodNomination, nominationMatchMethod) {
+	if pod == nil || !placementRunActive(run) {
 		return nil, ""
 	}
 	now := n.now()
 	podGroupName := placement.PodGroupName(pod)
-	var fungibleNomination *repackv1alpha1.PodNomination
-	var fungibleRunName string
-	for _, run := range runs {
-		if !placementRunActive(run) {
+	var homogeneousNomination *repackv1alpha1.PodNomination
+	for index := range run.Status.Nominations {
+		nomination := &run.Status.Nominations[index]
+		if nominationUnavailableForClaim(nomination) {
 			continue
 		}
-		for index := range run.Status.Nominations {
-			nomination := &run.Status.Nominations[index]
-			if nominationUnavailableForClaim(nomination) {
-				continue
+		if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
+			continue
+		}
+		// 1. An exact victim name has the strongest Pod identity, but it
+		// still belongs to a specific original or durably-recorded
+		// replacement PodGroup. This prevents a same-name Pod in an
+		// ambiguous scale-out group from claiming the placement.
+		if nomination.VictimPodName != "" && nomination.Namespace == pod.Namespace &&
+			nomination.VictimPodName == pod.Name &&
+			placement.NominationUsesPodGroup(nomination, podGroupName) {
+			return nomination, nominationMatchedByVictimName
+		}
+		// Hash and homogeneous matching require the same namespace and the
+		// original or durably recorded replacement PodGroup.
+		if nomination.Namespace != pod.Namespace || !placement.NominationUsesPodGroup(nomination, podGroupName) {
+			continue
+		}
+		if nomination.SchedulingRequirementsHash != "" {
+			if nomination.SchedulingRequirementsHash == candidateSchedulingRequirementsHash &&
+				n.victimGone(nomination) {
+				return nomination, nominationMatchedBySchedulingRequirements
 			}
-			if nomination.ReplacementPodName != "" &&
-				(nomination.ReplacementPodName != pod.Name || nomination.ReplacementPodUID != pod.UID) {
-				continue
-			}
-			if nomination.ExpirationTime != nil && now.After(nomination.ExpirationTime.Time) {
-				continue
-			}
-			// 1. An exact victim name has the strongest Pod identity, but it
-			// still belongs to a specific original or durably-recorded
-			// replacement PodGroup. This prevents a same-name Pod in an
-			// ambiguous scale-out group from claiming the placement.
-			if nomination.VictimPodName != "" && nomination.Namespace == pod.Namespace &&
-				nomination.VictimPodName == pod.Name &&
-				placement.NominationUsesPodGroup(nomination, podGroupName) {
-				return nomination, run.Name
-			}
-			// identity / fungible require same namespace + PodGroup.
-			if nomination.Namespace != pod.Namespace || !placement.NominationUsesPodGroup(nomination, podGroupName) {
-				continue
-			}
-			if len(nomination.IdentityLabels) > 0 {
-				// 2. label-superset identity match.
-				if labelsMatch(pod.Labels, nomination.IdentityLabels) && n.victimGone(nomination) {
-					return nomination, run.Name
-				}
-				continue
-			}
-			// 3. fungible: first pending record for this PodGroup.
-			// Do not consume it while the original victim still exists: prepared
-			// nominations are persisted before eviction, and a failed eviction must
-			// not redirect an unrelated Pending gang member.
-			if !n.victimGone(nomination) {
-				continue
-			}
-			if fungibleNomination == nil {
-				fungibleNomination, fungibleRunName = nomination, run.Name
-			}
+			continue
+		}
+		// 3. Homogeneous PodGroup: first pending record for this group.
+		// Do not consume it while the original victim still exists: prepared
+		// nominations are persisted before eviction, and a failed eviction must
+		// not redirect an unrelated Pending gang member.
+		if !n.victimGone(nomination) {
+			continue
+		}
+		if homogeneousNomination == nil {
+			homogeneousNomination = nomination
 		}
 	}
-	return fungibleNomination, fungibleRunName
+	if homogeneousNomination != nil {
+		return homogeneousNomination, nominationMatchedByHomogeneousPodGroup
+	}
+	return nil, ""
 }
 
 // ensureReplacementPodGroup persists the workload-level PodGroup recreation
@@ -874,11 +1079,7 @@ func (n *Nominator) recordReplacementPodGroupMapping(
 				continue
 			}
 			nomination.ReplacementPodGroupName = replacementPodGroupName
-			nomination.SelectedNodeName = ""
-			nomination.ReplacementPodName = ""
-			nomination.ReplacementPodUID = ""
-			nomination.ActualNodeName = ""
-			nomination.Phase = repackv1alpha1.PodPlacementPrepared
+			resetReplacementPlacement(nomination)
 			attemptUpdatedCount++
 		}
 		if attemptUpdatedCount == 0 {
@@ -935,6 +1136,19 @@ func effectivePodGroupName(nomination *repackv1alpha1.PodNomination) string {
 	return nomination.PodGroupName
 }
 
+// resetReplacementPlacement preserves the original plan and PodGroup lineage
+// while making the intent claimable by the next replacement Pod.
+func resetReplacementPlacement(nomination *repackv1alpha1.PodNomination) {
+	if nomination == nil {
+		return
+	}
+	nomination.SelectedNodeName = ""
+	nomination.ReplacementPodName = ""
+	nomination.ReplacementPodUID = ""
+	nomination.ActualNodeName = ""
+	nomination.Phase = repackv1alpha1.PodPlacementPrepared
+}
+
 // placementRunForPod reads only the Run recorded by the gate owner annotation.
 // The direct read closes informer ordering windows without scanning or matching
 // unrelated Runs.
@@ -982,17 +1196,6 @@ func (n *Nominator) victimGone(nomination *repackv1alpha1.PodNomination) bool {
 	return apierrors.IsNotFound(err)
 }
 
-// labelsMatch reports whether podLabels is a superset of want (all want entries
-// present with equal values). Empty want matches anything.
-func labelsMatch(podLabels, want map[string]string) bool {
-	for k, v := range want {
-		if podLabels[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
 // patchNominatedNode writes pod.status.nominatedNodeName via the status
 // subresource (a soft hint; the scheduler may still place elsewhere).
 func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, node string) error {
@@ -1010,16 +1213,34 @@ func (n *Nominator) patchNominatedNode(ctx context.Context, pod *corev1.Pod, nod
 // receiver is durable. The owner marker remains until actual binding is
 // observed, so scheduled Pod updates can find their Run without global scans.
 func (n *Nominator) openPlacementGate(ctx context.Context, pod *corev1.Pod) error {
-	return n.patchPlacementGate(ctx, pod, false)
+	return n.patchPlacementGate(ctx, pod, false, "", "")
 }
 
 // clearPlacementGate removes both Repack's gate and owner marker on terminal,
 // stale, unrelated, or already-observed paths.
 func (n *Nominator) clearPlacementGate(ctx context.Context, pod *corev1.Pod) error {
-	return n.patchPlacementGate(ctx, pod, true)
+	expectedOwner := ""
+	if pod != nil {
+		expectedOwner = pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]
+	}
+	return n.clearPlacementGateWithReason(ctx, pod, eventReasonPlacementReleased,
+		fmt.Sprintf("Released the Repack placement gate owned by %s.", expectedOwner))
 }
 
-func (n *Nominator) patchPlacementGate(ctx context.Context, pod *corev1.Pod, removeOwner bool) error {
+func (n *Nominator) clearPlacementGateWithReason(
+	ctx context.Context,
+	pod *corev1.Pod,
+	reason, message string,
+) error {
+	return n.patchPlacementGate(ctx, pod, true, reason, message)
+}
+
+func (n *Nominator) patchPlacementGate(
+	ctx context.Context,
+	pod *corev1.Pod,
+	removeOwner bool,
+	releaseReason, releaseMessage string,
+) error {
 	if pod == nil || (!hasPlacementGate(pod) &&
 		(!removeOwner || pod.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] == "")) {
 		return nil
@@ -1061,9 +1282,9 @@ func (n *Nominator) patchPlacementGate(ctx context.Context, pod *corev1.Pod, rem
 	}
 	if removeOwner {
 		klog.V(3).InfoS("repack nominator: released placement gate and owner marker",
-			"pod", pod.Namespace+"/"+pod.Name, "gateOwner", expectedOwner)
-		n.recordPodEvent(pod, corev1.EventTypeNormal, eventReasonPlacementReleased,
-			fmt.Sprintf("Released the Repack placement gate owned by %s.", expectedOwner))
+			"pod", pod.Namespace+"/"+pod.Name, "gateOwner", expectedOwner,
+			"reason", releaseReason)
+		n.recordPodEvent(pod, corev1.EventTypeNormal, releaseReason, releaseMessage)
 	} else {
 		klog.V(4).InfoS("repack nominator: opened placement gate after nomination became durable",
 			"pod", pod.Namespace+"/"+pod.Name, "gateOwner", expectedOwner)
@@ -1087,7 +1308,7 @@ func hasPlacementGate(pod *corev1.Pod) bool {
 
 // markPlacementNominated records the concrete replacement before opening its
 // gate. This makes the later bound-node observation unambiguous even for
-// fungible native workloads.
+// homogeneous PodGroups whose Pods are intentionally interchangeable.
 func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, nomination *repackv1alpha1.PodNomination, pod *corev1.Pod, selectedNode string) error {
 	if runName == "" || nomination == nil || pod == nil {
 		return fmt.Errorf("cannot persist replacement nomination without Run, placement, and Pod identity")
@@ -1106,10 +1327,20 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 			if nominationStatusKey(current) != key {
 				continue
 			}
-			if nominationUnavailableForClaim(current) {
-				durable = current.Phase == repackv1alpha1.PodPlacementNominated &&
+			if current.ReplacementPodName != "" &&
+				(current.ReplacementPodName != pod.Name || current.ReplacementPodUID != pod.UID) {
+				return nil
+			}
+			switch current.Phase {
+			case repackv1alpha1.PodPlacementNominated:
+				durable =
 					current.SelectedNodeName == selectedNode &&
-					current.ReplacementPodName == pod.Name && current.ReplacementPodUID == pod.UID
+						current.ReplacementPodName == pod.Name && current.ReplacementPodUID == pod.UID
+				return nil
+			case repackv1alpha1.PodPlacementPlaced,
+				repackv1alpha1.PodPlacementDegraded,
+				repackv1alpha1.PodPlacementExpired,
+				repackv1alpha1.PodNominationBound:
 				return nil
 			}
 			current.SelectedNodeName = selectedNode
@@ -1131,7 +1362,12 @@ func (n *Nominator) markPlacementNominated(ctx context.Context, runName string, 
 	return nil
 }
 
-func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod *corev1.Pod) error {
+func (n *Nominator) markPlacementGated(
+	ctx context.Context,
+	runName string,
+	pod *corev1.Pod,
+	candidateSchedulingRequirementsHash string,
+) error {
 	if runName == "" || pod == nil {
 		return nil
 	}
@@ -1141,7 +1377,13 @@ func (n *Nominator) markPlacementGated(ctx context.Context, runName string, pod 
 		if err != nil {
 			return ignoreNotFound(err)
 		}
-		current, _ := n.matchNominationInRuns(pod, []*repackv1alpha1.RepackRun{run})
+		current := nominationForReplacement(run, pod)
+		if current != nil && (current.Phase == repackv1alpha1.PodPlacementGated ||
+			current.Phase == repackv1alpha1.PodPlacementAwaitingCapacity) {
+			updated = true
+			return nil
+		}
+		current, _ = n.matchNomination(run, pod, candidateSchedulingRequirementsHash)
 		if current == nil {
 			return nil
 		}
@@ -1231,11 +1473,13 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 }
 
 // nominationUnavailableForClaim reports that this intent is already associated
-// with a concrete replacement Pod or has reached a terminal phase. Nominated is
-// unavailable to another Pod but deliberately not terminal; workload-level
-// recovery may still reset it when its replacement PodGroup is deleted.
+// with a concrete replacement Pod or has reached a terminal phase. A non-terminal
+// association may first be reset when its Pod or PodGroup generation disappears.
 func nominationUnavailableForClaim(nomination *repackv1alpha1.PodNomination) bool {
 	if nomination == nil {
+		return true
+	}
+	if nomination.ReplacementPodName != "" || nomination.ReplacementPodUID != "" {
 		return true
 	}
 	switch nomination.Phase {
