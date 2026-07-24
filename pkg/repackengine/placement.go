@@ -678,7 +678,28 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 			markExecuteBenefitUnverified(run)
 		} else {
 			updateActualExecuteResult(run, nodes, targetResource)
+			comparison, verificationPending := freedNodeVerificationPending(run, e.now())
 			schedframework.CloseSessionReadOnly(schedulerSession)
+			// Replacement binding and source-node resource release are observed
+			// through independent informer streams. A coherent scheduler snapshot
+			// can therefore contain the replacement while still retaining a
+			// terminating victim (or another stale source-node task) briefly.
+			// Do not turn that convergence window into a permanent failed Run.
+			//
+			// A genuinely occupied planned node is still a failed outcome: it
+			// remains unequal through the placement deadline and is evaluated
+			// below as BenefitNotRealized.
+			if verificationPending {
+				klog.V(4).InfoS("repack: waiting for planned node-freeing observation to converge",
+					"run", run.Name,
+					"plannedFreedNodes", comparison.Planned,
+					"actualFreedNodes", comparison.Actual,
+					"missingFreedNodes", comparison.Missing,
+					"unexpectedFreedNodes", comparison.Unexpected,
+					"retryAfter", placementRetryInterval)
+				e.workQueue.AddAfter(run.Name, placementRetryInterval)
+				return nil
+			}
 		}
 	}
 
@@ -817,6 +838,11 @@ func placementObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.
 		}
 	}
 	return !latest.IsZero() && !now.Before(latest)
+}
+
+func freedNodeVerificationPending(run *repackv1alpha1.RepackRun, now time.Time) (freedNodeSetComparison, bool) {
+	comparison := compareFreedNodeSets(run)
+	return comparison, !comparison.Equal && !placementObservationDeadlinePassed(run, now)
 }
 
 func placementBindingsVisible(nodes []*schedapi.NodeInfo, relocations []repackv1alpha1.PodRelocationStatus) bool {

@@ -179,4 +179,23 @@ func TestPlacementAppliesToPodGroupAcceptsRecordedAndWorkloadReplacement(t *test
 	if PlacementAppliesToPodGroup(run, preexisting) {
 		t.Fatal("PodGroup created before Execute started must not be inferred as a replacement")
 	}
+
+	// Once PodGroup admission has attached this Run's exact lease, Pod
+	// admission must honor it even before ReplacementPodGroupName is durable.
+	// Otherwise two consecutive admission requests can disagree about the same
+	// recreated PodGroup and allow its first Pod through without a gate.
+	run.Name = "run"
+	run.UID = types.UID("run-uid")
+	preexisting.Annotations = map[string]string{
+		repackv1alpha1.PlacementLeaseAnnotation: OwnerValue(run.Name, run.UID),
+	}
+	if !PlacementAppliesToPodGroup(run, preexisting) {
+		t.Fatal("PodGroup carrying the active Run's exact lease must remain covered")
+	}
+
+	foreignLease := preexisting.DeepCopy()
+	foreignLease.Annotations[repackv1alpha1.PlacementLeaseAnnotation] = "other/other-uid"
+	if PlacementAppliesToPodGroup(run, foreignLease) {
+		t.Fatal("a foreign lease must not bypass the preexisting PodGroup guard")
+	}
 }

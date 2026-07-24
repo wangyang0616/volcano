@@ -312,6 +312,42 @@ func TestPlacementObservationDeadlinePassed(t *testing.T) {
 	}
 }
 
+func TestPlannedNodeFreeingCanConvergeUntilPlacementDeadline(t *testing.T) {
+	deadline := metav1.NewTime(time.Unix(100, 0))
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan:   &repackv1alpha1.RepackPlan{FreedNodes: []string{"source"}},
+		Result: &repackv1alpha1.RepackResult{MetricsVerified: true},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Placement: repackv1alpha1.PodPlacementStatus{
+				ExpirationTime: &deadline,
+				Phase:          repackv1alpha1.PodPlacementPlaced,
+			},
+		}},
+	}}
+
+	comparison, pending := freedNodeVerificationPending(run, time.Unix(99, 0))
+	if comparison.Equal {
+		t.Fatal("planned and actual freed-node sets must initially differ")
+	}
+	if !pending {
+		t.Fatal("a transient missing node must be retried before the deadline")
+	}
+
+	run.Status.Result.FreedNodes = []string{"source"}
+	if comparison, pending = freedNodeVerificationPending(run, time.Unix(99, 0)); !comparison.Equal || pending {
+		t.Fatalf("comparison=%+v, want converged planned and actual node sets", comparison)
+	}
+
+	run.Status.Result.FreedNodes = nil
+	if comparison, pending = freedNodeVerificationPending(run, time.Unix(100, 0)); comparison.Equal || pending {
+		t.Fatal("a persistently occupied planned node must become terminal at the deadline")
+	}
+	decision := evaluatePlacementTerminal(run, false)
+	if decision.Succeeded || decision.Reason != state.ReasonBenefitNotRealized {
+		t.Fatalf("decision=%+v, want failed %s", decision, state.ReasonBenefitNotRealized)
+	}
+}
+
 func TestExpirePlacementsIncludesNominatedReplacement(t *testing.T) {
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	run := &repackv1alpha1.RepackRun{

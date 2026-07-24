@@ -214,7 +214,16 @@ func PlacementAppliesToPodGroup(run *repackv1alpha1.RepackRun, podGroup *schedul
 	if ActiveForPodGroup(run, podGroup.Namespace, podGroup.Name) {
 		return true
 	}
-	if run.Status.StartTime != nil && !podGroup.CreationTimestamp.IsZero() &&
+	// An exact lease owner is stronger evidence than the creation-time guard.
+	// This is important immediately after PodGroup admission: the CREATE webhook
+	// may have already attached the current Run's lease while the durable
+	// ReplacementPodGroupName mapping is still pending. Rejecting that same
+	// PodGroup during Pod admission would open a window where its first Pod is
+	// created without the placement gate.
+	expectedLease := OwnerValue(run.Name, run.UID)
+	ownedLease := expectedLease != "" &&
+		podGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] == expectedLease
+	if !ownedLease && run.Status.StartTime != nil && !podGroup.CreationTimestamp.IsZero() &&
 		podGroup.CreationTimestamp.Time.Before(run.Status.StartTime.Time) {
 		return false
 	}
