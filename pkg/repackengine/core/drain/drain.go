@@ -30,7 +30,6 @@ limitations under the License.
 package drain
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -185,7 +184,7 @@ func drainGreedy(
 		klog.V(4).InfoS("repack drain: step evaluated units", "step", step,
 			"totalUnits", len(units), "feasibleThisStep", len(feasible), "nodesFreedSoFar", len(s.freedNodes))
 		scoredCandidates := s.scoreCandidates(feasible)
-		s.logCandidateRanking(step, scoredCandidates)
+		s.logCandidateOrder(step, scoredCandidates)
 		if len(scoredCandidates) == 0 {
 			break
 		}
@@ -448,78 +447,12 @@ func leastDisruptiveCandidate(scored []scoredCandidate) candidate {
 	return scored[best].candidate
 }
 
-func rankScoredCandidates(scored []scoredCandidate) []scoredCandidate {
-	ranked := append([]scoredCandidate(nil), scored...)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return ranked[i].score.Total < ranked[j].score.Total
+func orderScoredCandidates(scored []scoredCandidate) []scoredCandidate {
+	ordered := append([]scoredCandidate(nil), scored...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].score.Total < ordered[j].score.Total
 	})
-	return ranked
-}
-
-func (s *drainState) logCandidateRanking(step int, scored []scoredCandidate) {
-	if !klog.V(3).Enabled() {
-		return
-	}
-	ranked := rankScoredCandidates(scored)
-	klog.V(3).InfoS("repack drain: drain target ranking for planning step",
-		"run", runName(s.ssn),
-		"step", step,
-		"resource", s.resource,
-		"feasibleCandidateCount", len(ranked),
-		"orderingRule", "lower weighted normalized disruption score first; ties prefer higher freeable-unit benefit weight, then lexical unit key",
-		"normalizationRule", "each enabled disruption term is min-max normalized across this step's feasible candidates",
-		"rankedTargets", formatRankedCandidates(ranked))
-}
-
-const candidateRankingEdgeCount = 3
-
-// formatRankedCandidates keeps the ranking useful on large clusters: show the
-// complete order for up to six candidates, otherwise retain the three best and
-// three worst candidates with an explicit omitted-count marker between them.
-func formatRankedCandidates(ranked []scoredCandidate) []string {
-	if len(ranked) == 0 {
-		return nil
-	}
-	formatAt := func(index int) string {
-		candidate := ranked[index]
-		terms := make([]string, 0, len(candidate.score.Terms))
-		for _, term := range candidate.score.Terms {
-			terms = append(terms, fmt.Sprintf(
-				"%s(raw=%.3f,weight=%.3f,normalized=%.3f,contribution=%.3f)",
-				term.Name, term.Raw, term.Weight, term.Normalized, term.Contribution))
-		}
-		return fmt.Sprintf(
-			"#%d unit=%s level=%s nodes=[%s] benefitWeight=%.3f disruptionScore=%.3f terms=[%s]",
-			index+1, candidate.candidate.key, candidate.candidate.unit.Level,
-			summarizeNames(candidate.candidate.unit.Nodes), candidate.candidate.unit.Weight,
-			candidate.score.Total, strings.Join(terms, ","))
-	}
-	if len(ranked) <= candidateRankingEdgeCount*2 {
-		result := make([]string, 0, len(ranked))
-		for index := range ranked {
-			result = append(result, formatAt(index))
-		}
-		return result
-	}
-	result := make([]string, 0, candidateRankingEdgeCount*2+1)
-	for index := 0; index < candidateRankingEdgeCount; index++ {
-		result = append(result, formatAt(index))
-	}
-	result = append(result, fmt.Sprintf("... %d candidates omitted ...", len(ranked)-candidateRankingEdgeCount*2))
-	for index := len(ranked) - candidateRankingEdgeCount; index < len(ranked); index++ {
-		result = append(result, formatAt(index))
-	}
-	return result
-}
-
-func summarizeNames(names []string) string {
-	if len(names) <= candidateRankingEdgeCount*2 {
-		return strings.Join(names, ",")
-	}
-	return fmt.Sprintf("%s,... %d omitted ...,%s",
-		strings.Join(names[:candidateRankingEdgeCount], ","),
-		len(names)-candidateRankingEdgeCount*2,
-		strings.Join(names[len(names)-candidateRankingEdgeCount:], ","))
+	return ordered
 }
 
 // commit applies the chosen candidate to the pass state: mark receivers filled and

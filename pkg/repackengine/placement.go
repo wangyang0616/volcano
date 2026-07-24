@@ -397,8 +397,6 @@ func (e *Engine) placementLeaseRepairDue(run *repackv1alpha1.RepackRun) bool {
 		now = e.now()
 	}
 	runIdentity := run.Name + "/" + string(run.UID)
-	e.placementLeaseRepairMutex.Lock()
-	defer e.placementLeaseRepairMutex.Unlock()
 	if e.placementLeaseRepairRunIdentity == runIdentity &&
 		now.Before(e.lastPlacementLeaseRepairTime.Add(placementLeaseRepairInterval)) {
 		klog.V(5).InfoS("repack: recreated PodGroup lease repair scan rate-limited",

@@ -119,14 +119,15 @@ type Engine struct {
 	activeExecuteRunName  string
 	lastExecuteFinishTime time.Time
 	// pendingTerminalStatuses retains the exact terminal projection across a
-	// bounded write failure, so the queued retry never reruns side effects.
-	terminalStatusMutex     sync.Mutex
+	// bounded write failure, so the queued retry never reruns side effects. It is
+	// owned by the single reconcile worker; recoverOrphans seeds it before that
+	// worker starts.
 	pendingTerminalStatuses map[string]*repackv1alpha1.RepackRunStatus
 
 	// The PodGroup webhook is the primary placement-lease barrier. This timestamp
 	// independently rate-limits the engine's namespace-wide fallback scan so the
-	// two-second placement loop does not repeatedly list every PodGroup.
-	placementLeaseRepairMutex       sync.Mutex
+	// two-second placement loop does not repeatedly list every PodGroup. The
+	// single reconcile worker owns this rate-limit state.
 	placementLeaseRepairRunIdentity string
 	lastPlacementLeaseRepairTime    time.Time
 }
@@ -538,8 +539,6 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 }
 
 func (e *Engine) pendingTerminalStatus(name string) (*repackv1alpha1.RepackRunStatus, bool) {
-	e.terminalStatusMutex.Lock()
-	defer e.terminalStatusMutex.Unlock()
 	status, found := e.pendingTerminalStatuses[name]
 	if !found {
 		return nil, false
@@ -551,18 +550,14 @@ func (e *Engine) rememberPendingTerminalStatus(name string, status *repackv1alph
 	if status == nil {
 		return
 	}
-	e.terminalStatusMutex.Lock()
 	if e.pendingTerminalStatuses == nil {
 		e.pendingTerminalStatuses = make(map[string]*repackv1alpha1.RepackRunStatus)
 	}
 	e.pendingTerminalStatuses[name] = status.DeepCopy()
-	e.terminalStatusMutex.Unlock()
 }
 
 func (e *Engine) forgetPendingTerminalStatus(name string) {
-	e.terminalStatusMutex.Lock()
 	delete(e.pendingTerminalStatuses, name)
-	e.terminalStatusMutex.Unlock()
 }
 
 // recoverOrphans fails an interrupted planning/eviction run. Placement runs are

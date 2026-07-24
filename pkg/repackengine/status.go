@@ -111,12 +111,15 @@ func mergeRelocationProgress(desired, latest []repackv1alpha1.PodRelocationStatu
 		}
 	}
 	for i := range desired {
-		if persisted, found := evictions[placementIdentityForRelocation(&desired[i])]; found &&
-			persisted.Eviction.Phase != "" &&
-			evictionPhaseRank(persisted.Eviction.Phase) >= evictionPhaseRank(desired[i].Eviction.Phase) {
-			desired[i].VictimPodUID = persisted.VictimPodUID
-			desired[i].Eviction.Phase = persisted.Eviction.Phase
-			desired[i].Eviction.Message = persisted.Eviction.Message
+		if persisted, found := evictions[placementIdentityForRelocation(&desired[i])]; found {
+			persistedPhase := persisted.Eviction.Phase
+			desiredPhase := desired[i].Eviction.Phase
+			if persistedPhase != "" && (persistedPhase == desiredPhase ||
+				evictionPhaseAdvances(desiredPhase, persistedPhase)) {
+				desired[i].VictimPodUID = persisted.VictimPodUID
+				desired[i].Eviction.Phase = persistedPhase
+				desired[i].Eviction.Message = persisted.Eviction.Message
+			}
 		}
 		if replacementPodGroupName := replacements[placementIdentityForRelocation(&desired[i])]; replacementPodGroupName != "" {
 			desired[i].ReplacementPodGroupName = replacementPodGroupName
@@ -129,7 +132,7 @@ func mergeRelocationProgress(desired, latest []repackv1alpha1.PodRelocationStatu
 			// WaitingForNodeSelection observation must not overwrite the
 			// Engine's durable TimedOut decision during terminal status merge.
 			if latestPhase == desiredPhase ||
-				placementPhaseRank(latestPhase) > placementPhaseRank(desiredPhase) {
+				placementPhaseAdvances(desiredPhase, latestPhase) {
 				desired[i].Placement.Phase = latestPhase
 				desired[i].Placement.SelectedNodeName = placement.Placement.SelectedNodeName
 				desired[i].Placement.ReplacementPodName = placement.Placement.ReplacementPodName
@@ -140,35 +143,47 @@ func mergeRelocationProgress(desired, latest []repackv1alpha1.PodRelocationStatu
 	}
 }
 
-func placementPhaseRank(phase repackv1alpha1.PodPlacementPhase) int {
-	switch phase {
+// placementPhaseAdvances reports whether observed is a later placement state
+// than current. Placed and TimedOut are sibling terminal states: neither may
+// replace the other.
+func placementPhaseAdvances(current, observed repackv1alpha1.PodPlacementPhase) bool {
+	switch observed {
 	case repackv1alpha1.PodPlacementWaitingForReplacement:
-		return 1
+		return current == ""
 	case repackv1alpha1.PodPlacementWaitingForNodeSelection:
-		return 2
+		return current == "" ||
+			current == repackv1alpha1.PodPlacementWaitingForReplacement
 	case repackv1alpha1.PodPlacementNominated:
-		return 3
+		return current == "" ||
+			current == repackv1alpha1.PodPlacementWaitingForReplacement ||
+			current == repackv1alpha1.PodPlacementWaitingForNodeSelection
 	case repackv1alpha1.PodPlacementPlaced,
 		repackv1alpha1.PodPlacementTimedOut:
-		return 4
-	default:
-		return 0
+		return current == "" ||
+			current == repackv1alpha1.PodPlacementWaitingForReplacement ||
+			current == repackv1alpha1.PodPlacementWaitingForNodeSelection ||
+			current == repackv1alpha1.PodPlacementNominated
 	}
+	return false
 }
 
-func evictionPhaseRank(phase repackv1alpha1.PodEvictionPhase) int {
-	switch phase {
+// evictionPhaseAdvances reports whether observed is a later eviction state than
+// current. Accepted, IndirectlyRemoved, and Rejected are sibling terminal states.
+func evictionPhaseAdvances(current, observed repackv1alpha1.PodEvictionPhase) bool {
+	switch observed {
 	case repackv1alpha1.PodEvictionPending:
-		return 1
+		return current == ""
 	case repackv1alpha1.PodEvictionInProgress:
-		return 2
+		return current == "" ||
+			current == repackv1alpha1.PodEvictionPending
 	case repackv1alpha1.PodEvictionAccepted,
 		repackv1alpha1.PodEvictionIndirectlyRemoved,
 		repackv1alpha1.PodEvictionRejected:
-		return 4
-	default:
-		return 0
+		return current == "" ||
+			current == repackv1alpha1.PodEvictionPending ||
+			current == repackv1alpha1.PodEvictionInProgress
 	}
+	return false
 }
 
 type placementIdentity struct {
