@@ -377,6 +377,9 @@ type PodNomination struct {
     PodGroupName   string            `json:"podGroupName,omitempty"`         // 计划时的原 PodGroup，执行中不改写
     ReplacementPodGroupName string   `json:"replacementPodGroupName,omitempty"` // workload 整组重建后当前承接替身 Pod 的最新 PodGroup
     VictimPodName  string            `json:"victimPodName,omitempty"`        // 被驱逐的旧 pod 名：审计 + 同名重建时的精确快路径
+    VictimPodUID   types.UID         `json:"victimPodUID,omitempty"`         // 计划时 Pod 实例；驱逐 UID precondition 与崩溃恢复依据
+    EvictionPhase  string            `json:"evictionPhase,omitempty"`        // Pending/InProgress/Accepted/VictimNotFound/CascadeDeleted/Rejected
+    EvictionMessage string           `json:"evictionMessage,omitempty"`      // 驱逐拒绝或恢复判断的人读说明
     SchedulingRequirementsHash string `json:"schedulingRequirementsHash,omitempty"` // 仅显式使用 SubGroup 时记录；归一化调度需求的等价性摘要
     NodeName       string            `json:"nodeName"`                       // 计划时目标节点（审计字段）
     SelectedNodeName string          `json:"selectedNodeName,omitempty"`     // 执行时基于最新快照选择的接收节点
@@ -386,6 +389,9 @@ type PodNomination struct {
     ExpirationTime *metav1.Time `json:"expirationTime,omitempty"` // 重申截止，到期即 Expired（对齐 *Time 命名惯例）
     Phase          string       `json:"phase,omitempty"`          // Prepared/Gated/AwaitingCapacity/Nominated/Placed/Degraded/Expired
 }
+// evictionPhase 由 engine 维护，placement phase 由 nomination controller 维护。
+// 只有 Accepted/CascadeDeleted（以及兼容旧对象的空值）可认领替身 Pod；每次 Eviction API
+// 调用前先持久化 InProgress，重启后结合 victimPodUID、Pod 是否存在/terminating 幂等恢复。
 // ---- status 子结构 ----
 // RepackPlan：DryRun 与 Execute 同一结构，始终是完整、不可变的计划时快照。
 type RepackPlan struct {

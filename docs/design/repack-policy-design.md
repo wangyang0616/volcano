@@ -821,6 +821,7 @@ status (RepackRunStatus)
 │   └── metricsVerified        bool    指标是否来自一致快照
 └── nominations[]             Execute 独有，仅保留已接受驱逐
         PodNomination{namespace, podGroupName, replacementPodGroupName, victimPodName,
+                      victimPodUID, evictionPhase, evictionMessage,
                       schedulingRequirementsHash, nodeName, selectedNodeName,
                       replacementPodName/UID, actualNodeName, expirationTime, phase}
 ```
@@ -3217,8 +3218,9 @@ type RepackRunStatus struct {
     Result         *RepackResult      `json:"result,omitempty"`         // Execute 独有：实际接受量与复测结果
     Nominations    []PodNomination    `json:"nominations,omitempty"`    // Execute 独有：落点提名意图（结构见 proposal §5.2）
     // PodNomination{namespace, podGroupName, replacementPodGroupName, victimPodName,
-    // schedulingRequirementsHash, nodeName, selectedNodeName, replacementPodName/UID,
-    // actualNodeName, expirationTime, phase}
+    // victimPodUID, evictionPhase, evictionMessage, schedulingRequirementsHash,
+    // nodeName, selectedNodeName, replacementPodName/UID, actualNodeName,
+    // expirationTime, phase}
     // 替身认领按 proposal §5.2.2：已有 replacement UID → victimPodName 精确 →
     // schedulingRequirementsHash（仅显式使用 SubGroup）→ 同构 PodGroup 兜底。
 }

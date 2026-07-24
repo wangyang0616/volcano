@@ -18,6 +18,7 @@ package repackengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,7 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
@@ -94,9 +95,11 @@ func (e *Engine) writeStatus(ctx context.Context, name string, desired *repackv1
 
 func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
 	placements := make(map[placementIdentity]repackv1alpha1.PodNomination, len(latest))
+	evictions := make(map[placementIdentity]repackv1alpha1.PodNomination, len(latest))
 	replacements := make(map[placementIdentity]string, len(latest))
 	for i := range latest {
 		r := &latest[i]
+		evictions[placementIdentityForNomination(r)] = *r
 		if r.ReplacementPodGroupName != "" {
 			replacements[placementIdentityForNomination(r)] = r.ReplacementPodGroupName
 		}
@@ -108,6 +111,13 @@ func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
 		}
 	}
 	for i := range desired {
+		if persisted, found := evictions[placementIdentityForNomination(&desired[i])]; found &&
+			persisted.EvictionPhase != "" &&
+			evictionPhaseRank(persisted.EvictionPhase) >= evictionPhaseRank(desired[i].EvictionPhase) {
+			desired[i].VictimPodUID = persisted.VictimPodUID
+			desired[i].EvictionPhase = persisted.EvictionPhase
+			desired[i].EvictionMessage = persisted.EvictionMessage
+		}
 		if replacementPodGroupName := replacements[placementIdentityForNomination(&desired[i])]; replacementPodGroupName != "" {
 			desired[i].ReplacementPodGroupName = replacementPodGroupName
 		}
@@ -118,6 +128,23 @@ func mergeNominationPhases(desired, latest []repackv1alpha1.PodNomination) {
 			desired[i].ReplacementPodUID = placement.ReplacementPodUID
 			desired[i].ActualNodeName = placement.ActualNodeName
 		}
+	}
+}
+
+func evictionPhaseRank(phase repackv1alpha1.PodEvictionPhase) int {
+	switch phase {
+	case repackv1alpha1.PodEvictionPending:
+		return 1
+	case repackv1alpha1.PodEvictionInProgress:
+		return 2
+	case repackv1alpha1.PodEvictionVictimNotFound:
+		return 3
+	case repackv1alpha1.PodEvictionAccepted,
+		repackv1alpha1.PodEvictionCascadeDeleted,
+		repackv1alpha1.PodEvictionRejected:
+		return 4
+	default:
+		return 0
 	}
 }
 
@@ -158,26 +185,49 @@ func (identity placementIdentity) less(other placementIdentity) bool {
 	}
 }
 
-// updateStatusTerminal keeps retrying until the terminal result is durable or
-// leadership/context is lost. After Execute side effects have started, returning
-// success without this write would leave an ambiguous, non-replayable Run.
+const terminalStatusWriteAttempts = 3
+
+type terminalStatusPersistenceError struct {
+	runName string
+	err     error
+}
+
+func (e *terminalStatusPersistenceError) Error() string {
+	return fmt.Sprintf("persist terminal status for %s: %v", e.runName, e.err)
+}
+
+func (e *terminalStatusPersistenceError) Unwrap() error { return e.err }
+
+func isTerminalStatusPersistenceError(err error) bool {
+	var target *terminalStatusPersistenceError
+	return errors.As(err, &target)
+}
+
+// updateStatusTerminal performs a bounded local retry. The workqueue owns the
+// longer-lived retry so a persistently broken object cannot monopolize the
+// engine's only worker and starve unrelated RepackRuns.
 func (e *Engine) updateStatusTerminal(ctx context.Context, run *repackv1alpha1.RepackRun) error {
 	stampLifecycle(run, time.Now())
 	desired := run.Status.DeepCopy()
 	name := run.Name
-	err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
-		if err := e.writeStatus(ctx, name, desired); err != nil {
-			if apierrors.IsNotFound(err) {
-				return true, nil // explicitly deleted; no terminal object remains to persist
-			}
-			klog.ErrorS(err, "repack: terminal status persistence failed; retrying", "run", name)
-			return false, nil
-		}
-		return true, nil
+	e.rememberPendingTerminalStatus(name, desired)
+	backoff := retry.DefaultBackoff
+	backoff.Steps = terminalStatusWriteAttempts
+	err := retry.OnError(backoff, func(err error) bool {
+		return !apierrors.IsNotFound(err) && ctx.Err() == nil
+	}, func() error {
+		return e.writeStatus(ctx, name, desired)
 	})
-	if err != nil {
-		return fmt.Errorf("persist terminal status for %s: %w", name, err)
+	if apierrors.IsNotFound(err) {
+		e.forgetPendingTerminalStatus(name)
+		return nil // explicitly deleted; no terminal object remains to persist
 	}
+	if err != nil {
+		klog.ErrorS(err, "repack: terminal status persistence exhausted local retry budget",
+			"run", name, "attempts", terminalStatusWriteAttempts)
+		return &terminalStatusPersistenceError{runName: name, err: err}
+	}
+	e.forgetPendingTerminalStatus(name)
 
 	outcome := terminalOutcome(run)
 	metrics.ObserveRun(string(run.Spec.Mode), outcome)
@@ -315,51 +365,6 @@ func prepareExecuteNominations(
 	return nil
 }
 
-// retainRealizedNominations keeps only intents whose Pods were removed by an
-// accepted eviction or a confirmed workload-level cascade. Existing records are
-// retained verbatim so deadlines and concurrent replacement associations survive.
-func retainRealizedNominations(
-	existing []repackv1alpha1.PodNomination,
-	realizedPlan *engineapi.RepackPlan,
-) []repackv1alpha1.PodNomination {
-	if realizedPlan == nil {
-		return nil
-	}
-	realized := make(map[placementIdentity]struct{}, len(realizedPlan.Moves))
-	for _, move := range realizedPlan.Moves {
-		if move == nil || move.Task == nil || move.To == move.From {
-			continue
-		}
-		_, podGroupName := splitPodGroupID(string(move.Task.Job))
-		realized[placementIdentityForMove(
-			move.Task.Namespace, podGroupName, move.Task.Name, move.To)] = struct{}{}
-	}
-	if len(realized) == 0 {
-		return nil
-	}
-	retained := make([]repackv1alpha1.PodNomination, 0, len(realized))
-	for index := range existing {
-		if _, found := realized[placementIdentityForNomination(&existing[index])]; found {
-			retained = append(retained, existing[index])
-		}
-	}
-	return retained
-}
-
-// initializeExecuteResult publishes the accepted disruption amount immediately
-// after CommitPlan. Cluster-wide benefit remains conservative until replacement
-// bindings are visible in one coherent scheduler snapshot.
-func initializeExecuteResult(run *repackv1alpha1.RepackRun, acceptedPlan *engineapi.RepackPlan, targetResource v1.ResourceName) {
-	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
-		return
-	}
-	run.Status.Result = &repackv1alpha1.RepackResult{
-		FragAfterPercent: run.Status.Plan.Summary.FragBeforePercent,
-		MovedCardCount:   movedCardCount(acceptedPlan, targetResource),
-		MetricsVerified:  false,
-	}
-}
-
 func initializeNoopExecuteResult(run *repackv1alpha1.RepackRun) {
 	if run == nil || run.Status.Plan == nil || run.Status.Plan.Summary == nil {
 		return
@@ -368,14 +373,6 @@ func initializeNoopExecuteResult(run *repackv1alpha1.RepackRun) {
 		FragAfterPercent: run.Status.Plan.Summary.FragBeforePercent,
 		MetricsVerified:  true,
 	}
-}
-
-func movedCardCount(plan *engineapi.RepackPlan, targetResource v1.ResourceName) int64 {
-	var cards int64
-	for _, move := range buildStatusMoves(plan, targetResource, nil) {
-		cards += move.Cards
-	}
-	return cards
 }
 
 // realizedFreedNodeNames derives source nodes whose complete planned victim set
@@ -579,6 +576,10 @@ func buildPodNominations(
 		}
 		task := move.Task
 		_, podGroupName := splitPodGroupID(string(task.Job))
+		var victimPodUID types.UID
+		if task.Pod != nil {
+			victimPodUID = task.Pod.UID
+		}
 		schedulingRequirementsHash := ""
 		if policyReader.PodGroupUsesSubGroupPolicy(task.Job) {
 			var err error
@@ -596,6 +597,8 @@ func buildPodNominations(
 			Namespace:                  task.Namespace,
 			PodGroupName:               podGroupName,
 			VictimPodName:              task.Name,
+			VictimPodUID:               victimPodUID,
+			EvictionPhase:              repackv1alpha1.PodEvictionPending,
 			SchedulingRequirementsHash: schedulingRequirementsHash,
 			NodeName:                   move.To,
 			Phase:                      repackv1alpha1.PodPlacementPrepared,

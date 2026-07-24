@@ -45,6 +45,14 @@ type PodNominationApplyConfiguration struct {
 	// VictimPodName is the evicted pod's name: audit + exact fast-path when the
 	// controller recreates the replacement with the same name.
 	VictimPodName *string `json:"victimPodName,omitempty"`
+	// VictimPodUID identifies the exact Pod instance selected by the plan. The
+	// engine uses it as an eviction precondition and during crash recovery so a
+	// same-name replacement is never evicted by a replayed request.
+	VictimPodUID *types.UID `json:"victimPodUID,omitempty"`
+	// EvictionPhase is the engine-owned, durable execution state for this victim.
+	EvictionPhase *repackv1alpha1.PodEvictionPhase `json:"evictionPhase,omitempty"`
+	// EvictionMessage contains an operator-readable rejection or recovery detail.
+	EvictionMessage *string `json:"evictionMessage,omitempty"`
 	// SchedulingRequirementsHash is an opaque hash of normalized scheduling
 	// requirements from the victim Pod. It is populated only when the PodGroup
 	// defines SubGroup policies and is compared only for equality when matching a
@@ -104,6 +112,30 @@ func (b *PodNominationApplyConfiguration) WithReplacementPodGroupName(value stri
 // If called multiple times, the VictimPodName field is set to the value of the last call.
 func (b *PodNominationApplyConfiguration) WithVictimPodName(value string) *PodNominationApplyConfiguration {
 	b.VictimPodName = &value
+	return b
+}
+
+// WithVictimPodUID sets the VictimPodUID field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the VictimPodUID field is set to the value of the last call.
+func (b *PodNominationApplyConfiguration) WithVictimPodUID(value types.UID) *PodNominationApplyConfiguration {
+	b.VictimPodUID = &value
+	return b
+}
+
+// WithEvictionPhase sets the EvictionPhase field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the EvictionPhase field is set to the value of the last call.
+func (b *PodNominationApplyConfiguration) WithEvictionPhase(value repackv1alpha1.PodEvictionPhase) *PodNominationApplyConfiguration {
+	b.EvictionPhase = &value
+	return b
+}
+
+// WithEvictionMessage sets the EvictionMessage field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the EvictionMessage field is set to the value of the last call.
+func (b *PodNominationApplyConfiguration) WithEvictionMessage(value string) *PodNominationApplyConfiguration {
+	b.EvictionMessage = &value
 	return b
 }
 

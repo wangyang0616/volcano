@@ -89,6 +89,30 @@ const (
 	PodNominationExpired PodNominationPhase = "Expired"
 )
 
+// PodEvictionPhase reports the durable execution state of one planned victim.
+// It is independent from PodNominationPhase: eviction is engine-owned, while
+// replacement placement is controller-owned.
+// +kubebuilder:validation:Enum=Pending;InProgress;Accepted;VictimNotFound;CascadeDeleted;Rejected
+type PodEvictionPhase string
+
+const (
+	// PodEvictionPending is persisted before the Eviction API is called.
+	PodEvictionPending PodEvictionPhase = "Pending"
+	// PodEvictionInProgress means the intent was persisted and the API call may
+	// have been issued. Recovery observes the original Pod UID before retrying.
+	PodEvictionInProgress PodEvictionPhase = "InProgress"
+	// PodEvictionAccepted means the Eviction API accepted this victim.
+	PodEvictionAccepted PodEvictionPhase = "Accepted"
+	// PodEvictionVictimNotFound is an intermediate result classified after all
+	// siblings have been attempted.
+	PodEvictionVictimNotFound PodEvictionPhase = "VictimNotFound"
+	// PodEvictionCascadeDeleted means a sibling eviction caused the workload to
+	// delete this victim while recreating the scheduling unit.
+	PodEvictionCascadeDeleted PodEvictionPhase = "CascadeDeleted"
+	// PodEvictionRejected means the planned victim was not evicted by this run.
+	PodEvictionRejected PodEvictionPhase = "Rejected"
+)
+
 // ---------- spec ----------
 
 // RepackRunSpec is the user-facing, self-contained spec of one repack job.
@@ -286,6 +310,17 @@ type PodNomination struct {
 	// controller recreates the replacement with the same name.
 	// +optional
 	VictimPodName string `json:"victimPodName,omitempty"`
+	// VictimPodUID identifies the exact Pod instance selected by the plan. The
+	// engine uses it as an eviction precondition and during crash recovery so a
+	// same-name replacement is never evicted by a replayed request.
+	// +optional
+	VictimPodUID types.UID `json:"victimPodUID,omitempty"`
+	// EvictionPhase is the engine-owned, durable execution state for this victim.
+	// +optional
+	EvictionPhase PodEvictionPhase `json:"evictionPhase,omitempty"`
+	// EvictionMessage contains an operator-readable rejection or recovery detail.
+	// +optional
+	EvictionMessage string `json:"evictionMessage,omitempty"`
 	// SchedulingRequirementsHash is an opaque hash of normalized scheduling
 	// requirements from the victim Pod. It is populated only when the PodGroup
 	// defines SubGroup policies and is compared only for equality when matching a

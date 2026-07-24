@@ -150,7 +150,6 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		MaxResource:               maxResource,
 		LimitPodGroups:            hasPodGroupLimit,
 		LimitResource:             hasResourceLimit,
-		Hooks:                     hooksFor(run, e.schedulerCache.Client()),
 		Free:                      adapter.NodeFreeCapacity,
 	}, e.config.Plugins)
 	engineSession.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
@@ -220,121 +219,11 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 			"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
 			"nominationCount", len(run.Status.Nominations), "nominationTTL", nominationTTL)
 
-		var commitResult *engineframework.CommitResult
-		result, err := engineframework.CommitPlan(plan, engineSession.Hooks())
-		if err != nil {
-			e.cleanupPlacement(ctx, run)
-			markExecuteNotPerformed(run)
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
-		}
-		commitResult = &result
-		classifyCascadeDeletions(commitResult)
-		engineSession.SetCommit(commitResult)
-
-		evictedCount, cascadeDeletedCount, rejectedCount :=
-			len(commitResult.Evicted), len(commitResult.CascadeDeleted), len(commitResult.Failed)
-		metrics.ObserveEvictions(evictedCount, rejectedCount)
-		metrics.ObserveCascadeDeletions(cascadeDeletedCount)
-		klog.V(3).InfoS("evictions issued", "run", run.Name,
-			"evictedCount", evictedCount, "cascadeDeletedCount", cascadeDeletedCount,
-			"rejectedCount", rejectedCount)
-		for _, outcome := range commitResult.Evicted {
-			klog.V(4).InfoS("repack: eviction accepted", "run", run.Name,
-				"pod", outcome.Namespace+"/"+outcome.PodName,
-				"fromNode", outcome.SourceNode, "plannedNode", outcome.TargetNode)
-		}
-		for _, outcome := range commitResult.Failed {
-			klog.V(4).InfoS("repack: eviction rejected", "run", run.Name,
-				"pod", outcome.Namespace+"/"+outcome.PodName, "fromNode", outcome.SourceNode,
-				"plannedNode", outcome.TargetNode, "error", outcome.Err)
-		}
-		for _, outcome := range commitResult.CascadeDeleted {
-			klog.V(3).InfoS("repack: victim disappeared through workload-level PodGroup cascade; placement intent retained",
-				"run", run.Name, "podGroup", outcome.PodGroupID,
-				"pod", outcome.Namespace+"/"+outcome.PodName, "fromNode", outcome.SourceNode,
-				"plannedNode", outcome.TargetNode)
-		}
-		evictionEventType := v1.EventTypeNormal
-		if rejectedCount > 0 {
-			evictionEventType = v1.EventTypeWarning
-		}
-		e.recordRunEvent(run, evictionEventType, eventReasonEvictionsIssued,
-			fmt.Sprintf("Eviction API accepted %d Pods; the workload cascade deleted %d additional planned Pods; %d requests were rejected.",
-				evictedCount, cascadeDeletedCount, rejectedCount))
-		if cascadeDeletedCount > 0 {
-			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonCascadeDeletionObserved,
-				fmt.Sprintf("Retained %d replacement placement intents after their workload deleted the remaining Pods with the original PodGroup.",
-					cascadeDeletedCount))
-		}
-
-		// Preserve the complete pre-eviction status.plan. Nominations retain every
-		// Pod that now requires replacement (accepted eviction or group cascade);
-		// Result.MovedCardCount remains the narrower Eviction-API-accepted amount.
-		// Release a lease as soon as a PodGroup has no realized replacement work.
-		plannedMoveCount, plannedFreedNodeCount := len(plan.Moves), len(plan.FreedNodes)
-		evictionAcceptedPlan := planAcceptedByEvictionAPI(plan, commitResult)
-		replacementPlacementPlan := planRequiringReplacementPlacement(plan, commitResult)
-		realizedReport := engineframework.RenderReport(replacementPlacementPlan)
-		run.Status.Nominations = retainRealizedNominations(
-			run.Status.Nominations, replacementPlacementPlan)
-		// MovedCardCount intentionally remains the amount accepted by the Eviction
-		// API. Cascade-deleted Pods participate in replacement completion and
-		// freed-node verification without silently changing that public metric.
-		initializeExecuteResult(run, evictionAcceptedPlan, targetResource)
-		groupsToRelease := placementGroupsDifference(preparedPlacementGroups, placementPodGroups(run))
-		if len(groupsToRelease) > 0 {
-			// Persist the realized nomination set before relinquishing any lease. A
-			// retry after an API interruption must never see a prepared nomination
-			// with no corresponding gate protection.
-			if err := e.updateStatus(ctx, run); err != nil {
-				return fmt.Errorf("persist realized Execute plan before lease cleanup: %w", err)
-			}
-		}
-		if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
-			markExecuteBenefitUnverified(run)
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed, err)
-		}
-		klog.V(3).InfoS("repack: Execute result reconciled with eviction outcomes",
-			"run", run.Name, "plannedMoveCount", plannedMoveCount,
-			"replacementRequiredMoveCount", len(replacementPlacementPlan.Moves),
-			"cascadeDeletedMoveCount", cascadeDeletedCount,
-			"plannedFreedNodeCount", plannedFreedNodeCount,
-			"replacementRequiredFreedNodeCount", len(replacementPlacementPlan.FreedNodes),
-			"acceptedMovedCardCount", run.Status.Result.MovedCardCount,
-			"remainingNominationCount", len(run.Status.Nominations))
-
-		if evictedCount == 0 && rejectedCount > 0 {
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-				fmt.Errorf("all %d evictions were rejected; no pods were moved", rejectedCount))
-		}
-		if realizedReport.NodesFreed == 0 {
-			return e.fail(ctx, run, generation, state.ReasonExecuteFailed,
-				fmt.Errorf("Eviction API accepted %d Pods and workload cascade deleted %d additional planned Pods, but no planned node was fully freed (%d requests rejected)",
-					evictedCount, cascadeDeletedCount, rejectedCount))
-		}
-		if evictedCount > 0 {
-			// An accepted eviction only begins the replacement placement protocol. Keep
-			// the Execute slot until the placement controller observes every actual
-			// binding (or degrades it on expiry), so another Run cannot overlap the same
-			// PodGroup lease.
-			state.SetCondition(&run.Status.Conditions, state.CondProgressing, metav1.ConditionTrue,
-				state.ReasonAwaitingPlacement, placementProgressMessage(run, targetResource), generation)
-			run.Status.Phase = state.DerivePhase(run.Status.Conditions)
-			if err := e.updateStatus(ctx, run); err != nil {
-				return fmt.Errorf("persist awaiting placement status: %w", err)
-			}
-			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonAwaitingPlacement,
-				placementProgressMessage(run, targetResource))
-			releaseExecuteSlot = false
-			klog.V(3).InfoS("repack: evictions accepted; awaiting replacement placement", "run", run.Name,
-				"evictedCount", evictedCount, "cascadeDeletedCount", cascadeDeletedCount,
-				"nominationCount", len(run.Status.Nominations))
-			// The replacement Pod is created asynchronously by its workload controller.
-			// A status update is not a reliable queue wake-up (the informer may already
-			// have observed this object), so guarantee a later placement reconciliation.
-			e.workQueue.AddAfter(run.Name, placementRetryInterval)
-			return nil
-		}
+		// Once eviction can begin, keep the K=1 slot across transient failures. A
+		// retry resumes the durable per-Pod journal instead of replanning or letting
+		// another Execute overlap a partially committed run.
+		releaseExecuteSlot = false
+		return e.executePreparedEvictions(ctx, run, generation, targetResource)
 	}
 	if execute && !worthwhile {
 		initializeNoopExecuteResult(run)
@@ -388,9 +277,12 @@ func hooksFor(run *repackv1alpha1.RepackRun, kubernetesClient kubernetes.Interfa
 			pod := move.Task.Pod
 			eviction := &policyv1.Eviction{
 				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
+				DeleteOptions: &metav1.DeleteOptions{
+					Preconditions: &metav1.Preconditions{UID: &pod.UID},
+				},
 			}
 			if gracePeriodSeconds != nil {
-				eviction.DeleteOptions = &metav1.DeleteOptions{GracePeriodSeconds: gracePeriodSeconds}
+				eviction.DeleteOptions.GracePeriodSeconds = gracePeriodSeconds
 			}
 			err := kubernetesClient.PolicyV1().Evictions(pod.Namespace).Evict(context.Background(), eviction)
 			if apierrors.IsNotFound(err) {
@@ -415,135 +307,4 @@ func (e *Engine) resolveResource(run *repackv1alpha1.RepackRun) v1.ResourceName 
 // spec.goals[0].resource and also guards the --repack-default-resource fallback.
 func supportedTarget(targetResource v1.ResourceName) bool {
 	return strings.Contains(string(targetResource), "/")
-}
-
-// planAcceptedByEvictionAPI is the narrow public execution result: only Pods
-// accepted by the Eviction API contribute to moved-card accounting. A
-// workload-level cascade still prevents the source from being reported as freed
-// at this stage; final freed-node verification uses live cluster state.
-func planAcceptedByEvictionAPI(
-	plan *engineapi.RepackPlan,
-	commitResult *engineframework.CommitResult,
-) *engineapi.RepackPlan {
-	if commitResult == nil {
-		return nil
-	}
-	failed := append([]engineframework.MoveOutcome(nil), commitResult.CascadeDeleted...)
-	failed = append(failed, commitResult.Failed...)
-	return realizedPlanForOutcomes(plan, commitResult.Evicted, failed)
-}
-
-// planRequiringReplacementPlacement includes both directly evicted and
-// cascade-deleted victims because both need replacement Pods before the Run can
-// complete.
-func planRequiringReplacementPlacement(
-	plan *engineapi.RepackPlan,
-	commitResult *engineframework.CommitResult,
-) *engineapi.RepackPlan {
-	return realizedPlan(plan, commitResult)
-}
-
-// realizedPlan filters an optimistic plan through the actual eviction results.
-// A node is reported freed only when every planned move sourced from that node
-// either had its eviction accepted or was removed by the same workload cascade.
-// The returned plan retains the original fragmentation baseline so RenderReport
-// can describe the realized benefit without inventing a new metric.
-func realizedPlan(plan *engineapi.RepackPlan, commitResult *engineframework.CommitResult) *engineapi.RepackPlan {
-	if plan == nil || commitResult == nil {
-		return nil
-	}
-	succeededOutcomes := append([]engineframework.MoveOutcome(nil), commitResult.Evicted...)
-	succeededOutcomes = append(succeededOutcomes, commitResult.CascadeDeleted...)
-	return realizedPlanForOutcomes(plan, succeededOutcomes, commitResult.Failed)
-}
-
-func realizedPlanForOutcomes(
-	plan *engineapi.RepackPlan,
-	succeededOutcomes, failedOutcomes []engineframework.MoveOutcome,
-) *engineapi.RepackPlan {
-	if plan == nil {
-		return nil
-	}
-	succeeded := make(map[moveOutcomeIdentity]int, len(succeededOutcomes))
-	failedSource := make(map[string]bool, len(failedOutcomes))
-	for _, moveOutcome := range succeededOutcomes {
-		succeeded[moveOutcomeKey(moveOutcome.Namespace, moveOutcome.PodName, moveOutcome.SourceNode, moveOutcome.TargetNode)]++
-	}
-	for _, moveOutcome := range failedOutcomes {
-		failedSource[moveOutcome.SourceNode] = true
-	}
-
-	realized := &engineapi.RepackPlan{Before: plan.Before}
-	for _, m := range plan.Moves {
-		if m == nil || m.Task == nil {
-			continue
-		}
-		key := moveOutcomeKey(m.Task.Namespace, m.Task.Name, m.From, m.To)
-		if succeeded[key] == 0 {
-			continue
-		}
-		succeeded[key]--
-		realized.Moves = append(realized.Moves, m)
-	}
-	for _, node := range plan.FreedNodes {
-		if !failedSource[node] {
-			realized.FreedNodes = append(realized.FreedNodes, node)
-		}
-	}
-	for _, unit := range plan.FreedUnits {
-		fullyFreed := true
-		for _, node := range unit.Nodes {
-			if failedSource[node] {
-				fullyFreed = false
-				break
-			}
-		}
-		if fullyFreed {
-			realized.FreedUnits = append(realized.FreedUnits, unit)
-		}
-	}
-	realized.Cost = engineapi.CalculateDisruptionCost(realized.Moves, plan.Before.Resource)
-	return realized
-}
-
-// classifyCascadeDeletions separates a workload-controller cascade from real
-// eviction rejection. A NotFound victim is treated as cascade-deleted only when
-// at least one sibling in the same PodGroup was accepted by the Eviction API in
-// this commit. Retaining those intents is safer than dropping them: the workload
-// has already demonstrated that it is rebuilding the scheduling unit, and every
-// retained nomination is still bounded by the normal placement deadline.
-func classifyCascadeDeletions(commitResult *engineframework.CommitResult) {
-	if commitResult == nil || len(commitResult.Failed) == 0 {
-		return
-	}
-	evictedPodGroups := make(map[string]struct{}, len(commitResult.Evicted))
-	for _, outcome := range commitResult.Evicted {
-		if outcome.PodGroupID != "" {
-			evictedPodGroups[outcome.PodGroupID] = struct{}{}
-		}
-	}
-	failed := make([]engineframework.MoveOutcome, 0, len(commitResult.Failed))
-	for _, outcome := range commitResult.Failed {
-		_, siblingEvicted := evictedPodGroups[outcome.PodGroupID]
-		if outcome.VictimPodNotFound && siblingEvicted {
-			commitResult.CascadeDeleted = append(commitResult.CascadeDeleted, outcome)
-			continue
-		}
-		failed = append(failed, outcome)
-	}
-	commitResult.Failed = failed
-}
-
-type moveOutcomeIdentity struct {
-	Namespace  string
-	PodName    string
-	SourceNode string
-	TargetNode string
-}
-
-func moveOutcomeKey(namespace, podName, sourceNode, targetNode string) moveOutcomeIdentity {
-	return moveOutcomeIdentity{
-		Namespace: namespace, PodName: podName,
-		SourceNode: sourceNode, TargetNode: targetNode,
-	}
 }

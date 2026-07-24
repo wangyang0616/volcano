@@ -101,6 +101,24 @@ func NominationUsesPodGroup(nomination *repackv1alpha1.PodNomination, podGroupNa
 		nomination.ReplacementPodGroupName == podGroupName
 }
 
+// EvictionAllowsPlacement reports whether a durable intent is ready to claim a
+// replacement Pod. Empty preserves compatibility with Runs created before the
+// eviction journal was introduced. Pending/InProgress/Rejected records continue
+// to keep the admission lease active, but cannot steer a Pod.
+func EvictionAllowsPlacement(nomination *repackv1alpha1.PodNomination) bool {
+	if nomination == nil {
+		return false
+	}
+	switch nomination.EvictionPhase {
+	case "",
+		repackv1alpha1.PodEvictionAccepted,
+		repackv1alpha1.PodEvictionCascadeDeleted:
+		return true
+	default:
+		return false
+	}
+}
+
 // WorkloadKey is the workload identity used by the current replacement
 // protocol. UID is intentionally excluded in P0; deleting and recreating a
 // workload under the same name during Execute remains an unsupported boundary.

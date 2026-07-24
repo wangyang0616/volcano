@@ -439,28 +439,6 @@ func TestApplyPlan(t *testing.T) {
 	}
 }
 
-func TestRetainRealizedNominationsPreservesDeadlineAndFiltersRejected(t *testing.T) {
-	acceptedMove := mkMove("accepted", "ns/g", 2, "n0", "n2")
-	acceptedMove.Task.Namespace = "ns"
-	rejectedMove := mkMove("rejected", "ns/g", 2, "n1", "n2")
-	rejectedMove.Task.Namespace = "ns"
-	fullPlan := &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove, rejectedMove}}
-	existing, err := buildPodNominations(fullPlan, time.Hour, testPodGroupPlacementPolicies{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := existing[0].ExpirationTime.DeepCopy()
-
-	got := retainRealizedNominations(
-		existing, &engineapi.RepackPlan{Moves: []*engineapi.Move{acceptedMove}})
-	if len(got) != 1 || got[0].VictimPodName != "accepted" {
-		t.Fatalf("accepted nominations = %+v, want accepted only", got)
-	}
-	if got[0].ExpirationTime == nil || !got[0].ExpirationTime.Equal(deadline) {
-		t.Fatalf("expirationTime = %v, want preserved %v", got[0].ExpirationTime, deadline)
-	}
-}
-
 func TestRealizedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
 		Plan: &repackv1alpha1.RepackPlan{
@@ -483,99 +461,6 @@ func TestRealizedFreedNodeNamesRequiresEveryPlannedVictim(t *testing.T) {
 	got := realizedFreedNodeNames(run)
 	if len(got) != 1 || got[0] != "n1" {
 		t.Fatalf("accepted freed nodes = %v, want [n1]", got)
-	}
-}
-
-func TestInitializeExecuteResultKeepsPlanBenefitAndRecordsAcceptedCards(t *testing.T) {
-	accepted := mkMove("accepted", "ns/g", 3, "n0", "n2")
-	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
-		Plan: &repackv1alpha1.RepackPlan{Summary: &repackv1alpha1.RepackSummary{
-			FragBeforePercent: 50,
-			FragAfterPercent:  25,
-			FreedNodeCount:    2,
-			MovedCardCount:    8,
-		}},
-	}}
-	initializeExecuteResult(run, &engineapi.RepackPlan{Moves: []*engineapi.Move{accepted}}, gpuResource)
-	if run.Status.Result == nil ||
-		run.Status.Result.FragAfterPercent != 50 ||
-		run.Status.Result.FreedNodeCount != 0 ||
-		run.Status.Result.MovedCardCount != 3 ||
-		run.Status.Result.MetricsVerified {
-		t.Fatalf("initial result = %+v, want conservative actual metrics and 3 accepted cards", run.Status.Result)
-	}
-	if run.Status.Plan.Summary.FragAfterPercent != 25 ||
-		run.Status.Plan.Summary.FreedNodeCount != 2 ||
-		run.Status.Plan.Summary.MovedCardCount != 8 {
-		t.Fatalf("plan benefit was overwritten: %+v", run.Status.Plan.Summary)
-	}
-}
-
-func TestRealizedPlanDropsFailedMovesAndFreedNodes(t *testing.T) {
-	a := mkMove("a", "ns/g", 2, "n0", "n2")
-	a.Task.Namespace = "ns"
-	b := mkMove("b", "ns/g", 2, "n1", "n2")
-	b.Task.Namespace = "ns"
-	plan := &engineapi.RepackPlan{
-		Moves:      []*engineapi.Move{a, b},
-		FreedNodes: []string{"n0", "n1"},
-		FreedUnits: []engineapi.FreeableUnit{
-			{Level: "node", Nodes: []string{"n0"}, Weight: 1},
-			{Level: "node", Nodes: []string{"n1"}, Weight: 1},
-		},
-		Before: engineapi.ResourceFragmentation{Resource: gpuResource, ProvidingNodeCount: 3, OccupiedNodeCount: 2, OptimalOccupiedNodeCount: 1},
-	}
-	commit := &engineframework.CommitResult{
-		Evicted: []engineframework.MoveOutcome{{Namespace: "ns", PodName: "a", SourceNode: "n0", TargetNode: "n2"}},
-		Failed:  []engineframework.MoveOutcome{{Namespace: "ns", PodName: "b", SourceNode: "n1", TargetNode: "n2", Err: "pdb"}},
-	}
-	realized := realizedPlan(plan, commit)
-	if len(realized.Moves) != 1 || realized.Moves[0].Task.Name != "a" {
-		t.Fatalf("realized moves=%+v, want only a", realized.Moves)
-	}
-	if len(realized.FreedNodes) != 1 || realized.FreedNodes[0] != "n0" {
-		t.Fatalf("realized freed nodes=%v, want [n0]", realized.FreedNodes)
-	}
-	if len(realized.FreedUnits) != 1 || realized.FreedUnits[0].Nodes[0] != "n0" {
-		t.Fatalf("realized freed units=%+v, want n0 unit", realized.FreedUnits)
-	}
-}
-
-func TestRealizedPlanRetainsCascadeDeletedMove(t *testing.T) {
-	move := mkMove("cascade", "ns/g", 2, "n0", "n1")
-	move.Task.Namespace = "ns"
-	plan := &engineapi.RepackPlan{
-		Moves:      []*engineapi.Move{move},
-		FreedNodes: []string{"n0"},
-		Before:     engineapi.ResourceFragmentation{Resource: gpuResource},
-	}
-	realized := realizedPlan(plan, &engineframework.CommitResult{
-		CascadeDeleted: []engineframework.MoveOutcome{{
-			Namespace: "ns", PodGroupID: "ns/g", PodName: "cascade", SourceNode: "n0", TargetNode: "n1",
-		}},
-	})
-	if len(realized.Moves) != 1 || len(realized.FreedNodes) != 1 {
-		t.Fatalf("cascade-deleted victim was not retained for replacement: moves=%d freedNodes=%v",
-			len(realized.Moves), realized.FreedNodes)
-	}
-}
-
-func TestPlanAcceptedByEvictionAPIExcludesCascadeDeletedMove(t *testing.T) {
-	move := mkMove("cascade", "ns/g", 2, "n0", "n1")
-	move.Task.Namespace = "ns"
-	plan := &engineapi.RepackPlan{
-		Moves:      []*engineapi.Move{move},
-		FreedNodes: []string{"n0"},
-		Before:     engineapi.ResourceFragmentation{Resource: gpuResource},
-	}
-	accepted := planAcceptedByEvictionAPI(plan, &engineframework.CommitResult{
-		CascadeDeleted: []engineframework.MoveOutcome{{
-			Namespace: "ns", PodGroupID: "ns/g", PodName: "cascade", SourceNode: "n0", TargetNode: "n1",
-		}},
-	})
-	if len(accepted.Moves) != 0 || len(accepted.FreedNodes) != 0 {
-		t.Fatalf("Eviction API result included workload-cascade deletion: moves=%d freedNodes=%v",
-			len(accepted.Moves), accepted.FreedNodes)
 	}
 }
 
@@ -712,5 +597,65 @@ func TestUpdateStatusTerminalPersistsMessageAndCompletionTime(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("terminal RepackRun event was not recorded")
+	}
+}
+
+func TestUpdateStatusTerminalYieldsAfterBoundedFailures(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "terminal-status-retry"},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeDryRun},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackSucceeded,
+			Conditions: []metav1.Condition{{
+				Type: state.CondComplete, Status: metav1.ConditionTrue, Reason: state.ReasonNoFragmentation,
+			}},
+		},
+	}
+	client := vcfake.NewSimpleClientset(run.DeepCopy())
+	failWrites := true
+	updateAttempts := 0
+	client.PrependReactor("update", "repackruns", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		updateAttempts++
+		if failWrites {
+			return true, nil, apierrors.NewForbidden(
+				schema.GroupResource{Group: repackv1alpha1.GroupName, Resource: "repackruns"},
+				run.Name, errors.New("simulated persistent RBAC failure"))
+		}
+		return false, nil, nil
+	})
+	engine := &Engine{
+		volcanoClient:           client,
+		pendingTerminalStatuses: make(map[string]*repackv1alpha1.RepackRunStatus),
+	}
+
+	err := engine.updateStatusTerminal(context.Background(), run.DeepCopy())
+	if !isTerminalStatusPersistenceError(err) {
+		t.Fatalf("updateStatusTerminal() error = %v, want terminal persistence error", err)
+	}
+	if updateAttempts != terminalStatusWriteAttempts {
+		t.Fatalf("status update attempts = %d, want bounded %d", updateAttempts, terminalStatusWriteAttempts)
+	}
+	if reconcileErrorConsumesRetryBudget(err) {
+		t.Fatal("terminal persistence error must yield and requeue without consuming poison-pill budget")
+	}
+	if _, found := engine.pendingTerminalStatus(run.Name); !found {
+		t.Fatal("terminal projection was not retained for the queued retry")
+	}
+
+	failWrites = false
+	desired, found := engine.pendingTerminalStatus(run.Name)
+	if !found {
+		t.Fatal("pending terminal projection disappeared")
+	}
+	retryRun := run.DeepCopy()
+	desired.DeepCopyInto(&retryRun.Status)
+	if err := engine.updateStatusTerminal(context.Background(), retryRun); err != nil {
+		t.Fatalf("terminal status retry failed: %v", err)
+	}
+	if _, found := engine.pendingTerminalStatus(run.Name); found {
+		t.Fatal("terminal projection was not cleared after persistence succeeded")
 	}
 }

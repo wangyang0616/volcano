@@ -112,6 +112,28 @@ func TestActiveForPodGroup(t *testing.T) {
 	}
 }
 
+func TestEvictionAllowsPlacement(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		phase repackv1alpha1.PodEvictionPhase
+		want  bool
+	}{
+		{name: "legacy status", want: true},
+		{name: "accepted", phase: repackv1alpha1.PodEvictionAccepted, want: true},
+		{name: "cascade deleted", phase: repackv1alpha1.PodEvictionCascadeDeleted, want: true},
+		{name: "pending", phase: repackv1alpha1.PodEvictionPending},
+		{name: "in progress", phase: repackv1alpha1.PodEvictionInProgress},
+		{name: "rejected", phase: repackv1alpha1.PodEvictionRejected},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			nomination := &repackv1alpha1.PodNomination{EvictionPhase: testCase.phase}
+			if got := EvictionAllowsPlacement(nomination); got != testCase.want {
+				t.Fatalf("EvictionAllowsPlacement() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestPlacementAppliesToPodGroupAcceptsRecordedAndWorkloadReplacement(t *testing.T) {
 	controller := true
 	start := metav1.NewTime(time.Unix(100, 0))

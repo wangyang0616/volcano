@@ -118,6 +118,10 @@ type Engine struct {
 	executeStateMutex     sync.Mutex
 	activeExecuteRunName  string
 	lastExecuteFinishTime time.Time
+	// pendingTerminalStatuses retains the exact terminal projection across a
+	// bounded write failure, so the queued retry never reruns side effects.
+	terminalStatusMutex     sync.Mutex
+	pendingTerminalStatuses map[string]*repackv1alpha1.RepackRunStatus
 
 	// The PodGroup webhook is the primary placement-lease barrier. This timestamp
 	// independently rate-limits the engine's namespace-wide fallback scan so the
@@ -202,6 +206,7 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 		repackRunInformerSynced: informer.Informer().HasSynced,
 		workQueue:               workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		now:                     time.Now,
+		pendingTerminalStatuses: make(map[string]*repackv1alpha1.RepackRunStatus),
 	}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: e.enqueue,
@@ -215,7 +220,8 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 			// controller (Gated -> Nominated -> Placed), so it must be requeued on
 			// a real update as well. Initial planning still ignores its own status
 			// writes; a same-RV update remains the informer-resync safety net.
-			if oldRun.ResourceVersion == newRun.ResourceVersion || isPlacementCandidate(newRun) || isPlacementCleanupCandidate(newRun) {
+			if oldRun.ResourceVersion == newRun.ResourceVersion || isEvictionCandidate(newRun) ||
+				isPlacementCandidate(newRun) || isPlacementCleanupCandidate(newRun) {
 				e.enqueue(newRun)
 			}
 		},
@@ -282,6 +288,9 @@ func (e *Engine) enqueue(obj interface{}) {
 // revisited only while it has durable placement records; it never repeats the
 // eviction commit.
 func isCandidate(run *repackv1alpha1.RepackRun) bool {
+	if isEvictionCandidate(run) {
+		return true
+	}
 	if isPlacementCandidate(run) {
 		return true
 	}
@@ -290,9 +299,43 @@ func isCandidate(run *repackv1alpha1.RepackRun) bool {
 		(p == repackv1alpha1.RepackRunning && run.Status.Plan == nil)
 }
 
+func isEvictionCandidate(run *repackv1alpha1.RepackRun) bool {
+	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute ||
+		run.Status.Phase != repackv1alpha1.RepackRunning || run.Status.Plan == nil {
+		return false
+	}
+	evictionJournalPresent := false
+	for index := range run.Status.Nominations {
+		if run.Status.Nominations[index].EvictionPhase != "" {
+			evictionJournalPresent = true
+		}
+		switch run.Status.Nominations[index].EvictionPhase {
+		case repackv1alpha1.PodEvictionPending,
+			repackv1alpha1.PodEvictionInProgress,
+			repackv1alpha1.PodEvictionVictimNotFound:
+			return true
+		}
+	}
+	if !evictionJournalPresent {
+		return false // compatibility with Runs created before the eviction journal
+	}
+	for index := range run.Status.Conditions {
+		condition := &run.Status.Conditions[index]
+		if condition.Type == state.CondProgressing &&
+			condition.Status == metav1.ConditionTrue &&
+			condition.Reason == state.ReasonAwaitingPlacement {
+			return false
+		}
+	}
+	// All per-Pod outcomes may be final while the aggregate accepted subset and
+	// AwaitingPlacement barrier are not yet durable. Resume finalization.
+	return true
+}
+
 func isPlacementCandidate(run *repackv1alpha1.RepackRun) bool {
 	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
-		run.Status.Phase == repackv1alpha1.RepackRunning && run.Status.Plan != nil && len(run.Status.Nominations) > 0
+		run.Status.Phase == repackv1alpha1.RepackRunning && run.Status.Plan != nil &&
+		len(run.Status.Nominations) > 0 && !isEvictionCandidate(run)
 }
 
 // isPlacementCleanupCandidate admits an already-terminal Execute Run only to
@@ -322,11 +365,10 @@ func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
 // than retrying forever (which would also keep re-panicking on a bad object).
 const maxReconcileRetries = 5
 
-// statusConflictRequeueInterval is the outer retry delay after the status
-// writer's exponential conflict backoff is exhausted. Conflict is normal
-// optimistic-lock contention between the engine and nominator, so it must not
-// consume the poison-pill budget reserved for deterministic reconcile failures.
-const statusConflictRequeueInterval = time.Second
+// statusPersistenceRequeueInterval is the outer retry delay after bounded local
+// status retries are exhausted. Status contention and terminal persistence
+// failures must yield the worker without consuming the poison-pill budget.
+const statusPersistenceRequeueInterval = time.Second
 
 func (e *Engine) processNext(ctx context.Context) bool {
 	key, shutdown := e.workQueue.Get()
@@ -341,9 +383,9 @@ func (e *Engine) processNext(ctx context.Context) bool {
 			// cannot turn into ReconcileGaveUp. RetryOnConflict already performed
 			// exponential backoff inside the status mutation; this delayed retry spans
 			// reconcile attempts while preserving any prior real-failure count.
-			klog.V(4).InfoS("requeueing RepackRun after status conflict",
-				"run", key, "retryAfter", statusConflictRequeueInterval, "error", err)
-			e.workQueue.AddAfter(key, statusConflictRequeueInterval)
+			klog.V(4).InfoS("requeueing RepackRun after retryable status persistence error",
+				"run", key, "retryAfter", statusPersistenceRequeueInterval, "error", err)
+			e.workQueue.AddAfter(key, statusPersistenceRequeueInterval)
 			return true
 		}
 		utilruntime.HandleError(fmt.Errorf("repack-engine reconcile %q: %w", key, err))
@@ -363,7 +405,7 @@ func (e *Engine) processNext(ctx context.Context) bool {
 }
 
 func reconcileErrorConsumesRetryBudget(err error) bool {
-	return err != nil && !apierrors.IsConflict(err)
+	return err != nil && !apierrors.IsConflict(err) && !isTerminalStatusPersistenceError(err)
 }
 
 // reconcileSafely runs reconcile with panic recovery so a single bad RepackRun
@@ -389,6 +431,9 @@ func (e *Engine) failByName(ctx context.Context, name, reason string, cause erro
 	work := run.DeepCopy()
 	if err := e.fail(ctx, work, work.Generation, reason, cause); err != nil {
 		klog.ErrorS(err, "repack: persist poison-pill failure", "run", name)
+		if isTerminalStatusPersistenceError(err) {
+			e.workQueue.AddAfter(name, statusPersistenceRequeueInterval)
+		}
 	}
 }
 
@@ -398,19 +443,30 @@ func (e *Engine) failByName(ctx context.Context, name, reason string, cause erro
 func (e *Engine) reconcile(ctx context.Context, name string) error {
 	run, err := e.repackRunLister.Get(name)
 	if apierrors.IsNotFound(err) {
+		e.forgetPendingTerminalStatus(name)
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if desired, found := e.pendingTerminalStatus(name); found {
+		work := run.DeepCopy()
+		desired.DeepCopyInto(&work.Status)
+		if err := e.updateStatusTerminal(ctx, work); err != nil {
+			return err
+		}
+		if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+			e.markExecuteDone(work.Name)
+			e.requeueGatedRuns()
+			return e.cleanupPlacement(ctx, work)
+		}
+		return nil
 	}
 	if isPlacementCleanupCandidate(run) {
 		return e.cleanupPlacement(ctx, run.DeepCopy())
 	}
 	if !isCandidate(run) {
 		return nil // already picked up / terminal
-	}
-	if isPlacementCandidate(run) {
-		return e.reconcilePlacement(ctx, run.DeepCopy())
 	}
 	klog.V(4).InfoS("reconciling RepackRun", "run", name, "mode", run.Spec.Mode)
 	work := run.DeepCopy()
@@ -459,7 +515,57 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
 		klog.V(3).InfoS("repack: Execute slot acquired", "run", work.Name, "cooldown", e.config.Cooldown)
 	}
+	if isEvictionCandidate(work) {
+		// The prepared status may have been persisted immediately before a crash,
+		// while lease publication was still in progress. Re-establish both halves
+		// of the admission barrier idempotently before resuming any API call.
+		if err := e.preparePlacementLeases(ctx, work); err != nil {
+			return fmt.Errorf("resume placement leases before eviction: %w", err)
+		}
+		if err := e.setPlacementActive(ctx, work, true); err != nil {
+			return fmt.Errorf("resume placement discovery before eviction: %w", err)
+		}
+		return e.executePreparedEvictions(ctx, work, work.Generation, e.resolveResource(work))
+	}
+	if isPlacementCandidate(work) {
+		// A crash can occur after the accepted nomination subset becomes durable
+		// but before leases for rejected PodGroups are released. Reconcile that
+		// one-way cleanup before placement; retained groups remain protected.
+		groupsToRelease := placementGroupsDifference(plannedPodGroups(work), placementPodGroups(work))
+		if err := e.releasePlacementLeases(ctx, work, groupsToRelease); err != nil {
+			return fmt.Errorf("release unused placement leases before placement recovery: %w", err)
+		}
+		return e.reconcilePlacement(ctx, work)
+	}
 	return e.process(ctx, work)
+}
+
+func (e *Engine) pendingTerminalStatus(name string) (*repackv1alpha1.RepackRunStatus, bool) {
+	e.terminalStatusMutex.Lock()
+	defer e.terminalStatusMutex.Unlock()
+	status, found := e.pendingTerminalStatuses[name]
+	if !found {
+		return nil, false
+	}
+	return status.DeepCopy(), true
+}
+
+func (e *Engine) rememberPendingTerminalStatus(name string, status *repackv1alpha1.RepackRunStatus) {
+	if status == nil {
+		return
+	}
+	e.terminalStatusMutex.Lock()
+	if e.pendingTerminalStatuses == nil {
+		e.pendingTerminalStatuses = make(map[string]*repackv1alpha1.RepackRunStatus)
+	}
+	e.pendingTerminalStatuses[name] = status.DeepCopy()
+	e.terminalStatusMutex.Unlock()
+}
+
+func (e *Engine) forgetPendingTerminalStatus(name string) {
+	e.terminalStatusMutex.Lock()
+	delete(e.pendingTerminalStatuses, name)
+	e.terminalStatusMutex.Unlock()
 }
 
 // recoverOrphans fails an interrupted planning/eviction run. Placement runs are
@@ -476,9 +582,10 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 		if r.Status.Phase != repackv1alpha1.RepackRunning {
 			continue
 		}
-		if isPlacementCandidate(r) {
+		if isEvictionCandidate(r) || isPlacementCandidate(r) {
 			e.workQueue.Add(r.Name)
-			klog.V(3).InfoS("recovered in-progress placement run", "run", r.Name)
+			klog.V(3).InfoS("recovered in-progress Execute run",
+				"run", r.Name, "evictionRecovery", isEvictionCandidate(r))
 			continue
 		}
 		work := r.DeepCopy()
@@ -490,10 +597,9 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 		state.SetCondition(&work.Status.Conditions, state.CondProgressing, metav1.ConditionFalse, reason, msg, generation)
 		state.SetCondition(&work.Status.Conditions, state.CondFailed, metav1.ConditionTrue, reason, msg, generation)
 		work.Status.Phase = state.DerivePhase(work.Status.Conditions)
-		if err := e.updateStatusTerminal(ctx, work); err != nil {
-			klog.ErrorS(err, "repack: persist orphan recovery", "run", work.Name)
-			return
-		}
-		klog.V(3).InfoS("recovered orphaned Running RepackRun -> Failed", "run", work.Name)
+		stampLifecycle(work, e.now())
+		e.rememberPendingTerminalStatus(work.Name, work.Status.DeepCopy())
+		e.workQueue.Add(work.Name)
+		klog.V(3).InfoS("queued orphaned Running RepackRun for terminal recovery", "run", work.Name)
 	}
 }

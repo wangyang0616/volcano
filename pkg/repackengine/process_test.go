@@ -40,12 +40,11 @@ func TestHooksForEvictionGracePeriod(t *testing.T) {
 	for _, testCase := range []struct {
 		name               string
 		gracePeriodSeconds *int64
-		wantDeleteOptions  bool
 		wantGracePeriod    int64
 	}{
-		{name: "unset preserves pod default", wantDeleteOptions: false},
-		{name: "explicit grace period", gracePeriodSeconds: int64Ptr(30), wantDeleteOptions: true, wantGracePeriod: 30},
-		{name: "explicit zero", gracePeriodSeconds: int64Ptr(0), wantDeleteOptions: true, wantGracePeriod: 0},
+		{name: "unset preserves pod default"},
+		{name: "explicit grace period", gracePeriodSeconds: int64Ptr(30), wantGracePeriod: 30},
+		{name: "explicit zero", gracePeriodSeconds: int64Ptr(0), wantGracePeriod: 0},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			client := fake.NewSimpleClientset()
@@ -67,17 +66,26 @@ func TestHooksForEvictionGracePeriod(t *testing.T) {
 				Mode:     repackv1alpha1.RepackModeExecute,
 				Eviction: &repackv1alpha1.EvictionPolicy{GracePeriodSeconds: testCase.gracePeriodSeconds},
 			}}
-			move := &engineapi.Move{Task: &schedapi.TaskInfo{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "victim", Namespace: "workload"}}}}
+			move := &engineapi.Move{Task: &schedapi.TaskInfo{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "victim", Namespace: "workload", UID: "victim-uid",
+			}}}}
 			if err := hooksFor(run, client).Evict(move); err != nil {
 				t.Fatalf("Evict() error = %v", err)
 			}
 			if received == nil {
 				t.Fatal("Evict() did not submit an Eviction")
 			}
-			if (received.DeleteOptions != nil) != testCase.wantDeleteOptions {
-				t.Fatalf("DeleteOptions=%+v, want present=%t", received.DeleteOptions, testCase.wantDeleteOptions)
+			if received.DeleteOptions == nil || received.DeleteOptions.Preconditions == nil ||
+				received.DeleteOptions.Preconditions.UID == nil ||
+				*received.DeleteOptions.Preconditions.UID != "victim-uid" {
+				t.Fatalf("DeleteOptions=%+v, want victim UID precondition", received.DeleteOptions)
 			}
-			if testCase.wantDeleteOptions && (received.DeleteOptions.GracePeriodSeconds == nil || *received.DeleteOptions.GracePeriodSeconds != testCase.wantGracePeriod) {
+			if testCase.gracePeriodSeconds == nil && received.DeleteOptions.GracePeriodSeconds != nil {
+				t.Fatalf("GracePeriodSeconds=%v, want nil", received.DeleteOptions.GracePeriodSeconds)
+			}
+			if testCase.gracePeriodSeconds != nil &&
+				(received.DeleteOptions.GracePeriodSeconds == nil ||
+					*received.DeleteOptions.GracePeriodSeconds != testCase.wantGracePeriod) {
 				t.Fatalf("GracePeriodSeconds=%v, want %d", received.DeleteOptions.GracePeriodSeconds, testCase.wantGracePeriod)
 			}
 		})
@@ -102,26 +110,6 @@ func TestHooksForPreservesVictimNotFoundReason(t *testing.T) {
 	err := hooksFor(run, client).Evict(move)
 	if !errors.Is(err, engineframework.ErrVictimNotFound) {
 		t.Fatalf("Evict() error = %v, want ErrVictimNotFound", err)
-	}
-}
-
-func TestClassifyCascadeDeletionsRetainsOnlySiblingNotFound(t *testing.T) {
-	result := &engineframework.CommitResult{
-		Evicted: []engineframework.MoveOutcome{{
-			Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-0",
-		}},
-		Failed: []engineframework.MoveOutcome{
-			{Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-1", VictimPodNotFound: true, Err: "not found"},
-			{Namespace: "ns", PodGroupID: "ns/group-b", PodName: "b-0", VictimPodNotFound: true, Err: "not found"},
-			{Namespace: "ns", PodGroupID: "ns/group-a", PodName: "a-2", Err: "pdb"},
-		},
-	}
-	classifyCascadeDeletions(result)
-	if len(result.CascadeDeleted) != 1 || result.CascadeDeleted[0].PodName != "a-1" {
-		t.Fatalf("cascadeDeleted = %+v, want only a-1", result.CascadeDeleted)
-	}
-	if len(result.Failed) != 2 {
-		t.Fatalf("failed = %+v, want unrelated NotFound and PDB rejection", result.Failed)
 	}
 }
 

@@ -509,6 +509,21 @@ spec:
                         ActualNodeName is populated after the replacement is bound. It makes drift
                         visible without overwriting the plan-time or selected target.
                       type: string
+                    evictionMessage:
+                      description: EvictionMessage contains an operator-readable rejection
+                        or recovery detail.
+                      type: string
+                    evictionPhase:
+                      description: EvictionPhase is the engine-owned, durable execution
+                        state for this victim.
+                      enum:
+                      - Pending
+                      - InProgress
+                      - Accepted
+                      - VictimNotFound
+                      - CascadeDeleted
+                      - Rejected
+                      type: string
                     expirationTime:
                       description: ExpirationTime bounds re-assertion; after it the
                         nomination is Expired.
@@ -558,11 +573,6 @@ spec:
                         don't ONLY use UUIDs, this is an alias to string.  Being a type captures
                         intent and helps make sure that UIDs and names do not get conflated.
                       type: string
-                    selectedNodeName:
-                      description: |-
-                        SelectedNodeName is the current receiver selected from the live scheduler
-                        snapshot. It is written before the placement gate is removed.
-                      type: string
                     schedulingRequirementsHash:
                       description: |-
                         SchedulingRequirementsHash is an opaque hash of normalized scheduling
@@ -570,10 +580,21 @@ spec:
                         defines SubGroup policies and is compared only for equality when matching a
                         renamed replacement Pod. Empty means the PodGroup is treated as homogeneous.
                       type: string
+                    selectedNodeName:
+                      description: |-
+                        SelectedNodeName is the current receiver selected from the live scheduler
+                        snapshot. It is written before the placement gate is removed.
+                      type: string
                     victimPodName:
                       description: |-
                         VictimPodName is the evicted pod's name: audit + exact fast-path when the
                         controller recreates the replacement with the same name.
+                      type: string
+                    victimPodUID:
+                      description: |-
+                        VictimPodUID identifies the exact Pod instance selected by the plan. The
+                        engine uses it as an eviction precondition and during crash recovery so a
+                        same-name replacement is never evicted by a replayed request.
                       type: string
                   required:
                   - namespace

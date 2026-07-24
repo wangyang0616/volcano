@@ -1086,3 +1086,30 @@ func TestEnqueueTerminalRunUsesGateOwnerIndex(t *testing.T) {
 		t.Fatalf("queued key = %q", key)
 	}
 }
+
+func TestNominationUnavailableUntilEvictionSucceeds(t *testing.T) {
+	for _, phase := range []repackv1alpha1.PodEvictionPhase{
+		repackv1alpha1.PodEvictionPending,
+		repackv1alpha1.PodEvictionInProgress,
+		repackv1alpha1.PodEvictionRejected,
+	} {
+		if !nominationUnavailableForClaim(&repackv1alpha1.PodNomination{
+			EvictionPhase: phase,
+			Phase:         repackv1alpha1.PodPlacementPrepared,
+		}) {
+			t.Fatalf("eviction phase %q unexpectedly allowed a replacement claim", phase)
+		}
+	}
+	for _, phase := range []repackv1alpha1.PodEvictionPhase{
+		"",
+		repackv1alpha1.PodEvictionAccepted,
+		repackv1alpha1.PodEvictionCascadeDeleted,
+	} {
+		if nominationUnavailableForClaim(&repackv1alpha1.PodNomination{
+			EvictionPhase: phase,
+			Phase:         repackv1alpha1.PodPlacementPrepared,
+		}) {
+			t.Fatalf("eviction phase %q unexpectedly blocked a replacement claim", phase)
+		}
+	}
+}

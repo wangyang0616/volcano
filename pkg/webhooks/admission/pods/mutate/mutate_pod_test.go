@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +32,42 @@ import (
 	"volcano.sh/repack-controller/pkg/placement"
 	webconfig "volcano.sh/volcano/pkg/webhooks/config"
 )
+
+func TestPatchPlacementGateOwnerReplacesExistingAnnotation(t *testing.T) {
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "replacement",
+		Annotations: map[string]string{
+			repackv1alpha1.PlacementGateOwnerAnnotation: "old/uid",
+			"example.com/preserved":                     "value",
+		},
+	}}
+	original, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchBytes, err := json.Marshal([]patchOperation{patchPlacementGateOwner(pod, "new/uid")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := jsonpatch.DecodePatch(patchBytes)
+	if err != nil {
+		t.Fatalf("decode JSON Patch: %v", err)
+	}
+	updatedBytes, err := patch.Apply(original)
+	if err != nil {
+		t.Fatalf("apply add operation to existing annotation: %v", err)
+	}
+	updated := &v1.Pod{}
+	if err := json.Unmarshal(updatedBytes, updated); err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation]; got != "new/uid" {
+		t.Fatalf("placement gate owner = %q, want new/uid", got)
+	}
+	if got := updated.Annotations["example.com/preserved"]; got != "value" {
+		t.Fatalf("unrelated annotation = %q, want value", got)
+	}
+}
 
 func TestMutatePods(t *testing.T) {
 	affinityJSONStr := `{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/os","operator":"In","values":["linux"]}]}]}}}`

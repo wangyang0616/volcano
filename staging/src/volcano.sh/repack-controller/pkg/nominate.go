@@ -720,6 +720,7 @@ func placementClaimCanBeRecoveredForPod(
 	now time.Time,
 ) bool {
 	if nomination == nil || candidate == nil ||
+		!placement.EvictionAllowsPlacement(nomination) ||
 		nomination.ReplacementPodName == "" || nomination.ReplacementPodUID == "" ||
 		nomination.Namespace != candidate.Namespace ||
 		!placement.NominationUsesPodGroup(nomination, placement.PodGroupName(candidate)) ||
@@ -1476,7 +1477,7 @@ func (n *Nominator) observePlacement(ctx context.Context, pod *corev1.Pod) error
 // with a concrete replacement Pod or has reached a terminal phase. A non-terminal
 // association may first be reset when its Pod or PodGroup generation disappears.
 func nominationUnavailableForClaim(nomination *repackv1alpha1.PodNomination) bool {
-	if nomination == nil {
+	if nomination == nil || !placement.EvictionAllowsPlacement(nomination) {
 		return true
 	}
 	if nomination.ReplacementPodName != "" || nomination.ReplacementPodUID != "" {
