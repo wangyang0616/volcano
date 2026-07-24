@@ -122,12 +122,37 @@ func mergeRelocationProgress(desired, latest []repackv1alpha1.PodRelocationStatu
 			desired[i].ReplacementPodGroupName = replacementPodGroupName
 		}
 		if placement, found := placements[placementIdentityForRelocation(&desired[i])]; found {
-			desired[i].Placement.Phase = placement.Placement.Phase
-			desired[i].Placement.SelectedNodeName = placement.Placement.SelectedNodeName
-			desired[i].Placement.ReplacementPodName = placement.Placement.ReplacementPodName
-			desired[i].Placement.ReplacementPodUID = placement.Placement.ReplacementPodUID
-			desired[i].Placement.ActualNodeName = placement.Placement.ActualNodeName
+			latestPhase := placement.Placement.Phase
+			desiredPhase := desired[i].Placement.Phase
+			// Preserve controller progress only when it advances the placement
+			// journal (or refreshes the same phase). In particular, an older
+			// WaitingForNodeSelection observation must not overwrite the
+			// Engine's durable TimedOut decision during terminal status merge.
+			if latestPhase == desiredPhase ||
+				placementPhaseRank(latestPhase) > placementPhaseRank(desiredPhase) {
+				desired[i].Placement.Phase = latestPhase
+				desired[i].Placement.SelectedNodeName = placement.Placement.SelectedNodeName
+				desired[i].Placement.ReplacementPodName = placement.Placement.ReplacementPodName
+				desired[i].Placement.ReplacementPodUID = placement.Placement.ReplacementPodUID
+				desired[i].Placement.ActualNodeName = placement.Placement.ActualNodeName
+			}
 		}
+	}
+}
+
+func placementPhaseRank(phase repackv1alpha1.PodPlacementPhase) int {
+	switch phase {
+	case repackv1alpha1.PodPlacementWaitingForReplacement:
+		return 1
+	case repackv1alpha1.PodPlacementWaitingForNodeSelection:
+		return 2
+	case repackv1alpha1.PodPlacementNominated:
+		return 3
+	case repackv1alpha1.PodPlacementPlaced,
+		repackv1alpha1.PodPlacementTimedOut:
+		return 4
+	default:
+		return 0
 	}
 }
 

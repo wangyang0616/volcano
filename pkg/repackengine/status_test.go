@@ -496,6 +496,36 @@ func TestMergeRelocationProgressPreservesControllerOwnedPlacementPhase(t *testin
 	}
 }
 
+func TestMergeRelocationProgressDoesNotOverwriteTerminalPlacementWithOlderObservation(t *testing.T) {
+	for _, olderPhase := range []repackv1alpha1.PodPlacementPhase{
+		repackv1alpha1.PodPlacementWaitingForReplacement,
+		repackv1alpha1.PodPlacementWaitingForNodeSelection,
+		repackv1alpha1.PodPlacementNominated,
+	} {
+		t.Run(string(olderPhase), func(t *testing.T) {
+			desired := []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "g", VictimPodName: "p", PlannedNodeName: "n",
+				Placement: repackv1alpha1.PodPlacementStatus{
+					Phase: repackv1alpha1.PodPlacementTimedOut,
+				},
+			}}
+			latest := []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "g", VictimPodName: "p", PlannedNodeName: "n",
+				Placement: repackv1alpha1.PodPlacementStatus{
+					Phase:              olderPhase,
+					ReplacementPodName: "replacement",
+					ReplacementPodUID:  "replacement-uid",
+				},
+			}}
+
+			mergeRelocationProgress(desired, latest)
+			if desired[0].Placement.Phase != repackv1alpha1.PodPlacementTimedOut {
+				t.Fatalf("phase=%q, want TimedOut", desired[0].Placement.Phase)
+			}
+		})
+	}
+}
+
 func TestMergeRelocationProgressPreservesPodGroupReplacement(t *testing.T) {
 	desired := []repackv1alpha1.PodRelocationStatus{{
 		Namespace: "ns", PodGroupName: "old", VictimPodName: "pod", PlannedNodeName: "node", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},

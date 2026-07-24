@@ -34,6 +34,7 @@ import (
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/repack-controller/pkg/placement"
+	"volcano.sh/repack-controller/pkg/state"
 
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
@@ -129,9 +130,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		Eventually(func() repackv1alpha1.PodRelocationStatus {
 			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
-			HaveField("ReplacementPodName", secondReplacement.Name),
-			HaveField("ReplacementPodUID", secondReplacement.UID),
-			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
+			HaveField("Placement.ReplacementPodName", secondReplacement.Name),
+			HaveField("Placement.ReplacementPodUID", secondReplacement.UID),
+			HaveField("Placement.Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 		waitPodEventReasons(ctx, secondReplacement, "RepackPlacementRecovered", "RepackReplacementGated")
 
@@ -444,10 +445,13 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, VictimPodName: victimPodName,
 				SchedulingRequirementsHash: schedulingRequirementsHash,
-				PlannedNodeName:            nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires,
+				PlannedNodeName:            nodes[1],
+				Eviction:                   acceptedEviction(),
+				Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires,
 					Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		}
+		markPlacementReconciliationCheckpoint(run)
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		_, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().Patch(
@@ -527,7 +531,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("ReplacementPodGroupName", newPodGroupName),
-			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
+			HaveField("Placement.Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		restoreEngine()
@@ -580,9 +584,12 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-				PlannedNodeName: nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+				PlannedNodeName: nodes[1],
+				Eviction:        acceptedEviction(),
+				Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 			}},
 		}
+		markPlacementReconciliationCheckpoint(run)
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(
 			context.TODO(), run, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -639,8 +646,8 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			return getRun(ctx, run.Name).Status.Relocations[0]
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("ReplacementPodGroupName", firstPodGroupName),
-			HaveField("ReplacementPodName", firstPod.Name),
-			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
+			HaveField("Placement.ReplacementPodName", firstPod.Name),
+			HaveField("Placement.Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		Expect(ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Delete(
@@ -660,9 +667,9 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 		}, repackTimeout, repackPoll).Should(And(
 			HaveField("PodGroupName", originalPodGroupName),
 			HaveField("ReplacementPodGroupName", secondPodGroupName),
-			HaveField("ReplacementPodName", secondPod.Name),
-			HaveField("ReplacementPodUID", secondPod.UID),
-			HaveField("Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
+			HaveField("Placement.ReplacementPodName", secondPod.Name),
+			HaveField("Placement.ReplacementPodUID", secondPod.UID),
+			HaveField("Placement.Phase", repackv1alpha1.PodPlacementWaitingForNodeSelection),
 		))
 
 		restoreEngine()
@@ -750,14 +757,19 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Relocations: []repackv1alpha1.PodRelocationStatus{
 				{
 					Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-					PlannedNodeName: nodes[1], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+					PlannedNodeName: nodes[1],
+					Eviction:        acceptedEviction(),
+					Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 				},
 				{
 					Namespace: peerNamespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
-					PlannedNodeName: nodes[2], Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+					PlannedNodeName: nodes[2],
+					Eviction:        acceptedEviction(),
+					Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 				},
 			},
 		}
+		markPlacementReconciliationCheckpoint(run)
 		run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(
 			context.TODO(), run, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -967,6 +979,12 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
 		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
+		// Keep the planned source node resource-free while making it infeasible
+		// to the replacement. Otherwise the scheduler may legitimately choose
+		// that empty source as the alternative and the planned drain benefit
+		// would, correctly, be reported as unrealized.
+		taintNode(ctx, nodes[0])
+		defer untaintNode(ctx, nodes[0])
 		setPlacementSelection(ctx, run.Name, nodes[1])
 		Eventually(func() string {
 			latest := getRun(ctx, run.Name)
@@ -1123,9 +1141,12 @@ func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, f
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: pgName, VictimPodName: podName,
-			PlannedNodeName: plannedNode, Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+			PlannedNodeName: plannedNode,
+			Eviction:        acceptedEviction(),
+			Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 		}},
 	}
+	markPlacementReconciliationCheckpoint(run)
 	run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "persist in-flight placement checkpoint")
 
@@ -1222,9 +1243,12 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: workload.podGroup, VictimPodName: workload.podName,
-			PlannedNodeName: plannedNode, Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+			PlannedNodeName: plannedNode,
+			Eviction:        acceptedEviction(),
+			Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &expires, Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 		}},
 	}
+	markPlacementReconciliationCheckpoint(run)
 	run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "persist native in-flight placement checkpoint")
 
@@ -1238,6 +1262,26 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 	_, err = ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Update(context.TODO(), podGroup, metav1.UpdateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "lease automatic PodGroup before eviction")
 	return run
+}
+
+// acceptedEviction marks hand-crafted placement fixtures as already past the
+// engine-owned eviction step. These fixtures exercise only replacement
+// discovery and placement; leaving the required eviction journal empty would
+// describe an impossible in-flight RepackRun.
+func acceptedEviction() repackv1alpha1.PodEvictionStatus {
+	return repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted}
+}
+
+// markPlacementReconciliationCheckpoint records the same durable stage barrier
+// written by the Engine after it has finalized every eviction journal. Without
+// this condition, an Engine restart must conservatively resume eviction
+// finalization before it is allowed to reconcile replacement placement.
+func markPlacementReconciliationCheckpoint(run *repackv1alpha1.RepackRun) {
+	state.MarkRunning(
+		run,
+		state.ReasonReconcilingPlacements,
+		"Eviction outcomes are durable; reconciling replacement placement.",
+	)
 }
 
 func workloadName(workload *nativeWorkload) string {

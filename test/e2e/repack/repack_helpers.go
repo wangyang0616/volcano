@@ -395,9 +395,19 @@ func (b *runBuilder) maxPerRun(m *repackv1alpha1.MaxPerRun) *runBuilder {
 	return b
 }
 
-// create submits the RepackRun; the caller defers deleteRun(created.Name).
+// create submits the RepackRun and immediately registers best-effort cleanup.
+// Registration here, before a fixture performs any further assertions, keeps a
+// failed setup from leaking a cluster-scoped run into later serial specs.
 func (b *runBuilder) create(ctx *e2eutil.TestContext) (*repackv1alpha1.RepackRun, error) {
-	return ctx.Vcclient.RepackV1alpha1().RepackRuns().Create(context.TODO(), b.run, metav1.CreateOptions{})
+	created, err := ctx.Vcclient.RepackV1alpha1().RepackRuns().Create(
+		context.TODO(), b.run, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	DeferCleanup(func() {
+		deleteRun(ctx, created.Name)
+	})
+	return created, nil
 }
 
 func getRun(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackRun {
@@ -454,9 +464,9 @@ func waitTerminal(ctx *e2eutil.TestContext, name string) *repackv1alpha1.RepackR
 	return last
 }
 
-// waitCondition blocks until the run has a True condition of condType, returning
-// its reason (used for the Queued gate, which is not terminal).
-func waitCondition(ctx *e2eutil.TestContext, name, condType string) string {
+// waitConditionReason blocks until the run has the requested condition status,
+// then returns its reason. Pending runs intentionally use Progressing=False.
+func waitConditionReason(ctx *e2eutil.TestContext, name, condType string, status metav1.ConditionStatus) string {
 	var reason string
 	var lastGetError error
 	err := wait.PollUntilContextTimeout(context.TODO(), repackPoll, repackTimeout, false,
@@ -468,7 +478,7 @@ func waitCondition(ctx *e2eutil.TestContext, name, condType string) string {
 			}
 			lastGetError = nil
 			for _, cond := range r.Status.Conditions {
-				if cond.Type == condType && cond.Status == metav1.ConditionTrue {
+				if cond.Type == condType && cond.Status == status {
 					reason = cond.Reason
 					return true, nil
 				}
@@ -476,9 +486,11 @@ func waitCondition(ctx *e2eutil.TestContext, name, condType string) string {
 			return false, nil
 		})
 	if err != nil {
-		recordRepackDiagnostics(ctx, name, fmt.Errorf("condition %s wait failed: %w (last GET error: %v)", condType, err, lastGetError))
+		recordRepackDiagnostics(ctx, name, fmt.Errorf(
+			"condition %s=%s wait failed: %w (last GET error: %v)",
+			condType, status, err, lastGetError))
 	}
-	Expect(err).NotTo(HaveOccurred(), "run %s never got a True %s condition", name, condType)
+	Expect(err).NotTo(HaveOccurred(), "run %s never got condition %s=%s", name, condType, status)
 	return reason
 }
 

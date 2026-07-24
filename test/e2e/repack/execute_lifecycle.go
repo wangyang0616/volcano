@@ -124,9 +124,10 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		Expect(got.Status.Relocations).To(BeEmpty())
 	})
 
-	// C8: after an Execute finishes, a second Execute within the cooldown window is
-	// gated (Queued/ExecuteCoolingDown). (K=1 concurrent AnotherRunActive is timing-
-	// racy in e2e — the gate logic itself is unit-tested in state.EvaluateGate.)
+	// C8: after an Execute finishes, a second Execute within the cooldown window
+	// remains Pending with Progressing=False/ExecuteCooldownActive. (K=1
+	// concurrent AnotherRunActive is timing-racy in e2e — the gate logic itself
+	// is unit-tested in state.EvaluateGate.)
 	It("gates a second Execute during the cooldown window", func() {
 		moving := occupyNativeDeployment(ctx, "cooldown-moving", nodes[0], "move", 4)
 		staying := occupyNativeDeployment(ctx, "cooldown-staying", nodes[1], "stay", 2)
@@ -140,11 +141,13 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		second, err := newRun("cooldown-2", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 		Expect(err).NotTo(HaveOccurred())
 		defer deleteRun(ctx, second.Name)
-		Expect(waitCondition(ctx, second.Name, "Queued")).To(Equal("ExecuteCoolingDown"))
+		Expect(waitConditionReason(ctx, second.Name, "Progressing", metav1.ConditionFalse)).
+			To(Equal("ExecuteCooldownActive"))
 	})
 
-	// C9: if every eviction is rejected (a maxUnavailable=0 PDB), Execute fails.
-	It("fails with ExecuteFailed when all evictions are blocked by a PDB", func() {
+	// C9: if every eviction is rejected (a maxUnavailable=0 PDB), Execute fails
+	// specifically at the eviction stage.
+	It("fails with EvictionFailed when all evictions are blocked by a PDB", func() {
 		jobA := occupy(ctx, "pdb-a", nodes[0], 4)
 		jobB := occupy(ctx, "pdb-b", nodes[1], 2)
 		// Every movable fixture pod is protected. This makes every possible plan
@@ -176,7 +179,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 		defer deleteRun(ctx, run.Name)
 
 		got := waitTerminal(ctx, run.Name)
-		Expect(completeReason(got)).To(Equal("ExecuteFailed"))
+		Expect(completeReason(got)).To(Equal("EvictionFailed"))
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
 		Expect(got.Status.Plan).NotTo(BeNil())
 		Expect(got.Status.Plan.Summary).NotTo(BeNil())
@@ -225,7 +228,7 @@ var _ = Describe("Repack Execute, scope, maxPerRun & lifecycle", Serial, func() 
 
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("ExecuteFailed"))
+		Expect(completeReason(got)).To(Equal("EvictionFailed"))
 		Expect(got.Status.Plan.Moves).To(HaveLen(2), "the immutable plan must retain both intended PodGroups")
 		Expect(got.Status.Plan.Summary.MovedCardCount).To(BeEquivalentTo(4))
 		Expect(got.Status.Plan.Summary.FreedNodeCount).To(BeEquivalentTo(1))
