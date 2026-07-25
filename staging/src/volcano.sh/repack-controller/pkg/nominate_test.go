@@ -242,6 +242,133 @@ func TestHomogeneousNominationWaitsForVictimDeletion(t *testing.T) {
 	}
 }
 
+func TestVictimGoneDistinguishesRecreatedPodByUID(t *testing.T) {
+	victimUID := types.UID("old-uid")
+	current := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "worker", UID: victimUID},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := pods.Add(current); err != nil {
+		t.Fatal(err)
+	}
+	nominator := nominatorWith()
+	nominator.podLister = corelisters.NewPodLister(pods)
+	relocation := &repackv1alpha1.PodRelocationStatus{
+		Namespace: "ns", VictimPodName: current.Name, VictimPodUID: victimUID,
+	}
+
+	if nominator.victimGone(relocation) {
+		t.Fatal("the original victim UID is still running")
+	}
+
+	recreated := current.DeepCopy()
+	recreated.UID = "new-uid"
+	if err := pods.Update(recreated); err != nil {
+		t.Fatal(err)
+	}
+	if !nominator.victimGone(relocation) {
+		t.Fatal("a same-name Pod with a different UID must not keep the original victim alive")
+	}
+
+	if err := pods.Update(current); err != nil {
+		t.Fatal(err)
+	}
+	terminating := current.DeepCopy()
+	now := metav1.Now()
+	terminating.DeletionTimestamp = &now
+	if err := pods.Update(terminating); err != nil {
+		t.Fatal(err)
+	}
+	if !nominator.victimGone(relocation) {
+		t.Fatal("the original victim is no longer placement-blocking after termination starts")
+	}
+
+	relocation.VictimPodUID = ""
+	if nominator.victimGone(relocation) {
+		t.Fatal("without a durable victim UID, preserve the conservative name-based behavior")
+	}
+}
+
+func TestReconcileOpensGateAfterVictimNameIsReused(t *testing.T) {
+	future := metav1.NewTime(time.Unix(5000, 0))
+	replacementPod2 := pendingPod("ns", "pod-2", "group", nil)
+	replacementPod2.UID = "new-pod-2-uid"
+	replacementPod3 := pendingPod("ns", "pod-3", "group", nil)
+	replacementPod3.UID = "new-pod-3-uid"
+	replacementPod3.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: repackv1alpha1.PlacementGateName}}
+	replacementPod3.Annotations[repackv1alpha1.PlacementGateOwnerAnnotation] = "run/run-uid"
+
+	run := runWithNoms("run",
+		repackv1alpha1.PodRelocationStatus{
+			Namespace: "ns", PodGroupName: "group", VictimPodName: "pod-1", VictimPodUID: "old-pod-1-uid",
+			PlannedNodeName: "node-a",
+			Placement: repackv1alpha1.PodPlacementStatus{
+				ReplacementPodName: replacementPod2.Name,
+				ReplacementPodUID:  replacementPod2.UID,
+				Phase:              repackv1alpha1.PodPlacementWaitingForNodeSelection,
+				ExpirationTime:     &future,
+			},
+		},
+		repackv1alpha1.PodRelocationStatus{
+			Namespace: "ns", PodGroupName: "group", VictimPodName: "pod-2", VictimPodUID: "old-pod-2-uid",
+			PlannedNodeName: "node-b",
+			Placement:       repackv1alpha1.PodPlacementStatus{ExpirationTime: &future},
+		},
+	)
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, pod := range []*corev1.Pod{replacementPod2, replacementPod3} {
+		if err := pods.Add(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kubernetesClient := k8sfake.NewSimpleClientset(replacementPod2.DeepCopy(), replacementPod3.DeepCopy())
+	volcanoClient := vcfake.NewSimpleClientset(run.DeepCopy())
+	nominator := &Nominator{
+		kubernetesClient: kubernetesClient,
+		volcanoClient:    volcanoClient,
+		podLister:        corelisters.NewPodLister(pods),
+		recorder:         record.NewFakeRecorder(10),
+		now:              func() time.Time { return time.Unix(1000, 0) },
+	}
+
+	if err := nominator.reconcile(context.Background(), "ns/pod-3"); err != nil {
+		t.Fatalf("associate pod-3 with the remaining relocation: %v", err)
+	}
+	updatedRun, err := volcanoClient.RepackV1alpha1().RepackRuns().Get(
+		context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := &updatedRun.Status.Relocations[1]
+	if remaining.Placement.ReplacementPodName != replacementPod3.Name ||
+		remaining.Placement.ReplacementPodUID != replacementPod3.UID ||
+		remaining.Placement.Phase != repackv1alpha1.PodPlacementWaitingForNodeSelection {
+		t.Fatalf("pod-3 did not durably claim the remaining relocation: %+v", remaining)
+	}
+
+	remaining.Placement.SelectedNodeName = remaining.PlannedNodeName
+	if _, err := volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(
+		context.Background(), updatedRun, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nominator.reconcile(context.Background(), "ns/pod-3"); err != nil {
+		t.Fatalf("nominate pod-3 and open its gate: %v", err)
+	}
+
+	updatedPod, err := kubernetesClient.CoreV1().Pods(replacementPod3.Namespace).Get(
+		context.Background(), replacementPod3.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedPod.Status.NominatedNodeName != "node-b" {
+		t.Fatalf("pod-3 nominatedNodeName = %q, want node-b", updatedPod.Status.NominatedNodeName)
+	}
+	if hasPlacementGate(updatedPod) {
+		t.Fatal("pod-3 placement gate remained closed after its receiver became durable")
+	}
+}
+
 func TestMatchNominationUsesRecordedReplacementPodGroupForEveryMatchingStrategy(t *testing.T) {
 	future := metav1.NewTime(time.Unix(5000, 0))
 	hashMatchedPod := pendingPod("ns", "new-worker", "new", nil)

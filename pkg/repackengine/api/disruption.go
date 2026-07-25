@@ -77,6 +77,27 @@ type PodGroupMoveAggregate struct {
 	MovedResource int64
 }
 
+// PodGroupDisruption is the gang impact of moving some Pods from one PodGroup.
+type PodGroupDisruption struct {
+	Breached        bool
+	DamagedResource int64
+}
+
+// MeasurePodGroupDisruption applies the shared minAvailable semantics used by
+// both plan scoring and drain receiver preference. Moves within the PodGroup's
+// running slack damage only the moved resource; once minAvailable is breached,
+// the whole PodGroup footprint is considered damaged.
+func MeasurePodGroupDisruption(view PodGroupView, movedPods, movedResource int64) PodGroupDisruption {
+	slack := int64(view.Running) - int64(view.MinAvailable)
+	if slack < 0 {
+		slack = 0
+	}
+	if movedPods > slack {
+		return PodGroupDisruption{Breached: true, DamagedResource: view.Footprint}
+	}
+	return PodGroupDisruption{DamagedResource: movedResource}
+}
+
 // PlanMoveAggregate is the whole-plan move aggregate, with a per-PodGroup breakdown.
 type PlanMoveAggregate struct {
 	AffectedPodGroups int64

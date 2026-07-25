@@ -30,6 +30,7 @@ limitations under the License.
 package drain
 
 import (
+	"cmp"
 	"sort"
 	"strings"
 	"time"
@@ -125,31 +126,37 @@ type scoredCandidate struct {
 // and the disruption budget.
 type drainState struct {
 	// Fixed for the whole pass.
-	ssn              *framework.Session
-	snapshot         framework.Snapshot
-	nodes            []*schedapi.NodeInfo
-	nodesByName      map[string]*schedapi.NodeInfo
-	movable          api.Movable
-	resource         v1.ResourceName
-	maxPodGroups     int
-	maxResource      int64
-	hasPodGroupLimit bool
-	hasResourceLimit bool
+	ssn                 *framework.Session
+	snapshot            framework.Snapshot
+	nodes               []*schedapi.NodeInfo
+	nodesByName         map[string]*schedapi.NodeInfo
+	movable             api.Movable
+	resource            v1.ResourceName
+	maxPodGroups        int
+	maxResource         int64
+	hasPodGroupLimit    bool
+	hasResourceLimit    bool
+	alwaysStaysOccupied map[string]bool // immovable or outside drain scope
+	// futureDrainPodGroupsByNode caches the movable Pod/resource totals used to
+	// assess each node as a possible next drain target.
+	futureDrainPodGroupsByNode map[string]map[schedapi.JobID]api.PodGroupMoveAggregate
 
 	// Mutated as units are committed.
-	drained                map[string]bool // emptied — no longer a receiver
-	filled                 map[string]bool // received a moved-in pod
-	provenStuck            map[string]bool // proven un-vacatable this pass → prefer as receiver
-	stuckUnits             map[string]bool // monotonic infeasibility cache; never re-simulate
-	movedPodGroups         map[schedapi.JobID]bool
-	movedResource          int64
-	placedResourceByNode   map[string]int64 // resource already assigned to a receiver by committed moves
-	candidatesEvaluated    int
-	feasibilitySimulations int
-	prunedByReason         map[string]int
-	moves                  []*api.Move
-	freedNodes             []string
-	freedUnits             []api.FreeableUnit
+	drained                 map[string]bool // emptied — no longer a receiver
+	filled                  map[string]bool // received a moved-in pod
+	provenStuck             map[string]bool // proven un-vacatable this pass → prefer as receiver
+	stuckUnits              map[string]bool // monotonic infeasibility cache; never re-simulate
+	movedPodGroups          map[schedapi.JobID]bool
+	movedPodsByPodGroup     map[schedapi.JobID]int64
+	movedResourceByPodGroup map[schedapi.JobID]int64
+	movedResource           int64
+	placedResourceByNode    map[string]int64 // resource already assigned to a receiver by committed moves
+	candidatesEvaluated     int
+	feasibilitySimulations  int
+	prunedByReason          map[string]int
+	moves                   []*api.Move
+	freedNodes              []string
+	freedUnits              []api.FreeableUnit
 }
 
 // drainGreedy is the single dynamic pass. Each step re-evaluates every still-
@@ -206,25 +213,41 @@ func newDrainState(
 	movable api.Movable,
 	targetResource v1.ResourceName,
 ) *drainState {
-	return &drainState{
-		ssn:                  ssn,
-		snapshot:             ssn.Snapshot(),
-		nodes:                nodes,
-		nodesByName:          nodesByName,
-		movable:              movable,
-		resource:             targetResource,
-		maxPodGroups:         ssn.MaxPodGroups(),
-		maxResource:          ssn.MaxResource(),
-		hasPodGroupLimit:     ssn.LimitPodGroups(),
-		hasResourceLimit:     ssn.LimitResource(),
-		drained:              make(map[string]bool),
-		filled:               make(map[string]bool),
-		provenStuck:          make(map[string]bool),
-		stuckUnits:           make(map[string]bool),
-		movedPodGroups:       make(map[schedapi.JobID]bool),
-		placedResourceByNode: make(map[string]int64),
-		prunedByReason:       make(map[string]int),
+	state := &drainState{
+		ssn:                        ssn,
+		snapshot:                   ssn.Snapshot(),
+		nodes:                      nodes,
+		nodesByName:                nodesByName,
+		movable:                    movable,
+		resource:                   targetResource,
+		maxPodGroups:               ssn.MaxPodGroups(),
+		maxResource:                ssn.MaxResource(),
+		hasPodGroupLimit:           ssn.LimitPodGroups(),
+		hasResourceLimit:           ssn.LimitResource(),
+		alwaysStaysOccupied:        make(map[string]bool, len(nodes)),
+		futureDrainPodGroupsByNode: make(map[string]map[schedapi.JobID]api.PodGroupMoveAggregate, len(nodes)),
+		drained:                    make(map[string]bool),
+		filled:                     make(map[string]bool),
+		provenStuck:                make(map[string]bool),
+		stuckUnits:                 make(map[string]bool),
+		movedPodGroups:             make(map[schedapi.JobID]bool),
+		movedPodsByPodGroup:        make(map[schedapi.JobID]int64),
+		movedResourceByPodGroup:    make(map[schedapi.JobID]int64),
+		placedResourceByNode:       make(map[string]int64),
+		prunedByReason:             make(map[string]int),
 	}
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		state.alwaysStaysOccupied[node.Name] =
+			!api.EvaluateNodeFreeability(node, api.NodeFreeabilityState{}, movable, targetResource).Freeable ||
+				!state.snapshot.NodeInScope(node)
+		state.futureDrainPodGroupsByNode[node.Name] = aggregateTasksByPodGroup(
+			api.VictimsOf(node, movable, targetResource), targetResource,
+		)
+	}
+	return state
 }
 
 // evaluateUnit checks whether `unit` can be vacated now — every victim relocates
@@ -285,7 +308,7 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 			"wouldBe", s.movedResource+additionalResource, "max", s.maxResource)
 		return candidate{}, false
 	}
-	receivers := s.receiversInPreferenceOrder(inUnit)
+	receivers := s.receiversInPreferenceOrder(inUnit, victims)
 	if !s.receiversHaveResourceCapacity(receivers, additionalResource) {
 		s.recordPruned("insufficient_receiver_resource")
 		// This is only a necessary resource-capacity check; scheduler predicates
@@ -355,32 +378,158 @@ func (s *drainState) markUnitInfeasible(key string, unit api.FreeableUnit) {
 	s.stuckUnits[key] = true
 }
 
-// receiversInPreferenceOrder returns the nodes that may receive relocated pods, in
-// the order the drain prefers to fill them. A node is eligible if it is not in the
-// unit being vacated, not already drained, and not accelerator-EMPTY (0 pods
-// requesting the accelerator — a CPU/memory-only node counts as empty too):
-// draining onto one just relights a free accelerator node (net-zero shuffle).
+type receiverPreference struct {
+	node              *schedapi.NodeInfo
+	staysOccupied     bool
+	futureDrainImpact futureDrainImpact
+	availableResource int64
+}
+
+// futureDrainImpact describes the incremental disruption caused by draining a
+// receiver after the current candidate. Larger values make a node more useful
+// as a receiver now, because preserving it as a future target would be costlier.
+type futureDrainImpact struct {
+	additionalGangBreaches      int
+	additionalAffectedPodGroups int
+	additionalDamagedResource   int64
+	movedResource               int64
+	movedPods                   int64
+}
+
+// receiversInPreferenceOrder returns the nodes that may receive relocated pods,
+// in the order the drain prefers to fill them. A node is eligible if it is not
+// in the unit being vacated, not already drained, and not accelerator-empty (0
+// pods requesting the accelerator — a CPU/memory-only node counts as empty too).
+// Moving onto an empty accelerator node would merely relight it and provide no
+// consolidation benefit.
 //
-// Order: STAYING nodes first (they remain occupied regardless, so filling their
-// slack never wastes a drainable node's empty-ability), then best-fit (tightest
-// target-resource FutureIdle) within a tier so relocations consolidate onto
-// already-loaded nodes rather than lighting up near-empty ones (§4.9).
-func (s *drainState) receiversInPreferenceOrder(inUnit map[string]bool) []*schedapi.NodeInfo {
-	receivers := make([]*schedapi.NodeInfo, 0, len(s.nodes))
+// The preference is intentionally soft; FeasibleRelocation may skip an earlier
+// receiver that lacks capacity or fails a scheduler predicate:
+//   - Nodes that cannot be drained later are filled first.
+//   - Among still-drainable nodes, hypothetically drain each receiver after the
+//     current candidate. Prefer receivers whose future drain would first add
+//     minAvailable breaches, then affect more PodGroups or damage more resource.
+//     This consumes expensive future targets and preserves cheaper ones.
+//   - Within an equal disruption tier, use best-fit so relocations consolidate
+//     onto the receiver with the least remaining target resource (§4.9).
+func (s *drainState) receiversInPreferenceOrder(
+	inUnit map[string]bool,
+	candidateVictims []*schedapi.TaskInfo,
+) []*schedapi.NodeInfo {
+	candidatePodGroupMoves := aggregateTasksByPodGroup(candidateVictims, s.resource)
+	preferences := make([]receiverPreference, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		if inUnit[n.Name] || s.drained[n.Name] || !occupiesAccelerator(n, s.resource) {
 			continue
 		}
-		receivers = append(receivers, n)
-	}
-	sort.SliceStable(receivers, func(i, j int) bool {
-		si, sj := s.staying(receivers[i]), s.staying(receivers[j])
-		if si != sj {
-			return si // staying nodes first
+		staysOccupied := s.staysOccupied(n)
+		impact := futureDrainImpact{}
+		if !staysOccupied {
+			impact = s.measureFutureDrainImpact(n, candidatePodGroupMoves)
 		}
-		return receiverSlack(receivers[i], s.resource) < receiverSlack(receivers[j], s.resource)
+		preferences = append(preferences, receiverPreference{
+			node:              n,
+			staysOccupied:     staysOccupied,
+			futureDrainImpact: impact,
+			availableResource: receiverSlack(n, s.resource) - s.placedResourceByNode[n.Name],
+		})
+	}
+	sort.SliceStable(preferences, func(i, j int) bool {
+		if preferences[i].staysOccupied != preferences[j].staysOccupied {
+			return preferences[i].staysOccupied
+		}
+		if comparison := compareFutureDrainImpact(
+			preferences[i].futureDrainImpact,
+			preferences[j].futureDrainImpact,
+		); comparison != 0 {
+			return comparison > 0
+		}
+		return preferences[i].availableResource < preferences[j].availableResource
 	})
+	if klog.V(5).Enabled() && len(preferences) > 0 {
+		preferred := preferences[0]
+		klog.V(5).InfoS("repack drain: preferred receiver calculated",
+			"candidateVictims", taskNames(candidateVictims),
+			"receiverCount", len(preferences),
+			"preferredReceiver", preferred.node.Name,
+			"staysOccupied", preferred.staysOccupied,
+			"futureAdditionalGangBreaches", preferred.futureDrainImpact.additionalGangBreaches,
+			"futureAdditionalAffectedPodGroups", preferred.futureDrainImpact.additionalAffectedPodGroups,
+			"futureAdditionalDamagedResource", preferred.futureDrainImpact.additionalDamagedResource,
+			"availableResource", preferred.availableResource)
+	}
+
+	receivers := make([]*schedapi.NodeInfo, 0, len(preferences))
+	for _, preference := range preferences {
+		receivers = append(receivers, preference.node)
+	}
 	return receivers
+}
+
+// measureFutureDrainImpact compares the prospective plan before and after the
+// receiver's own movable Pods are added. MeasurePodGroupDisruption is shared
+// with the gang plugin, so both paths use exactly the same minAvailable rule.
+func (s *drainState) measureFutureDrainImpact(
+	node *schedapi.NodeInfo,
+	candidatePodGroupMoves map[schedapi.JobID]api.PodGroupMoveAggregate,
+) futureDrainImpact {
+	impact := futureDrainImpact{}
+	for podGroup, futureMoves := range s.futureDrainPodGroupsByNode[node.Name] {
+		candidateMoves := candidatePodGroupMoves[podGroup]
+		movedPodsBefore := s.movedPodsByPodGroup[podGroup] + candidateMoves.MovedPods
+		movedResourceBefore := s.movedResourceByPodGroup[podGroup] + candidateMoves.MovedResource
+		movedPodsAfter := movedPodsBefore + futureMoves.MovedPods
+		movedResourceAfter := movedResourceBefore + futureMoves.MovedResource
+
+		if movedPodsBefore == 0 {
+			impact.additionalAffectedPodGroups++
+		}
+		view := s.snapshot.PodGroupView(podGroup)
+		before := api.MeasurePodGroupDisruption(view, movedPodsBefore, movedResourceBefore)
+		after := api.MeasurePodGroupDisruption(view, movedPodsAfter, movedResourceAfter)
+		if !before.Breached && after.Breached {
+			impact.additionalGangBreaches++
+		}
+		impact.additionalDamagedResource += after.DamagedResource - before.DamagedResource
+		impact.movedPods += futureMoves.MovedPods
+		impact.movedResource += futureMoves.MovedResource
+	}
+	return impact
+}
+
+// compareFutureDrainImpact returns a positive value when left would be the more
+// disruptive future drain target. Gang safety is compared first, followed by
+// blast radius and move size; equal impact falls back to receiver best-fit.
+func compareFutureDrainImpact(left, right futureDrainImpact) int {
+	switch {
+	case left.additionalGangBreaches != right.additionalGangBreaches:
+		return cmp.Compare(left.additionalGangBreaches, right.additionalGangBreaches)
+	case left.additionalAffectedPodGroups != right.additionalAffectedPodGroups:
+		return cmp.Compare(left.additionalAffectedPodGroups, right.additionalAffectedPodGroups)
+	case left.additionalDamagedResource != right.additionalDamagedResource:
+		return cmp.Compare(left.additionalDamagedResource, right.additionalDamagedResource)
+	case left.movedResource != right.movedResource:
+		return cmp.Compare(left.movedResource, right.movedResource)
+	default:
+		return cmp.Compare(left.movedPods, right.movedPods)
+	}
+}
+
+func aggregateTasksByPodGroup(
+	tasks []*schedapi.TaskInfo,
+	targetResource v1.ResourceName,
+) map[schedapi.JobID]api.PodGroupMoveAggregate {
+	aggregates := make(map[schedapi.JobID]api.PodGroupMoveAggregate)
+	for _, task := range tasks {
+		if task == nil || task.Job == "" {
+			continue
+		}
+		aggregate := aggregates[task.Job]
+		aggregate.MovedPods++
+		aggregate.MovedResource += api.Scalar(task.InitResreq, targetResource)
+		aggregates[task.Job] = aggregate
+	}
+	return aggregates
 }
 
 // receiverSlack is the target-resource free capacity used to best-fit sort receivers.
@@ -403,12 +552,14 @@ func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
 	return api.Scalar(free, targetResource)
 }
 
-// staying reports whether a node will remain occupied regardless of this pass — so
-// it is a preferred receiver. A node stays if it has an immovable accelerator pod
-// (not freeable), is receiver-only (excluded from draining by scope.nodes), or was
-// already proven un-vacatable this pass.
-func (s *drainState) staying(n *schedapi.NodeInfo) bool {
-	return !api.EvaluateNodeFreeability(n, api.NodeFreeabilityState{}, s.movable, s.resource).Freeable || !s.snapshot.NodeInScope(n) || s.provenStuck[n.Name]
+// staysOccupied reports whether a node will remain occupied regardless of this pass,
+// so it is a preferred receiver. A node stays if it already received a committed
+// move, has an immovable accelerator pod, is receiver-only (excluded from
+// draining by scope.nodes), or was already proven un-vacatable this pass.
+func (s *drainState) staysOccupied(n *schedapi.NodeInfo) bool {
+	return s.filled[n.Name] ||
+		s.alwaysStaysOccupied[n.Name] ||
+		s.provenStuck[n.Name]
 }
 
 // scoreCandidates orders feasible candidates by the deterministic tie-breakers,
@@ -461,7 +612,10 @@ func (s *drainState) commit(chosen candidate) {
 	for _, m := range chosen.placed {
 		s.filled[m.To] = true
 		if m.Task != nil {
-			s.placedResourceByNode[m.To] += api.Scalar(m.Task.InitResreq, s.resource)
+			movedResource := api.Scalar(m.Task.InitResreq, s.resource)
+			s.placedResourceByNode[m.To] += movedResource
+			s.movedPodsByPodGroup[m.Task.Job]++
+			s.movedResourceByPodGroup[m.Task.Job] += movedResource
 		}
 	}
 	for pg := range chosen.newPodGroups {

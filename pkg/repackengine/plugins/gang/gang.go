@@ -56,12 +56,10 @@ func (*gangPlugin) OnSessionClose(*framework.Session) {}
 func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 	var breachedGangs int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
-		view := ctx.PodGroupView(podGroupID)
-		slack := int64(view.Running) - int64(view.MinAvailable)
-		if slack < 0 {
-			slack = 0
-		}
-		if moved.MovedPods > slack {
+		disruption := api.MeasurePodGroupDisruption(
+			ctx.PodGroupView(podGroupID), moved.MovedPods, moved.MovedResource,
+		)
+		if disruption.Breached {
 			breachedGangs++
 		}
 	}
@@ -74,16 +72,10 @@ func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 	var damagedResource int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
-		view := ctx.PodGroupView(podGroupID)
-		slack := int64(view.Running) - int64(view.MinAvailable)
-		if slack < 0 {
-			slack = 0
-		}
-		if moved.MovedPods > slack {
-			damagedResource += view.Footprint
-		} else {
-			damagedResource += moved.MovedResource
-		}
+		disruption := api.MeasurePodGroupDisruption(
+			ctx.PodGroupView(podGroupID), moved.MovedPods, moved.MovedResource,
+		)
+		damagedResource += disruption.DamagedResource
 	}
 	return float64(damagedResource)
 }

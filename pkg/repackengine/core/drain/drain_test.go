@@ -227,6 +227,122 @@ func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
 	}
 }
 
+// Once draining a node has already disrupted a gang, receivers must be chosen
+// without consuming the remaining nodes of that same gang. Otherwise those
+// nodes become ineligible as later drain targets and the next step is forced to
+// disrupt an unrelated gang.
+//
+// Job A spans node-1/node-2 and Job B spans node-3/node-4. The first step
+// deterministically chooses node-1. Its victim should land on node-3 or node-4,
+// preserving node-2 as the cheap continuation target. The resulting plan must
+// empty node-1/node-2 and leave Job B intact.
+func TestDrain_PreservesAlreadyAffectedGangNodesForLaterDrain(t *testing.T) {
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("node-1", 8, gpuTask("job-a-1", "job-a", 4)),
+			capNode("node-2", 8, gpuTask("job-a-2", "job-a", 4)),
+			capNode("node-3", 8, gpuTask("job-b-1", "job-b", 4)),
+			capNode("node-4", 8, gpuTask("job-b-2", "job-b", 4)),
+		},
+		views: map[schedapi.JobID]api.PodGroupView{
+			"job-a": {Running: 2, MinAvailable: 2, Footprint: 8},
+			"job-b": {Running: 2, MinAvailable: 2, Footprint: 8},
+		},
+	}
+
+	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 2, 0, 0, []string{"base", "gang"}))
+	if !ok || plan == nil {
+		t.Fatal("expected a feasible two-node drain plan")
+	}
+	freed := append([]string(nil), plan.FreedNodes...)
+	sort.Strings(freed)
+	if got, want := fmt.Sprint(freed), "[node-1 node-2]"; got != want {
+		t.Fatalf("freed=%v, want %s: continue draining the already affected job", freed, want)
+	}
+	for _, move := range realMoves(plan) {
+		if move.Task.Job != "job-a" {
+			t.Fatalf("move=%s/%s:%s->%s affects a second job; all moves must remain within job-a",
+				move.Task.Job, move.Task.Name, move.From, move.To)
+		}
+	}
+}
+
+// Preserving a node from an already-affected gang is a preference, not a hard
+// placement constraint. If the preferred unrelated-gang receiver lacks
+// capacity, feasibility must continue to the preserved node so a valid drain
+// plan is not rejected.
+func TestReceiverPreferenceFallsBackWhenPreferredReceiverLacksCapacity(t *testing.T) {
+	victim := gpuTask("job-a-1", "job-a", 4)
+	sameGangReceiver := capNode("same-gang", 8, gpuTask("job-a-2", "job-a", 2))
+	unrelatedReceiver := capNode("unrelated-gang", 8, gpuTask("job-b-1", "job-b", 7))
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("drain-target", 8, victim),
+		sameGangReceiver,
+		unrelatedReceiver,
+	}}
+	session := drainSession(snap, allMovable, 1, 0, 0)
+	defer framework.CloseSession(session)
+
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(snap.nodes))
+	for _, node := range snap.nodes {
+		nodesByName[node.Name] = node
+	}
+	state := newDrainState(snap.nodes, nodesByName, session, allMovable, gpu)
+	receivers := state.receiversInPreferenceOrder(
+		map[string]bool{"drain-target": true},
+		[]*schedapi.TaskInfo{victim},
+	)
+	if len(receivers) != 2 || receivers[0].Name != "unrelated-gang" || receivers[1].Name != "same-gang" {
+		t.Fatalf("receivers=%v, want [unrelated-gang same-gang]", nodeNames(receivers))
+	}
+
+	moves, feasible := snap.FeasibleRelocation(nil, []*schedapi.TaskInfo{victim}, receivers)
+	if !feasible || len(moves) != 1 {
+		t.Fatalf("feasible=%v moves=%+v, want fallback placement", feasible, moves)
+	}
+	if moves[0].To != "same-gang" {
+		t.Fatalf("move target=%q, want same-gang after unrelated-gang capacity fallback", moves[0].To)
+	}
+}
+
+// Two receivers can each introduce one new PodGroup while having very different
+// gang consequences. The node whose future drain would breach minAvailable is
+// more valuable as a receiver; preserving it as a target would make a later
+// drain step unnecessarily disruptive.
+func TestReceiverPreferenceAccountsForFutureMinAvailableBreach(t *testing.T) {
+	victim := gpuTask("job-a-1", "job-a", 1)
+	safeToDrain := capNode("safe-to-drain", 8, gpuTask("job-b-1", "job-b", 4))
+	costlyToDrain := capNode("costly-to-drain", 8, gpuTask("job-c-1", "job-c", 4))
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("drain-target", 8, victim),
+			safeToDrain,
+			costlyToDrain,
+		},
+		views: map[schedapi.JobID]api.PodGroupView{
+			"job-a": {Running: 4, MinAvailable: 2, Footprint: 4},
+			"job-b": {Running: 4, MinAvailable: 2, Footprint: 24},
+			"job-c": {Running: 1, MinAvailable: 1, Footprint: 8},
+		},
+	}
+	session := drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"})
+	defer framework.CloseSession(session)
+
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(snap.nodes))
+	for _, node := range snap.nodes {
+		nodesByName[node.Name] = node
+	}
+	state := newDrainState(snap.nodes, nodesByName, session, allMovable, gpu)
+	receivers := state.receiversInPreferenceOrder(
+		map[string]bool{"drain-target": true},
+		[]*schedapi.TaskInfo{victim},
+	)
+	if len(receivers) != 2 || receivers[0].Name != "costly-to-drain" {
+		t.Fatalf("receivers=%v, want costly-to-drain first because draining it would breach job-c minAvailable",
+			nodeNames(receivers))
+	}
+}
+
 func TestOrderCandidatesUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
 	session := drainSessionWithPlugins(&fakeSnap{}, allMovable, 1, 0, 0, []string{"base"})
 	defer framework.CloseSession(session)

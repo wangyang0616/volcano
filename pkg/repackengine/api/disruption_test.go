@@ -67,6 +67,40 @@ func TestAggregateIncludesCommittedAndIncrementalMoves(t *testing.T) {
 	}
 }
 
+func TestMeasurePodGroupDisruption(t *testing.T) {
+	view := PodGroupView{Running: 4, MinAvailable: 2, Footprint: 16}
+	tests := []struct {
+		name                string
+		movedPods           int64
+		movedResource       int64
+		wantBreached        bool
+		wantDamagedResource int64
+	}{
+		{
+			name:                "within running slack",
+			movedPods:           2,
+			movedResource:       8,
+			wantDamagedResource: 8,
+		},
+		{
+			name:                "breaches minAvailable",
+			movedPods:           3,
+			movedResource:       12,
+			wantBreached:        true,
+			wantDamagedResource: 16,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := MeasurePodGroupDisruption(view, test.movedPods, test.movedResource)
+			if got.Breached != test.wantBreached || got.DamagedResource != test.wantDamagedResource {
+				t.Fatalf("disruption=%+v, want breached=%v damagedResource=%d",
+					got, test.wantBreached, test.wantDamagedResource)
+			}
+		})
+	}
+}
+
 // CalculateDisruptionCost summarizes a move set's default dimensions.
 func TestCostOf(t *testing.T) {
 	c := CalculateDisruptionCost([]*Move{

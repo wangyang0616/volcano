@@ -1191,8 +1191,25 @@ func (n *Nominator) victimGone(nomination *repackv1alpha1.PodRelocationStatus) b
 	if nomination == nil || nomination.VictimPodName == "" || n.podLister == nil {
 		return true
 	}
-	_, err := n.podLister.Pods(nomination.Namespace).Get(nomination.VictimPodName)
-	return apierrors.IsNotFound(err)
+	pod, err := n.podLister.Pods(nomination.Namespace).Get(nomination.VictimPodName)
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if err != nil || nomination.VictimPodUID == "" {
+		// Without the plan-time UID, preserve the conservative legacy behavior:
+		// a same-name Pod may still be the original victim.
+		return false
+	}
+	// Kubernetes permits a controller to recreate the same Pod name after the
+	// original instance is deleted. The durable victim UID distinguishes that
+	// replacement from the instance Repack actually evicted.
+	if pod.UID != nomination.VictimPodUID {
+		klog.V(4).InfoS("repack nominator: victim Pod name now belongs to a recreated instance",
+			"pod", nomination.Namespace+"/"+nomination.VictimPodName,
+			"victimPodUID", nomination.VictimPodUID, "currentPodUID", pod.UID)
+		return true
+	}
+	return pod.DeletionTimestamp != nil
 }
 
 // patchNominatedNode writes pod.status.nominatedNodeName via the status
