@@ -1,0 +1,51 @@
+<svg viewBox="0 0 1120 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>腾空候选排序：硬性过滤后选择最小扰动方案</title>
+  <desc>在同一轮规划中，node-a、node-b 和 node-c 都是初始腾空候选。node-b 因存在不可移动的目标资源 Pod 被硬性过滤；node-a 与 node-c 均能完成重落点模拟，但 node-a 的相对扰动总分更低，因此被提交。提交后状态发生变化，下一轮重新评估剩余候选。</desc>
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1c7ed6"/></marker><marker id="g" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#2f9e44"/></marker></defs>
+  <rect width="1120" height="420" fill="#fff"/>
+  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">腾空候选排序：先判断“能不能腾”，再比较“动谁代价更小”</text>
+  <text x="32" y="56" font-size="11" fill="#57606a">排序对象是节点或 HyperNode 腾空单元；真正被 Eviction 的是单元上的可移动 Pod，而不是节点本身。</text>
+
+  <text x="44" y="92" font-size="12" font-weight="700" fill="#1f2328">第 N 轮 · 三个初始候选</text>
+  <g transform="translate(42,112)">
+    <rect width="248" height="174" rx="11" fill="#edf9f1" stroke="#2f9e44"/>
+    <text x="20" y="30" font-size="12" font-weight="700" fill="#1f2328">node-a · 2/8 GPU</text>
+    <g transform="translate(20,48)"><rect width="18" height="18" rx="3" fill="#1c7ed6"/><rect x="24" width="18" height="18" rx="3" fill="#1c7ed6"/><g fill="#fff" stroke="#9aa4b2" stroke-dasharray="3 2"><rect x="48" width="18" height="18" rx="3"/><rect x="72" width="18" height="18" rx="3"/><rect x="96" width="18" height="18" rx="3"/><rect x="120" width="18" height="18" rx="3"/><rect x="144" width="18" height="18" rx="3"/><rect x="168" width="18" height="18" rx="3"/></g></g>
+    <text x="20" y="91" font-size="10" fill="#57606a">✓ 可腾空 · 不超预算</text>
+    <text x="20" y="110" font-size="10" fill="#57606a">✓ 所有 Pod 模拟重落成功</text>
+    <text x="20" y="129" font-size="10" fill="#57606a">✓ 不新增 Gang breach</text>
+    <rect x="20" y="142" width="208" height="22" rx="6" fill="#2f9e44"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#fff">相对扰动最低 · 本轮选择</text>
+  </g>
+  <g transform="translate(314,112)">
+    <rect width="248" height="174" rx="11" fill="#fff1f0" stroke="#e03131"/>
+    <text x="20" y="30" font-size="12" font-weight="700" fill="#1f2328">node-b · 4/8 GPU</text>
+    <g transform="translate(20,48)"><rect width="18" height="18" rx="3" fill="#e03131"/><rect x="24" width="18" height="18" rx="3" fill="#1c7ed6"/><rect x="48" width="18" height="18" rx="3" fill="#1c7ed6"/><rect x="72" width="18" height="18" rx="3" fill="#1c7ed6"/><g fill="#fff" stroke="#9aa4b2" stroke-dasharray="3 2"><rect x="96" width="18" height="18" rx="3"/><rect x="120" width="18" height="18" rx="3"/><rect x="144" width="18" height="18" rx="3"/><rect x="168" width="18" height="18" rx="3"/></g></g>
+    <text x="20" y="92" font-size="10" font-weight="700" fill="#e03131">× 存在不可移动的目标资源 Pod</text>
+    <text x="20" y="114" font-size="10" fill="#57606a">例如：无可识别 PodGroup、被 Scope 排除</text>
+    <text x="20" y="133" font-size="10" fill="#57606a">或节点已被填充/已腾空</text>
+    <rect x="20" y="142" width="208" height="22" rx="6" fill="#fff" stroke="#e03131"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#e03131">硬性过滤 · 不参与评分</text>
+  </g>
+  <g transform="translate(586,112)">
+    <rect width="248" height="174" rx="11" fill="#fff8e8" stroke="#e8890c"/>
+    <text x="20" y="30" font-size="12" font-weight="700" fill="#1f2328">node-c · 2/8 GPU</text>
+    <g transform="translate(20,48)"><rect width="18" height="18" rx="3" fill="#8b5cf6"/><rect x="24" width="18" height="18" rx="3" fill="#8b5cf6"/><g fill="#fff" stroke="#9aa4b2" stroke-dasharray="3 2"><rect x="48" width="18" height="18" rx="3"/><rect x="72" width="18" height="18" rx="3"/><rect x="96" width="18" height="18" rx="3"/><rect x="120" width="18" height="18" rx="3"/><rect x="144" width="18" height="18" rx="3"/><rect x="168" width="18" height="18" rx="3"/></g></g>
+    <text x="20" y="91" font-size="10" fill="#57606a">✓ 可腾空 · 模拟重落成功</text>
+    <text x="20" y="110" font-size="10" fill="#57606a">△ 新增 Gang breach</text>
+    <text x="20" y="129" font-size="10" fill="#57606a">△ 整组受损资源更大</text>
+    <rect x="20" y="142" width="208" height="22" rx="6" fill="#fff" stroke="#e8890c"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#e8890c">可行但扰动更高 · 排序靠后</text>
+  </g>
+
+  <path d="M852,199 L890,199" fill="none" stroke="#1c7ed6" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="904" y="112" width="176" height="174" rx="11" fill="#eaf4ff" stroke="#1c7ed6"/>
+  <text x="992" y="140" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">本轮决策</text>
+  <text x="992" y="169" text-anchor="middle" font-size="10" fill="#57606a">候选内归一化</text>
+  <text x="992" y="188" text-anchor="middle" font-size="10" fill="#57606a">加权汇总五个维度</text>
+  <rect x="924" y="208" width="136" height="34" rx="7" fill="#2f9e44"/>
+  <text x="992" y="230" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">提交 node-a</text>
+  <text x="992" y="263" text-anchor="middle" font-size="9.5" fill="#57606a">分数并列：收益权重 → 名称</text>
+
+  <path d="M992,297 L992,324 L232,324 L232,305" fill="none" stroke="#2f9e44" stroke-width="2" marker-end="url(#g)"/>
+  <text x="612" y="319" text-anchor="middle" font-size="10" font-weight="700" fill="#2f9e44">提交迁移后，容量与 Gang 状态都已变化</text>
+  <rect x="154" y="350" width="812" height="36" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="560" y="373" text-anchor="middle" font-size="10.5" fill="#1f2328">进入下一轮时重新检查全部剩余候选；不会沿用一份已经过期的静态节点顺序。</text>
+</svg>

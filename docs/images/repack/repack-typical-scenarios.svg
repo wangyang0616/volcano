@@ -1,0 +1,51 @@
+<svg viewBox="0 0 1120 470" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>Repack 的典型使用方式：周期治理与大任务提交前容量准备</title>
+  <desc>左侧展示平台在业务低峰期定期治理资源碎片，右侧展示在多机多卡任务进入调度队列前提前恢复所需的完整节点容量。</desc>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1c7ed6"/></marker>
+  </defs>
+  <rect width="1120" height="470" fill="#fff"/>
+  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">事前治理：定期维护资源池，按计划准备大任务容量</text>
+  <text x="32" y="56" font-size="11" fill="#57606a">在业务真正受阻前识别分散的资源布局，通过受控整理恢复完整节点容量。</text>
+
+  <rect x="32" y="84" width="510" height="340" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="54" y="114" font-size="14" font-weight="700" fill="#1f2328">周期治理 · 资源池碎片持续积累</text>
+  <text x="54" y="136" font-size="10" fill="#57606a">平台结合碎片趋势和完整节点数量，在业务低峰期定期评估资源布局。</text>
+  <g transform="translate(58,160)">
+    <g><rect width="88" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="44" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">node-a · 6/8</text>
+      <g fill="#1c7ed6"><rect x="10" y="32" width="14" height="14" rx="2"/><rect x="28" y="32" width="14" height="14" rx="2"/><rect x="46" y="32" width="14" height="14" rx="2"/><rect x="64" y="32" width="14" height="14" rx="2"/><rect x="10" y="52" width="14" height="14" rx="2"/><rect x="28" y="52" width="14" height="14" rx="2"/></g><g fill="none" stroke="#d0d7de" stroke-dasharray="2 2"><rect x="46" y="52" width="14" height="14" rx="2"/><rect x="64" y="52" width="14" height="14" rx="2"/></g></g>
+    <g transform="translate(104,0)"><rect width="88" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="44" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">node-b · 6/8</text>
+      <g fill="#14b8a6"><rect x="10" y="32" width="14" height="14" rx="2"/><rect x="28" y="32" width="14" height="14" rx="2"/><rect x="46" y="32" width="14" height="14" rx="2"/><rect x="64" y="32" width="14" height="14" rx="2"/><rect x="10" y="52" width="14" height="14" rx="2"/><rect x="28" y="52" width="14" height="14" rx="2"/></g><g fill="none" stroke="#d0d7de" stroke-dasharray="2 2"><rect x="46" y="52" width="14" height="14" rx="2"/><rect x="64" y="52" width="14" height="14" rx="2"/></g></g>
+    <g transform="translate(208,0)"><rect width="88" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="44" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">node-c · 6/8</text>
+      <g fill="#e8890c"><rect x="10" y="32" width="14" height="14" rx="2"/><rect x="28" y="32" width="14" height="14" rx="2"/><rect x="46" y="32" width="14" height="14" rx="2"/><rect x="64" y="32" width="14" height="14" rx="2"/><rect x="10" y="52" width="14" height="14" rx="2"/><rect x="28" y="52" width="14" height="14" rx="2"/></g><g fill="none" stroke="#d0d7de" stroke-dasharray="2 2"><rect x="46" y="52" width="14" height="14" rx="2"/><rect x="64" y="52" width="14" height="14" rx="2"/></g></g>
+    <g transform="translate(312,0)"><rect width="88" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="44" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">node-d · 6/8</text>
+      <g fill="#8b5cf6"><rect x="10" y="32" width="14" height="14" rx="2"/><rect x="28" y="32" width="14" height="14" rx="2"/><rect x="46" y="32" width="14" height="14" rx="2"/><rect x="64" y="32" width="14" height="14" rx="2"/><rect x="10" y="52" width="14" height="14" rx="2"/><rect x="28" y="52" width="14" height="14" rx="2"/></g><g fill="none" stroke="#d0d7de" stroke-dasharray="2 2"><rect x="46" y="52" width="14" height="14" rx="2"/><rect x="64" y="52" width="14" height="14" rx="2"/></g></g>
+  </g>
+  <rect x="58" y="288" width="316" height="70" rx="8" fill="#fff1f0" stroke="#e03131"/>
+  <text x="78" y="310" font-size="12" font-weight="700" fill="#1f2328">治理动作：在碎片达到阈值时主动整理</text>
+  <text x="78" y="330" font-size="10" fill="#57606a">避免资源布局持续分散，保持存量资源可调度</text>
+  <path d="M384,323 L414,323" fill="none" stroke="#1c7ed6" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="426" y="288" width="92" height="70" rx="8" fill="#edf9f1" stroke="#2f9e44"/>
+  <text x="472" y="308" text-anchor="middle" font-size="9.5" font-weight="700" fill="#2f9e44">整理后</text>
+  <text x="472" y="327" text-anchor="middle" font-size="9.5" fill="#1f2328">完整节点</text>
+  <text x="472" y="345" text-anchor="middle" font-size="9.5" fill="#1f2328">保持健康</text>
+
+  <rect x="578" y="84" width="510" height="340" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="600" y="114" font-size="14" font-weight="700" fill="#1f2328">任务准备 · 大规格训练即将提交</text>
+  <text x="600" y="136" font-size="10" fill="#57606a">提交前检查 Worker 数量和单 Worker 卡数，确认当前资源布局能否满足。</text>
+  <g transform="translate(604,160)">
+    <g><rect width="92" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="46" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">pool-a · 2/8</text><rect x="12" y="35" width="30" height="20" rx="4" fill="#14b8a6"/><text x="27" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text><rect x="48" y="35" width="30" height="20" rx="4" fill="#14b8a6"/><text x="63" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text></g>
+    <g transform="translate(108,0)"><rect width="92" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="46" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">pool-b · 1/8</text><rect x="12" y="35" width="30" height="20" rx="4" fill="#e8890c"/><text x="27" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text></g>
+    <g transform="translate(216,0)"><rect width="92" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="46" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">pool-c · 2/8</text><rect x="12" y="35" width="30" height="20" rx="4" fill="#8b5cf6"/><text x="27" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text><rect x="48" y="35" width="30" height="20" rx="4" fill="#8b5cf6"/><text x="63" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text></g>
+    <g transform="translate(324,0)"><rect width="92" height="104" rx="8" fill="#fff" stroke="#d0d7de"/><text x="46" y="19" text-anchor="middle" font-size="10" font-weight="700" fill="#1f2328">pool-d · 1/8</text><rect x="12" y="35" width="30" height="20" rx="4" fill="#1c7ed6"/><text x="27" y="49" text-anchor="middle" font-size="8" fill="#fff">task</text></g>
+  </g>
+  <rect x="604" y="288" width="306" height="70" rx="8" fill="#fff8e8" stroke="#e8890c"/>
+  <text x="624" y="310" font-size="12" font-weight="700" fill="#1f2328">容量准备：先恢复完整节点，再提交任务</text>
+  <text x="624" y="330" font-size="10" fill="#57606a">降低任务进入队列后因资源分散而长时间等待的概率</text>
+  <path d="M920,323 L950,323" fill="none" stroke="#1c7ed6" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="962" y="288" width="102" height="70" rx="8" fill="#edf9f1" stroke="#2f9e44"/>
+  <text x="1013" y="308" text-anchor="middle" font-size="9.5" font-weight="700" fill="#2f9e44">整理后</text>
+  <text x="1013" y="327" text-anchor="middle" font-size="9.5" fill="#1f2328">容量就绪</text>
+  <text x="1013" y="345" text-anchor="middle" font-size="9.5" fill="#1f2328">再提交任务</text>
+  <text x="560" y="450" text-anchor="middle" font-size="10.5" fill="#57606a">Repack 当前适合用户主动发起的事前容量治理，不替代基于 Pending 作业的自动容量编排。</text>
+</svg>

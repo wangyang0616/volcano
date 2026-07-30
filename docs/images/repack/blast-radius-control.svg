@@ -1,0 +1,44 @@
+<svg viewBox="0 0 1120 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>爆炸半径控制：工作负载与目标资源双重上限</title>
+  <desc>Scope 中有多个允许被驱逐的工作负载，但 maxPerRun 将一次 Run 的影响限制为一个工作负载和四张 NPU。候选 A 影响一个工作负载并移动四张卡，允许进入后续排序；候选 B 影响两个工作负载，候选 C 移动八张卡，均在规划阶段被淘汰。工作负载数量在系统内部按 PodGroup 计数。</desc>
+  <rect width="1120" height="400" fill="#fff"/>
+  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">爆炸半径：Scope 里“可以动”的业务，不代表一次 Run 会全部动</text>
+  <text x="32" y="56" font-size="11" fill="#57606a">maxPerRun 同时限制受影响工作负载数和移动卡数；突破任一上限的候选在规划阶段直接淘汰。</text>
+
+  <rect x="40" y="92" width="236" height="216" rx="12" fill="#eaf4ff" stroke="#1c7ed6"/>
+  <text x="60" y="122" font-size="13" font-weight="700" fill="#1f2328">Scope 内可整理业务</text>
+  <text x="60" y="143" font-size="10" fill="#57606a">train-a · train-b · infer-c</text>
+  <g transform="translate(60,166)"><rect width="66" height="36" rx="7" fill="#fff" stroke="#1c7ed6"/><rect x="76" width="66" height="36" rx="7" fill="#fff" stroke="#1c7ed6"/><rect x="152" width="66" height="36" rx="7" fill="#fff" stroke="#1c7ed6"/><text x="33" y="23" text-anchor="middle" font-size="9.5" fill="#1f2328">负载 A</text><text x="109" y="23" text-anchor="middle" font-size="9.5" fill="#1f2328">负载 B</text><text x="185" y="23" text-anchor="middle" font-size="9.5" fill="#1f2328">负载 C</text></g>
+  <text x="60" y="230" font-size="10" fill="#57606a">这些对象只是“有资格参与”，</text>
+  <text x="60" y="248" font-size="10" fill="#57606a">不是本次都会被驱逐。</text>
+  <text x="60" y="282" font-size="10.5" font-weight="700" fill="#1c7ed6">授权边界由 Scope 决定</text>
+
+  <rect x="314" y="92" width="236" height="216" rx="12" fill="#fff8e8" stroke="#e8890c"/>
+  <text x="334" y="122" font-size="13" font-weight="700" fill="#1f2328">本次 Run 的硬上限</text>
+  <rect x="334" y="153" width="196" height="78" rx="9" fill="#fff" stroke="#e8890c"/>
+  <text x="354" y="180" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#1f2328">podGroups: 1</text>
+  <text x="354" y="207" font-size="11" font-family="ui-monospace,Menlo,monospace" fill="#1f2328">huawei.com/ascend-1980: 4</text>
+  <text x="334" y="258" font-size="10" fill="#57606a">两个上限独立判断；</text>
+  <text x="334" y="276" font-size="10" fill="#57606a">任一个超出，本候选即停止。</text>
+  <text x="334" y="296" font-size="10.5" font-weight="700" fill="#e8890c">单次影响面由 maxPerRun 决定</text>
+
+  <rect x="588" y="92" width="492" height="216" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="608" y="122" font-size="13" font-weight="700" fill="#1f2328">候选计划在执行前就完成预算检查</text>
+  <rect x="610" y="146" width="140" height="124" rx="9" fill="#edf9f1" stroke="#2f9e44"/>
+  <text x="680" y="170" text-anchor="middle" font-size="11" font-weight="700" fill="#2f9e44">候选 A · 通过</text>
+  <text x="680" y="196" text-anchor="middle" font-size="10" fill="#1f2328">1 个工作负载</text>
+  <text x="680" y="216" text-anchor="middle" font-size="10" fill="#1f2328">移动 4 张 NPU</text>
+  <text x="680" y="247" text-anchor="middle" font-size="10" font-weight="700" fill="#2f9e44">进入扰动排序</text>
+  <rect x="764" y="146" width="140" height="124" rx="9" fill="#fff1f0" stroke="#e03131"/>
+  <text x="834" y="170" text-anchor="middle" font-size="11" font-weight="700" fill="#e03131">候选 B · 淘汰</text>
+  <text x="834" y="196" text-anchor="middle" font-size="10" fill="#1f2328">2 个工作负载</text>
+  <text x="834" y="216" text-anchor="middle" font-size="10" fill="#1f2328">移动 4 张 NPU</text>
+  <text x="834" y="247" text-anchor="middle" font-size="10" font-weight="700" fill="#e03131">工作负载数超限</text>
+  <rect x="918" y="146" width="140" height="124" rx="9" fill="#fff1f0" stroke="#e03131"/>
+  <text x="988" y="170" text-anchor="middle" font-size="11" font-weight="700" fill="#e03131">候选 C · 淘汰</text>
+  <text x="988" y="196" text-anchor="middle" font-size="10" fill="#1f2328">1 个工作负载</text>
+  <text x="988" y="216" text-anchor="middle" font-size="10" fill="#1f2328">移动 8 张 NPU</text>
+  <text x="988" y="247" text-anchor="middle" font-size="10" font-weight="700" fill="#e03131">目标资源数超限</text>
+  <rect x="168" y="340" width="784" height="34" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="560" y="362" text-anchor="middle" font-size="10.5" fill="#1f2328">推荐先从 1 个工作负载、少量卡开始：DryRun 看清影响，Execute 小步验证，再逐步放大预算。</text>
+</svg>
