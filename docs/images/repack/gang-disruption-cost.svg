@@ -1,40 +1,40 @@
 <svg viewBox="0 0 1120 430" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif" role="img">
-  <title>Gang 中断成本：优先选择不打破 minAvailable 的腾空方案</title>
-  <desc>两个节点都可腾空。候选 A 移动两个 Pod 后训练任务仍满足 minAvailable；候选 B 虽只移动一个 Pod，却使训练任务低于 minAvailable。Repack 对可行候选按 Gang 破坏、受影响工作负载、受损加速卡、移动资源和 Pod 数计算扰动分数，优先选择候选 A。</desc>
+  <title>Gang 中断影响：优先选择迁移后仍满足 MinAvailable 的腾空方案</title>
+  <desc>两个节点都可腾空。候选 A 迁移两个 Pod 后训练任务仍满足 MinAvailable；候选 B 虽只迁移一个 Pod，却使训练任务低于 MinAvailable。Repack 对可行候选按低于 MinAvailable 的 PodGroup 数、受影响工作负载数、受影响目标资源量、迁移资源量和 Pod 数计算中断影响分数，优先选择候选 A。</desc>
   <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1c7ed6"/></marker></defs>
   <rect width="1120" height="430" fill="#fff"/>
-  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">Gang 中断成本：少搬一个 Pod，不一定代表对业务更安全</text>
-  <text x="32" y="56" font-size="11" fill="#57606a">所有候选先通过可调度性验证；在可行方案中，Repack 优先选择不会新增打破 <tspan font-family="ui-monospace,Menlo,monospace">minAvailable</tspan> 的方案。</text>
+  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">Gang 中断影响：迁移 Pod 数量更少不一定影响更小</text>
+  <text x="32" y="56" font-size="11" fill="#57606a">所有候选先通过可调度性验证；在可行方案中，Repack 优先选择迁移后仍满足 <tspan font-family="ui-monospace,Menlo,monospace">MinAvailable</tspan> 的方案。</text>
 
   <rect x="34" y="86" width="454" height="260" rx="12" fill="#edf9f1" stroke="#2f9e44" stroke-width="1.5"/>
   <text x="56" y="116" font-size="14" font-weight="700" fill="#1f2328">候选 A · 优先选择</text>
   <text x="56" y="138" font-size="10" fill="#57606a">腾空 node-a，需要迁移 train-a 的 2 个 Pod</text>
   <rect x="56" y="159" width="144" height="104" rx="8" fill="#fff" stroke="#2f9e44"/>
   <text x="128" y="182" text-anchor="middle" font-size="11" font-weight="700" fill="#1f2328">train-a</text>
-  <text x="128" y="199" text-anchor="middle" font-size="9.5" fill="#57606a">minAvailable = 4</text>
+  <text x="128" y="199" text-anchor="middle" font-size="9.5" fill="#57606a">MinAvailable = 4</text>
   <g transform="translate(70,215)"><rect width="20" height="20" rx="4" fill="#2f9e44"/><rect x="27" width="20" height="20" rx="4" fill="#2f9e44"/><rect x="54" width="20" height="20" rx="4" fill="#2f9e44"/><rect x="81" width="20" height="20" rx="4" fill="#2f9e44"/><rect x="108" width="20" height="20" rx="4" fill="#eaf4ff" stroke="#1c7ed6"/><text x="10" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="37" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="64" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="91" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="118" y="14" text-anchor="middle" font-size="8" fill="#1c7ed6">M×2</text></g>
   <path d="M216,211 L276,211" fill="none" stroke="#1c7ed6" stroke-width="2" marker-end="url(#arrow)"/>
   <rect x="292" y="159" width="166" height="104" rx="8" fill="#fff" stroke="#2f9e44"/>
-  <text x="375" y="185" text-anchor="middle" font-size="11" font-weight="700" fill="#2f9e44">移动后仍满足 minAvailable</text>
-  <text x="375" y="207" text-anchor="middle" font-size="10" fill="#57606a">剩余运行副本：4</text>
-  <text x="375" y="227" text-anchor="middle" font-size="10" fill="#57606a">新增 Gang 破坏：0</text>
-  <text x="56" y="300" font-size="11" font-weight="700" fill="#2f9e44">扰动评分较低 → 可以先提交该候选</text>
-  <text x="56" y="322" font-size="10" fill="#57606a">计划仍记录移动范围，并在 Execute 时遵守 PDB 与实时调度约束。</text>
+  <text x="375" y="185" text-anchor="middle" font-size="11" font-weight="700" fill="#2f9e44">迁移后仍满足 MinAvailable</text>
+  <text x="375" y="207" text-anchor="middle" font-size="10" fill="#57606a">剩余 Running Pod：4</text>
+  <text x="375" y="227" text-anchor="middle" font-size="10" fill="#57606a">低于 MinAvailable：否</text>
+  <text x="56" y="300" font-size="11" font-weight="700" fill="#2f9e44">中断影响评分较低 → 优先选择</text>
+  <text x="56" y="322" font-size="10" fill="#57606a">计划仍记录迁移范围，并在 Execute 时遵守 PDB 与实时调度约束。</text>
 
   <rect x="632" y="86" width="454" height="260" rx="12" fill="#fff1f0" stroke="#e03131" stroke-width="1.5"/>
   <text x="654" y="116" font-size="14" font-weight="700" fill="#1f2328">候选 B · 可行但排序靠后</text>
   <text x="654" y="138" font-size="10" fill="#57606a">腾空 node-b，只需迁移 train-b 的 1 个 Pod</text>
   <rect x="654" y="159" width="144" height="104" rx="8" fill="#fff" stroke="#e03131"/>
   <text x="726" y="182" text-anchor="middle" font-size="11" font-weight="700" fill="#1f2328">train-b</text>
-  <text x="726" y="199" text-anchor="middle" font-size="9.5" fill="#57606a">minAvailable = 4</text>
+  <text x="726" y="199" text-anchor="middle" font-size="9.5" fill="#57606a">MinAvailable = 4</text>
   <g transform="translate(668,215)"><rect width="20" height="20" rx="4" fill="#2f9e44"/><rect x="27" width="20" height="20" rx="4" fill="#2f9e44"/><rect x="54" width="20" height="20" rx="4" fill="#2f9e44"/><rect x="81" width="20" height="20" rx="4" fill="#eaf4ff" stroke="#e03131"/><text x="10" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="37" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="64" y="14" text-anchor="middle" font-size="8" fill="#fff">R</text><text x="91" y="14" text-anchor="middle" font-size="8" fill="#e03131">M</text></g>
   <path d="M814,211 L874,211" fill="none" stroke="#e03131" stroke-width="2" marker-end="url(#arrow)"/>
   <rect x="890" y="159" width="166" height="104" rx="8" fill="#fff" stroke="#e03131"/>
-  <text x="973" y="185" text-anchor="middle" font-size="11" font-weight="700" fill="#e03131">移动后低于 minAvailable</text>
-  <text x="973" y="207" text-anchor="middle" font-size="10" fill="#57606a">剩余运行副本：3</text>
-  <text x="973" y="227" text-anchor="middle" font-size="10" fill="#57606a">新增 Gang 破坏：1</text>
-  <text x="654" y="300" font-size="11" font-weight="700" fill="#e03131">扰动评分更高 → 只有更优候选不存在时才可能被选中</text>
-  <text x="654" y="322" font-size="10" fill="#57606a">完全不可中断的业务应通过 Scope 排除，而不是仅依赖评分排序。</text>
+  <text x="973" y="185" text-anchor="middle" font-size="11" font-weight="700" fill="#e03131">迁移后低于 MinAvailable</text>
+  <text x="973" y="207" text-anchor="middle" font-size="10" fill="#57606a">剩余 Running Pod：3</text>
+  <text x="973" y="227" text-anchor="middle" font-size="10" fill="#57606a">低于 MinAvailable：是</text>
+  <text x="654" y="300" font-size="11" font-weight="700" fill="#e03131">中断影响评分较高 → 排序靠后</text>
+  <text x="654" y="322" font-size="10" fill="#57606a">不可中断的工作负载应通过 Scope 排除，而不是仅依赖评分排序。</text>
 
   <rect x="144" y="372" width="832" height="34" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
   <text x="560" y="394" text-anchor="middle" font-size="10.5" fill="#1f2328">五个维度在本轮候选间分别归一化并加权求和；总分越低越优先，分数不能跨轮次或跨 Run 比较。</text>
