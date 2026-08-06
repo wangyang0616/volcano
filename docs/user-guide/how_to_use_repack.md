@@ -107,14 +107,17 @@ Repack 当前适合由平台主动发起的周期性碎片整理、大规格训�
 
 - `RepackRun` 是一次性任务，`spec` 创建后不可修改；调整目标、范围或预算需要创建新的 Run。
 - 每个 Run 当前只支持一种带 `/` 的扩展资源。`cpu`、`memory`、`ephemeral-storage` 和 `pods` 等原生资源不属于整理目标。
+- 为控制规划开销，Repack 基于当前集群快照采用启发式搜索，不承诺获得全局最优解。系统仅推荐预计能够释放完整目标资源节点并达到收益门槛的方案；实际收益以执行结果为准。
 - Execute 在集群内串行执行；同一时刻只运行一个 Execute，并在完成后进入冷却时间。DryRun 不受该并发限制。
 - `scope.podGroups` 限定允许被驱逐的工作负载，`scope.nodes` 限定可腾空节点；`scope` 为空表示在全局范围评估。
 - Repack 只整理目标扩展资源。不申请目标资源的 DaemonSet、系统 Pod 和普通 Pod 不会被迁移，也不会阻止目标资源腾空。
 - 请求目标资源但不满足可迁移条件的 Pod 会阻止所在节点被腾空，例如使用 kube-scheduler、缺少 PodGroup、被 `scope` 排除或不满足其他可迁移要求的 Pod。
-- 规划阶段基于集群快照验证调度可行性，但不能冻结集群状态，也不预先保证 Execute 时 PDB 一定允许驱逐。
-- Execute 使用 Eviction API，不能绕过 PDB。`nominatedNodeName` 仅提供候选节点建议；Repack 不执行抢占，不 cordon 节点，也不通过污点或资源预留独占已释放容量。
+- Repack 与常规资源调度并行运行，不锁定规划时的节点资源，也不暂停工作负载的创建、删除或调度。并发状态变化可能使实际布局偏离计划，甚至导致计划无法完整执行，属于预期行为。
+- Execute 通过 Kubernetes Eviction API 驱逐 Pod，由 API Server 按实时状态校验 PDB。Repack 不提前规划 PDB 规避策略；PDB 不允许驱逐时，对应迁移可能失败。
+- Repack 不执行抢占、不 cordon 节点，也不通过污点独占已释放容量。
+- Repack 通过 `pod.status.nominatedNodeName` 为重建 Pod 提供候选节点建议，不绑定节点或预留资源。重建 Pod 仍由 Volcano Scheduler 统一调度；发生资源竞争时，可能调度到其他节点或保持 Pending，Repack 不保证其在本次整理周期内恢复调度。
 - Repack 不会根据 Pending 作业自动触发整理，也不会为计划外的后续任务预留已释放资源；周期性整理和大任务提交前整理需要由用户或外部平台流程发起。
-- VCJob 的 `PodEvicted` 生命周期策略和 ModelServing 的 `ServingGroupRecreate` 可能扩大控制器侧的实际重建范围，不能仅以 Repack 计划迁移的 Pod 数评估工作负载中断范围。
+- VCJob 的 `PodEvicted` 生命周期策略或 ModelServing 的 `ServingGroupRecreate` 可能将单个 Pod 驱逐放大为多个 Pod 重建。Repack 当前不评估上层控制器的级联重建成本，实际中断范围可能大于计划迁移的 Pod 数量。
 
 ## 开启方式
 
