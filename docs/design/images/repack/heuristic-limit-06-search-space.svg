@@ -1,0 +1,20 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>预定义腾空单元限制搜索空间</title>
+  <desc>当前算法只允许已注册单元、单跳迁移和已占用接收节点，因此无法完成需要空节点缓冲和多跳交换的路径；全局方案使用临时节点 E 完成交换并最终再次腾空 E。</desc>
+  <defs><marker id="a6" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.node{fill:#fff;stroke:#8c959f}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a6)}.no{fill:none;stroke:#e03131;stroke-width:2;stroke-dasharray:5 3}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 6 · 最优路径需要预定义空间之外的联合移动</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/><text x="52" y="76" class="t" font-size="12" font-weight="700">目标节点 T 上的 Pod 不能直接到最终节点 R，需要空节点 E 临时中转并配合另一个节点交换</text><text x="52" y="102" class="s" font-size="11">当前默认只搜索单节点腾空、单跳放置，且不把目标资源完全空闲的节点作为接收节点。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法 · 允许的边</text>
+  <rect x="68" y="220" width="92" height="76" rx="8" class="node"/><text x="114" y="240" text-anchor="middle" class="t" font-size="11" font-weight="700">T</text><text x="114" y="264" text-anchor="middle" class="s" font-size="9.5">待腾空</text>
+  <rect x="240" y="220" width="92" height="76" rx="8" class="node"/><text x="286" y="240" text-anchor="middle" class="t" font-size="11" font-weight="700">R</text><text x="286" y="264" text-anchor="middle" class="s" font-size="9.5">直接不满足约束</text>
+  <rect x="408" y="220" width="92" height="76" rx="8" class="node"/><text x="454" y="240" text-anchor="middle" class="t" font-size="11" font-weight="700">E</text><text x="454" y="264" text-anchor="middle" class="s" font-size="9.5">加速卡空节点</text>
+  <path d="M160 258 H232" class="no"/><text x="196" y="244" text-anchor="middle" fill="#e03131" font-size="9.5">不可行</text><path d="M408 276 H340" class="no"/><text x="374" y="294" text-anchor="middle" fill="#e03131" font-size="9.5">不纳入接收集</text><text x="286" y="342" text-anchor="middle" fill="#e03131" font-size="12" font-weight="700">结果：NoRepack</text>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优 · 临时缓冲 + 多跳</text>
+  <rect x="608" y="228" width="88" height="68" rx="8" class="node"/><text x="652" y="250" text-anchor="middle" class="t" font-size="11" font-weight="700">T</text><text x="652" y="273" text-anchor="middle" class="s" font-size="9">P1</text>
+  <rect x="760" y="228" width="88" height="68" rx="8" class="node"/><text x="804" y="250" text-anchor="middle" class="t" font-size="11" font-weight="700">E</text><text x="804" y="273" text-anchor="middle" class="s" font-size="9">临时缓冲</text>
+  <rect x="938" y="228" width="88" height="68" rx="8" class="node"/><text x="982" y="250" text-anchor="middle" class="t" font-size="11" font-weight="700">R</text><text x="982" y="273" text-anchor="middle" class="s" font-size="9">最终承接</text>
+  <path d="M696 250 H752" class="arr"/><text x="724" y="236" text-anchor="middle" class="s" font-size="9">① P1</text><path d="M848 274 C884 318 920 318 938 274" class="arr"/><text x="894" y="326" text-anchor="middle" class="s" font-size="9">② 交换后 P1 → R</text>
+  <rect x="672" y="348" width="260" height="40" rx="8" fill="#2f9e44"/><text x="802" y="368" text-anchor="middle" fill="#fff" font-size="10.5" font-weight="700">目标腾空，临时节点 E 最终恢复为空</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>为了避免无收益搬迁和搜索爆炸，当前只搜索 Domain 明确给出的单元与单跳接收路径。</text>
+</svg>

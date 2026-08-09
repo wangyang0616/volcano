@@ -15,3 +15,12 @@
 | `core-invocation.svg` | **图1 · core 外层调用链**：engine reconcile→gate→process → ①调度器 Session(OpenSession/ResolveScope/Snapshot) → ②引擎 Session(framework.OpenSession 注册回调 + RunActions) → ③action 里 `GetCore(drain).Plan(esn)`，Execute 再 CommitPlan(Evict/Nominate) → engine 写回 status | 整理算法详解 |
 | `core-drain-flow.svg` | **图2 · drain 内部流程**（单趟动态贪心·字典序增量代价·唯一 plan）：①挑增量代价最小单元→②可腾空→③取 victims→④INV-RESCHED(FFD+best-fit+回溯)→⑤预算→⑥提交并记入已破组→⑦动态重选→⑧freed≥Min→⑨输出唯一 plan；右列关键能力 + 底部"搭便车"（B 先腾）例子 | 整理算法详解 |
 | `core-unit-cost.svg` | **图3 · 选单元=字典序增量代价**：每提交后重算每个候选单元的三元组（①增量破组受损卡[已破组记0] → ②搬走卡 → ③搬走 pod），逐位比较取最小；示例 n1(0,2,1)&lt;n3(0,4,2)&lt;n2(16,4,1) 选 n1；含动态重算/搭便车来源说明 | 整理算法详解 |
+| `heuristic-limit-01-budget.svg` | 局部低成本候选消耗 PodGroup 预算，对比复用同一 PodGroup 的全局序列 | 启发式规划 §5.1 |
+| `heuristic-limit-02-first-fit.svg` | first-fit 抢占受限 Pod 唯一落点，对比联合 Pod—Node 映射 | 启发式规划 §5.2 |
+| `heuristic-limit-03-best-fit.svg` | best-fit 填充未来腾空目标，对比保留目标后的两节点释放路径 | 启发式规划 §5.3 |
+| `heuristic-limit-04-tie-break.svg` | 同分候选名称排序，对比考虑后续潜力的选择 | 启发式规划 §5.4 |
+| `heuristic-limit-05-normalization.svg` | 每轮相对归一化，对比固定目标下的完整路径成本 | 启发式规划 §5.5 |
+| `heuristic-limit-06-search-space.svg` | 预定义单元与单跳路径，对比临时缓冲和多跳联合移动 | 启发式规划 §5.6 |
+| `heuristic-limit-07-cache.svg` | 不可行缓存跳过候选，对比非单调条件变化后的重新评估 | 启发式规划 §5.7 |
+| `heuristic-limit-08-gate.svg` | 唯一贪心路径未达收益门槛，对比可通过门槛的另一序列 | 启发式规划 §5.8 |
+| `heuristic-limit-09-runtime-drift.svg` | 稳定快照计划与实时 Execute 漂移对比 | 启发式规划 §5.9 |

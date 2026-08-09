@@ -1,0 +1,21 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>best-fit 提前填充未来可腾空节点</title>
+  <desc>T1 和 T2 各运行一个一加速卡 Pod，R 剩余两卡。当前 best-fit 将 T1 的 Pod 放入剩余一张卡的 T2，使 T2 失去腾空资格；全局方案把两个 Pod 都放到 R，释放 T1 和 T2。</desc>
+  <defs><marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.node{fill:#fff;stroke:#8c959f}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a3)}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 3 · 单步 best-fit 填掉了下一步的腾空目标</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/><text x="52" y="76" class="t" font-size="12" font-weight="700">T1：1 卡 Pod　　T2：1 卡 Pod + 1 卡空闲　　R：已有负载 + 2 卡空闲</text><text x="52" y="102" class="s" font-size="11">T2 的余量更小，因此当前 best-fit 会优先把 T1 的 Pod 填入 T2。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法</text>
+  <rect x="60" y="208" width="100" height="84" rx="8" class="node"/><text x="110" y="226" text-anchor="middle" class="t" font-size="11" font-weight="700">T1</text><rect x="82" y="242" width="56" height="25" rx="5" fill="#1c7ed6"/><text x="110" y="255" text-anchor="middle" fill="#fff" font-size="9">P1 · 1卡</text>
+  <rect x="228" y="208" width="112" height="84" rx="8" class="node"/><text x="284" y="226" text-anchor="middle" class="t" font-size="11" font-weight="700">T2 · 余 1</text><rect x="246" y="242" width="44" height="25" rx="5" fill="#8b5cf6"/><rect x="294" y="242" width="28" height="25" rx="5" fill="#f6f8fa" stroke="#8c959f" stroke-dasharray="3 2"/>
+  <path d="M160 250 H220" class="arr"/><text x="190" y="236" text-anchor="middle" class="s" font-size="9">best-fit</text>
+  <rect x="390" y="208" width="112" height="84" rx="8" class="node"/><text x="446" y="226" text-anchor="middle" class="t" font-size="11" font-weight="700">R · 余 2</text><rect x="412" y="242" width="68" height="25" rx="5" fill="#f6f8fa" stroke="#8c959f" stroke-dasharray="3 2"/>
+  <text x="284" y="326" text-anchor="middle" fill="#e03131" font-size="11" font-weight="700">T2 标记 filled，不再可腾空</text><text x="284" y="352" text-anchor="middle" class="t" font-size="12" font-weight="700">结果：仅 T1 空</text>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优</text>
+  <rect x="602" y="208" width="92" height="84" rx="8" class="node"/><text x="648" y="226" text-anchor="middle" class="t" font-size="11" font-weight="700">T1</text><rect x="620" y="242" width="56" height="25" rx="5" fill="#1c7ed6"/>
+  <rect x="724" y="208" width="92" height="84" rx="8" class="node"/><text x="770" y="226" text-anchor="middle" class="t" font-size="11" font-weight="700">T2</text><rect x="742" y="242" width="56" height="25" rx="5" fill="#8b5cf6"/>
+  <rect x="946" y="202" width="112" height="96" rx="8" class="node"/><text x="1002" y="222" text-anchor="middle" class="t" font-size="11" font-weight="700">R · 余 2</text><rect x="964" y="240" width="36" height="25" rx="5" fill="#1c7ed6"/><rect x="1004" y="240" width="36" height="25" rx="5" fill="#8b5cf6"/>
+  <path d="M694 250 H938" class="arr"/><path d="M816 270 C866 310 906 310 946 270" class="arr"/><text x="870" y="218" text-anchor="middle" class="s" font-size="9.5">两次都放入 R</text>
+  <rect x="620" y="326" width="196" height="50" rx="8" fill="#2f9e44"/><text x="718" y="351" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">T1、T2 均腾空</text><text x="936" y="351" text-anchor="middle" class="t" font-size="12" font-weight="700">结果：释放 2 节点</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>best-fit 优化当前装箱紧凑度；接收 Pod 后的节点不可再腾空，早期落点会不可逆地缩小后续空间。</text>
+</svg>

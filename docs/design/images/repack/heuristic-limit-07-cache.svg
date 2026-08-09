@@ -1,0 +1,19 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>不可行缓存错过后来可行的候选</title>
+  <desc>候选 U 在第一轮因拓扑约束失败并被缓存。候选 V 移动后拓扑计数变化，U 本可重新可行，但当前算法不再评估；全局方案或重新评估可释放 U 和 V。</desc>
+  <defs><marker id="a7" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.box{fill:#fff;stroke:#d0d7de}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.bad{fill:#fff1f0;stroke:#e03131}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a7)}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 7 · 调度条件变化后，失败候选没有重新进入搜索</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/><text x="52" y="76" class="t" font-size="12" font-weight="700">U：第一轮受反亲和 / Topology Spread 阻塞　　V：可以先迁移并改变拓扑计数</text><text x="52" y="102" class="s" font-size="11">纯容量余量通常单调减少，但部分 Scheduler 谓词会随 Pod 位置变化而重新满足。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法 · 失败结果缓存</text>
+  <rect x="58" y="202" width="112" height="62" rx="8" class="bad"/><text x="114" y="221" text-anchor="middle" fill="#e03131" font-size="10.5" font-weight="700">① U 不可行</text><text x="114" y="243" text-anchor="middle" class="s" font-size="9.5">写入 stuckUnits</text>
+  <path d="M170 233 H232" class="arr"/><rect x="240" y="202" width="112" height="62" rx="8" class="box"/><text x="296" y="221" text-anchor="middle" class="t" font-size="10.5" font-weight="700">② 迁移 V</text><text x="296" y="243" text-anchor="middle" class="s" font-size="9.5">拓扑计数变化</text>
+  <path d="M352 233 H414" class="arr"/><rect x="422" y="196" width="98" height="74" rx="8" class="bad"/><text x="471" y="217" text-anchor="middle" fill="#e03131" font-size="10" font-weight="700">③ U 跳过</text><text x="471" y="239" text-anchor="middle" class="s" font-size="9">命中缓存</text><text x="471" y="256" text-anchor="middle" class="s" font-size="9">不再模拟</text>
+  <text x="286" y="330" text-anchor="middle" class="t" font-size="12" font-weight="700">结果：只释放 V</text>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优 / 选择性重新评估</text>
+  <rect x="608" y="202" width="118" height="62" rx="8" class="box"/><text x="667" y="221" text-anchor="middle" class="t" font-size="10.5" font-weight="700">① 先迁移 V</text><text x="667" y="243" text-anchor="middle" class="s" font-size="9.5">更新谓词状态</text>
+  <path d="M726 233 H796" class="arr"/><rect x="804" y="202" width="118" height="62" rx="8" class="box"/><text x="863" y="221" text-anchor="middle" class="t" font-size="10.5" font-weight="700">② 重新评估 U</text><text x="863" y="243" text-anchor="middle" class="s" font-size="9.5">现在通过 Filter</text>
+  <path d="M922 233 H964" class="arr"/><rect x="972" y="196" width="88" height="74" rx="8" fill="#2f9e44"/><text x="1016" y="219" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">U + V</text><text x="1016" y="243" text-anchor="middle" fill="#fff" font-size="9.5">释放 2 节点</text>
+  <text x="834" y="330" text-anchor="middle" class="t" font-size="11.5" font-weight="700">只对可能非单调的失败重新模拟</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>缓存显著减少昂贵 Filter 调用，但把“当前失败”近似成“本轮永远失败”。</text>
+</svg>

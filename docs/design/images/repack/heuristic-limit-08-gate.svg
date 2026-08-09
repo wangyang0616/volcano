@@ -1,0 +1,19 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>最终收益门槛放大局部路径影响</title>
+  <desc>收益门槛要求释放两个节点。当前唯一贪心路径 A 最终只释放一个节点，被整体拒绝；全局路径 B、C 可释放两个节点并通过门槛。</desc>
+  <defs><marker id="a8" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.box{fill:#fff;stroke:#d0d7de}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.bad{fill:#fff1f0;stroke:#e03131}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a8)}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 8 · 局部路径未达门槛，最终表现为“没有推荐计划”</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/><text x="52" y="76" class="t" font-size="12" font-weight="700">收益门槛：至少释放 2 个节点，或达到等价的碎片率改善要求</text><text x="52" y="102" class="s" font-size="11">门槛在唯一贪心路径完成后检查；失败时不会返回搜索起点尝试另一条路径。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法</text>
+  <rect x="70" y="216" width="104" height="62" rx="8" class="box"/><text x="122" y="236" text-anchor="middle" class="t" font-size="11" font-weight="700">选择 A</text><text x="122" y="258" text-anchor="middle" class="s" font-size="9.5">释放 1 节点</text>
+  <path d="M174 247 H248" class="arr"/><rect x="256" y="210" width="126" height="74" rx="8" class="bad"/><text x="319" y="232" text-anchor="middle" fill="#e03131" font-size="10.5" font-weight="700">最终收益检查</text><text x="319" y="255" text-anchor="middle" class="s" font-size="9.5">1 &lt; 2</text>
+  <path d="M382 247 H424" class="arr"/><rect x="432" y="210" width="88" height="74" rx="8" fill="#e03131"/><text x="476" y="233" text-anchor="middle" fill="#fff" font-size="10.5" font-weight="700">NoRepack</text><text x="476" y="256" text-anchor="middle" fill="#fff" font-size="9">整份计划拒绝</text>
+  <text x="286" y="338" text-anchor="middle" class="s" font-size="10.5">不是“返回 1 节点次优计划”，而是“不建议执行”</text>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优</text>
+  <rect x="612" y="216" width="100" height="62" rx="8" class="box"/><text x="662" y="236" text-anchor="middle" class="t" font-size="11" font-weight="700">选择 B</text><text x="662" y="258" text-anchor="middle" class="s" font-size="9.5">释放 1</text>
+  <path d="M712 247 H782" class="arr"/><rect x="790" y="216" width="100" height="62" rx="8" class="box"/><text x="840" y="236" text-anchor="middle" class="t" font-size="11" font-weight="700">继续 C</text><text x="840" y="258" text-anchor="middle" class="s" font-size="9.5">累计释放 2</text>
+  <path d="M890 247 H956" class="arr"/><rect x="964" y="210" width="96" height="74" rx="8" fill="#2f9e44"/><text x="1012" y="233" text-anchor="middle" fill="#fff" font-size="10.5" font-weight="700">通过门槛</text><text x="1012" y="256" text-anchor="middle" fill="#fff" font-size="9.5">推荐执行</text>
+  <text x="834" y="338" text-anchor="middle" class="t" font-size="11.5" font-weight="700">另一条序列达到相同安全门槛</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>收益门槛用于避免低价值中断；没有跨路径搜索时，它会把局部最优放大成 false negative。</text>
+</svg>

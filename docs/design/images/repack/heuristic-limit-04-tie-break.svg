@@ -1,0 +1,19 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>同分候选具有不同后续潜力</title>
+  <desc>A 和 B 当前成本收益完全相同。当前算法按名称选 A 后只能释放一个节点；全局方案选 B 后为 C 保留容量，最终释放两个节点。</desc>
+  <defs><marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.box{fill:#fff;stroke:#d0d7de}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a4)}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 4 · 同分候选看起来一样，后续潜力却不同</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/><text x="52" y="76" class="t" font-size="12" font-weight="700">A 与 B：中断分数相同、收益相同　　C：只有在先选择 B 时仍可腾空</text><text x="52" y="102" class="s" font-size="11">当前评分只描述“现在增加多少成本”，没有“选择后还剩多少机会”这一维。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法</text>
+  <rect x="62" y="202" width="118" height="62" rx="8" class="box"/><text x="121" y="221" text-anchor="middle" class="t" font-size="11" font-weight="700">A · score 0.2</text><text x="121" y="243" text-anchor="middle" class="s" font-size="9.5">benefit 1</text>
+  <rect x="62" y="292" width="118" height="62" rx="8" class="box"/><text x="121" y="311" text-anchor="middle" class="t" font-size="11" font-weight="700">B · score 0.2</text><text x="121" y="333" text-anchor="middle" class="s" font-size="9.5">benefit 1</text>
+  <path d="M180 233 H236" class="arr"/><path d="M180 323 H216 V248" class="arr"/><rect x="244" y="204" width="126" height="58" rx="8" fill="#e8890c"/><text x="307" y="223" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">名称 A &lt; B</text><text x="307" y="244" text-anchor="middle" fill="#fff" font-size="9.5">稳定选择 A</text>
+  <path d="M370 233 H414" class="arr"/><rect x="422" y="202" width="98" height="62" rx="8" class="box"/><text x="471" y="221" text-anchor="middle" class="t" font-size="10" font-weight="700">C 被阻塞</text><text x="471" y="243" text-anchor="middle" class="s" font-size="9.5">容量/拓扑耗尽</text><text x="291" y="338" text-anchor="middle" class="t" font-size="12" font-weight="700">结果：释放 A，共 1 节点</text>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优</text>
+  <rect x="612" y="216" width="116" height="62" rx="8" class="box"/><text x="670" y="236" text-anchor="middle" class="t" font-size="11" font-weight="700">选择 B</text><text x="670" y="258" text-anchor="middle" class="s" font-size="9.5">保留关键空间</text>
+  <path d="M728 247 H798" class="arr"/><rect x="806" y="216" width="116" height="62" rx="8" class="box"/><text x="864" y="236" text-anchor="middle" class="t" font-size="11" font-weight="700">继续选择 C</text><text x="864" y="258" text-anchor="middle" class="s" font-size="9.5">仍满足约束</text>
+  <path d="M922 247 H964" class="arr"/><rect x="972" y="210" width="88" height="74" rx="8" fill="#2f9e44"/><text x="1016" y="233" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">B + C</text><text x="1016" y="257" text-anchor="middle" fill="#fff" font-size="10">释放 2 节点</text>
+  <text x="830" y="334" text-anchor="middle" class="t" font-size="12" font-weight="700">用未来收益打破当前平局</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>最终名称排序只保证确定性；当前评分没有估计候选对后续容量、拓扑域和可行性的影响。</text>
+</svg>

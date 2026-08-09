@@ -1,0 +1,22 @@
+<svg viewBox="0 0 1120 500" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" role="img">
+  <title>局部低成本候选消耗关键预算</title>
+  <desc>PodGroup 预算为一。当前算法先选低干扰的 G1 候选 A，只释放一个节点；全局方案先选 G2 的 B，再复用 G2 释放 C，共释放两个节点。</desc>
+  <defs><marker id="a1" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#57606a"/></marker></defs>
+  <style>.t{fill:#1f2328}.s{fill:#57606a}.box{fill:#fff;stroke:#d0d7de}.cur{fill:#fff4e6;stroke:#e8890c}.opt{fill:#edf9f1;stroke:#2f9e44}.bad{fill:#fff1f0;stroke:#e03131}.arr{fill:none;stroke:#57606a;stroke-width:1.8;marker-end:url(#a1)}text{dominant-baseline:middle}</style>
+  <rect width="1120" height="500" fill="#fff"/><text x="32" y="30" class="t" font-size="18" font-weight="700">场景 1 · 当前低成本选择耗尽关键 PodGroup 预算</text>
+  <rect x="32" y="54" width="1056" height="72" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="52" y="76" class="t" font-size="12" font-weight="700">输入约束：maxPerRun.podGroups = 1</text>
+  <text x="52" y="102" class="s" font-size="11">A 属于 G1，当前迁移 1 卡；B、C 同属 G2，各迁移 2 卡，连续选择可释放 2 个节点。</text>
+  <rect x="32" y="146" width="514" height="270" rx="12" class="cur"/><text x="52" y="170" class="t" font-size="14" font-weight="700">当前算法</text>
+  <rect x="58" y="196" width="104" height="56" rx="8" class="box"/><text x="110" y="215" text-anchor="middle" class="t" font-size="11" font-weight="700">A · G1</text><text x="110" y="236" text-anchor="middle" class="s" font-size="10">最低中断</text>
+  <rect x="58" y="274" width="104" height="46" rx="8" class="box"/><text x="110" y="297" text-anchor="middle" class="s" font-size="10">B · G2</text><rect x="58" y="334" width="104" height="46" rx="8" class="box"/><text x="110" y="357" text-anchor="middle" class="s" font-size="10">C · G2</text>
+  <path d="M170 224 H236" class="arr"/><rect x="244" y="196" width="122" height="56" rx="8" fill="#e8890c"/><text x="305" y="217" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">选择 A</text><text x="305" y="237" text-anchor="middle" fill="#fff" font-size="9.5">预算锁定 G1</text>
+  <path d="M366 224 H414" class="arr"/><rect x="422" y="190" width="98" height="68" rx="8" class="bad"/><text x="471" y="211" text-anchor="middle" fill="#e03131" font-size="10" font-weight="700">B、C 淘汰</text><text x="471" y="232" text-anchor="middle" class="s" font-size="9">引入 G2 超预算</text><text x="471" y="286" text-anchor="middle" class="t" font-size="12" font-weight="700">结果：释放 1 节点</text>
+  <path d="M162 297 H214 V240" class="arr"/><path d="M162 357 H214 V240" class="arr"/>
+  <rect x="574" y="146" width="514" height="270" rx="12" class="opt"/><text x="594" y="170" class="t" font-size="14" font-weight="700">全局最优</text>
+  <rect x="602" y="202" width="112" height="58" rx="8" class="box"/><text x="658" y="221" text-anchor="middle" class="t" font-size="11" font-weight="700">先选 B · G2</text><text x="658" y="242" text-anchor="middle" class="s" font-size="9.5">影响 1 个 PG</text>
+  <path d="M714 231 H770" class="arr"/><rect x="778" y="202" width="128" height="58" rx="8" class="box"/><text x="842" y="221" text-anchor="middle" class="t" font-size="11" font-weight="700">再选 C · G2</text><text x="842" y="242" text-anchor="middle" class="s" font-size="9.5">复用已影响 PG</text>
+  <path d="M906 231 H956" class="arr"/><rect x="964" y="196" width="96" height="70" rx="8" fill="#2f9e44"/><text x="1012" y="218" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">预算仍为 1</text><text x="1012" y="240" text-anchor="middle" fill="#fff" font-size="10">释放 2 节点</text>
+  <text x="831" y="316" text-anchor="middle" class="t" font-size="13" font-weight="700">完整序列收益：B → C ＞ A</text>
+  <rect x="32" y="438" width="1056" height="38" rx="8" fill="#f6f8fa" stroke="#d0d7de"/><text x="560" y="457" text-anchor="middle" class="t" font-size="11"><tspan font-weight="700">为什么：</tspan>每步优先当前中断分数，不回溯第一次 PodGroup 选择，也不比较完整序列收益。</text>
+</svg>
