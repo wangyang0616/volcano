@@ -13,7 +13,7 @@
 
 本文讨论的是当前 `drain` 核心算法和生产调度快照适配器。代码入口主要包括：
 
-- `pkg/repackengine/core/drain/drain.go`
+- `pkg/repackengine/planner/drain/drain.go`
 - `pkg/repackengine/adapter/snapshot_session.go`
 - `pkg/repackengine/framework/session.go`
 - `pkg/repackengine/plugins/base/base.go`

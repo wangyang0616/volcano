@@ -92,7 +92,6 @@ func Run(opt *options.ServerOption) error {
 		SchedulerConf:   opt.SchedulerConf,
 		ResyncPeriod:    opt.ResyncPeriod,
 		Cooldown:        opt.Cooldown,
-		Core:            opt.Algorithm,
 		Actions:         opt.Actions,
 		MinNodesFreed:   opt.MinNodesFreed,
 		DefaultResource: opt.DefaultResource,

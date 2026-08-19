@@ -29,7 +29,10 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/base"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/budget"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/gang"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/resource"
 )
 
 const gpu = v1.ResourceName("nvidia.com/gpu")
@@ -146,11 +149,11 @@ func drainSession(snap framework.Snapshot, movable framework.MovableFn, minFreed
 }
 
 func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableFn, minFreed int, maxPG int, maxRes int64, plugins []string) *framework.Session {
+	plugins = append([]string{"resource", "budget", "binpack"}, plugins...)
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Snapshot:      snap,
 		Resource:      gpu,
 		Mode:          repackv1alpha1.RepackModeDryRun,
-		CoreName:      framework.CoreDrain,
 		MinNodesFreed: minFreed,
 		MaxPodGroups:  maxPG,
 		MaxResource:   maxRes,
@@ -159,6 +162,22 @@ func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableF
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(movable)
 	return ssn
+}
+
+// finalizedPlan keeps planner tests focused on the historical public outcome
+// while production lifecycle ownership remains in the repack Action.
+func finalizedPlan(ssn *framework.Session) (*api.RepackPlan, bool) {
+	before := api.MeasureResourceFragmentation(ssn.Nodes(), ssn.Resource())
+	plan := BuildPlan(ssn)
+	if plan == nil {
+		return nil, false
+	}
+	plan.Before = before
+	if !ssn.PlanAdmissible(plan) {
+		return nil, false
+	}
+	plan.Cost = api.CalculateDisruptionCost(plan.Moves, ssn.Resource())
+	return plan, true
 }
 
 func allMovable(*schedapi.TaskInfo) bool { return true }
@@ -180,7 +199,7 @@ func TestDrain_FreesOneNode(t *testing.T) {
 	b := gpuTask("b", "g-b", 6)
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan")
 	}
@@ -218,7 +237,7 @@ func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
 		"pg-b0": {Running: 1, MinAvailable: 1, Footprint: 2},
 	}}
 
-	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"}))
 	if !ok || plan == nil {
 		t.Fatal("expected both drain directions to be feasible")
 	}
@@ -243,7 +262,7 @@ func TestDrain_LazySelectionFallsBackToNextSchedulerFeasibleCandidate(t *testing
 		infeasibleSources: map[string]bool{"node-a": true},
 	}
 
-	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
 	if !ok || plan == nil {
 		t.Fatal("expected the second-ranked candidate to be feasible")
 	}
@@ -267,7 +286,7 @@ func TestDrain_LazySelectionAt4000NodesRunsOneFullSimulation(t *testing.T) {
 	}
 	snap := &fakeSnap{nodes: nodes, views: views}
 
-	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
 	if !ok || plan == nil || len(plan.FreedNodes) != 1 {
 		t.Fatalf("plan=%+v ok=%v, want one freed node", plan, ok)
 	}
@@ -299,7 +318,7 @@ func TestDrain_PreservesAlreadyAffectedGangNodesForLaterDrain(t *testing.T) {
 		},
 	}
 
-	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 2, 0, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 2, 0, 0, []string{"base", "gang"}))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible two-node drain plan")
 	}
@@ -445,7 +464,7 @@ func TestDrain_FourSmallIntoOne(t *testing.T) {
 		nodes[i] = capNode(name, 8, gpuTask(fmt.Sprintf("w%d", i), fmt.Sprintf("g%d", i), 2))
 	}
 	snap := &fakeSnap{nodes: nodes}
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan")
 	}
@@ -460,7 +479,7 @@ func TestDrain_RejectsBelowMinFreed(t *testing.T) {
 	b := gpuTask("b", "g-b", 6)
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
-	if plan, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 2, 0, 0)); ok {
+	if plan, ok := finalizedPlan(drainSession(snap, allMovable, 2, 0, 0)); ok {
 		t.Fatalf("expected NoRepack (min 2 nodes), got %+v", plan)
 	}
 }
@@ -471,7 +490,7 @@ func TestDrain_BudgetBlocks(t *testing.T) {
 	b := gpuTask("b", "g-b", 6)
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
-	if _, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 1)); ok {
+	if _, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 1)); ok {
 		t.Fatal("expected NoRepack: maxResource=1 < victim 2")
 	}
 	if snap.feasibilityCalls != 0 {
@@ -487,7 +506,7 @@ func TestDrain_ResourceCapacityPreflightSkipsFeasibilitySimulation(t *testing.T)
 	b := gpuTask("b", "g-b", 4)
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
-	if _, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0)); ok {
+	if _, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 0)); ok {
 		t.Fatal("expected no plan when neither receiver has enough resource capacity")
 	}
 	if snap.feasibilityCalls != 0 {
@@ -539,15 +558,14 @@ func TestDrain_ExplicitZeroBudgetBlocks(t *testing.T) {
 		Snapshot:       snap,
 		Resource:       gpu,
 		Mode:           repackv1alpha1.RepackModeDryRun,
-		CoreName:       framework.CoreDrain,
 		MinNodesFreed:  1,
 		MaxPodGroups:   0,
 		LimitPodGroups: true,
 		Free:           freeByCapMinusUsed,
-	}, nil)
+	}, []string{"resource", "budget", "binpack"})
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
-	if plan, ok := (&drainCore{}).Plan(ssn); ok {
+	if plan, ok := finalizedPlan(ssn); ok {
 		t.Fatalf("explicit podGroups=0 must block every move, got %+v", plan)
 	}
 }
@@ -561,7 +579,7 @@ func TestDrain_FrozenNodeSkippedAsTarget(t *testing.T) {
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
 	frozen := func(t *schedapi.TaskInfo) bool { return t.Job != "g-a" } // g-a frozen
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, frozen, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, frozen, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected n1 to be freed (n0 frozen but usable as receiver)")
 	}
@@ -581,7 +599,7 @@ func TestDrain_AllFrozenNoRepack(t *testing.T) {
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
 	none := func(*schedapi.TaskInfo) bool { return false }
-	if _, ok := (&drainCore{}).Plan(drainSession(snap, none, 1, 0, 0)); ok {
+	if _, ok := finalizedPlan(drainSession(snap, none, 1, 0, 0)); ok {
 		t.Fatal("expected NoRepack: nothing movable")
 	}
 }
@@ -596,8 +614,8 @@ func TestDrain_Deterministic(t *testing.T) {
 			capNode("n2", 8, gpuTask("c", "g-c", 6)),
 		}}
 	}
-	p1, ok1 := (&drainCore{}).Plan(drainSession(mk(), allMovable, 1, 0, 0))
-	p2, ok2 := (&drainCore{}).Plan(drainSession(mk(), allMovable, 1, 0, 0))
+	p1, ok1 := finalizedPlan(drainSession(mk(), allMovable, 1, 0, 0))
+	p2, ok2 := finalizedPlan(drainSession(mk(), allMovable, 1, 0, 0))
 	if !ok1 || !ok2 {
 		t.Fatalf("expected feasible plans (ok1=%v ok2=%v)", ok1, ok2)
 	}
@@ -634,7 +652,7 @@ func TestDrain_PrefersStayingReceiver(t *testing.T) {
 		capNode("n2", 8, gpuTask("f", "g-f", 2)),
 	}}
 	movable := func(tk *schedapi.TaskInfo) bool { return tk.Job != "g-f" } // g-f frozen
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, movable, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, movable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan")
 	}
@@ -661,7 +679,7 @@ func TestDrain_ExcludedNodeIsReceiverNotTarget(t *testing.T) {
 		},
 		notInScope: map[string]bool{"n2": true}, // excluded from draining
 	}
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, allMovable, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan")
 	}
@@ -688,7 +706,7 @@ func TestDrain_SystemPodDoesNotBlockFreeing(t *testing.T) {
 	// Everything movable except the system pod (no gang → out of scope in reality).
 	movable := func(t *schedapi.TaskInfo) bool { return t.Name != "kube-proxy" }
 
-	plan, ok := (&drainCore{}).Plan(drainSession(snap, movable, 1, 0, 0))
+	plan, ok := finalizedPlan(drainSession(snap, movable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan: n0's TargetResource pod can move; the system pod stays")
 	}
@@ -707,11 +725,10 @@ func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework
 		Snapshot:                  snap,
 		Resource:                  gpu,
 		Mode:                      repackv1alpha1.RepackModeDryRun,
-		CoreName:                  framework.CoreDrain,
 		MinNodesFreed:             1,
 		MinFragImprovementPercent: minImprovePct,
 		Free:                      freeByCapMinusUsed,
-	}, nil)
+	}, []string{"resource", "budget", "binpack"})
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 	return ssn
@@ -727,10 +744,10 @@ func TestDrain_FragImprovementGate(t *testing.T) {
 			capNode("n1", 8, gpuTask("b", "g-b", 6)),
 		}}
 	}
-	if plan, ok := (&drainCore{}).Plan(drainSessionFragGate(newSnap(), 50)); !ok || plan == nil {
+	if plan, ok := finalizedPlan(drainSessionFragGate(newSnap(), 50)); !ok || plan == nil {
 		t.Fatalf("gate=50: expected a feasible plan (50pp improvement meets the bar)")
 	}
-	if plan, ok := (&drainCore{}).Plan(drainSessionFragGate(newSnap(), 60)); ok {
+	if plan, ok := finalizedPlan(drainSessionFragGate(newSnap(), 60)); ok {
 		t.Fatalf("gate=60: expected NoRepack (50pp improvement below the bar), got %+v", plan)
 	}
 }
@@ -771,13 +788,13 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 		capNPUNode("n2", 8000, 0),
 	}}
 	ssn := framework.OpenSession(framework.SessionConfig{
-		Snapshot: snap, Resource: e2eNPU, CoreName: framework.CoreDrain,
+		Snapshot: snap, Resource: e2eNPU,
 		MinNodesFreed: 1, Free: freeNPU,
-	}, nil)
+	}, []string{"resource", "budget", "binpack"})
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 
-	plan, ok := (&drainCore{}).Plan(ssn)
+	plan, ok := finalizedPlan(ssn)
 	if !ok || plan == nil {
 		t.Fatal("expected consolidation plan for milli-scale e2e layout")
 	}

@@ -17,6 +17,7 @@ limitations under the License.
 package gang
 
 import (
+	"reflect"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -24,6 +25,7 @@ import (
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
+	"volcano.sh/volcano/pkg/repackengine/framework"
 )
 
 const gpu = v1.ResourceName("nvidia.com/gpu")
@@ -83,5 +85,22 @@ func TestScoreGangBreaches(t *testing.T) {
 	}}
 	if s := scoreGangBreaches(ctx, breach); s != 1 {
 		t.Errorf("breach: %v, want 1", s)
+	}
+}
+
+func TestScoreFutureReceiverImpactUsesMarginalGangCost(t *testing.T) {
+	ctx := gangCtx()
+	candidate := &framework.PlanningCandidate{Plan: &api.CandidatePlan{
+		Moves: []*api.Move{mv(tk("p0", "ns/g", 2))}, // consumes the gang's one-pod slack
+	}}
+	receiver := &framework.ReceiverCandidate{FutureMoves: map[schedapi.JobID]api.PodGroupMoveAggregate{
+		"ns/g": {MovedPods: 1, MovedResource: 2},
+	}}
+
+	// Filling this receiver prevents a future drain that would newly breach the
+	// gang. Damaged resource grows from the two moved cards to the full footprint.
+	want := framework.ReceiverRank{1, 0, 6, 2, 1}
+	if got := scoreFutureReceiverImpact(ctx, candidate, receiver); !reflect.DeepEqual(got, want) {
+		t.Fatalf("future receiver rank=%v, want %v", got, want)
 	}
 }

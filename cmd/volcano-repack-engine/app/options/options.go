@@ -52,10 +52,8 @@ type ServerOption struct {
 	SchedulerConf string
 	ResyncPeriod  time.Duration
 
-	// Algorithm selects the planner ("" = drain). Actions overrides the pipeline
-	// ("" = DefaultActions). MinNodesFreed is the benefit gate. DefaultResource is
-	// the target when a RepackRun's spec.goals is empty.
-	Algorithm       string
+	// Actions overrides the pipeline ("" = DefaultActions). MinNodesFreed is the
+	// benefit gate. DefaultResource is the target when a RepackRun's spec.goals is empty.
 	Actions         []string
 	MinNodesFreed   int
 	DefaultResource string
@@ -93,7 +91,6 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&s.ResyncPeriod, "resync-period", defaultResyncPeriod, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
 	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", defaultExecuteCooldown, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
 
-	fs.StringVar(&s.Algorithm, "repack-algorithm", "", "Planner: drain (default) or concentration")
 	fs.StringSliceVar(&s.Actions, "repack-actions", nil, "Ordered action pipeline (default: repack)")
 	fs.IntVar(&s.MinNodesFreed, "repack-min-nodes-freed", 0, "Benefit gate: minimum whole nodes a plan must free (0 = engine default 1)")
 	fs.StringVar(&s.DefaultResource, "repack-default-resource", "", "Target resource when a RepackRun's spec.goals is empty (e.g. nvidia.com/gpu)")

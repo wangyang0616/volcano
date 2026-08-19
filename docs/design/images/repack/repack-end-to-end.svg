@@ -60,7 +60,7 @@
   <text x="460" y="252" font-size="9.5" class="s">· 事件驱动 watch RepackRun</text>
   <text x="460" y="270" font-size="9.5" class="s">· 复用 schedcache + OpenSession</text>
   <text x="460" y="288" font-size="9.5" class="s">· 门控 K=1 + 冷静期(自串行)</text>
-  <text x="460" y="306" font-size="9.5" class="s">· 规划 Core=drain</text>
+  <text x="460" y="306" font-size="9.5" class="s">· Action + Plugin 驱动惰性规划</text>
   <line x1="460" y1="318" x2="660" y2="318" stroke="#2f9e44" opacity="0.35"/>
   <text x="460" y="336" font-size="9.5" class="t"><tspan fill="#1c7ed6" font-weight="700">DryRun</tspan> → 写 status.plan</text>
   <text x="460" y="356" font-size="9.5" class="t"><tspan fill="#2f9e44" font-weight="700">Execute</tspan> → Evict + result</text>

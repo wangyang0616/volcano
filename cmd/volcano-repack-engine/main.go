@@ -31,9 +31,9 @@ import (
 	componentbaseoptions "k8s.io/component-base/config/options"
 	"k8s.io/klog/v2"
 
+	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app"
 	"volcano.sh/volcano/cmd/volcano-repack-engine/app/options"
-	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 	commonutil "volcano.sh/volcano/pkg/util"
 	"volcano.sh/volcano/pkg/version"
 
@@ -44,12 +44,15 @@ import (
 	_ "volcano.sh/volcano/pkg/scheduler/actions"
 	_ "volcano.sh/volcano/pkg/scheduler/plugins"
 
-	// Register the repack core, capability plugins and action pipeline.
+	// Register the repack action pipeline and capability plugins.
 	_ "volcano.sh/volcano/pkg/repackengine/actions/repack"
-	_ "volcano.sh/volcano/pkg/repackengine/core/drain"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/base"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/budget"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/gang"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/node"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/resource"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/scope"
 )
 
 var logFlushFreq = pflag.Duration("log-flush-frequency", 5*time.Second, "Maximum number of seconds between log flushes")

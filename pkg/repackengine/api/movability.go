@@ -27,7 +27,7 @@ import (
 // scope.podGroups include/exclude, gang/PDB rules). Tasks of frozen PodGroups
 // return false and are never evicted. A nil Movable means everything is movable.
 // The engine Session aggregates the MovableFns registered by plugins (AND: any
-// plugin may veto a move) into a single Movable for the core to consume.
+// plugin may veto a move) into a single Movable for planners to consume.
 type Movable func(task *api.TaskInfo) bool
 
 // NodeFreeabilityReason explains why a node cannot be drained in the current

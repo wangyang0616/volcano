@@ -44,7 +44,7 @@ func BenchmarkDrain(b *testing.B) {
 			snap := &fakeSnap{nodes: nodes, views: views}
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				(&drainCore{}).Plan(drainSessionWithPlugins(
+				finalizedPlan(drainSessionWithPlugins(
 					snap, allMovable, 1, 0, 0, []string{"base", "gang"},
 				))
 			}

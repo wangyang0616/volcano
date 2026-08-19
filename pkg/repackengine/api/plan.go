@@ -27,7 +27,7 @@ import (
 // and a benefit weight. A node-level domain yields one unit per node (weight ~1);
 // a hypernode-level domain yields one unit per hypernode (higher weight, since a
 // whole topology block is far more valuable to a large gang). With several domain
-// plugins enabled the core optimizes the combined weighted benefit (their union),
+// plugins enabled the planner optimizes the combined weighted benefit (their union),
 // i.e. a holistic node+hypernode optimum rather than an either/or.
 type FreeableUnit struct {
 	Level  string   // "node" / "hypernode" (for reporting)
@@ -35,8 +35,7 @@ type FreeableUnit struct {
 	Weight float64  // benefit of freeing this unit
 }
 
-// RepackPlan is the outcome of one core search pass — the algorithm-agnostic plan
-// every core (drain, concentration, ...) returns.
+// RepackPlan is the algorithm-independent outcome of one planning pass.
 type RepackPlan struct {
 	Moves      []*Move               // every gang relocation (from -> to)
 	FreedNodes []string              // nodes fully vacated by this plan
@@ -49,7 +48,7 @@ type RepackPlan struct {
 func (p *RepackPlan) NodesFreed() int { return len(p.FreedNodes) }
 
 // Benefit is the realized weighted benefit across all freed units (the objective
-// the core maximizes). Falls back to node count when no units are recorded
+// the planner maximizes). Falls back to node count when no units are recorded
 // (node-only), so it equals NodesFreed in that case.
 func (p *RepackPlan) Benefit() float64 {
 	if p == nil {

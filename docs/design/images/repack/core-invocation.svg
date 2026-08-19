@@ -1,6 +1,6 @@
 <svg viewBox="0 0 940 620" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img">
-  <title>core 的外层调用链</title>
-  <desc>engine reconcile→gate→process：开调度器 Session、ResolveScope、包 Snapshot；再开引擎 Session 跑各 plugin 注册回调、RunActions 跑 repack；action 里 GetCore(drain).Plan(esn)，Execute 再 CommitPlan(Evict)，engine 写回 status。</desc>
+  <title>Repack Action 的外层调用链</title>
+  <desc>engine reconcile→gate→process：打开调度器 Session、解析 Scope、构造 Snapshot；再打开引擎 Session 注册 Plugin 回调、运行 Repack Action；Action 调用 Lazy Drain Planner 并生成计划，Engine 持久化后提交 Execute。</desc>
   <style>
     .t{fill:#111827;} .s{fill:#5b6472;}
     .m{font-family:ui-monospace,Menlo,monospace;}
@@ -13,7 +13,7 @@
   </style>
   <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6.5,3 L0,6 Z" fill="#5b6472"/></marker></defs>
 
-  <text x="470" y="22" text-anchor="middle" font-size="15.5" font-weight="700" class="t">图1 · core 在外层怎么被调用（engine → session → action → core）</text>
+  <text x="470" y="22" text-anchor="middle" font-size="15.5" font-weight="700" class="t">图1 · Repack 主流程（engine → session → action → planner）</text>
 
   <rect x="24" y="42" width="892" height="84" rx="9" class="eng"/>
   <text x="40" y="60" font-size="12" font-weight="700" class="t">repack-engine（driver）</text>
@@ -36,11 +36,11 @@
   <rect x="40" y="282" width="410" height="72" rx="6" class="card"/>
   <text x="245" y="299" text-anchor="middle" font-size="10" class="t m">framework.OpenSession(cfg, plugins)</text>
   <text x="245" y="317" text-anchor="middle" font-size="8.8" class="s">逐个 plugin.OnSessionOpen 注册回调</text>
-  <text x="245" y="332" text-anchor="middle" font-size="8.8" class="s m">movecost · node · gang</text>
-  <text x="245" y="347" text-anchor="middle" font-size="8.5" class="s">+ driver 注入 scope movable</text>
+  <text x="245" y="332" text-anchor="middle" font-size="8.8" class="s m">resource · scope · budget · node · base · gang · binpack</text>
+  <text x="245" y="347" text-anchor="middle" font-size="8.5" class="s">组合候选过滤、评分与接收排序</text>
   <rect x="468" y="282" width="430" height="72" rx="6" class="card"/>
   <text x="683" y="299" text-anchor="middle" font-size="10" class="t m">RunActions(["repack"], esn)</text>
-  <text x="683" y="318" text-anchor="middle" font-size="8.8" class="s">cfg 带：Mode · Core=drain · Hooks{Evict,Nominate}</text>
+  <text x="683" y="318" text-anchor="middle" font-size="8.8" class="s">cfg 带：Mode · Scope · MaxPerRun · Goals</text>
   <text x="683" y="335" text-anchor="middle" font-size="8.8" class="s">MaxPerRun · MinNodesFreed（来自 spec）</text>
   <text x="683" y="350" text-anchor="middle" font-size="8.5" class="s">action 有序流水线（P0 只有 repack）</text>
 
@@ -49,13 +49,13 @@
   <rect x="24" y="386" width="892" height="116" rx="9" class="act"/>
   <text x="40" y="404" font-size="12" font-weight="700" class="t">③ action: repack.Execute(esn)</text>
   <rect x="40" y="414" width="300" height="80" rx="6" class="card"/>
-  <text x="190" y="431" text-anchor="middle" font-size="10.5" font-weight="700" class="t m">core := GetCore(CoreName)</text>
-  <text x="190" y="451" text-anchor="middle" font-size="11.5" font-weight="700" fill="#2f9e44" class="m">plan, ok := core.Plan(esn)</text>
-  <text x="190" y="470" text-anchor="middle" font-size="8.5" class="s">← core(drain) 在此跑（见 图2）</text>
-  <text x="190" y="485" text-anchor="middle" font-size="8.3" class="s">core 只读 esn，与 CRD/调度器解耦</text>
+  <text x="190" y="431" text-anchor="middle" font-size="10.5" font-weight="700" class="t m">before := MeasureFragmentation</text>
+  <text x="190" y="451" text-anchor="middle" font-size="11.5" font-weight="700" fill="#2f9e44" class="m">plan := drain.BuildPlan(esn)</text>
+  <text x="190" y="470" text-anchor="middle" font-size="8.5" class="s">Plugin 回调驱动过滤、排序和策略</text>
+  <text x="190" y="485" text-anchor="middle" font-size="8.3" class="s">Planner 只维护增量搜索状态</text>
   <rect x="358" y="414" width="258" height="80" rx="6" class="card"/>
-  <text x="487" y="431" text-anchor="middle" font-size="10" class="t m">SetPlan / SetReport</text>
-  <text x="487" y="450" text-anchor="middle" font-size="9.5" class="s m">RenderReport(plan)</text>
+  <text x="487" y="431" text-anchor="middle" font-size="10" class="t m">PlanAdmissible / Cost</text>
+  <text x="487" y="450" text-anchor="middle" font-size="9.5" class="s m">SetPlan / RenderReport</text>
   <text x="487" y="472" text-anchor="middle" font-size="8.7" class="s">DryRun 到此为止</text>
   <text x="487" y="486" text-anchor="middle" font-size="8.7" class="s">（只出报告）</text>
   <rect x="634" y="414" width="264" height="80" rx="6" class="card"/>
@@ -70,5 +70,5 @@
   <text x="470" y="542" text-anchor="middle" font-size="11" font-weight="700" class="t">engine 写回 RepackRun.status</text>
   <text x="470" y="558" text-anchor="middle" font-size="8.6" class="s">DryRun→plan · Execute→result+relocations · phase/conditions · CloseSession</text>
 
-  <text x="470" y="592" text-anchor="middle" font-size="9" class="s">要点：core 只认 esn（Snapshot + 各 plugin 注册的回调），与调度器/CRD 解耦；两层 Session — 外层看集群，内层是引擎自己的扩展点框架。</text>
+  <text x="470" y="592" text-anchor="middle" font-size="9" class="s">要点：Action 维护稳定业务流程，Plugin 承载场景策略，Planner 只认 Session 聚合视图并执行惰性搜索。</text>
 </svg>

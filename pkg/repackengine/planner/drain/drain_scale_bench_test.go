@@ -67,7 +67,7 @@ func BenchmarkDrainScale(b *testing.B) {
 					infeasibleSources[fmt.Sprintf("n%04d", source)] = true
 				}
 				snap := &fakeSnap{nodes: nodes, views: views, notInScope: notInScope, infeasibleSources: infeasibleSources}
-				plan, _ := (&drainCore{}).Plan(drainSessionWithPlugins(
+				plan, _ := finalizedPlan(drainSessionWithPlugins(
 					snap, allMovable, 1, tc.maxGroups, 0, []string{"base", "gang"},
 				))
 				totalCalls += snap.feasibilityCalls

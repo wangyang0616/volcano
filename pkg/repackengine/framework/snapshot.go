@@ -16,9 +16,8 @@ limitations under the License.
 
 // Package framework is the repack engine's plugin/action framework — the
 // analogue of pkg/scheduler/framework. It defines the engine Session (a plugin-
-// populated, action-consumed view of one repack pass), the three extension-point
-// contracts (Plugin = capability, Action = pipeline stage, Core = single-select
-// search strategy) and their registries, plus the commit (evict/nominate) and
+// populated, action-consumed view of one repack pass), the Plugin and Action
+// extension contracts and their registries, plus the commit (evict/nominate) and
 // report plumbing. It depends only on pkg/repackengine/api (pure model) and
 // pkg/scheduler/api (NodeInfo/TaskInfo) — never on the scheduler framework; the
 // live-Session coupling lives in pkg/repackengine/adapter.

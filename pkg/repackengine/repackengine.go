@@ -20,7 +20,7 @@ limitations under the License.
 // the cluster exactly as the scheduler does, then per cycle: selects one cleared
 // RepackRun, opens a scheduler Session, resolves scope, wraps the Session as the
 // engine Snapshot, opens an engine Session (running the configured capability
-// plugins), runs the action pipeline (which runs the selected core), and writes
+// plugins), runs the action pipeline, and writes
 // the RepackRun status. The pure model/contracts live in api/ and framework/;
 // the scheduler-coupled adapters in adapter/.
 //
@@ -72,7 +72,6 @@ import (
 	state "volcano.sh/repack-controller/pkg/state"
 
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
-	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
 	"volcano.sh/volcano/pkg/scheduler"
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
@@ -85,8 +84,7 @@ type Config struct {
 	SchedulerConf   string        // shared --scheduler-conf (same as volcano-scheduler)
 	ResyncPeriod    time.Duration // informer resync safety-net (0 = pure event-driven)
 	Cooldown        time.Duration // min gap after an Execute before the next may start
-	Core            string        // search strategy (framework.CoreDrain default)
-	Plugins         []string      // capability plugins (default base,node,gang)
+	Plugins         []string      // capability plugins (default resource,scope,budget,node,base,gang,binpack)
 	Actions         []string      // action pipeline (default: repack)
 	MinNodesFreed   int           // benefit gate
 	DefaultResource string        // target when spec.goals is empty
@@ -172,11 +170,8 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 		opt.RegisterOptions()
 	}
 
-	if engineConfig.Core == "" {
-		engineConfig.Core = engineframework.CoreDrain
-	}
 	if len(engineConfig.Plugins) == 0 {
-		engineConfig.Plugins = []string{"base", "node", "gang"}
+		engineConfig.Plugins = []string{"resource", "scope", "budget", "node", "base", "gang", "binpack"}
 	}
 	if engineConfig.NominationTTL <= 0 {
 		engineConfig.NominationTTL = defaultNominationTTL
@@ -248,7 +243,7 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 	e.recoverOrphans(ctx) // fail runs left Running by a crashed predecessor
 	klog.V(3).InfoS("repack-engine started (event-driven)",
-		"core", e.config.Core, "plugins", e.config.Plugins,
+		"plugins", e.config.Plugins,
 		"defaultResource", e.config.DefaultResource, "cooldown", e.config.Cooldown, "resyncPeriod", e.config.ResyncPeriod)
 	// Single worker: Execute runs serialize naturally (one reconcile at a time).
 	go func() {

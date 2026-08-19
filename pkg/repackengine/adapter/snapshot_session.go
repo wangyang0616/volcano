@@ -23,7 +23,6 @@ package adapter
 
 import (
 	"context"
-	"sort"
 
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -38,7 +37,7 @@ import (
 // SessionSnapshot adapts a live scheduler Session to framework.Snapshot. The
 // standalone engine could instead build a Snapshot from informers; this is the
 // in-scheduler-cache implementation. It applies the resolved scope.nodes filter
-// so the core only ever sees in-scope nodes.
+// so the planner only ever sees in-scope drain candidates.
 type SessionSnapshot struct {
 	ssn      *schedframework.Session
 	resource v1.ResourceName
@@ -104,7 +103,7 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 		}
 	}
 	sourceTasksToRemove = append(sourceTasksToRemove, victims...)
-	for _, victim := range s.victimsLargestFirst(victims) {
+	for _, victim := range victims {
 		simulatedVictim := clearNodeBinding(victim)
 		// Build a plan-wide PreFilter state: every source victim is absent and
 		// every previously placed victim is present on its receiver. Without this,
@@ -245,16 +244,6 @@ func (s *SessionSnapshot) receiverHasTargetResourceCapacity(victim *schedapi.Tas
 		}
 	}
 	return api.Scalar(victim.InitResreq, s.resource) <= available
-}
-
-// victimsLargestFirst orders victims by descending target-resource request (first-
-// fit-decreasing): place the biggest pods first to fail fast and pack tightly.
-func (s *SessionSnapshot) victimsLargestFirst(victims []*schedapi.TaskInfo) []*schedapi.TaskInfo {
-	ordered := append([]*schedapi.TaskInfo(nil), victims...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return api.Scalar(ordered[i].InitResreq, s.resource) > api.Scalar(ordered[j].InitResreq, s.resource)
-	})
-	return ordered
 }
 
 // PodGroupView reads disruption-scoring facts off JobInfo.

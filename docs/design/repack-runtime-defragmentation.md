@@ -90,7 +90,7 @@ Volcano 已有基于 [kubernetes-sigs/descheduler](https://github.com/kubernetes
 | 统一标签圈定范围 | RepackRun | `scope.podGroups.include.selector` | P0 |
 | 限定节点 / 排除受保护对象 | RepackRun | `scope.nodes` / `scope.podGroups.exclude` | P0 |
 | 控爆炸半径 | RepackRun | `maxPerRun.podGroups` / `maxPerRun.resources`（+引擎串行/冷静期） | P0 |
-| 选整理算法 | scheduler-conf | `repack.core: drain \| concentration` | P0 |
+| 扩展整理策略 | 引擎 Plugin | 通过 Session 回调组合 Scope、预算、Gang、接收节点等策略 | P0 |
 | 落点与调度器一致 | 引擎内建 | 复用 `scheduler-conf` / framework / predicate（无需配置） | P0 |
 | 完成后自动清理 | RepackRun | `ttlSecondsAfterFinished` | P0 |
 | 只整理本队列（租户自助） | RepackRun | `scope.podGroups.include.selector`（本 ns/队列标签） | P0 |
@@ -870,20 +870,15 @@ status:
 
 **一句话**：**vcjob 开箱即用；自建 CRD 的框架保证 PG 继承业务标签，并在组内非同构时使用 SubGroup；纯 Deployment 类走通用 pg-controller。** Repack 不为任何框架写死负载类型或身份标签。
 
-### 5.3 扩展点：能力插件 / 动作 / 核心算法
+### 5.3 扩展点：Action + Plugin
 
-repack-engine 复刻 scheduler 的扩展模型，分**三类扩展点**（在 `--scheduler-conf` 同款配置里选用）：
+repack-engine 采用与 scheduler 一致的 **Action + Plugin + Session 回调**模型：
 
-- **能力 plugin（多个、可组合）**：往引擎 Session 注册回调，刻画"场景/能力"。P0：`base`（通用扰动评分）、`node`（面向节点的整理域）、`gang`（gang 感知：受损卡数 / 破组评分）；后续 `hypernode`（面向超节点）、`pdb`、`priority`。多个域插件同开时，核心对其贡献的"可释放单元"做**综合最优**（node 与 hypernode 单元按权重并集权衡），而非二选一。
-- **action（有序、可组合）**：流水线阶段，对应 scheduler 的 action。P0 仅 `repack`（跑核心算法 → 渲染报告 → Execute 时提交）；未来 `relief` / `simulate` 追加。
-- **core（恰选其一）**：整体搜索策略——"怎么搜出迁移计划"。与 plugin/action 不同，**一次只跑一个**（互斥，不能像 allocate→backfill 那样串联）。
+- **Action** 维护稳定主流程。P0 的 `repack` Action 负责碎片度量、调用 Planner、收益准入、成本汇总和报告生成；Execute 副作用仍由 Engine 在计划持久化后提交。
+- **Plugin** 刻画可组合的场景策略。默认启用 `resource`、`scope`、`budget`、`node`、`base`、`gang`、`binpack`，分别负责资源容量、业务授权边界、爆炸半径、可释放单元、通用扰动、Gang 成本和接收节点装箱策略。
+- **Planner** 只保留候选准备、增量状态和惰性调度模拟等搜索机制，不解释具体场景语义。
 
-| core | 思路 | 阶段 |
-|---|---|---|
-| **A · 节点腾空法**（`drain`，默认） | 动态贪心：每轮对活动候选的**预期完整计划**做多策略扰动预排序，沿排序惰性执行完整调度模拟并原子提交首个可行候选；负载优先填入已有占用的节点碎片 | **P0** |
-| **B · 集中度法**（`concentration`） | 逐 gang 往更满节点挪，沿集中度 Σused² 涨分爬山 | 接口预留、P0 不实现 |
-
-经 `repack.core` 选择；详见 [§6 整理算法](#整理算法详解)。
+当前不再提供 Core 注册表或算法选择参数。新增 Node/HyperNode、PDB、Gang 或接收节点策略时增加 Plugin；只有新增业务阶段时才增加 Action。详细契约见 [Repack Action + Plugin 架构设计](./repack-action-plugin-architecture.md)。
 
 ### 5.4 执行与落点引导
 
@@ -1211,24 +1206,15 @@ API 不声明字段、类型或 YAML 形状。
 
 ### 整理算法详解
 
-核心算法对**引擎 Session**（持有只读 `Snapshot` + 各 plugin 注册的回调）编程，统一入口：
+`repack` Action 对**引擎 Session**（只读 `Snapshot` + Plugin 回调）编程。Action 先度量碎片，再调用 `planner/drain.BuildPlan`，最后执行 `PlanAdmissible`、扰动成本汇总和 Report 渲染。
 
-```go
-type Core interface {
-    Name() string
-    Plan(ssn *framework.Session) (*api.RepackPlan, bool)  // 恰选其一
-}
-```
-
-core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.FeasibleRelocation()`（克隆式可调度性检查，见上"可调度性兜底"）、以及 `base`/`gang` 插件注册的扰动评分维度。
-
-- **A（drain，P0）**：**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 unit、victim、工作负载聚合和节点目标资源余量。每一轮先对活动候选执行预算与容量预检，再按“此前已提交 moves + 当前候选 victim”的完整计划扰动进行预排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选，不再模拟后续候选。提交后增量更新接收端容量、预算和活动集合，直到没有候选可提交，最后统一检查 `MinNodesFreed` 与 `goals[].minFragImprovementPercent` 收益门槛。当前内置 domain 为 `node`（一节点一 unit）；HyperNode 多节点 unit 是既有 `FreeableUnit` 扩展位，待后续插件接入。
+Drain Planner 采用**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 Unit、victim、工作负载聚合和节点目标资源余量。每一轮先通过 Plugin 执行预算与容量预检，再按“此前已提交 moves + 当前候选 victim”的完整计划扰动排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选。提交后增量更新接收端容量和活动集合，直到没有候选可提交。最终收益门槛由 Action 通过 Session 约束统一检查。
 
 #### 当前 P0 多策略扰动预排序与惰性校验
 
 > **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 做**逐维 min-max 归一化的加权求和**。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
 
-默认启用 `base + node + gang`，其中 `node` 仅提供可腾空单元；实际评分由 `base` 与 `gang` 注册五个维度：
+默认启用 `resource + scope + budget + node + base + gang + binpack`。其中 `base` 与 `gang` 注册五个扰动维度：
 
 | 评分维度 | 默认权重 | 原始值 | 目的 |
 |---|---:|---|---|
@@ -1253,15 +1239,9 @@ score(i) = Σ weight(k) × norm(i, k)
 
 若总分相同，候选在进入评分前已按 `FreeableUnit.Weight` 降序、unit key 字典序升序排列，稳定排序保留该顺序；这为未来 HyperNode 等更高 Weight 的 unit 留出确定性同分决策。Weight 不是硬优先级：低 Weight 候选若总扰动更低，仍可排在前面。
 
-- **B（concentration，未实现）**：势函数 `Φ=Σusedᵢ²` 爬山（`ΔΦ=2g·(g+usedTo−usedFrom)` 最大步，整数严格涨分保证终止）；接口已留，P0 不构建。
-
-> 跨"整体 plan"的对比只在 **DryRun 同时启用两个 core（A/B，P1）** 时才需要——那属于"并排展示、人工/配置择一"，不是执行期的自动挑选。
-
-DryRun 在 B 落地后可并排跑两 core，对比腾出节点数与扰动，辅助选型。
-
 ### 引擎扩展模型与流水线
 
-repack-engine 不复用调度器的 `actions`（allocate/preempt/backfill），而有自己镜像 `scheduler/framework` 的扩展模型：**plugin（能力）/ action（动作）/ core（核心搜索，单选）**。引擎 `Session` 由 plugin 在 `OnSessionOpen` 注册回调、由 action 与 core 消费——与 scheduler 的 Session+plugin 同构。
+repack-engine 不复用调度器的 `actions`（allocate/preempt/backfill），而有自己镜像 `scheduler/framework` 的 **Action + Plugin** 扩展模型。Plugin 在 `OnSessionOpen` 注册回调，Action 消费聚合后的 Session，Planner 只执行通用搜索机制。
 
 整体架构与扩展点（对照 volcano-scheduler 的经典架构图形式）：
 
@@ -1272,13 +1252,13 @@ P0 流水线只有一个 action `repack`：
 ```mermaid
 flowchart TD
     P["OpenSession：跑各 plugin.OnSessionOpen<br/>注册 域 / 可动性 / 评分 回调"] --> A["action: repack"]
-    A --> B["选定 core(drain).Plan(ssn)<br/>FreeableUnits → 扰动预排序 → 惰性 FeasibleRelocation(INV-RESCHED)"]
+    A --> B["度量 → drain.BuildPlan<br/>Plugin 过滤/排序 → 惰性 FeasibleRelocation → 收益准入 → Report"]
     B --> C{"mode?"}
     C -->|DryRun| E["RenderPlan → status.plan"]
     C -->|Execute| F["prepare barrier + Evict + 动态选点/提名 → status.plan/result/relocations"]
 ```
 
-新评分只加 plugin、新搜索只加 core、新阶段（`relief`/模拟器）只加 action——互不牵连。
+新场景策略增加 Plugin，新业务阶段增加 Action；两者不修改 Planner 的增量搜索主循环。
 
 ### 复用 scheduler 框架与插件
 
@@ -1347,12 +1327,12 @@ flowchart TD
 | `staging/src/volcano.sh/repack-controller` | **独立模块**：RepackRun TTL 控制器 + placement/nominator reconciler（替身认领、PodGroup 代际、gate、提名与绑定观察）+ 纯决策 `state` 包（含 `EvaluateGate`，由引擎调用） |
 | `pkg/controllers/repack` | 主模块 shim：`framework.Controller` 适配器，把上面的库注册进 volcano-controller-manager（默认随其编译运行） |
 | `pkg/repackengine/api` | 纯模型与算法原语：`Move`、碎片度量、`RepackPlan`/`FreeableUnit`、可动性、扰动聚合，以及参考求解器 `Domain.Feasible`（仅单测 fake 复用，非生产路径）（零框架依赖） |
-| `pkg/repackengine/framework` | 引擎契约：`Session`（plugin 注册 + 聚合消费）、`Plugin`/`Action`/`Core` 接口与注册表、`Report`、`CommitPlan`、scope 解析 |
-| `pkg/repackengine/core/drain` | 核心算法 A（`drain`，P0）；`core/concentration` 为未来槽位 |
-| `pkg/repackengine/plugins/{base,node,gang}` | 能力插件（init 自注册）；`hypernode`/`pdb` 后续 |
-| `pkg/repackengine/actions/repack` | P0 动作 |
+| `pkg/repackengine/framework` | 引擎契约：`Session`、`Plugin`/`Action` 注册表、规划回调聚合、`Report`、`CommitPlan`、scope 解析 |
+| `pkg/repackengine/planner/drain` | 通用惰性 Drain 搜索机制与 4000 节点性能基准 |
+| `pkg/repackengine/plugins/{resource,scope,budget,node,base,gang,binpack}` | 场景策略插件（init 自注册）；`hypernode`/`pdb` 后续 |
+| `pkg/repackengine/actions/repack` | P0 主流程：度量、规划、收益准入、成本与 Report |
 | `pkg/repackengine/adapter` | 唯一耦合 `scheduler/framework` 的适配层：`SessionSnapshot`（含 `FeasibleRelocation` 克隆 feasibility check，走 `ssn.SimulatePredicateFn`）/`SessionGangScopeLookup`/`NodeFreeCapacity` |
-| `pkg/repackengine/repackengine.go` | 驱动：cache + `OpenSession`(tiers) + 跑 plugin/action/core + 写 status |
+| `pkg/repackengine/repackengine.go` | 驱动：cache + `OpenSession`(tiers) + 跑 Plugin/Action + 写 status |
 | `cmd/volcano-repack-engine` | 独立引擎二进制入口（leader + 周期驱动；提名 reconciler 在控制器模块内） |
 
 ### 未来考虑（Future considerations）

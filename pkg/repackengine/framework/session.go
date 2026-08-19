@@ -31,7 +31,7 @@ type (
 	// plugin may veto a move (gang breach, PDB, frozen scope).
 	MovableFn func(task *schedapi.TaskInfo) bool
 	// DomainFn enumerates the freeable units a domain contributes (node units,
-	// hypernode units, ...). Aggregated by union; the core optimizes their combined
+	// hypernode units, ...). Aggregated by union; the planner optimizes their combined
 	// weighted benefit.
 	DomainFn func(snapshot Snapshot) []api.FreeableUnit
 	// DisruptionScoreFn scores a candidate plan on one dimension (higher = more
@@ -79,10 +79,9 @@ type CandidateDisruptionScore struct {
 type SessionConfig struct {
 	Snapshot      Snapshot
 	Run           *repackv1alpha1.RepackRun
+	Scope         *ScopeMatcher
 	Resource      v1.ResourceName
 	Mode          repackv1alpha1.RepackMode
-	CoreName      string      // selected search strategy (repack.core)
-	Hooks         CommitHooks // Execute side effects (nil funcs for DryRun)
 	MinNodesFreed int
 	// MinFragImprovementPercent is the run's benefit gate from
 	// spec.goals[0].minFragImprovementPercent (percentage points, 0-100): a plan
@@ -96,7 +95,7 @@ type SessionConfig struct {
 }
 
 // Session is one repack pass: a snapshot plus the callbacks plugins register,
-// consumed by the core and actions. Mirrors framework.Session in the scheduler.
+// consumed by actions and their planners. Mirrors framework.Session in the scheduler.
 type Session struct {
 	configuration SessionConfig
 	plugins       []Plugin // opened plugins, for OnSessionClose
@@ -106,10 +105,14 @@ type Session struct {
 	scoreTerms    []scoreTerm
 	constraintFns []PlanConstraintFn
 
+	candidateFilterFns []namedCandidateFilter
+	receiverPoolFns    []ReceiverPoolFn
+	victimOrderFns     []namedVictimOrder
+	receiverRankFns    []namedReceiverRank
+
 	// results filled by the action, read by the driver
-	plan         *api.RepackPlan
-	report       Report
-	commitResult *CommitResult // Execute-only; nil for DryRun or an empty plan
+	plan   *api.RepackPlan
+	report Report
 }
 
 // OpenSession builds a Session and runs each named plugin's OnSessionOpen (which
@@ -129,7 +132,7 @@ func OpenSession(configuration SessionConfig, pluginNames []string) *Session {
 }
 
 // registerBuiltinConstraints turns the run's benefit gates into first-class
-// plan constraints, so the core just asks PlanAdmissible instead of hardcoding
+// plan constraints, so actions just ask PlanAdmissible instead of hardcoding
 // them. Additional plan-level policies (e.g. disruptionPolicy.maxDisruptionScore) join
 // the same seam via AddConstraintFn.
 func (s *Session) registerBuiltinConstraints() {
@@ -204,10 +207,9 @@ func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
 
 func (s *Session) Snapshot() Snapshot              { return s.configuration.Snapshot }
 func (s *Session) Run() *repackv1alpha1.RepackRun  { return s.configuration.Run }
+func (s *Session) Scope() *ScopeMatcher            { return s.configuration.Scope }
 func (s *Session) Resource() v1.ResourceName       { return s.configuration.Resource }
 func (s *Session) Mode() repackv1alpha1.RepackMode { return s.configuration.Mode }
-func (s *Session) CoreName() string                { return s.configuration.CoreName }
-func (s *Session) Hooks() CommitHooks              { return s.configuration.Hooks }
 func (s *Session) MinNodesFreed() int              { return s.configuration.MinNodesFreed }
 func (s *Session) MinFragImprovementPercent() int  { return s.configuration.MinFragImprovementPercent }
 func (s *Session) MaxPodGroups() int               { return s.configuration.MaxPodGroups }
@@ -223,7 +225,7 @@ func (s *Session) Free() func(*schedapi.NodeInfo) *schedapi.Resource {
 	return func(n *schedapi.NodeInfo) *schedapi.Resource { return n.FutureIdle() }
 }
 
-// ---- aggregate consumption (called by the core/actions) ----
+// ---- aggregate consumption (called by actions/planners) ----
 
 // Nodes returns the snapshot's candidate nodes.
 func (s *Session) Nodes() []*schedapi.NodeInfo { return s.configuration.Snapshot.Nodes() }
@@ -253,7 +255,7 @@ func (s *Session) Movable() api.Movable {
 }
 
 // FreeableUnits is the union of every domain plugin's units. With both node and
-// hypernode domains enabled this carries both levels; the core ranks them in one
+// hypernode domains enabled this carries both levels; the planner ranks them in one
 // active candidate set.
 func (s *Session) FreeableUnits() []api.FreeableUnit {
 	var out []api.FreeableUnit
@@ -266,15 +268,6 @@ func (s *Session) FreeableUnits() []api.FreeableUnit {
 // PlanContext builds the scoring context from the snapshot and target resource.
 func (s *Session) PlanContext() *api.PlanContext {
 	return &api.PlanContext{TargetResource: s.configuration.Resource, PodGroupViews: s.configuration.Snapshot}
-}
-
-// CurrentFragmentationRate is the target resource's cluster-wide fragmentation
-// rate over all snapshot nodes, independent of action scope and any plan. Used
-// to fill report.FragmentationRateBefore when the core returns no plan, so the
-// driver can tell a clean cluster (NoFragmentation) apart from a fragmented one
-// with no worthwhile in-scope plan (BelowGoalThreshold).
-func (s *Session) CurrentFragmentationRate() float64 {
-	return api.MeasureResourceFragmentation(s.Nodes(), s.configuration.Resource).FragmentationRate()
 }
 
 // DisruptionScores evaluates the registered disruption terms with min-max
@@ -323,9 +316,7 @@ func (s *Session) DisruptionScores(candidates []*api.CandidatePlan) []CandidateD
 
 // ---- result (set by the action, read by the driver) ----
 
-func (s *Session) SetPlan(p *api.RepackPlan)            { s.plan = p }
-func (s *Session) Plan() *api.RepackPlan                { return s.plan }
-func (s *Session) SetReport(r Report)                   { s.report = r }
-func (s *Session) Report() Report                       { return s.report }
-func (s *Session) SetCommit(commitResult *CommitResult) { s.commitResult = commitResult }
-func (s *Session) Commit() *CommitResult                { return s.commitResult }
+func (s *Session) SetPlan(p *api.RepackPlan) { s.plan = p }
+func (s *Session) Plan() *api.RepackPlan     { return s.plan }
+func (s *Session) SetReport(r Report)        { s.report = r }
+func (s *Session) Report() Report            { return s.report }

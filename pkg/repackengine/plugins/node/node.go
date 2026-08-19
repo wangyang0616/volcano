@@ -17,7 +17,7 @@ limitations under the License.
 // Package node is the node-level defragmentation domain plugin: the freeable unit
 // is a single node (weight 1). Enable it (tiers in --scheduler-conf) for "free
 // whole nodes" repack. The hypernode plugin contributes larger units; with both
-// enabled the core optimizes their combined benefit.
+// enabled the planner optimizes their combined benefit.
 package node
 
 import (

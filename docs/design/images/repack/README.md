@@ -9,10 +9,10 @@
 | `algorithm-selection.svg` | 评审一页图：方案 A 节点腾空法 vs 方案 B 集中度法 + 三条选型路线 | §4.17 |
 | `multi-objective-framework.svg` | 多目标泛化三轴（目标粒度×形状×域）+ NVLink/超节点 k-配额（P1） | §4.15.5 |
 | `gang-damage-stepfn.svg` | 受损卡数按 gang 语义计的**阶跃函数**：没破 minAvailable=只赔搬走的卡、破了=整作业全赔、已破再搬=边际 0；8 卡 vs 1024 卡对比 | §4.16.5 |
-| `repack-engine-architecture.svg` | **整体架构与扩展点**（Volcano 风格）：apiserver→复用 schedcache→引擎 Session(OpenSession→repack action(Core=drain)→CloseSession)→movecost/node/gang 插件注册的扩展点函数；底部含 4 回调 / 3 接缝 / 3 组件注册表 | 引擎扩展模型 |
+| `repack-engine-architecture.svg` | **整体架构与扩展点**（Volcano 风格）：apiserver→复用 schedcache→引擎 Session→repack Action→Lazy Drain Planner；场景策略由 Plugin 回调组合 | 引擎扩展模型 |
 | `repack-end-to-end.svg` | **端到端使用与模块交互**（讲解用，①–⑦）：用户建 RepackRun/RepackPolicy → admission 校验 → engine 规划(DryRun 报告 / Execute 驱逐+提名) → 各负载各自控制器重建 pod → repack-controller 打 nominatedNodeName → scheduler 落位 + 排队作业占空位 → 用户取结果 | 端到端使用 |
 | `repack-controller-architecture.svg` | **repack-controller 架构与职责**（Volcano 风格）：左=apiserver(RepackRun/RepackPolicy P1/替身 Pod)→中=控制器三个 reconciler（① RunGC·TTL、② 提名 reconciler、③ RepackPolicy 生成 P1）+ `pkg/state` 纯函数→右=协作产出（引擎写 relocations、patch pod.nominatedNodeName、scheduler honor、DELETE/CREATE Run）；底部收纳边界(不做准入/不做驱逐)、部署(shim 或独立)、配置 | repack-controller |
-| `core-invocation.svg` | **图1 · core 外层调用链**：engine reconcile→gate→process → ①调度器 Session(OpenSession/ResolveScope/Snapshot) → ②引擎 Session(framework.OpenSession 注册回调 + RunActions) → ③action 里 `GetCore(drain).Plan(esn)`，Execute 再 CommitPlan(Evict/Nominate) → engine 写回 status | 整理算法详解 |
+| `core-invocation.svg` | **图1 · Action 外层调用链**：engine reconcile→gate→process → 调度器 Session/Snapshot → 引擎 Session 注册 Plugin 回调 → Repack Action 调用 `drain.BuildPlan` 并完成收益准入/报告 → Engine 持久化后提交 Execute | 整理算法详解 |
 | `core-drain-flow.svg` | 历史流程草图：字典序增量代价版本，已被“多策略扰动预排序 + 惰性完整调度校验”替代，不再作为当前实现说明 | 历史存档 |
 | `core-unit-cost.svg` | 历史评分草图：三元组字典序版本，已被 `DisruptionScores` 的多维归一化加权评分替代，不再作为当前实现说明 | 历史存档 |
 | `heuristic-limit-01-budget.svg` | 局部低成本候选消耗 PodGroup 预算，对比复用同一 PodGroup 的全局序列 | 启发式规划 §5.1 |

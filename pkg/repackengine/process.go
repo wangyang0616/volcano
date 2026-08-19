@@ -36,7 +36,6 @@ import (
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
-	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
@@ -86,10 +85,6 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
 			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources (e.g. nvidia.com/gpu) can be defragmented, not core resources like cpu/memory", targetResource))
 	}
-	if _, ok := engineframework.GetCore(e.config.Core); !ok {
-		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
-			fmt.Errorf("unknown repack core %q (registered: %v)", e.config.Core, engineframework.CoreNames()))
-	}
 	actions := e.config.Actions
 	if len(actions) == 0 {
 		actions = engineframework.DefaultActions()
@@ -108,7 +103,7 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	}
 	klog.V(3).InfoS("repack: run execution started",
 		"run", run.Name, "mode", run.Spec.Mode, "resource", targetResource,
-		"core", e.config.Core, "actions", actions, "plugins", e.config.Plugins)
+		"actions", actions, "plugins", e.config.Plugins)
 
 	progressMessage := fmt.Sprintf(
 		"Planning cluster-wide fragmentation for %s in %s mode.",
@@ -134,9 +129,9 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	engineSession := engineframework.OpenSession(engineframework.SessionConfig{
 		Snapshot:                  snapshot,
 		Run:                       run,
+		Scope:                     scope,
 		Resource:                  targetResource,
 		Mode:                      run.Spec.Mode,
-		CoreName:                  e.config.Core,
 		MinNodesFreed:             e.config.MinNodesFreed,
 		MinFragImprovementPercent: minFragImprovement(run),
 		MaxPodGroups:              maxPodGroups,
@@ -145,7 +140,6 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		LimitResource:             hasResourceLimit,
 		Free:                      adapter.NodeFreeCapacity,
 	}, e.config.Plugins)
-	engineSession.AddMovableFn(func(t *schedapi.TaskInfo) bool { return scope.InScope(t.Job) })
 	defer engineframework.CloseSession(engineSession)
 
 	// Actions are planning-only. Execute is committed below, after applyPlan has

@@ -23,7 +23,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
-	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 )
 
 // fakeConfig is a non-nil rest.Config that never connects — client construction
@@ -39,9 +38,6 @@ func TestNewEngineAppliesDefaults(t *testing.T) {
 	}
 	if e == nil {
 		t.Fatal("NewEngine() returned nil engine")
-	}
-	if e.config.Core != engineframework.CoreDrain {
-		t.Errorf("default Core = %q, want %q", e.config.Core, engineframework.CoreDrain)
 	}
 	if len(e.config.Plugins) == 0 {
 		t.Error("default Plugins should be non-empty")

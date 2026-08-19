@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package repack is the planning action: run the selected core to produce a plan
-// and render the report. Execute side effects deliberately live in the engine
+// Package repack is the planning action: run the plugin-driven lazy planner and
+// render the report. Execute side effects deliberately live in the engine
 // driver, after the plan and relocation journal have been durably persisted.
 // Future planning actions (relief, simulate) compose after it in the pipeline.
 package repack
@@ -23,7 +23,9 @@ package repack
 import (
 	"k8s.io/klog/v2"
 
+	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
+	"volcano.sh/volcano/pkg/repackengine/planner/drain"
 )
 
 func init() {
@@ -35,28 +37,49 @@ type repackAction struct{}
 func (*repackAction) Name() string { return framework.ActionRepack }
 
 func (*repackAction) Execute(ssn *framework.Session) {
-	name := ssn.CoreName()
-	if name == "" {
-		name = framework.CoreDrain
+	runName := ""
+	if run := ssn.Run(); run != nil {
+		runName = run.Name
 	}
-	core, ok := framework.GetCore(name)
-	if !ok {
-		klog.ErrorS(nil, "repack: unknown core in config", "core", name, "registered", framework.CoreNames())
-		return
-	}
+	resource := ssn.Resource()
+	nodes := ssn.Nodes()
+	before := api.MeasureResourceFragmentation(nodes, resource)
+	klog.V(3).InfoS("repack: planning pass started", "run", runName, "resource", resource,
+		"nodes", len(nodes),
+		"occupiedNodes", before.OccupiedNodeCount, "optimalNodes", before.OptimalOccupiedNodeCount,
+		"providingNodes", before.ProvidingNodeCount)
 
-	plan, found := core.Plan(ssn)
+	plan := drain.BuildPlan(ssn)
+	if plan != nil {
+		plan.Before = before
+		if !ssn.PlanAdmissible(plan) {
+			klog.V(3).InfoS("repack: plan rejected by benefit constraints", "run", runName, "resource", resource,
+				"freedNodeCount", len(plan.FreedNodes), "moveCount", len(plan.Moves),
+				"fragmentationBefore", before.FragmentationRate(), "fragmentationDelta", plan.FragmentationRateDelta())
+			plan = nil
+		} else {
+			plan.Cost = api.CalculateDisruptionCost(plan.Moves, resource)
+			klog.V(3).InfoS("repack: plan accepted", "run", runName, "resource", resource,
+				"freedNodeCount", len(plan.FreedNodes), "moveCount", len(plan.Moves),
+				"movedResource", plan.Cost.MovedResource, "affectedPodGroupCount", plan.Cost.AffectedPodGroups,
+				"fragmentationBefore", before.FragmentationRate(), "fragmentationDelta", plan.FragmentationRateDelta())
+			klog.V(4).InfoS("repack: accepted plan details", "run", runName, "freedNodes", plan.FreedNodes,
+				"affectedPodGroups", plan.AffectedPodGroups())
+		}
+	} else {
+		klog.V(3).InfoS("repack: no plan produced", "run", runName, "resource", resource, "reason", "NoFreeableUnit")
+	}
 	ssn.SetPlan(plan)
 	report := framework.RenderReport(plan)
 	if plan == nil {
 		// No plan: still record the cluster's current fragmentation so the driver
 		// can tell NoFragmentation (clean) apart from BelowGoalThreshold (fragmented
 		// but no worthwhile plan). RenderReport(nil) leaves FragmentationRateBefore at 0.
-		currentFragmentationRate := ssn.CurrentFragmentationRate()
+		currentFragmentationRate := before.FragmentationRate()
 		report.FragmentationRateBefore, report.FragmentationRateAfter = currentFragmentationRate, currentFragmentationRate
 	}
 	ssn.SetReport(report)
-	if !found || plan == nil {
+	if plan == nil {
 		return // NoRepackNeeded
 	}
 }

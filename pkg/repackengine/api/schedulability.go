@@ -28,7 +28,7 @@ limitations under the License.
 // tests with fakes and cross-checked against a brute-force assignment search.
 //
 // In production the live feasibility check does NOT run this solver: the drain
-// core delegates to Snapshot.FeasibleRelocation, whose adapter implementation
+// planner delegates to Snapshot.FeasibleRelocation, whose adapter implementation
 // clones the node + cycle-state and runs the scheduler's full filter stack via
 // ssn.SimulatePredicateFn (see pkg/repackengine/adapter). This pure Domain solver
 // is retained as the reference model that the drain unit-test fakes reuse.

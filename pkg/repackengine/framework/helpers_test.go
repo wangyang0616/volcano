@@ -38,7 +38,7 @@ func (f *fakeSnap) NodeInScope(*schedapi.NodeInfo) bool             { return tru
 func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView { return f.views[id] }
 
 // FeasibleRelocation is not exercised by the framework-level tests (they cover
-// session plumbing, not the drain core), so this is an inert stand-in.
+// session plumbing, not the drain planner), so this is an inert stand-in.
 func (f *fakeSnap) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	return nil, false
 }
