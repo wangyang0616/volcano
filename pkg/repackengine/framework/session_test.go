@@ -66,23 +66,6 @@ func TestSession_FreeableUnitsUnion(t *testing.T) {
 	}
 }
 
-// LeastDisruptive min-max normalizes the registered scores and returns the index
-// of the cheapest candidate.
-func TestSession_LeastDisruptive(t *testing.T) {
-	ssn := newSession(&fakeSnap{})
-	ssn.AddDisruptionScoreFn("movedPods", 1.0, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.MoveAggregate(ctx).MovedPods)
-	})
-	cheap := &api.CandidatePlan{Moves: []*api.Move{move(task("a", "ga", 1), "n0", "n1")}}
-	costly := &api.CandidatePlan{Moves: []*api.Move{
-		move(task("b", "gb", 1), "n0", "n1"),
-		move(task("c", "gc", 1), "n0", "n1"),
-	}}
-	if idx := ssn.LeastDisruptive([]*api.CandidatePlan{costly, cheap}); idx != 1 {
-		t.Errorf("LeastDisruptive=%d, want 1 (the cheaper candidate)", idx)
-	}
-}
-
 func TestSession_DisruptionScoresExplainNormalizationAndWeighting(t *testing.T) {
 	ssn := newSession(&fakeSnap{})
 	ssn.AddDisruptionScoreFn("movedPods", 0.5, func(ctx *api.PlanContext, plan *api.CandidatePlan) float64 {

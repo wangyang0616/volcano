@@ -36,7 +36,10 @@ type (
 	DomainFn func(snapshot Snapshot) []api.FreeableUnit
 	// DisruptionScoreFn scores a candidate plan on one dimension (higher = more
 	// disruptive). Weighted + min-max normalized across candidates by the Session.
-	// This is SOFT ranking (used by LeastDisruptive to pick among feasible plans).
+	// This is SOFT ranking: drain uses it to order active candidates before lazy
+	// scheduler-feasibility simulation. A score must therefore depend on the moved
+	// tasks and cumulative plan impact, not on a final receiver node: prospective
+	// moves are scored before FeasibleRelocation assigns their destinations.
 	DisruptionScoreFn func(ctx *api.PlanContext, p *api.CandidatePlan) float64
 	// PlanConstraintFn is a HARD admissibility gate on a finished plan: return
 	// false to reject it outright. Aggregated with AND — any constraint may veto.
@@ -185,9 +188,8 @@ func (s *Session) AddConstraintFn(fn PlanConstraintFn) {
 
 // PlanAdmissible reports whether a finished plan passes every hard constraint
 // (built-in benefit gates + any plugin-registered PlanConstraintFns), AND-
-// aggregated: a single false rejects the plan. Soft ranking among admissible
-// plans is LeastDisruptive; this is the hard veto the core applies before
-// committing a plan.
+// aggregated: a single false rejects the plan. Soft candidate ordering and this
+// final hard veto are independent.
 func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
 	ctx := s.PlanContext()
 	for _, fn := range s.constraintFns {
@@ -251,8 +253,8 @@ func (s *Session) Movable() api.Movable {
 }
 
 // FreeableUnits is the union of every domain plugin's units. With both node and
-// hypernode domains enabled this carries both levels, and Benefit/LeastDisruptive
-// let the core weigh them jointly (holistic optimum).
+// hypernode domains enabled this carries both levels; the core ranks them in one
+// active candidate set.
 func (s *Session) FreeableUnits() []api.FreeableUnit {
 	var out []api.FreeableUnit
 	for _, fn := range s.domainFns {
@@ -317,23 +319,6 @@ func (s *Session) DisruptionScores(candidates []*api.CandidatePlan) []CandidateD
 		}
 	}
 	return scores
-}
-
-// LeastDisruptive returns the index of the least-disruptive candidate. Ties
-// keep the earliest index, so callers should pass candidates in a meaningful
-// order (for example, higher benefit first). Returns 0 for a single/empty batch.
-func (s *Session) LeastDisruptive(candidates []*api.CandidatePlan) int {
-	if len(candidates) <= 1 {
-		return 0
-	}
-	scores := s.DisruptionScores(candidates)
-	best, bestScore := 0, scores[0].Total
-	for index := range scores {
-		if scores[index].Total < bestScore {
-			best, bestScore = index, scores[index].Total
-		}
-	}
-	return best
 }
 
 // ---- result (set by the action, read by the driver) ----

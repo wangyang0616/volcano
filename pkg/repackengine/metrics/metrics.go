@@ -59,14 +59,14 @@ var (
 		Help:      "Number of times the Execute serialization gate deferred a run, by reason.",
 	}, []string{"reason"})
 
-	// PlannerCandidatesEvaluated observes how many drain units are considered in
-	// one planning pass. It exposes the search width independently of the overall
-	// reconcile duration.
+	// PlannerCandidatesEvaluated observes how many active drain-unit evaluations
+	// occur across all steps in one planning pass. It exposes the cheap search
+	// width independently of expensive feasibility simulations and wall time.
 	PlannerCandidatesEvaluated = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Subsystem: subsystem,
 		Name:      "planner_candidates_evaluated",
 		Help:      "Number of drain candidates evaluated in one planning pass.",
-		Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500},
+		Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000},
 	}, []string{"mode"})
 
 	// PlannerFeasibilitySimulations observes how many candidates reached the

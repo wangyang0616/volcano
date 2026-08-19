@@ -18,6 +18,7 @@ package drain
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -29,18 +30,18 @@ import (
 const candidateOrderEdgeCount = 3
 
 // logCandidateOrder separates the operator-facing decision from its scoring
-// mechanics: V3 summarizes the choice, V4 explains displayed candidates, and V5
-// exposes the normalization formula for algorithm debugging.
-func (s *drainState) logCandidateOrder(step int, scored []scoredCandidate) {
+// mechanics. scored is already in preliminary disruption order;
+// selectedPosition identifies the first candidate that passed full scheduling
+// simulation (one-based).
+func (s *drainState) logCandidateOrder(step int, ordered []scoredCandidate, selectedPosition int) {
 	if !klog.V(3).Enabled() {
 		return
 	}
-	ordered := orderScoredCandidates(scored)
-	if len(ordered) == 0 {
+	if len(ordered) == 0 || selectedPosition < 1 || selectedPosition > len(ordered) {
 		return
 	}
 
-	selected := ordered[0]
+	selected := ordered[selectedPosition-1]
 	klog.V(3).InfoS("repack drain: selected drain target",
 		"run", runName(s.ssn),
 		"step", step,
@@ -49,19 +50,19 @@ func (s *drainState) logCandidateOrder(step int, scored []scoredCandidate) {
 		"targetLevel", selected.candidate.unit.Level,
 		"nodesToFree", selected.candidate.unit.Nodes,
 		"candidateCount", len(ordered),
-		"selectedPosition", 1,
+		"selectedPosition", selectedPosition,
 		"totalDisruptionScore", selected.score.Total,
 		"scorePreference", "lower-is-better",
-		"additionalMoveCount", len(selected.candidate.placed),
+		"additionalMoveCount", candidateMoveCount(selected.candidate),
 		"additionalMovedResource", selected.candidate.additionalResource,
 		"prospectivePlanImpact", formatPlanImpact(selected.score.Terms, s.resource),
-		"selectionReason", candidateSelectionReason(ordered),
+		"selectionReason", candidateSelectionReason(ordered, selectedPosition),
 		"orderBestToWorst", formatCandidateOrderSummary(ordered))
 
 	if !klog.V(4).Enabled() {
 		return
 	}
-	displayedIndexes, omittedCandidateCount := displayedCandidateIndexes(len(ordered))
+	displayedIndexes, omittedCandidateCount := displayedCandidateIndexes(len(ordered), selectedPosition-1)
 	for position, index := range displayedIndexes {
 		if omittedCandidateCount > 0 && position == candidateOrderEdgeCount {
 			klog.V(4).InfoS("repack drain: candidate order entries omitted",
@@ -75,13 +76,13 @@ func (s *drainState) logCandidateOrder(step int, scored []scoredCandidate) {
 			"step", step,
 			"position", index+1,
 			"candidateCount", len(ordered),
-			"selected", index == 0,
+			"selected", index == selectedPosition-1,
 			"drainTarget", entry.candidate.key,
 			"targetLevel", entry.candidate.unit.Level,
 			"nodesToFree", entry.candidate.unit.Nodes,
 			"drainBenefitWeight", entry.candidate.unit.Weight,
 			"totalDisruptionScore", entry.score.Total,
-			"additionalMoveCount", len(entry.candidate.placed),
+			"additionalMoveCount", candidateMoveCount(entry.candidate),
 			"additionalMovedResource", entry.candidate.additionalResource,
 			"prospectivePlanImpact", formatPlanImpact(entry.score.Terms, s.resource),
 			"scoreContributions", formatScoreContributions(entry.score.Terms, s.resource))
@@ -89,9 +90,17 @@ func (s *drainState) logCandidateOrder(step int, scored []scoredCandidate) {
 	}
 }
 
+func candidateMoveCount(candidate candidate) int {
+	if len(candidate.victims) > 0 {
+		return len(candidate.victims)
+	}
+	return len(candidate.placed)
+}
+
 // displayedCandidateIndexes bounds candidate-order logs on large clusters and reports
-// how many middle entries were omitted.
-func displayedCandidateIndexes(candidateCount int) ([]int, int) {
+// how many entries were omitted. requiredIndex is included when it identifies a
+// valid middle entry; pass -1 when no additional entry is required.
+func displayedCandidateIndexes(candidateCount, requiredIndex int) ([]int, int) {
 	if candidateCount <= 0 {
 		return nil, 0
 	}
@@ -109,7 +118,11 @@ func displayedCandidateIndexes(candidateCount int) ([]int, int) {
 	for index := candidateCount - candidateOrderEdgeCount; index < candidateCount; index++ {
 		indexes = append(indexes, index)
 	}
-	return indexes, candidateCount - candidateOrderEdgeCount*2
+	if requiredIndex >= candidateOrderEdgeCount && requiredIndex < candidateCount-candidateOrderEdgeCount {
+		indexes = append(indexes, requiredIndex)
+		sort.Ints(indexes)
+	}
+	return indexes, candidateCount - len(indexes)
 }
 
 // formatCandidateOrderSummary presents the decision order without exposing scoring
@@ -121,7 +134,7 @@ func formatCandidateOrderSummary(ordered []scoredCandidate) []string {
 	formatAt := func(index int) string {
 		return fmt.Sprintf("#%d %s(score=%.3f)", index+1, ordered[index].candidate.key, ordered[index].score.Total)
 	}
-	displayedIndexes, omittedCandidateCount := displayedCandidateIndexes(len(ordered))
+	displayedIndexes, omittedCandidateCount := displayedCandidateIndexes(len(ordered), -1)
 	result := make([]string, 0, min(len(ordered), candidateOrderEdgeCount*2+1))
 	for position, index := range displayedIndexes {
 		if omittedCandidateCount > 0 && position == candidateOrderEdgeCount {
@@ -132,12 +145,15 @@ func formatCandidateOrderSummary(ordered []scoredCandidate) []string {
 	return result
 }
 
-func candidateSelectionReason(ordered []scoredCandidate) string {
+func candidateSelectionReason(ordered []scoredCandidate, selectedPosition int) string {
 	if len(ordered) == 0 {
 		return ""
 	}
+	if selectedPosition > 1 {
+		return "first scheduler-feasible target in disruption order"
+	}
 	if len(ordered) == 1 {
-		return "only feasible drain target"
+		return "only active drain target"
 	}
 	if ordered[0].score.Total < ordered[1].score.Total {
 		return "lowest disruption score"
@@ -186,7 +202,7 @@ func formatReadableScoreValue(value float64) string {
 
 // logScoreFormula reserves normalization mechanics for V5. The values are only
 // comparable within this planning step because each term is min-max normalized
-// across that step's feasible candidates.
+// across that step's active preliminary candidates.
 func (s *drainState) logScoreFormula(step, position int, entry scoredCandidate) {
 	if !klog.V(5).Enabled() {
 		return

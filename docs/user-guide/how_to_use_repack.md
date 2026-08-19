@@ -275,7 +275,7 @@ kubectl -n volcano-system logs deploy/volcano-repack-engine --since=10m \
 
 #### 多维中断影响评分
 
-每个可行候选都按完整计划计算五个维度，而不是只评价当前节点上的局部 Pod：
+每个活动候选都按“已选迁移 + 当前候选预期迁移”的完整计划计算五个维度，而不是只评价当前节点上的局部 Pod：
 
 - **受影响工作负载数，默认权重 1.0**：尽量减少同时受到迁移影响的训练或推理工作负载；系统内部按不同 PodGroup 计数；
 - **低于 `MinAvailable` 的 PodGroup 数，默认权重 0.8**；
@@ -297,11 +297,13 @@ Repack 的规划不是预先排好一次节点顺序后逐个执行。规划器�
 
 #### 腾空候选的选择
 
-每一轮首先排除不满足可迁移性、执行预算、接收容量或 Scheduler 可行性的候选，再按中断影响总分从低到高选择。该总分同时考虑受影响工作负载数、低于 `MinAvailable` 的 PodGroup 数、受影响目标资源量、迁移资源量和迁移 Pod 数。分数相同时，继续比较腾空收益和候选名称，以获得稳定结果。
+规划开始时，Repack 会一次性识别可腾空候选，并缓存待迁移 Pod、工作负载信息和节点目标资源余量。每一轮先排除已被使用、超出执行预算或接收总容量不足的候选，再按中断影响总分从低到高排序。该总分同时考虑受影响工作负载数、低于 `MinAvailable` 的 PodGroup 数、受影响目标资源量、迁移资源量和迁移 Pod 数。分数相同时，继续比较腾空收益和候选名称，以获得稳定结果。
+
+候选排序完成后，Repack 从第一名开始执行完整 Scheduler 模拟，选择第一个所有待迁移 Pod 都具有可行落点的候选；若校验失败，则继续尝试下一名。这样既保留 Volcano Scheduler 的完整可行性判断，也避免在大规模集群中每轮预先模拟全部候选。每次提交后，剩余候选会基于已消耗容量和累计工作负载影响重新评分。
 
 因此，Repack 选择的不是“当前空闲卡最多的节点”，而是“能够腾空、具备完整迁移路径，并且工作负载中断影响相对较低的节点”。
 
-![腾空候选排序：过滤不可行候选后选择中断影响最小的方案](../images/repack/drain-candidate-order.svg)
+![腾空候选排序：按中断影响排序并选择首个通过完整调度校验的方案](../images/repack/drain-candidate-order.svg)
 
 #### 接收节点的填充
 
@@ -325,7 +327,7 @@ kubectl -n volcano-system logs deploy/volcano-repack-engine --since=10m \
   | grep -E 'drain target score|selected drain target|not freeable'
 ```
 
-`drain target score` 用于比较本轮多个可行候选；`selected drain target` 是本轮最终选择。规划器提交该候选到模拟状态后，会重新计算下一轮候选，而不是继续使用一张静态节点排序表。
+`drain target score` 用于展示本轮活动候选的扰动预排序；`selected drain target` 中的 `selectedPosition` 表示最终候选在该排序中的位置。位置大于 1，说明前面的候选未通过容量预检或完整 Scheduler 校验。规划器提交该候选到模拟状态后，会重新计算下一轮候选，而不是继续使用一张静态节点排序表。
 
 ### 6. 通过执行预算限制单次影响范围
 

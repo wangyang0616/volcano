@@ -880,7 +880,7 @@ repack-engine 复刻 scheduler 的扩展模型，分**三类扩展点**（在 `-
 
 | core | 思路 | 阶段 |
 |---|---|---|
-| **A · 节点腾空法**（`drain`，默认） | 动态贪心：每轮评估全部可腾空单元，对每个可行候选的**完整计划**做多策略扰动评分，选择最小扰动者后原子提交；负载优先填入已有占用的节点碎片 | **P0** |
+| **A · 节点腾空法**（`drain`，默认） | 动态贪心：每轮对活动候选的**预期完整计划**做多策略扰动预排序，沿排序惰性执行完整调度模拟并原子提交首个可行候选；负载优先填入已有占用的节点碎片 | **P0** |
 | **B · 集中度法**（`concentration`） | 逐 gang 往更满节点挪，沿集中度 Σused² 涨分爬山 | 接口预留、P0 不实现 |
 
 经 `repack.core` 选择；详见 [§6 整理算法](#整理算法详解)。
@@ -1222,11 +1222,11 @@ type Core interface {
 
 core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调度器：`ssn.FreeableUnits()`（各域插件贡献的可释放单元）、`ssn.Movable()`（各 plugin 以 AND 合成的可动性）、`ssn.FeasibleRelocation()`（克隆式可调度性检查，见上"可调度性兜底"）、以及 `base`/`gang` 插件注册的扰动评分维度。
 
-- **A（drain，P0）**：**单趟动态贪心、产出唯一 plan**。每一轮先评估全部仍可腾空的 unit；每个 unit 只有在 victim 可全部通过 `FeasibleRelocation` 重落、且不超过 `maxPerRun` 等硬约束时才成为可行候选。随后比较候选的**完整计划**（此前已提交的 moves + 该候选新增的 moves），选择扰动最小者并原子提交；提交后更新接收端容量和预算，再从头动态重选，直到没有可行候选。最后统一检查 `MinNodesFreed` 与 `goals[].minFragImprovementPercent` 收益门槛。当前内置 domain 为 `node`（一节点一 unit）；HyperNode 多节点 unit 是既有 `FreeableUnit` 扩展位，待后续插件接入。
+- **A（drain，P0）**：**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 unit、victim、工作负载聚合和节点目标资源余量。每一轮先对活动候选执行预算与容量预检，再按“此前已提交 moves + 当前候选 victim”的完整计划扰动进行预排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选，不再模拟后续候选。提交后增量更新接收端容量、预算和活动集合，直到没有候选可提交，最后统一检查 `MinNodesFreed` 与 `goals[].minFragImprovementPercent` 收益门槛。当前内置 domain 为 `node`（一节点一 unit）；HyperNode 多节点 unit 是既有 `FreeableUnit` 扩展位，待后续插件接入。
 
-#### 当前 P0 多策略扰动评分（`LeastDisruptive`）
+#### 当前 P0 多策略扰动预排序与惰性校验
 
-> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + Moves` 计算全计划扰动，并由 `Session.LeastDisruptive` 做**逐维 min-max 归一化的加权求和**。评分只在已经通过可行性与预算硬过滤的候选之间排序，不会放宽 INV-RESCHED 或 `maxPerRun`。
+> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 做**逐维 min-max 归一化的加权求和**。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
 
 默认启用 `base + node + gang`，其中 `node` 仅提供可腾空单元；实际评分由 `base` 与 `gang` 注册五个维度：
 
@@ -1238,7 +1238,7 @@ core 在 `Plan` 里只消费 Session 的聚合视图，不直接接触 CRD/调�
 | `movedResource` | 0.3 | 全计划搬迁的目标资源总量 | 控制 GPU/NPU 搬迁规模 |
 | `movedPods` | 0.1 | 全计划实际重落的 Pod 数 | 控制 Pod churn |
 
-对本轮第 `i` 个可行候选、每个维度 `k`，先在本轮候选集合内归一化：
+对本轮第 `i` 个活动候选、每个维度 `k`，先在本轮候选集合内归一化：
 
 ```text
 norm(i, k) = 0                                      if max(raw(*, k)) == min(raw(*, k))
@@ -1247,11 +1247,11 @@ norm(i, k) = 0                                      if max(raw(*, k)) == min(raw
 score(i) = Σ weight(k) × norm(i, k)
 ```
 
-选择 `score(i)` 最小的候选。某维度在本轮所有候选都相同，说明它不能区分当前选择，归一化后贡献为 0；因此分数是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
+按 `score(i)` 从低到高尝试候选，选择第一个通过完整调度校验的候选。某维度在本轮所有候选都相同，说明它不能区分当前选择，归一化后贡献为 0；因此分数是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
 
 把已提交 moves 纳入每个候选有两个关键效果：一是新触及一个 PodGroup 会增加 `affectedPodGroups`；二是一个 gang 已被打破后，继续搬其 Pod 不再增加 `gangBreaches`，`damagedResource` 也仍是该 gang 的一次 footprint 计费，但 `movedResource` 与 `movedPods` 仍会增加。该机制会倾向复用已有扰动面，却不会把后续迁移误判为零代价。
 
-若总分相同，候选在进入评分前已按 `FreeableUnit.Weight` 降序、unit key 字典序升序排列，`LeastDisruptive` 保留第一个；这为未来 HyperNode 等更高 Weight 的 unit 留出确定性同分决策。Weight 不是硬优先级：低 Weight 候选若总扰动更低，仍可胜出。
+若总分相同，候选在进入评分前已按 `FreeableUnit.Weight` 降序、unit key 字典序升序排列，稳定排序保留该顺序；这为未来 HyperNode 等更高 Weight 的 unit 留出确定性同分决策。Weight 不是硬优先级：低 Weight 候选若总扰动更低，仍可排在前面。
 
 - **B（concentration，未实现）**：势函数 `Φ=Σusedᵢ²` 爬山（`ΔΦ=2g·(g+usedTo−usedFrom)` 最大步，整数严格涨分保证终止）；接口已留，P0 不构建。
 
@@ -1272,7 +1272,7 @@ P0 流水线只有一个 action `repack`：
 ```mermaid
 flowchart TD
     P["OpenSession：跑各 plugin.OnSessionOpen<br/>注册 域 / 可动性 / 评分 回调"] --> A["action: repack"]
-    A --> B["选定 core(drain).Plan(ssn)<br/>FreeableUnits → 腾空 → FeasibleRelocation(INV-RESCHED) → LeastDisruptive"]
+    A --> B["选定 core(drain).Plan(ssn)<br/>FreeableUnits → 扰动预排序 → 惰性 FeasibleRelocation(INV-RESCHED)"]
     B --> C{"mode?"}
     C -->|DryRun| E["RenderPlan → status.plan"]
     C -->|Execute| F["prepare barrier + Evict + 动态选点/提名 → status.plan/result/relocations"]

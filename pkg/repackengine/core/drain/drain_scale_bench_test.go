@@ -34,11 +34,13 @@ func BenchmarkDrainScale(b *testing.B) {
 		totalNodes int
 		scopeNodes int
 		maxGroups  int
+		failFirst  int
 	}{
 		{name: "total4000_scope250_steps1", totalNodes: 4000, scopeNodes: 250, maxGroups: 1},
 		{name: "total4000_scope250_steps4", totalNodes: 4000, scopeNodes: 250, maxGroups: 4},
 		{name: "total4000_scope1000_steps1", totalNodes: 4000, scopeNodes: 1000, maxGroups: 1},
 		{name: "total4000_scope4000_steps1", totalNodes: 4000, scopeNodes: 4000, maxGroups: 1},
+		{name: "total4000_scope4000_fail32_steps1", totalNodes: 4000, scopeNodes: 4000, maxGroups: 1, failFirst: 32},
 		{name: "total4000_scope4000_steps4", totalNodes: 4000, scopeNodes: 4000, maxGroups: 4},
 	}
 
@@ -60,7 +62,11 @@ func BenchmarkDrainScale(b *testing.B) {
 			var totalCalls, totalFreed int
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				snap := &fakeSnap{nodes: nodes, views: views, notInScope: notInScope}
+				infeasibleSources := make(map[string]bool, tc.failFirst)
+				for source := 0; source < tc.failFirst; source++ {
+					infeasibleSources[fmt.Sprintf("n%04d", source)] = true
+				}
+				snap := &fakeSnap{nodes: nodes, views: views, notInScope: notInScope, infeasibleSources: infeasibleSources}
 				plan, _ := (&drainCore{}).Plan(drainSessionWithPlugins(
 					snap, allMovable, 1, tc.maxGroups, 0, []string{"base", "gang"},
 				))

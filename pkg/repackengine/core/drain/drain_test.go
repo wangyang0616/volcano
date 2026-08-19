@@ -36,11 +36,12 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 
 // fakeSnap is a minimal framework.Snapshot for solver tests (every node fits).
 type fakeSnap struct {
-	resource         v1.ResourceName // default nvidia.com/gpu when empty
-	nodes            []*schedapi.NodeInfo
-	views            map[schedapi.JobID]api.PodGroupView
-	notInScope       map[string]bool // node name → excluded from draining (receiver only)
-	feasibilityCalls int
+	resource          v1.ResourceName // default nvidia.com/gpu when empty
+	nodes             []*schedapi.NodeInfo
+	views             map[schedapi.JobID]api.PodGroupView
+	notInScope        map[string]bool // node name → excluded from draining (receiver only)
+	infeasibleSources map[string]bool
+	feasibilityCalls  int
 }
 
 func (f *fakeSnap) res() v1.ResourceName {
@@ -67,6 +68,9 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 // pure api.Domain best-fit solver.
 func (f *fakeSnap) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	f.feasibilityCalls++
+	if len(victims) > 0 && f.infeasibleSources[victims[0].NodeName] {
+		return nil, false
+	}
 	res := f.res()
 	placed := map[string]int64{}
 	for _, m := range committed {
@@ -225,6 +229,51 @@ func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
 	if len(moves) != 1 || moves[0].Task.Name != "b-0" || moves[0].From != "node-b" || moves[0].To != "node-a" {
 		t.Fatalf("moves=%+v, want b-0:node-b->node-a", moves)
 	}
+	if snap.feasibilityCalls != 1 {
+		t.Fatalf("lazy selection must stop after the first feasible candidate, calls=%d want=1", snap.feasibilityCalls)
+	}
+}
+
+func TestDrain_LazySelectionFallsBackToNextSchedulerFeasibleCandidate(t *testing.T) {
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("node-a", 8, gpuTask("a", "pg-a", 1)),
+			capNode("node-b", 8, gpuTask("b", "pg-b", 2)),
+		},
+		infeasibleSources: map[string]bool{"node-a": true},
+	}
+
+	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	if !ok || plan == nil {
+		t.Fatal("expected the second-ranked candidate to be feasible")
+	}
+	if got := fmt.Sprint(plan.FreedNodes); got != "[node-b]" {
+		t.Fatalf("freed=%s, want [node-b] after node-a fails full scheduler validation", got)
+	}
+	if snap.feasibilityCalls != 2 {
+		t.Fatalf("feasibility calls=%d, want 2 (first fails, second succeeds)", snap.feasibilityCalls)
+	}
+}
+
+func TestDrain_LazySelectionAt4000NodesRunsOneFullSimulation(t *testing.T) {
+	const nodeCount = 4000
+	nodes := make([]*schedapi.NodeInfo, 0, nodeCount)
+	views := make(map[schedapi.JobID]api.PodGroupView, nodeCount)
+	for index := 0; index < nodeCount; index++ {
+		name := fmt.Sprintf("n%04d", index)
+		podGroup := schedapi.JobID(fmt.Sprintf("g%04d", index))
+		nodes = append(nodes, capNode(name, 8, gpuTask("pod-"+name, string(podGroup), 2)))
+		views[podGroup] = api.PodGroupView{Running: 1, MinAvailable: 1, Footprint: 2}
+	}
+	snap := &fakeSnap{nodes: nodes, views: views}
+
+	plan, ok := (&drainCore{}).Plan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	if !ok || plan == nil || len(plan.FreedNodes) != 1 {
+		t.Fatalf("plan=%+v ok=%v, want one freed node", plan, ok)
+	}
+	if snap.feasibilityCalls != 1 {
+		t.Fatalf("4000-node lazy selection made %d full simulations, want 1", snap.feasibilityCalls)
+	}
 }
 
 // Once draining a node has already disrupted a gang, receivers must be chosen
@@ -292,8 +341,8 @@ func TestReceiverPreferenceFallsBackWhenPreferredReceiverLacksCapacity(t *testin
 		map[string]bool{"drain-target": true},
 		[]*schedapi.TaskInfo{victim},
 	)
-	if len(receivers) != 2 || receivers[0].Name != "unrelated-gang" || receivers[1].Name != "same-gang" {
-		t.Fatalf("receivers=%v, want [unrelated-gang same-gang]", nodeNames(receivers))
+	if len(receivers) != 1 || receivers[0].Name != "same-gang" {
+		t.Fatalf("receivers=%v, want [same-gang]: receiver unable to fit even the smallest victim must be pruned", nodeNames(receivers))
 	}
 
 	moves, feasible := snap.FeasibleRelocation(nil, []*schedapi.TaskInfo{victim}, receivers)
@@ -343,7 +392,7 @@ func TestReceiverPreferenceAccountsForFutureMinAvailableBreach(t *testing.T) {
 	}
 }
 
-func TestOrderCandidatesUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
+func TestPreliminaryCandidateOrderUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
 	session := drainSessionWithPlugins(&fakeSnap{}, allMovable, 1, 0, 0, []string{"base"})
 	defer framework.CloseSession(session)
 	state := &drainState{ssn: session}
@@ -364,9 +413,6 @@ func TestOrderCandidatesUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
 		},
 	}
 	scored := state.scoreCandidates([]candidate{moreDisruptive, lessDisruptive})
-	if chosen := leastDisruptiveCandidate(scored); chosen.key != "node-b" {
-		t.Fatalf("chosen=%s, want node-b", chosen.key)
-	}
 	ordered := orderScoredCandidates(scored)
 	if len(ordered) != 2 || ordered[0].candidate.key != "node-b" ||
 		ordered[0].score.Total >= ordered[1].score.Total {
@@ -446,6 +492,42 @@ func TestDrain_ResourceCapacityPreflightSkipsFeasibilitySimulation(t *testing.T)
 	}
 	if snap.feasibilityCalls != 0 {
 		t.Fatalf("capacity-rejected candidates must not enter feasibility simulation, calls=%d", snap.feasibilityCalls)
+	}
+}
+
+func TestPreliminaryCandidatesExcludeAggregateCapacityFailuresBeforeScoring(t *testing.T) {
+	// The 16-card node cannot be drained because the two 8-card nodes provide only
+	// six cards of receiver slack. The smaller candidates remain eligible, proving
+	// that the aggregate capacity check runs before the scoring candidate set is built.
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("large", 16, gpuTask("large-task", "large-group", 12)),
+		capNode("small", 8, gpuTask("small-task", "small-group", 2)),
+		capNode("full", 8, gpuTask("full-task", "full-group", 8)),
+	}}
+	session := drainSession(snap, allMovable, 1, 0, 0)
+	defer framework.CloseSession(session)
+
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(snap.nodes))
+	for _, node := range snap.nodes {
+		nodesByName[node.Name] = node
+	}
+	state := newDrainState(snap.nodes, nodesByName, session, allMovable, gpu)
+	state.prepareUnits(nodeUnits(snap))
+	preliminary := state.preliminaryCandidates()
+
+	keys := make([]string, 0, len(preliminary))
+	for _, candidate := range preliminary {
+		keys = append(keys, candidate.key)
+	}
+	sort.Strings(keys)
+	if got, want := fmt.Sprint(keys), fmt.Sprint([]string{"full", "small"}); got != want {
+		t.Fatalf("preliminary candidates=%v, want %v", keys, []string{"full", "small"})
+	}
+	if !state.stuckUnits["large"] {
+		t.Fatal("aggregate-capacity failure must deactivate the large candidate")
+	}
+	if state.prunedByReason["insufficient_receiver_resource"] != 1 {
+		t.Fatalf("capacity prune count=%d, want 1", state.prunedByReason["insufficient_receiver_resource"])
 	}
 }
 

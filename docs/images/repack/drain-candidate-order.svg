@@ -1,9 +1,9 @@
 <svg viewBox="0 0 1120 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif" role="img">
-  <title>腾空候选排序：过滤不可行候选后选择中断影响最小的方案</title>
-  <desc>在同一轮规划中，node-a、node-b 和 node-c 都是初始腾空候选。node-b 因存在不可迁移的目标资源 Pod 被过滤；node-a 与 node-c 均能通过迁移模拟，但 node-a 的中断影响总分更低，因此被选中。更新模拟状态后，下一轮重新评估剩余候选。</desc>
+  <title>腾空候选排序：扰动预排序后惰性验证调度可行性</title>
+  <desc>node-b 因存在不可迁移的目标资源 Pod 在静态准备阶段被过滤。node-a 与 node-c 进入扰动预排序；node-a 排名第一并通过完整调度模拟，因此立即被选中，node-c 无需执行本轮模拟。提交后重新评分剩余活动候选。</desc>
   <defs><marker id="a" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1c7ed6"/></marker><marker id="g" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#2f9e44"/></marker></defs>
   <rect width="1120" height="420" fill="#fff"/>
-  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">腾空候选排序：先验证可行性，再比较工作负载中断影响</text>
+  <text x="32" y="32" font-size="17" font-weight="700" fill="#1f2328">腾空候选排序：先按扰动预排序，再惰性验证调度可行性</text>
   <text x="32" y="56" font-size="11" fill="#57606a">排序对象是节点或 HyperNode 腾空单元；实际通过 Eviction API 驱逐的是单元上的可迁移 Pod。</text>
 
   <text x="44" y="92" font-size="12" font-weight="700" fill="#1f2328">第 N 轮 · 三个初始候选</text>
@@ -12,7 +12,7 @@
     <text x="20" y="30" font-size="12" font-weight="700" fill="#1f2328">node-a · 2/8 GPU</text>
     <g transform="translate(20,48)"><rect width="18" height="18" rx="3" fill="#1c7ed6"/><rect x="24" width="18" height="18" rx="3" fill="#1c7ed6"/><g fill="#fff" stroke="#9aa4b2" stroke-dasharray="3 2"><rect x="48" width="18" height="18" rx="3"/><rect x="72" width="18" height="18" rx="3"/><rect x="96" width="18" height="18" rx="3"/><rect x="120" width="18" height="18" rx="3"/><rect x="144" width="18" height="18" rx="3"/><rect x="168" width="18" height="18" rx="3"/></g></g>
     <text x="20" y="91" font-size="10" fill="#57606a">✓ 可腾空 · 不超预算</text>
-    <text x="20" y="110" font-size="10" fill="#57606a">✓ 所有 Pod 模拟调度成功</text>
+    <text x="20" y="110" font-size="10" fill="#57606a">✓ 预排序第 1 · 完整调度模拟成功</text>
     <text x="20" y="129" font-size="10" fill="#57606a">✓ PodGroup 仍满足 MinAvailable</text>
     <rect x="20" y="142" width="208" height="22" rx="6" fill="#2f9e44"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#fff">中断影响最低 · 本轮选择</text>
   </g>
@@ -29,23 +29,23 @@
     <rect width="248" height="174" rx="11" fill="#fff8e8" stroke="#e8890c"/>
     <text x="20" y="30" font-size="12" font-weight="700" fill="#1f2328">node-c · 2/8 GPU</text>
     <g transform="translate(20,48)"><rect width="18" height="18" rx="3" fill="#8b5cf6"/><rect x="24" width="18" height="18" rx="3" fill="#8b5cf6"/><g fill="#fff" stroke="#9aa4b2" stroke-dasharray="3 2"><rect x="48" width="18" height="18" rx="3"/><rect x="72" width="18" height="18" rx="3"/><rect x="96" width="18" height="18" rx="3"/><rect x="120" width="18" height="18" rx="3"/><rect x="144" width="18" height="18" rx="3"/><rect x="168" width="18" height="18" rx="3"/></g></g>
-    <text x="20" y="91" font-size="10" fill="#57606a">✓ 可腾空 · 模拟调度成功</text>
-    <text x="20" y="110" font-size="10" fill="#57606a">△ PodGroup 低于 MinAvailable</text>
-    <text x="20" y="129" font-size="10" fill="#57606a">△ 受影响目标资源量更高</text>
-    <rect x="20" y="142" width="208" height="22" rx="6" fill="#fff" stroke="#e8890c"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#e8890c">可行但中断影响更高 · 排序靠后</text>
+    <text x="20" y="91" font-size="10" fill="#57606a">✓ 基础条件、预算与总容量预检通过</text>
+    <text x="20" y="110" font-size="10" fill="#57606a">△ 预计 PodGroup 低于 MinAvailable</text>
+    <text x="20" y="129" font-size="10" fill="#57606a">△ 预计受影响目标资源量更高</text>
+    <rect x="20" y="142" width="208" height="22" rx="6" fill="#fff" stroke="#e8890c"/><text x="124" y="157" text-anchor="middle" font-size="9.5" font-weight="700" fill="#e8890c">预排序第 2 · 本轮无需完整模拟</text>
   </g>
 
   <path d="M852,199 L890,199" fill="none" stroke="#1c7ed6" stroke-width="2" marker-end="url(#a)"/>
   <rect x="904" y="112" width="176" height="174" rx="11" fill="#eaf4ff" stroke="#1c7ed6"/>
   <text x="992" y="140" text-anchor="middle" font-size="12" font-weight="700" fill="#1f2328">本轮决策</text>
-  <text x="992" y="169" text-anchor="middle" font-size="10" fill="#57606a">候选内归一化</text>
-  <text x="992" y="188" text-anchor="middle" font-size="10" fill="#57606a">加权汇总五个维度</text>
+  <text x="992" y="169" text-anchor="middle" font-size="10" fill="#57606a">扰动评分预排序</text>
+  <text x="992" y="188" text-anchor="middle" font-size="10" fill="#57606a">按序执行完整模拟</text>
   <rect x="924" y="208" width="136" height="34" rx="7" fill="#2f9e44"/>
-  <text x="992" y="230" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">选择 node-a</text>
+  <text x="992" y="230" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">首个可行 node-a</text>
   <text x="992" y="263" text-anchor="middle" font-size="9.5" fill="#57606a">分数并列：收益权重 → 名称</text>
 
   <path d="M992,297 L992,324 L232,324 L232,305" fill="none" stroke="#2f9e44" stroke-width="2" marker-end="url(#g)"/>
   <text x="612" y="319" text-anchor="middle" font-size="10" font-weight="700" fill="#2f9e44">更新模拟状态后，接收容量与 PodGroup 状态随之变化</text>
   <rect x="154" y="350" width="812" height="36" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
-  <text x="560" y="373" text-anchor="middle" font-size="10.5" fill="#1f2328">进入下一轮时重新检查全部剩余候选；不会沿用一份已经过期的静态节点顺序。</text>
+  <text x="560" y="373" text-anchor="middle" font-size="10.5" fill="#1f2328">进入下一轮时按最新容量和工作负载影响重新评分剩余活动候选。</text>
 </svg>

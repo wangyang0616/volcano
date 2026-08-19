@@ -73,6 +73,23 @@ func TestFormatCandidateOrderSummaryShowsOnlyThreeBestAndThreeWorst(t *testing.T
 	}
 }
 
+func TestDisplayedCandidateIndexesIncludesSelectedMiddleCandidate(t *testing.T) {
+	indexes, omitted := displayedCandidateIndexes(10, 4)
+	want := []int{0, 1, 2, 4, 7, 8, 9}
+	if fmt.Sprint(indexes) != fmt.Sprint(want) {
+		t.Fatalf("displayed indexes=%v, want %v", indexes, want)
+	}
+	if omitted != 3 {
+		t.Fatalf("omitted=%d, want 3", omitted)
+	}
+
+	edgeIndexes, edgeOmitted := displayedCandidateIndexes(10, 1)
+	wantEdges := []int{0, 1, 2, 7, 8, 9}
+	if fmt.Sprint(edgeIndexes) != fmt.Sprint(wantEdges) || edgeOmitted != 4 {
+		t.Fatalf("selected edge changed bounded output: indexes=%v omitted=%d", edgeIndexes, edgeOmitted)
+	}
+}
+
 func TestCandidateSelectionReasonExplainsDecision(t *testing.T) {
 	scored := func(key string, score, benefit float64) scoredCandidate {
 		return scoredCandidate{
@@ -81,34 +98,45 @@ func TestCandidateSelectionReasonExplainsDecision(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name    string
-		ordered []scoredCandidate
-		want    string
+		name             string
+		ordered          []scoredCandidate
+		selectedPosition int
+		want             string
 	}{
 		{
-			name:    "only feasible target",
-			ordered: []scoredCandidate{scored("node-a", 0, 1)},
-			want:    "only feasible drain target",
+			name:             "only active target",
+			ordered:          []scoredCandidate{scored("node-a", 0, 1)},
+			selectedPosition: 1,
+			want:             "only active drain target",
 		},
 		{
-			name:    "lowest score",
-			ordered: []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.2, 2)},
-			want:    "lowest disruption score",
+			name:             "lowest score",
+			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.2, 2)},
+			selectedPosition: 1,
+			want:             "lowest disruption score",
 		},
 		{
-			name:    "benefit tie breaker",
-			ordered: []scoredCandidate{scored("node-a", 0.1, 2), scored("node-b", 0.1, 1)},
-			want:    "score tie; higher drain benefit",
+			name:             "benefit tie breaker",
+			ordered:          []scoredCandidate{scored("node-a", 0.1, 2), scored("node-b", 0.1, 1)},
+			selectedPosition: 1,
+			want:             "score tie; higher drain benefit",
 		},
 		{
-			name:    "name tie breaker",
-			ordered: []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.1, 1)},
-			want:    "score and drain benefit tie; lexical target name",
+			name:             "name tie breaker",
+			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.1, 1)},
+			selectedPosition: 1,
+			want:             "score and drain benefit tie; lexical target name",
+		},
+		{
+			name:             "lazy feasibility fallback",
+			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.2, 1)},
+			selectedPosition: 2,
+			want:             "first scheduler-feasible target in disruption order",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := candidateSelectionReason(test.ordered); got != test.want {
+			if got := candidateSelectionReason(test.ordered, test.selectedPosition); got != test.want {
 				t.Fatalf("candidateSelectionReason()=%q, want %q", got, test.want)
 			}
 		})

@@ -15,14 +15,14 @@ limitations under the License.
 */
 
 // Package drain is the core (algorithm A): node-anchored, incremental,
-// gang-aware greedy. A single dynamic pass repeatedly re-evaluates every
-// still-freeable unit against the committed moves so far and commits the feasible
-// one whose prospective plan is least disruptive — because gang damage is scored over
-// the whole plan, a unit that reuses an already-broken gang is cheap, so the
-// dynamic re-pick naturally prefers it (that's the "incremental gang-aware"
-// part). Vacating a unit is atomic (all member nodes must empty via the
-// feasibility solver, INV-RESCHED) and bounded by the disruption budget. The loop
-// runs until no unit can be freed, then the plan is kept iff it meets MinNodesFreed.
+// gang-aware greedy. Each step cheaply ranks the active drain units against the
+// committed moves, then lazily invokes the scheduler-faithful relocation solver
+// in that order. The first feasible unit is committed. This preserves complete
+// scheduler validation for the selected plan without paying that cost for every
+// candidate in a large cluster. Because gang damage is scored over the whole
+// prospective plan, a unit that reuses an already-affected gang remains cheap.
+// Vacating a unit is atomic, bounded by the disruption budget, and the final plan
+// is kept only when it meets the configured benefit constraints.
 //
 // "Unit" generalizes "node": a node-domain plugin yields one single-node unit per
 // node; a hypernode-domain plugin yields multi-node units. With both enabled
@@ -50,6 +50,8 @@ func init() {
 }
 
 type drainCore struct{}
+
+const prospectiveReceiver = "<prospective>"
 
 func (*drainCore) Name() string { return framework.CoreDrain }
 
@@ -109,10 +111,22 @@ func (*drainCore) Plan(ssn *framework.Session) (*api.RepackPlan, bool) {
 // it and the disruption-budget deltas those moves imply.
 type candidate struct {
 	unit               api.FreeableUnit
+	inUnit             map[string]bool
+	victims            []*schedapi.TaskInfo
+	scoringMoves       []*api.Move
 	placed             []*api.Move
+	podGroups          map[schedapi.JobID]bool
 	newPodGroups       map[schedapi.JobID]bool
 	additionalResource int64
 	key                string
+}
+
+// preparedUnit contains the immutable data collected once for a drain unit.
+// active is monotonic: a unit leaves the set after it is proven infeasible,
+// exceeds a monotonic budget, is drained, or receives a committed move.
+type preparedUnit struct {
+	candidate candidate
+	active    bool
 }
 
 type scoredCandidate struct {
@@ -128,7 +142,6 @@ type drainState struct {
 	// Fixed for the whole pass.
 	ssn                 *framework.Session
 	snapshot            framework.Snapshot
-	nodes               []*schedapi.NodeInfo
 	nodesByName         map[string]*schedapi.NodeInfo
 	movable             api.Movable
 	resource            v1.ResourceName
@@ -137,6 +150,9 @@ type drainState struct {
 	hasPodGroupLimit    bool
 	hasResourceLimit    bool
 	alwaysStaysOccupied map[string]bool // immovable or outside drain scope
+	receiverNodes       []*schedapi.NodeInfo
+	receiverSlackByNode map[string]int64
+	receiverResource    int64 // remaining target-resource slack across eligible receivers
 	// futureDrainPodGroupsByNode caches the movable Pod/resource totals used to
 	// assess each node as a possible next drain target.
 	futureDrainPodGroupsByNode map[string]map[schedapi.JobID]api.PodGroupMoveAggregate
@@ -154,15 +170,16 @@ type drainState struct {
 	candidatesEvaluated     int
 	feasibilitySimulations  int
 	prunedByReason          map[string]int
+	activeUnits             []*preparedUnit
 	moves                   []*api.Move
 	freedNodes              []string
 	freedUnits              []api.FreeableUnit
 }
 
-// drainGreedy is the single dynamic pass. Each step re-evaluates every still-
-// freeable unit and commits the feasible one whose prospective plan is least
-// disruptive. Terminates because each commit drains >= 1 node, and a drained node
-// never becomes freeable again.
+// drainGreedy is the single dynamic pass. Static unit facts are prepared once.
+// Each step ranks active units with cheap prospective moves, then runs complete
+// scheduler simulation lazily until the first feasible candidate is found.
+// Terminates because each commit drains >= 1 node and inactive units never return.
 func drainGreedy(
 	nodes []*schedapi.NodeInfo,
 	nodesByName map[string]*schedapi.NodeInfo,
@@ -172,6 +189,7 @@ func drainGreedy(
 	targetResource v1.ResourceName,
 ) *api.RepackPlan {
 	s := newDrainState(nodes, nodesByName, ssn, movable, targetResource)
+	s.prepareUnits(units)
 	planningStartTime := time.Now()
 	defer func() {
 		metrics.ObservePlanner(string(ssn.Mode()), s.candidatesEvaluated, s.feasibilitySimulations, s.prunedByReason)
@@ -180,23 +198,23 @@ func drainGreedy(
 			"prunedByReason", s.prunedByReason, "duration", time.Since(planningStartTime))
 	}()
 	for step := 1; ; step++ {
-		// 1. Evaluate every still-freeable unit against the committed moves so far.
-		var feasible []candidate
-		for _, unit := range units {
-			s.candidatesEvaluated++
-			if c, ok := s.evaluateUnit(unit); ok {
-				feasible = append(feasible, c)
-			}
-		}
-		klog.V(4).InfoS("repack drain: step evaluated units", "step", step,
-			"totalUnits", len(units), "feasibleThisStep", len(feasible), "nodesFreedSoFar", len(s.freedNodes))
-		scoredCandidates := s.scoreCandidates(feasible)
-		s.logCandidateOrder(step, scoredCandidates)
-		if len(scoredCandidates) == 0 {
+		// 1. Rank all currently active candidates without constructing receiver
+		// lists, cloning scheduler state, or running predicates.
+		preliminary := s.preliminaryCandidates()
+		if len(preliminary) == 0 {
 			break
 		}
-		// 2. Pick the least-disruptive one and 3. commit it.
-		chosen := leastDisruptiveCandidate(scoredCandidates)
+		ordered := orderScoredCandidates(s.scoreCandidates(preliminary))
+		klog.V(4).InfoS("repack drain: step ranked active units", "step", step,
+			"activeCandidates", len(ordered), "nodesFreedSoFar", len(s.freedNodes))
+
+		// 2. Lazily run the expensive scheduler simulation in disruption order.
+		chosen, selectedPosition, ok := s.firstFeasibleCandidate(ordered)
+		if !ok {
+			break
+		}
+		s.logCandidateOrder(step, ordered, selectedPosition)
+		// 3. Commit the first scheduler-feasible candidate.
 		klog.V(4).InfoS("repack drain: committing unit", "step", step, "unit", chosen.key,
 			"freesNodes", chosen.unit.Nodes, "moves", len(chosen.placed), "movedResource", chosen.additionalResource)
 		s.commit(chosen)
@@ -216,7 +234,6 @@ func newDrainState(
 	state := &drainState{
 		ssn:                        ssn,
 		snapshot:                   ssn.Snapshot(),
-		nodes:                      nodes,
 		nodesByName:                nodesByName,
 		movable:                    movable,
 		resource:                   targetResource,
@@ -225,6 +242,8 @@ func newDrainState(
 		hasPodGroupLimit:           ssn.LimitPodGroups(),
 		hasResourceLimit:           ssn.LimitResource(),
 		alwaysStaysOccupied:        make(map[string]bool, len(nodes)),
+		receiverNodes:              make([]*schedapi.NodeInfo, 0, len(nodes)),
+		receiverSlackByNode:        make(map[string]int64, len(nodes)),
 		futureDrainPodGroupsByNode: make(map[string]map[schedapi.JobID]api.PodGroupMoveAggregate, len(nodes)),
 		drained:                    make(map[string]bool),
 		filled:                     make(map[string]bool),
@@ -246,20 +265,30 @@ func newDrainState(
 		state.futureDrainPodGroupsByNode[node.Name] = aggregateTasksByPodGroup(
 			api.VictimsOf(node, movable, targetResource), targetResource,
 		)
+		if occupiesAccelerator(node, targetResource) {
+			state.receiverNodes = append(state.receiverNodes, node)
+			slack := receiverSlack(node, targetResource)
+			state.receiverSlackByNode[node.Name] = slack
+			state.receiverResource += max(slack, 0)
+		}
 	}
 	return state
 }
 
-// evaluateUnit checks whether `unit` can be vacated now — every victim relocates
-// onto a surviving receiver within the disruption budget — and returns the moves
-// that vacate it. ok=false means "not freeable this step".
-func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
-	key := unitKey(unit)
-	if s.stuckUnits[key] {
-		s.recordPruned("cached_infeasible")
-		return candidate{}, false
+// prepareUnits performs all snapshot-stable drain checks and materializes the
+// victims/scoring moves once. Dynamic state and budgets are handled per step.
+func (s *drainState) prepareUnits(units []api.FreeableUnit) {
+	s.activeUnits = make([]*preparedUnit, 0, len(units))
+	for _, unit := range units {
+		if prepared, ok := s.prepareUnit(unit); ok {
+			s.activeUnits = append(s.activeUnits, &preparedUnit{candidate: prepared, active: true})
+		}
 	}
-	inUnit, diagnostics, ok := freeableNow(unit, s.nodesByName, s.drained, s.filled, s.movable, s.resource)
+}
+
+func (s *drainState) prepareUnit(unit api.FreeableUnit) (candidate, bool) {
+	key := unitKey(unit)
+	inUnit, diagnostics, ok := freeableNow(unit, s.nodesByName, nil, nil, s.movable, s.resource)
 	if !ok {
 		logNonFreeableNodes(key, diagnostics, s.resource)
 		return candidate{}, false
@@ -288,62 +317,129 @@ func (s *drainState) evaluateUnit(unit api.FreeableUnit) (candidate, bool) {
 	// Calculate cheap, deterministic prospective deltas before invoking the full
 	// scheduler simulation. Under a tight maxPerRun this avoids cloning cycle
 	// state and running predicates for candidates that cannot be selected anyway.
-	newPodGroups := make(map[schedapi.JobID]bool)
+	podGroups := make(map[schedapi.JobID]bool)
 	var additionalResource int64
 	for _, v := range victims {
-		if !s.movedPodGroups[v.Job] {
-			newPodGroups[v.Job] = true
-		}
+		podGroups[v.Job] = true
 		additionalResource += api.Scalar(v.InitResreq, s.resource)
 	}
-	if (s.hasPodGroupLimit || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(newPodGroups) > s.maxPodGroups {
-		s.recordPruned("max_pod_groups")
-		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.podGroups", "unit", key,
-			"wouldBe", len(s.movedPodGroups)+len(newPodGroups), "max", s.maxPodGroups)
-		return candidate{}, false
+	scoringMoves := make([]*api.Move, 0, len(victims))
+	for _, victim := range victims {
+		scoringMoves = append(scoringMoves, &api.Move{Task: victim, From: victim.NodeName, To: prospectiveReceiver})
 	}
-	if (s.hasResourceLimit || s.maxResource > 0) && s.movedResource+additionalResource > s.maxResource {
-		s.recordPruned("max_resource")
-		klog.V(5).InfoS("repack drain: skip unit — would exceed maxPerRun.resources", "unit", key,
-			"wouldBe", s.movedResource+additionalResource, "max", s.maxResource)
-		return candidate{}, false
+	return candidate{
+		unit: unit, inUnit: inUnit, victims: victims, scoringMoves: scoringMoves,
+		podGroups: podGroups, additionalResource: additionalResource, key: key,
+	}, true
+}
+
+// preliminaryCandidates applies cheap, monotonic state, budget, and aggregate
+// receiver-capacity checks. Candidates rejected here never enter disruption
+// scoring and are removed permanently from the active set.
+func (s *drainState) preliminaryCandidates() []candidate {
+	preliminary := make([]candidate, 0, len(s.activeUnits))
+	active := s.activeUnits[:0]
+	for _, prepared := range s.activeUnits {
+		if !prepared.active {
+			continue
+		}
+		candidate := prepared.candidate
+		if s.stuckUnits[candidate.key] {
+			prepared.active = false
+			continue
+		}
+		if s.unitConsumed(candidate.unit) {
+			prepared.active = false
+			continue
+		}
+		s.candidatesEvaluated++
+		candidate.newPodGroups = make(map[schedapi.JobID]bool)
+		for podGroup := range candidate.podGroups {
+			if !s.movedPodGroups[podGroup] {
+				candidate.newPodGroups[podGroup] = true
+			}
+		}
+		if (s.hasPodGroupLimit || s.maxPodGroups > 0) && len(s.movedPodGroups)+len(candidate.newPodGroups) > s.maxPodGroups {
+			s.recordPruned("max_pod_groups")
+			prepared.active = false
+			continue
+		}
+		if (s.hasResourceLimit || s.maxResource > 0) && s.movedResource+candidate.additionalResource > s.maxResource {
+			s.recordPruned("max_resource")
+			prepared.active = false
+			continue
+		}
+		if !s.hasAggregateReceiverCapacity(candidate) {
+			s.recordPruned("insufficient_receiver_resource")
+			klog.V(5).InfoS("repack drain: skip unit — aggregate receiver resource capacity is insufficient",
+				"unit", candidate.key, "required", candidate.additionalResource)
+			s.markUnitInfeasible(candidate.key, candidate.unit)
+			prepared.active = false
+			continue
+		}
+		preliminary = append(preliminary, candidate)
+		active = append(active, prepared)
 	}
-	receivers := s.receiversInPreferenceOrder(inUnit, victims)
-	if !s.receiversHaveResourceCapacity(receivers, additionalResource) {
-		s.recordPruned("insufficient_receiver_resource")
-		// This is only a necessary resource-capacity check; scheduler predicates
-		// remain authoritative for every candidate that passes it.
-		klog.V(5).InfoS("repack drain: skip unit — receiver resource capacity is insufficient", "unit", key,
-			"required", additionalResource, "receivers", len(receivers))
-		s.markUnitInfeasible(key, unit)
-		return candidate{}, false
-	}
-	klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", key,
-		"victims", taskNames(victims), "victimCount", len(victims),
-		"receivers", nodeNames(receivers), "receiverCount", len(receivers))
-	// Feasibility = the scheduler-faithful relocation feasibility check: it simulates evicting
-	// these victims and greedily placing them onto the receivers (in the preference
-	// order we pass) with the full scheduler filter stack, over the moves already
-	// committed this pass.
-	s.feasibilitySimulations++
-	placed, feasible := s.snapshot.FeasibleRelocation(s.moves, victims, receivers)
-	if !feasible {
-		// Vacatability is monotonic (slack only shrinks), so a unit infeasible now
-		// stays infeasible — remember its nodes as preferred (staying) receivers.
-		klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
-			"unit", key, "victims", len(victims), "receivers", len(receivers))
-		s.markUnitInfeasible(key, unit)
-		s.recordPruned("scheduler_infeasible")
-		return candidate{}, false
-	}
-	if klog.V(5).Enabled() {
-		for _, m := range placed {
-			klog.V(5).InfoS("repack drain: victim placement", "unit", key,
-				"pod", m.Task.Name, "from", m.From, "to", m.To)
+	s.activeUnits = active
+	return preliminary
+}
+
+func (s *drainState) unitConsumed(unit api.FreeableUnit) bool {
+	for _, nodeName := range unit.Nodes {
+		if s.drained[nodeName] || s.filled[nodeName] {
+			return true
 		}
 	}
-	klog.V(5).InfoS("repack drain: unit FEASIBLE", "unit", key, "moves", len(placed), "movedResource", additionalResource)
-	return candidate{unit: unit, placed: placed, newPodGroups: newPodGroups, additionalResource: additionalResource, key: key}, true
+	return false
+}
+
+// firstFeasibleCandidate is the lazy boundary: candidates are already ordered
+// by cheap disruption scoring, and complete scheduler simulation stops at the
+// first success. selectedPosition is one-based within the preliminary order.
+func (s *drainState) firstFeasibleCandidate(ordered []scoredCandidate) (candidate, int, bool) {
+	for index := range ordered {
+		candidate := ordered[index].candidate
+		receivers := s.receiversInPreferenceOrder(candidate.inUnit, candidate.victims)
+		if !s.receiversHaveResourceCapacity(receivers, candidate.additionalResource) {
+			s.recordPruned("insufficient_receiver_resource")
+			klog.V(5).InfoS("repack drain: skip unit — receiver resource capacity is insufficient", "unit", candidate.key,
+				"required", candidate.additionalResource, "receivers", len(receivers))
+			s.markUnitInfeasible(candidate.key, candidate.unit)
+			continue
+		}
+		klog.V(5).InfoS("repack drain: evaluating unit feasibility", "unit", candidate.key,
+			"victims", taskNames(candidate.victims), "victimCount", len(candidate.victims),
+			"receivers", nodeNames(receivers), "receiverCount", len(receivers))
+		s.feasibilitySimulations++
+		placed, feasible := s.snapshot.FeasibleRelocation(s.moves, candidate.victims, receivers)
+		if !feasible {
+			klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
+				"unit", candidate.key, "victims", len(candidate.victims), "receivers", len(receivers))
+			s.markUnitInfeasible(candidate.key, candidate.unit)
+			s.recordPruned("scheduler_infeasible")
+			continue
+		}
+		candidate.placed = placed
+		if klog.V(5).Enabled() {
+			for _, move := range placed {
+				klog.V(5).InfoS("repack drain: victim placement", "unit", candidate.key,
+					"pod", move.Task.Name, "from", move.From, "to", move.To)
+			}
+		}
+		return candidate, index + 1, true
+	}
+	return candidate{}, 0, false
+}
+
+// hasAggregateReceiverCapacity rejects an impossible drain in O(unit size)
+// before constructing and sorting an O(cluster size) receiver list. It is only
+// a necessary target-resource check; full scheduler predicates remain decisive.
+func (s *drainState) hasAggregateReceiverCapacity(candidate candidate) bool {
+	available := s.receiverResource
+	for nodeName := range candidate.inUnit {
+		available -= max(s.receiverSlackByNode[nodeName]-s.placedResourceByNode[nodeName], 0)
+	}
+	return available >= candidate.additionalResource
 }
 
 func (s *drainState) recordPruned(reason string) {
@@ -363,7 +459,7 @@ func runName(ssn *framework.Session) string {
 func (s *drainState) receiversHaveResourceCapacity(receivers []*schedapi.NodeInfo, requiredResource int64) bool {
 	var availableResource int64
 	for _, receiver := range receivers {
-		availableResource += receiverSlack(receiver, s.resource) - s.placedResourceByNode[receiver.Name]
+		availableResource += s.receiverSlackByNode[receiver.Name] - s.placedResourceByNode[receiver.Name]
 		if availableResource >= requiredResource {
 			return true
 		}
@@ -417,9 +513,16 @@ func (s *drainState) receiversInPreferenceOrder(
 	candidateVictims []*schedapi.TaskInfo,
 ) []*schedapi.NodeInfo {
 	candidatePodGroupMoves := aggregateTasksByPodGroup(candidateVictims, s.resource)
-	preferences := make([]receiverPreference, 0, len(s.nodes))
-	for _, n := range s.nodes {
-		if inUnit[n.Name] || s.drained[n.Name] || !occupiesAccelerator(n, s.resource) {
+	preferences := make([]receiverPreference, 0, len(s.receiverNodes))
+	minimumVictimResource := minTaskResource(candidateVictims, s.resource)
+	for _, n := range s.receiverNodes {
+		if inUnit[n.Name] || s.drained[n.Name] {
+			continue
+		}
+		availableResource := s.receiverSlackByNode[n.Name] - s.placedResourceByNode[n.Name]
+		// Every victim requests the target resource. A receiver that cannot fit
+		// even the smallest victim can never be selected by the full solver.
+		if availableResource < minimumVictimResource {
 			continue
 		}
 		staysOccupied := s.staysOccupied(n)
@@ -431,7 +534,7 @@ func (s *drainState) receiversInPreferenceOrder(
 			node:              n,
 			staysOccupied:     staysOccupied,
 			futureDrainImpact: impact,
-			availableResource: receiverSlack(n, s.resource) - s.placedResourceByNode[n.Name],
+			availableResource: availableResource,
 		})
 	}
 	sort.SliceStable(preferences, func(i, j int) bool {
@@ -464,6 +567,17 @@ func (s *drainState) receiversInPreferenceOrder(
 		receivers = append(receivers, preference.node)
 	}
 	return receivers
+}
+
+func minTaskResource(tasks []*schedapi.TaskInfo, targetResource v1.ResourceName) int64 {
+	var minimum int64
+	for _, task := range tasks {
+		requested := api.Scalar(task.InitResreq, targetResource)
+		if requested > 0 && (minimum == 0 || requested < minimum) {
+			minimum = requested
+		}
+	}
+	return minimum
 }
 
 // measureFutureDrainImpact compares the prospective plan before and after the
@@ -562,11 +676,11 @@ func (s *drainState) staysOccupied(n *schedapi.NodeInfo) bool {
 		s.provenStuck[n.Name]
 }
 
-// scoreCandidates orders feasible candidates by the deterministic tie-breakers,
-// then evaluates their disruption scores. Keeping this order means a linear
-// minimum scan selects higher unit benefit and lexical unit key when scores tie.
-func (s *drainState) scoreCandidates(feasible []candidate) []scoredCandidate {
-	orderedCandidates := append([]candidate(nil), feasible...)
+// scoreCandidates orders active candidates by deterministic tie-breakers, then
+// evaluates their preliminary disruption scores. Stable score ordering preserves
+// higher unit benefit and lexical unit key when scores tie.
+func (s *drainState) scoreCandidates(activeCandidates []candidate) []scoredCandidate {
+	orderedCandidates := append([]candidate(nil), activeCandidates...)
 	sort.SliceStable(orderedCandidates, func(i, j int) bool {
 		if orderedCandidates[i].unit.Weight != orderedCandidates[j].unit.Weight {
 			return orderedCandidates[i].unit.Weight > orderedCandidates[j].unit.Weight
@@ -575,7 +689,11 @@ func (s *drainState) scoreCandidates(feasible []candidate) []scoredCandidate {
 	})
 	candidatePlans := make([]*api.CandidatePlan, len(orderedCandidates))
 	for index, candidate := range orderedCandidates {
-		candidatePlans[index] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: candidate.placed}
+		moves := candidate.scoringMoves
+		if len(moves) == 0 {
+			moves = candidate.placed // direct unit tests and already-realized candidates
+		}
+		candidatePlans[index] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: moves}
 	}
 	scores := s.ssn.DisruptionScores(candidatePlans)
 	scored := make([]scoredCandidate, len(orderedCandidates))
@@ -583,19 +701,6 @@ func (s *drainState) scoreCandidates(feasible []candidate) []scoredCandidate {
 		scored[index] = scoredCandidate{candidate: orderedCandidates[index], score: scores[index]}
 	}
 	return scored
-}
-
-func leastDisruptiveCandidate(scored []scoredCandidate) candidate {
-	if len(scored) == 0 {
-		return candidate{}
-	}
-	best := 0
-	for index := 1; index < len(scored); index++ {
-		if scored[index].score.Total < scored[best].score.Total {
-			best = index
-		}
-	}
-	return scored[best].candidate
 }
 
 func orderScoredCandidates(scored []scoredCandidate) []scoredCandidate {
@@ -614,6 +719,7 @@ func (s *drainState) commit(chosen candidate) {
 		if m.Task != nil {
 			movedResource := api.Scalar(m.Task.InitResreq, s.resource)
 			s.placedResourceByNode[m.To] += movedResource
+			s.receiverResource -= movedResource
 			s.movedPodsByPodGroup[m.Task.Job]++
 			s.movedResourceByPodGroup[m.Task.Job] += movedResource
 		}
@@ -624,6 +730,7 @@ func (s *drainState) commit(chosen candidate) {
 	s.movedResource += chosen.additionalResource
 	for _, nodeName := range chosen.unit.Nodes {
 		s.drained[nodeName] = true
+		s.receiverResource -= max(s.receiverSlackByNode[nodeName]-s.placedResourceByNode[nodeName], 0)
 		s.freedNodes = append(s.freedNodes, nodeName)
 	}
 	s.freedUnits = append(s.freedUnits, chosen.unit)

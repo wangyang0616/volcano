@@ -1529,31 +1529,31 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
    (M,B,A)   ← MeasureResource(域内节点, R)         # 碎片度量，§4.12
    收益上界  ← B−A                                  # 理论最多可腾空节点数
 
-2. 候选腾空节点（drain 候选）排序  —— 节点是「收益单位」
-   freeable  ← { n | NodeFreeable(n, movable) }     # 非空且其上 pod 全可动
-   按「腾空成本」升序：受影响 gang 少且小、占用率低者优先
+2. 一次性准备活动候选
+   active ← { n | NodeFreeable(n, movable) }         # 非空且目标资源 pod 全可动
+   缓存每个候选的 victims、工作负载集合、迁移资源量
+   缓存接收节点目标资源余量和工作负载聚合信息
 
-3. 逐节点 drain（外层循环 = 节点）
-   retained  ← 其余保留节点（含其空闲碎片）
-   for n in freeable（成本低 → 高）:
-       victims ← VictimsOf(n, movable)              # n 上的可动 pod
-       gangs   ← victims 按 PodGroup 聚合，FFD 大 gang 先   ←── PodGroup 是「动作单位」
-       moves   ← 对每个 gang，best-fit 填入 retained 的碎片
-                 （留原地优先、不点亮空节点；§4.14.0 落点规则）
-       # INV-RESCHED 硬校验（§4.14.2）：所有被挪 pod 都要有可行落点
-       if not FeasibleRelocation(committed, victims, retained):  放弃 n，continue
-       # 扰动预算
-       if 受影响 gang 数/卡数 + 本轮 > 预算:                  放弃 n，continue
-       # 原子提交：只有 n 真被清空才算收益
-       提交 moves；nodesFreed++；更新 retained、累计 affectedPGs/cards
+3. 动态 drain（外层循环 = 整理步骤）
+   while active 非空:
+       preliminary ← 对 active 执行状态、maxPerRun、接收总容量预检
+       ordered     ← 按 CommittedMoves + ProspectiveMoves 的多策略扰动评分排序
+
+       for candidate in ordered（成本低 → 高）:
+           receivers ← 排除源节点/已腾空节点/无法容纳最小 victim 的节点
+           receivers ← 保持占用优先、未来腾空代价高优先、best-fit 排序
+           # INV-RESCHED：仅沿候选顺序惰性执行完整调度校验
+           moves, ok ← FeasibleRelocation(committed, candidate.victims, receivers)
+           if not ok: 将 candidate 标记为不可行；continue
+
+           原子提交首个可行 candidate
+           更新接收容量、预算、已影响工作负载和 active；break
+
+       本轮没有可行 candidate → 结束
 
 4. 收益门控（§4.13）
    ΔFragRate = −nodesFreed / ΣM
    达标且在预算内 → 生成 plan；否则 NoRepackNeeded（不驱逐）
-
-5. 多候选择优
-   不同 drain 集 / 顺序得到多个 candidate plan
-   → WeightedDisruption.Best 选最优（扰动评分 §4.13.3 / §4.16）
 ```
 
 **「留原地 vs 填碎片」落点规则（第 3 步内层）。** 对每个待安置 gang 的每个 pod：
@@ -1569,7 +1569,7 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
 | 第 1 步 | 碎片度量、理论最优 A、收益上界 B−A | `api/fragmentation.go`：`MeasureResource` / `OptimalNodes` / `WeightedFragRate`（后者多资源聚合，P1 预留） |
 | 第 2/3 步划片 | 可动判定、可腾空判定、victim 提取 | `api/movability.go`：`Movable` / `NodeFreeable` / `VictimsOf` |
 | 第 3 步落点+硬校验 | 克隆 node + cycle-state、`SimulatePredicateFn` 跑完整过滤栈模拟重落（INV-RESCHED） | `adapter/snapshot_session.go`：`FeasibleRelocation`。（纯 FFD+回溯求解器 `api/schedulability.go`：`Domain.Feasible` 保留为参考模型，仅单测 fake 复用） |
-| 第 5 步择优 | 归一化加权扰动评分（可插拔策略，§4.13.3/§4.16） | `framework/session.go`：`LeastDisruptive`；评分项由 `plugins/base`、`plugins/gang` 注册 |
+| 第 5 步择优 | 归一化加权扰动预排序；沿排序惰性执行完整调度校验，首个可行候选胜出（§4.13.3/§4.16） | `framework/session.go`：`DisruptionScores`；`core/drain/drain.go`：`firstFeasibleCandidate`；评分项由 `plugins/base`、`plugins/gang` 注册 |
 
 **整理前后效果（同一批作业拢紧、腾出 2 个整空节点、作业全程不停）：**
 
@@ -1634,15 +1634,17 @@ drain N2:  已满 → 跳过      drain N1: 已满 → 跳过
 
 ```mermaid
 flowchart TB
-    A["度量碎片 (M,B,A)<br/>MeasureResource（§4.12）"] --> B["挑候选腾空节点<br/>NodeFreeable + 腾空成本低优先"]
-    B --> C["取其上可动 gang<br/>FFD 大 gang 先"]
-    C --> D["沙箱：逐 gang best-fit<br/>填保留节点的碎片"]
-    D --> E{"FeasibleRelocation<br/>人人有家? (INV-RESCHED)"}
-    E -->|否| B
-    E -->|是| F{"够本?<br/>ΔFragRate≥门槛 且 ≤maxPerRun"}
-    F -->|不达标| X["NoRepackNeeded<br/>不驱逐"]
-    F -->|达标| G["多候选 → LeastDisruptive<br/>选扰动最小方案"]
-    G --> H{mode}
+    A["度量碎片 (M,B,A)<br/>MeasureResource（§4.12）"] --> B["一次性准备活动候选<br/>缓存 victims / 余量 / Gang 聚合"]
+    B --> C["状态、预算、总容量预检<br/>活动候选扰动预排序"]
+    C --> D["按顺序取下一个候选<br/>裁剪并排序接收节点"]
+    D --> E{"FeasibleRelocation<br/>完整调度校验通过?"}
+    E -->|否，继续下一名| D
+    E -->|是，首个可行| F["原子提交<br/>更新容量、预算和活动集合"]
+    F --> C
+    C -->|无活动候选| G{"最终收益达标?"}
+    D -->|候选耗尽| G
+    G -->|否| X["NoRepackNeeded<br/>不驱逐"]
+    G -->|是| H{mode}
     H -->|DryRun| R1["写 plan：moves/freedNodes"]
     H -->|Execute| R2["Eviction API 驱逐 + 提名 reconciler<br/>patch NominatedNodeName（§4.7.1）→ result"]
 ```
@@ -1890,7 +1892,7 @@ disruptionPolicy:
 
 #### 4.16.3 编排骨架（核心库只编排，策略全可插拔）
 
-> **注（与落地的关系）**：下面这段伪代码是**早期概念草图**，其 `TargetProfileFn`/`FragmentScoreFn`/`RepackBenefitFn`/`AddDisruptionCostFn` 等已按 §4.16.2「落地口径」收敛为五维插件面。**实际编排**为:`Action`(P0 `repack`) 调选定 `Core`(P0 `drain`) 的 `Plan(ssn)` → 增量破组感知贪心出计划 → `ssn.PlanAdmissible(plan)` 过硬约束闸(内置收益门控 + 插件 constraint) → `LeastDisruptive` 用软打分择优。碎片度量在 `api.MeasureResource`，不再是一个插件 Fn。下图仅存档设计意图。
+> **注（与落地的关系）**：下面这段伪代码是**早期概念草图**，其 `TargetProfileFn`/`FragmentScoreFn`/`RepackBenefitFn`/`AddDisruptionCostFn` 等已按 §4.16.2「落地口径」收敛为五维插件面。**实际编排**为:`Action`(P0 `repack`) 调选定 `Core`(P0 `drain`) 的 `Plan(ssn)` → `DisruptionScores` 对活动候选软打分预排序 → 沿排序惰性执行 `FeasibleRelocation` 并提交首个可行候选 → `ssn.PlanAdmissible(plan)` 过硬约束闸(内置收益门控 + 插件 constraint)。碎片度量在 `api.MeasureResource`，不再是一个插件 Fn。下图仅存档设计意图。
 
 ```text
 RepackEngine.Run(ssn, scope):                      // pkg/repackengine
@@ -1951,7 +1953,7 @@ func DefaultActions() []string { return []string{ActionRepack} } // P0 流水线
 
 #### 4.16.5 集中度精修的可插拔策略 + config 权重（对接 §4.14.6）
 
-> **⚠️ 本节属方案 B（集中度爬山）的策略/权重设计，方案 B 未实现（P1）**。P0 落地的 Core `drain` 用字典序增量代价 + `LeastDisruptive` 择优（§4.14.0 / §4.16.4.1），不涉及下面的 λ/净分调参。下文为 P1 设计存档。
+> **⚠️ 本节属方案 B（集中度爬山）的策略/权重设计，方案 B 未实现（P1）**。P0 落地的 Core `drain` 使用增量扰动评分预排序，并沿排序惰性校验首个可行候选（§4.14.0 / §4.16.4.1），不涉及下面的 λ/净分调参。下文为 P1 设计存档。
 
 集中度精修（§4.14.6）的"搬不搬、搬哪个"决策完全由**可插拔策略 + config 权重**驱动，平台改配置即可调出不同效果，核心库不写死。单步净分：
 
@@ -2150,7 +2152,7 @@ repack:
 
 #### 4.17.0 两方案的流程图与时序图（结合 Volcano 现有机制）
 
-> **⚠️ 本节 4 张图为早期两方案（A/B）设计示意，与当前 P0 落地有出入，仅作方案对比存档**：① 落地只有方案 A（Core `drain`），方案 B（集中度）未实现（P1）；② 当前 drain 是**单趟动态增量贪心、产出唯一 plan**（每步动态重选、`LeastDisruptive` 择优），**不是**图中"枚举多种腾空顺序→pickBest"的旧结构——**权威 P0 流程见 §4.14.3 的 mermaid**；③ 可行性用**克隆式 `Snapshot.FeasibleRelocation`**（`ssn.SimulatePredicateFn` 完整过滤栈），**不用** `framework.Statement` 沙箱（其 `unPipeline` 置空 `NodeName`，见 §4.14.1）；④ 落子为 **Eviction 子资源 + 提名 reconciler patch `NominatedNodeName`**（§4.7.1），非 `Statement.Commit`。所用 Volcano 机制：`Session`(Nodes `FutureIdle` / Jobs PodGroup)、`PrePredicateFn`/`SimulatePredicateFn`(落点校验=INV-RESCHED)、`pod.status.NominatedNodeName`(执行产物)。下方图中的 `BuildPlan`/`Consolidate`/`EngineFit`/`Statement`/`Domain.Feasible`/`pickBest` 均为旧标签。
+> **⚠️ 本节 4 张图为早期两方案（A/B）设计示意，与当前 P0 落地有出入，仅作方案对比存档**：① 落地只有方案 A（Core `drain`），方案 B（集中度）未实现（P1）；② 当前 drain 是**单趟动态增量贪心、产出唯一 plan**（每步对活动候选扰动预排序，惰性校验并提交首个可行候选），**不是**图中"枚举多种腾空顺序→pickBest"的旧结构——**权威 P0 流程见 §4.14.3 的 mermaid**；③ 可行性用**克隆式 `Snapshot.FeasibleRelocation`**（`ssn.SimulatePredicateFn` 完整过滤栈），**不用** `framework.Statement` 沙箱（其 `unPipeline` 置空 `NodeName`，见 §4.14.1）；④ 落子为 **Eviction 子资源 + 提名 reconciler patch `NominatedNodeName`**（§4.7.1），非 `Statement.Commit`。所用 Volcano 机制：`Session`(Nodes `FutureIdle` / Jobs PodGroup)、`PrePredicateFn`/`SimulatePredicateFn`(落点校验=INV-RESCHED)、`pod.status.NominatedNodeName`(执行产物)。下方图中的 `BuildPlan`/`Consolidate`/`EngineFit`/`Statement`/`Domain.Feasible`/`pickBest` 均为旧标签。
 
 **① 方案 A · 节点腾空法 — 流程图**（对应 `orchestrator.go`）
 
