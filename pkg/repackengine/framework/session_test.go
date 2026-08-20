@@ -100,3 +100,22 @@ func TestSession_DisruptionScoresExplainNormalizationAndWeighting(t *testing.T) 
 		t.Errorf("constant term explanation=%+v; tied terms must contribute zero", constantRisk)
 	}
 }
+
+func TestSession_DisruptionScoresSkipZeroWeight(t *testing.T) {
+	ssn := newSession(&fakeSnap{})
+	calls := 0
+	ssn.AddDisruptionScoreFn("disabled", 0, func(*api.PlanContext, *api.CandidatePlan) float64 {
+		calls++
+		return 100
+	})
+
+	scores := ssn.DisruptionScores([]*api.CandidatePlan{{}, {}})
+	if calls != 0 {
+		t.Fatalf("disabled score function called %d times, want 0", calls)
+	}
+	for index, score := range scores {
+		if score.Total != 0 || len(score.Terms) != 0 {
+			t.Errorf("score[%d]=%+v, want no contribution or explanation for disabled term", index, score)
+		}
+	}
+}

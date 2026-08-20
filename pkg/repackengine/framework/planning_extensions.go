@@ -28,10 +28,8 @@ import (
 // The planner owns all mutable bookkeeping; plugins only decide whether and how
 // this prospective plan should be considered.
 type PlanningCandidate struct {
-	Unit                      api.FreeableUnit
-	Plan                      *api.CandidatePlan
-	RequiredResource          int64
-	AvailableReceiverResource int64
+	Unit api.FreeableUnit
+	Plan *api.CandidatePlan
 }
 
 // CandidateFilterResult rejects a candidate before disruption scoring. Filters
@@ -53,19 +51,18 @@ type ReceiverCandidate struct {
 	Node              *schedapi.NodeInfo
 	StaysOccupied     bool
 	AvailableResource int64
-	FutureMoves       map[schedapi.JobID]api.PodGroupMoveAggregate
 }
 
 type (
 	CandidateFilterFn func(ctx *api.PlanContext, candidate *PlanningCandidate) *CandidateFilterResult
 	// ReceiverPoolFn applies a snapshot-stable receiver-universe policy once per
-	// planning pass. Pool functions are chained in configured plugin order.
+	// planning pass. Pool functions are chained in canonical plugin-name order.
 	ReceiverPoolFn func(ctx *api.PlanContext, nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo
 	// VictimOrderFn returns a negative value when left should be simulated first,
 	// positive when right should be first, and zero to defer to the next plugin.
 	VictimOrderFn func(left, right *schedapi.TaskInfo) int
 	// ReceiverRankFn returns a fixed-width lexicographic rank. Larger values are
-	// preferred. Terms run by ascending priority, then registration order. Five
+	// preferred. Terms run by phase, then canonical plugin-name order. Five
 	// values cover the built-in Gang rank without allocating in large receiver
 	// sets; a plugin needing more dimensions can register another term.
 	ReceiverRankFn func(ctx *api.PlanContext, candidate *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank
@@ -73,6 +70,22 @@ type (
 
 // ReceiverRank is one plugin's allocation-free lexicographic rank vector.
 type ReceiverRank [5]int64
+
+// ReceiverRankPhase defines the stable, framework-owned receiver decision
+// sequence. Plugins select a semantic phase instead of coordinating through
+// private numeric priorities.
+type ReceiverRankPhase int
+
+const (
+	// ReceiverRankPhaseStability prefers receivers that cannot be released by
+	// this pass, avoiding the loss of another viable drain target.
+	ReceiverRankPhaseStability ReceiverRankPhase = iota
+	// ReceiverRankPhaseDisruption minimizes the future workload disruption caused
+	// by consuming a receiver.
+	ReceiverRankPhaseDisruption
+	// ReceiverRankPhasePacking applies final resource-packing preferences.
+	ReceiverRankPhasePacking
+)
 
 type namedCandidateFilter struct {
 	name string
@@ -85,10 +98,10 @@ type namedVictimOrder struct {
 }
 
 type namedReceiverRank struct {
-	name     string
-	priority int
-	order    int
-	fn       ReceiverRankFn
+	name  string
+	phase ReceiverRankPhase
+	order int
+	fn    ReceiverRankFn
 }
 
 // ReceiverRankTerm is retained with an ordered receiver so logs can explain the
@@ -122,16 +135,16 @@ func (s *Session) AddVictimOrderFn(name string, fn VictimOrderFn) {
 	}
 }
 
-func (s *Session) AddReceiverRankFn(name string, priority int, fn ReceiverRankFn) {
+func (s *Session) AddReceiverRankFn(name string, phase ReceiverRankPhase, fn ReceiverRankFn) {
 	if fn == nil {
 		return
 	}
 	s.receiverRankFns = append(s.receiverRankFns, namedReceiverRank{
-		name: name, priority: priority, order: len(s.receiverRankFns), fn: fn,
+		name: name, phase: phase, order: len(s.receiverRankFns), fn: fn,
 	})
 	sort.SliceStable(s.receiverRankFns, func(i, j int) bool {
-		if s.receiverRankFns[i].priority != s.receiverRankFns[j].priority {
-			return s.receiverRankFns[i].priority < s.receiverRankFns[j].priority
+		if s.receiverRankFns[i].phase != s.receiverRankFns[j].phase {
+			return s.receiverRankFns[i].phase < s.receiverRankFns[j].phase
 		}
 		return s.receiverRankFns[i].order < s.receiverRankFns[j].order
 	})
@@ -148,15 +161,41 @@ func (s *Session) CandidateAdmissible(candidate *PlanningCandidate) *CandidateFi
 	return nil
 }
 
-// ReceiverPool applies snapshot-stable receiver policies once. Each plugin gets
-// its own slice so it cannot mutate another plugin's retained input.
+// ReceiverPool applies snapshot-stable receiver policies once. A ReceiverPoolFn
+// is a filter-only extension: each plugin may retain nodes from the current pool,
+// but cannot reintroduce a node removed by an earlier plugin, add a foreign node,
+// or create duplicate capacity. The framework preserves the current pool's order;
+// receiver ordering belongs to ReceiverRankFn.
 func (s *Session) ReceiverPool(nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo {
-	pool := append([]*schedapi.NodeInfo(nil), nodes...)
+	pool := intersectReceiverPool(nodes, nodes)
 	ctx := s.PlanContext()
 	for _, fn := range s.receiverPoolFns {
-		pool = fn(ctx, append([]*schedapi.NodeInfo(nil), pool...))
+		selected := fn(ctx, append([]*schedapi.NodeInfo(nil), pool...))
+		pool = intersectReceiverPool(pool, selected)
 	}
 	return pool
+}
+
+// intersectReceiverPool returns the unique nodes from current that are named in
+// selected, retaining current's order and NodeInfo instances. Node names are the
+// scheduler's stable identity within a snapshot.
+func intersectReceiverPool(current, selected []*schedapi.NodeInfo) []*schedapi.NodeInfo {
+	selectedNames := make(map[string]bool, len(selected))
+	for _, node := range selected {
+		if node != nil && node.Name != "" {
+			selectedNames[node.Name] = true
+		}
+	}
+	retained := make([]*schedapi.NodeInfo, 0, min(len(current), len(selectedNames)))
+	seen := make(map[string]bool, len(current))
+	for _, node := range current {
+		if node == nil || node.Name == "" || seen[node.Name] || !selectedNames[node.Name] {
+			continue
+		}
+		seen[node.Name] = true
+		retained = append(retained, node)
+	}
+	return retained
 }
 
 // OrderVictims applies configured lexicographic comparators and preserves the

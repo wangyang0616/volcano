@@ -68,7 +68,7 @@ func BenchmarkDrainScale(b *testing.B) {
 				}
 				snap := &fakeSnap{nodes: nodes, views: views, notInScope: notInScope, infeasibleSources: infeasibleSources}
 				plan, _ := finalizedPlan(drainSessionWithPlugins(
-					snap, allMovable, 1, tc.maxGroups, 0, []string{"base", "gang"},
+					snap, allMovable, 1, tc.maxGroups, 0, []string{"workloaddisruption", "gangdisruption"},
 				))
 				totalCalls += snap.feasibilityCalls
 				if plan != nil {

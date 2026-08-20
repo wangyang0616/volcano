@@ -52,8 +52,28 @@ kubectl apply -f installer/repack/repack-engine.yaml
 ```
 
 The engine mounts `volcano-scheduler-configmap` for `--scheduler-conf`, so it sees
-the cluster exactly as the scheduler does. Adjust `--repack-default-resource`
-(e.g. `nvidia.com/gpu`) and `--repack-algorithm` (P0: `drain`) as needed.
+the cluster exactly as the scheduler does. Its own Action and Plugin pipeline is
+defined separately in `repack-engine.conf` and loaded with `--repack-conf`.
+`actions` follows the scheduler syntax (`actions: "repack"`; multiple Actions are
+comma-separated). Command-line `--repack-actions` and `--repack-plugins` values
+take precedence over the Repack configuration file. The file is mounted from
+`volcano-repack-engine-configmap`; it is plain component configuration, not a CR.
+The `workloaddisruption` and `gangdisruption` plugin arguments configure cluster-wide disruption-score
+weights. Omitted weights use the built-in defaults shown in the manifest; `0`
+disables a score term. Values must be finite, non-negative YAML numbers. These
+weights rank freeable candidates only; receiver nodes retain the fixed
+Stability, Disruption, then Packing lexicographic order.
+The configuration is parsed strictly: unknown or misspelled top-level fields,
+plugin fields, and plugin arguments stop the engine instead of silently using
+defaults.
+
+The plugin list is order-independent. `workloadscope`, `repackbudget`,
+`workloaddisruption`, `gangdisruption`, and `binpack` are optional; omitting one
+only disables its policy. The `repack` Action requires at least one plugin that
+provides the `domain` capability (`nodeconsolidation` today). Empty accelerator
+nodes and fully occupied accelerator nodes are always excluded from both sides
+of node-level relocation before scoring; this correctness boundary does not
+depend on `binpack`.
 
 ## Notes
 

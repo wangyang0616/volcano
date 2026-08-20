@@ -46,13 +46,12 @@ import (
 
 	// Register the repack action pipeline and capability plugins.
 	_ "volcano.sh/volcano/pkg/repackengine/actions/repack"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/base"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/budget"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/gang"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/node"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/resource"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/scope"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/gangdisruption"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/nodeconsolidation"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloadscope"
 )
 
 var logFlushFreq = pflag.Duration("log-flush-frequency", 5*time.Second, "Maximum number of seconds between log flushes")

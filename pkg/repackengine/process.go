@@ -89,21 +89,13 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 	if len(actions) == 0 {
 		actions = engineframework.DefaultActions()
 	}
-	for _, name := range actions {
-		if _, ok := engineframework.GetAction(name); !ok {
-			return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
-				fmt.Errorf("unknown repack action %q (registered: %v)", name, engineframework.ActionNames()))
-		}
+	if err := validatePipelineConfiguration(actions, e.config.Plugins); err != nil {
+		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration, err)
 	}
-	for _, name := range e.config.Plugins {
-		if _, ok := engineframework.GetPlugin(name); !ok {
-			return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration,
-				fmt.Errorf("unknown repack plugin %q", name))
-		}
-	}
+	plugins := configuredPluginNames(e.config.Plugins)
 	klog.V(3).InfoS("repack: run execution started",
 		"run", run.Name, "mode", run.Spec.Mode, "resource", targetResource,
-		"actions", actions, "plugins", e.config.Plugins)
+		"actions", actions, "plugins", plugins)
 
 	progressMessage := fmt.Sprintf(
 		"Planning cluster-wide fragmentation for %s in %s mode.",
@@ -141,6 +133,9 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		Free:                      adapter.NodeFreeCapacity,
 	}, e.config.Plugins)
 	defer engineframework.CloseSession(engineSession)
+	if err := validateSessionCapabilities(actions, e.config.Plugins, engineSession); err != nil {
+		return e.fail(ctx, run, generation, state.ReasonInvalidConfiguration, err)
+	}
 
 	// Actions are planning-only. Execute is committed below, after applyPlan has
 	// been persisted successfully.
@@ -238,6 +233,101 @@ func (e *Engine) process(ctx context.Context, run *repackv1alpha1.RepackRun) err
 		"freedNodeCount", report.NodesFreed, "movedResource", report.MovedResource,
 		"affectedPodGroupCount", report.AffectedPodGroups, "evictedCount", evictedCount, "rejectedCount", rejectedCount,
 		"duration", time.Since(processingStartTime))
+	return nil
+}
+
+func configuredPluginNames(options []engineframework.PluginOption) []string {
+	names := make([]string, 0, len(options))
+	for _, option := range options {
+		names = append(names, option.Name)
+	}
+	return names
+}
+
+func validatePluginOptions(options []engineframework.PluginOption) error {
+	seen := make(map[string]bool, len(options))
+	for _, option := range options {
+		if option.Name == "" {
+			return fmt.Errorf("repack plugin name must not be empty")
+		}
+		if seen[option.Name] {
+			return fmt.Errorf("repack plugin %q is configured more than once", option.Name)
+		}
+		seen[option.Name] = true
+		if !engineframework.HasPlugin(option.Name) {
+			return fmt.Errorf("unknown repack plugin %q (registered: %v)", option.Name, engineframework.PluginNames())
+		}
+		if err := engineframework.ValidatePluginArguments(option.Name, option.Arguments); err != nil {
+			return fmt.Errorf("invalid arguments for repack plugin %q: %w", option.Name, err)
+		}
+	}
+	return nil
+}
+
+func validatePipelineConfiguration(actions []string, plugins []engineframework.PluginOption) error {
+	if len(actions) == 0 {
+		actions = engineframework.DefaultActions()
+	}
+	if err := validatePluginOptions(plugins); err != nil {
+		return err
+	}
+	enabledCapabilities := make(map[engineframework.PluginCapability]bool)
+	for _, plugin := range plugins {
+		for _, capability := range engineframework.PluginProvides(plugin.Name) {
+			enabledCapabilities[capability] = true
+		}
+	}
+	for _, plugin := range plugins {
+		for _, required := range engineframework.PluginRequires(plugin.Name) {
+			if !enabledCapabilities[required] {
+				return fmt.Errorf("repack plugin %q requires capability %q, but no configured plugin provides it",
+					plugin.Name, required)
+			}
+		}
+	}
+	for _, name := range actions {
+		if _, ok := engineframework.GetAction(name); !ok {
+			return fmt.Errorf("unknown repack action %q (registered: %v)", name, engineframework.ActionNames())
+		}
+		for _, required := range engineframework.ActionRequires(name) {
+			if !enabledCapabilities[required] {
+				return fmt.Errorf("repack action %q requires capability %q, but no configured plugin provides it",
+					name, required)
+			}
+		}
+	}
+	return nil
+}
+
+// validateSessionCapabilities verifies that the callbacks registered by the
+// opened plugins implement every statically declared requirement. Static
+// Provides metadata enables fail-fast composition checks at startup; this
+// runtime check catches an incorrectly wired provider before an Action can turn
+// a missing callback into a misleading empty plan.
+func validateSessionCapabilities(
+	actions []string,
+	plugins []engineframework.PluginOption,
+	ssn *engineframework.Session,
+) error {
+	if len(actions) == 0 {
+		actions = engineframework.DefaultActions()
+	}
+	for _, plugin := range plugins {
+		for _, required := range engineframework.PluginRequires(plugin.Name) {
+			if !ssn.ProvidesCapability(required) {
+				return fmt.Errorf("repack plugin %q requires runtime capability %q, but no opened plugin registered its callback",
+					plugin.Name, required)
+			}
+		}
+	}
+	for _, name := range actions {
+		for _, required := range engineframework.ActionRequires(name) {
+			if !ssn.ProvidesCapability(required) {
+				return fmt.Errorf("repack action %q requires runtime capability %q, but no opened plugin registered its callback",
+					name, required)
+			}
+		}
+	}
 	return nil
 }
 

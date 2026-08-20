@@ -17,6 +17,8 @@ limitations under the License.
 package framework
 
 import (
+	"sort"
+
 	v1 "k8s.io/api/core/v1"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
@@ -99,6 +101,7 @@ type SessionConfig struct {
 type Session struct {
 	configuration SessionConfig
 	plugins       []Plugin // opened plugins, for OnSessionClose
+	capabilities  map[PluginCapability]bool
 
 	movableFns    []MovableFn
 	domainFns     []DomainFn
@@ -115,13 +118,23 @@ type Session struct {
 	report Report
 }
 
-// OpenSession builds a Session and runs each named plugin's OnSessionOpen (which
-// registers its callbacks). Unknown plugin names are ignored.
-func OpenSession(configuration SessionConfig, pluginNames []string) *Session {
-	ssn := &Session{configuration: configuration}
+// OpenSession builds a Session and runs each configured plugin's OnSessionOpen
+// in canonical name order. Plugin configuration is a set: reordering the YAML
+// list cannot change callback composition or planning behavior. Unknown plugin
+// names are ignored; the engine validates them before opening a production
+// session.
+func OpenSession(configuration SessionConfig, pluginOptions []PluginOption) *Session {
+	ssn := &Session{
+		configuration: configuration,
+		capabilities:  make(map[PluginCapability]bool),
+	}
 	ssn.registerBuiltinConstraints()
-	for _, name := range pluginNames {
-		p, ok := GetPlugin(name)
+	canonicalOptions := append([]PluginOption(nil), pluginOptions...)
+	sort.SliceStable(canonicalOptions, func(i, j int) bool {
+		return canonicalOptions[i].Name < canonicalOptions[j].Name
+	})
+	for _, option := range canonicalOptions {
+		p, ok := GetPlugin(option.Name, option.Arguments)
 		if !ok {
 			continue
 		}
@@ -176,7 +189,20 @@ func (s *Session) AddMovableFn(fn MovableFn) {
 func (s *Session) AddDomainFn(fn DomainFn) {
 	if fn != nil {
 		s.domainFns = append(s.domainFns, fn)
+		if s.capabilities == nil {
+			s.capabilities = make(map[PluginCapability]bool)
+		}
+		s.capabilities[CapabilityDomain] = true
 	}
+}
+
+// ProvidesCapability reports capabilities backed by callbacks actually
+// registered in this Session. It complements the static registration metadata:
+// metadata validates composition before opening a Session, while this runtime
+// view prevents a plugin that only declares a capability from silently running
+// an Action without the callback that implements it.
+func (s *Session) ProvidesCapability(capability PluginCapability) bool {
+	return s != nil && s.capabilities[capability]
 }
 func (s *Session) AddDisruptionScoreFn(name string, weight float64, fn DisruptionScoreFn) {
 	if fn != nil {

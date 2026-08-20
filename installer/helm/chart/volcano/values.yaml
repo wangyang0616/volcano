@@ -43,7 +43,14 @@ custom:
   repack_schedule_period: "5m"
   repack_execute_cooldown: "10m" # min gap after an Execute finishes before the next Execute may start
   repack_default_resource: "nvidia.com/gpu" # used when a RepackRun's spec.goals is empty
-  repack_core: "drain"
+  # Optional complete repack-engine.conf override. Empty renders the chart's
+  # default Action and Plugin configuration.
+  repack_config_override: ""
+  # Optional order-independent Repack capability plugin command-line override. Empty uses
+  # repack-engine.conf; command-line values take precedence over the file. The repack
+  # action requires at least one domain provider (currently nodeconsolidation).
+  # Example: [workloadscope, repackbudget, nodeconsolidation, workloaddisruption, gangdisruption, binpack]
+  repack_plugins: []
   repack_log_level: 3
   scheduler_metrics_enable: true
   scheduler_pprof_enable: false

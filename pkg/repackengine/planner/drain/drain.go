@@ -108,10 +108,6 @@ type drainState struct {
 	receiverNodes       []*schedapi.NodeInfo
 	receiverSlackByNode map[string]int64
 	receiverResource    int64 // remaining target-resource slack across eligible receivers
-	// futureDrainPodGroupsByNode caches the movable Pod/resource totals used to
-	// assess each node as a possible next drain target.
-	futureDrainPodGroupsByNode map[string]map[schedapi.JobID]api.PodGroupMoveAggregate
-
 	// Mutated as units are committed.
 	drained                map[string]bool  // emptied — no longer a receiver
 	filled                 map[string]bool  // received a moved-in pod
@@ -183,22 +179,33 @@ func newDrainState(
 	targetResource v1.ResourceName,
 ) *drainState {
 	state := &drainState{
-		ssn:                        ssn,
-		snapshot:                   ssn.Snapshot(),
-		nodesByName:                nodesByName,
-		movable:                    movable,
-		resource:                   targetResource,
-		alwaysStaysOccupied:        make(map[string]bool, len(nodes)),
-		receiverSlackByNode:        make(map[string]int64, len(nodes)),
-		futureDrainPodGroupsByNode: make(map[string]map[schedapi.JobID]api.PodGroupMoveAggregate, len(nodes)),
-		drained:                    make(map[string]bool),
-		filled:                     make(map[string]bool),
-		provenStuck:                make(map[string]bool),
-		stuckUnits:                 make(map[string]bool),
-		placedResourceByNode:       make(map[string]int64),
-		prunedByReason:             make(map[string]int),
+		ssn:                  ssn,
+		snapshot:             ssn.Snapshot(),
+		nodesByName:          nodesByName,
+		movable:              movable,
+		resource:             targetResource,
+		alwaysStaysOccupied:  make(map[string]bool, len(nodes)),
+		receiverSlackByNode:  make(map[string]int64, len(nodes)),
+		drained:              make(map[string]bool),
+		filled:               make(map[string]bool),
+		provenStuck:          make(map[string]bool),
+		stuckUnits:           make(map[string]bool),
+		placedResourceByNode: make(map[string]int64),
+		prunedByReason:       make(map[string]int),
 	}
-	state.receiverNodes = ssn.ReceiverPool(nodes)
+	// Base receiver eligibility is a planner invariant, not an optional packing
+	// policy. Repack never lights up an empty target-resource node, and a fully
+	// occupied node has no useful receiver capacity. Give plugins only this
+	// prefiltered universe. ReceiverPool enforces filter-only subset semantics;
+	// the second eligibility pass remains a defensive boundary for custom code.
+	baseReceivers, receiverStats := eligibleReceiverNodes(nodes, targetResource)
+	state.receiverNodes, _ = eligibleReceiverNodes(ssn.ReceiverPool(baseReceivers), targetResource)
+	klog.V(4).InfoS("repack drain: base receiver pool prepared",
+		"eligibleReceivers", len(state.receiverNodes),
+		"emptyNodesExcluded", receiverStats.empty,
+		"fullNodesExcluded", receiverStats.full,
+		"noSlackNodesExcluded", receiverStats.noSlack,
+		"unavailableNodesExcluded", receiverStats.unavailable)
 	for _, node := range nodes {
 		if node == nil {
 			continue
@@ -206,9 +213,6 @@ func newDrainState(
 		state.alwaysStaysOccupied[node.Name] =
 			!api.EvaluateNodeFreeability(node, api.NodeFreeabilityState{}, movable, targetResource).Freeable ||
 				!state.snapshot.NodeInScope(node)
-		state.futureDrainPodGroupsByNode[node.Name] = aggregateTasksByPodGroup(
-			api.VictimsOf(node, movable, targetResource), targetResource,
-		)
 	}
 	for _, node := range state.receiverNodes {
 		slack := receiverSlack(node, targetResource)
@@ -231,6 +235,18 @@ func (s *drainState) prepareUnits(units []api.FreeableUnit) {
 
 func (s *drainState) prepareUnit(unit api.FreeableUnit) (candidate, bool) {
 	key := unitKey(unit)
+	// Domain plugins should only contribute partially occupied nodes, but retain
+	// this defensive planner gate so a custom domain cannot move pods off an
+	// empty or already compact, fully occupied node.
+	for _, nodeName := range unit.Nodes {
+		class := api.ClassifyTargetResourceNode(s.nodesByName[nodeName], s.resource)
+		if class != api.TargetResourceNodePartial {
+			s.recordPruned("source_node_not_partially_occupied")
+			klog.V(5).InfoS("repack drain: skip unit — source node is not partially occupied",
+				"unit", key, "node", nodeName, "targetResource", s.resource, "classification", class)
+			return candidate{}, false
+		}
+	}
 	inUnit, diagnostics, ok := freeableNow(unit, s.nodesByName, nil, nil, s.movable, s.resource)
 	if !ok {
 		logNonFreeableNodes(key, diagnostics, s.resource)
@@ -294,6 +310,16 @@ func (s *drainState) preliminaryCandidates() []candidate {
 			continue
 		}
 		s.candidatesEvaluated++
+		availableReceiverResource := s.availableReceiverResource(candidate.inUnit)
+		if availableReceiverResource < candidate.additionalResource {
+			s.recordPruned("insufficient_receiver_resource")
+			klog.V(5).InfoS("repack drain: candidate rejected by aggregate receiver capacity preflight",
+				"unit", candidate.key, "required", candidate.additionalResource,
+				"available", availableReceiverResource)
+			s.markUnitInfeasible(candidate.key, candidate.unit)
+			prepared.active = false
+			continue
+		}
 		planningCandidate := s.planningCandidate(candidate)
 		if rejected := s.ssn.CandidateAdmissible(planningCandidate); rejected != nil {
 			s.recordPruned(rejected.Reason)
@@ -363,22 +389,26 @@ func (s *drainState) firstFeasibleCandidate(ordered []scoredCandidate) (candidat
 	return candidate{}, 0, false
 }
 
-// planningCandidate exposes the complete prospective plan and the cached
-// aggregate receiver capacity to policy plugins before disruption scoring.
+// planningCandidate exposes the complete prospective plan to policy plugins
+// before disruption scoring.
 func (s *drainState) planningCandidate(candidate candidate) *framework.PlanningCandidate {
-	available := s.receiverResource
-	for nodeName := range candidate.inUnit {
-		available -= max(s.receiverSlackByNode[nodeName]-s.placedResourceByNode[nodeName], 0)
-	}
 	return &framework.PlanningCandidate{
 		Unit: candidate.unit,
 		Plan: &api.CandidatePlan{
 			CommittedMoves: s.moves,
 			Moves:          candidate.scoringMoves,
 		},
-		RequiredResource:          candidate.additionalResource,
-		AvailableReceiverResource: available,
 	}
+}
+
+// availableReceiverResource is the target-resource slack outside the candidate
+// unit after accounting for moves committed earlier in this planning pass.
+func (s *drainState) availableReceiverResource(inUnit map[string]bool) int64 {
+	available := s.receiverResource
+	for nodeName := range inUnit {
+		available -= max(s.receiverSlackByNode[nodeName]-s.placedResourceByNode[nodeName], 0)
+	}
+	return available
 }
 
 func (s *drainState) recordPruned(reason string) {
@@ -445,7 +475,6 @@ func (s *drainState) receiversInPreferenceOrderWithPlan(
 			Node:              n,
 			StaysOccupied:     s.staysOccupied(n),
 			AvailableResource: availableResource,
-			FutureMoves:       s.futureDrainPodGroupsByNode[n.Name],
 		})
 	}
 	if prospectivePlan == nil {
@@ -490,23 +519,6 @@ func minTaskResource(tasks []*schedapi.TaskInfo, targetResource v1.ResourceName)
 	return minimum
 }
 
-func aggregateTasksByPodGroup(
-	tasks []*schedapi.TaskInfo,
-	targetResource v1.ResourceName,
-) map[schedapi.JobID]api.PodGroupMoveAggregate {
-	aggregates := make(map[schedapi.JobID]api.PodGroupMoveAggregate)
-	for _, task := range tasks {
-		if task == nil || task.Job == "" {
-			continue
-		}
-		aggregate := aggregates[task.Job]
-		aggregate.MovedPods++
-		aggregate.MovedResource += api.Scalar(task.InitResreq, targetResource)
-		aggregates[task.Job] = aggregate
-	}
-	return aggregates
-}
-
 // receiverSlack is the target-resource free capacity used to best-fit sort receivers.
 // Prefer FutureIdle (scheduler cache); fall back to Allocatable−Used for test nodes
 // that only set Used/Allocatable without initializing Idle.
@@ -525,6 +537,50 @@ func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
 		free.SubWithoutAssert(n.Used)
 	}
 	return api.Scalar(free, targetResource)
+}
+
+// eligibleReceiverNodes performs the snapshot-stable receiver prefilter before
+// any candidate scoring. Only partially occupied nodes with positive scheduler-
+// visible slack may receive moved pods; empty nodes remain idle and full nodes
+// never enter plugin ranking or scheduler simulation.
+type receiverEligibilityStats struct {
+	unavailable int
+	empty       int
+	full        int
+	noSlack     int
+}
+
+func eligibleReceiverNodes(
+	nodes []*schedapi.NodeInfo,
+	targetResource v1.ResourceName,
+) ([]*schedapi.NodeInfo, receiverEligibilityStats) {
+	eligible := make([]*schedapi.NodeInfo, 0, len(nodes))
+	var stats receiverEligibilityStats
+	for _, node := range nodes {
+		class := api.ClassifyTargetResourceNode(node, targetResource)
+		switch class {
+		case api.TargetResourceNodeUnavailable:
+			stats.unavailable++
+			continue
+		case api.TargetResourceNodeEmpty:
+			stats.empty++
+			continue
+		case api.TargetResourceNodeFull:
+			stats.full++
+			continue
+		case api.TargetResourceNodePartial:
+			// Continue with scheduler-visible slack validation below.
+		default:
+			stats.unavailable++
+			continue
+		}
+		if receiverSlack(node, targetResource) <= 0 {
+			stats.noSlack++
+			continue
+		}
+		eligible = append(eligible, node)
+	}
+	return eligible, stats
 }
 
 // staysOccupied reports whether a node will remain occupied regardless of this pass,

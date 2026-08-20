@@ -14,26 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package budget enforces the per-run blast-radius limits against the complete
+// Package repackbudget enforces the per-run blast-radius budget against the complete
 // prospective plan (committed moves plus the candidate under consideration).
-package budget
+package repackbudget
 
 import (
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
 )
 
-const Name = "budget"
+const Name = "repackbudget"
 
 func init() {
-	framework.RegisterPlugin(Name, func() framework.Plugin { return &budgetPlugin{} })
+	framework.RegisterPlugin(Name, framework.PluginRegistration{
+		Factory: func(framework.Arguments) framework.Plugin { return &repackBudgetPlugin{} },
+	})
 }
 
-type budgetPlugin struct{}
+type repackBudgetPlugin struct{}
 
-func (*budgetPlugin) Name() string { return Name }
+func (*repackBudgetPlugin) Name() string { return Name }
 
-func (*budgetPlugin) OnSessionOpen(ssn *framework.Session) {
+func (*repackBudgetPlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddCandidateFilterFn("maxPerRun", func(ctx *api.PlanContext, candidate *framework.PlanningCandidate) *framework.CandidateFilterResult {
 		if candidate == nil || candidate.Plan == nil {
 			return nil
@@ -49,4 +51,4 @@ func (*budgetPlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 }
 
-func (*budgetPlugin) OnSessionClose(*framework.Session) {}
+func (*repackBudgetPlugin) OnSessionClose(*framework.Session) {}

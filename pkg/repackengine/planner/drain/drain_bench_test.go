@@ -45,7 +45,7 @@ func BenchmarkDrain(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				finalizedPlan(drainSessionWithPlugins(
-					snap, allMovable, 1, 0, 0, []string{"base", "gang"},
+					snap, allMovable, 1, 0, 0, []string{"workloaddisruption", "gangdisruption"},
 				))
 			}
 		})

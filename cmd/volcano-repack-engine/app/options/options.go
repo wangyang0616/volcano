@@ -50,11 +50,16 @@ type ServerOption struct {
 	// SchedulerConf is the SAME --scheduler-conf the volcano-scheduler uses, so
 	// the engine's tiers/plugins match the scheduler's exactly.
 	SchedulerConf string
-	ResyncPeriod  time.Duration
+	// RepackConf is the engine-owned action/plugin configuration file.
+	RepackConf   string
+	ResyncPeriod time.Duration
 
-	// Actions overrides the pipeline ("" = DefaultActions). MinNodesFreed is the
-	// benefit gate. DefaultResource is the target when a RepackRun's spec.goals is empty.
+	// Actions override the ordered action pipeline. Plugins select an
+	// order-independent capability set.
+	// MinNodesFreed is the benefit gate. DefaultResource is the target when a
+	// RepackRun's spec.goals is empty.
 	Actions         []string
+	Plugins         []string
 	MinNodesFreed   int
 	DefaultResource string
 	NominationTTL   time.Duration
@@ -88,10 +93,13 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.KubeClientOptions.Burst, "kube-api-burst", defaultBurst, "Burst to use while talking with kubernetes apiserver")
 
 	fs.StringVar(&s.SchedulerConf, "scheduler-conf", "", "Absolute path of the shared scheduler configuration file (same as volcano-scheduler)")
+	fs.StringVar(&s.RepackConf, "repack-conf", "", "Absolute path of the Repack Engine action/plugin configuration file")
 	fs.DurationVar(&s.ResyncPeriod, "resync-period", defaultResyncPeriod, "Informer resync safety-net period so a dropped watch that misses events self-heals (0 = pure event-driven)")
 	fs.DurationVar(&s.Cooldown, "repack-execute-cooldown", defaultExecuteCooldown, "Minimum gap after an Execute RepackRun finishes before the next Execute may start")
 
-	fs.StringSliceVar(&s.Actions, "repack-actions", nil, "Ordered action pipeline (default: repack)")
+	fs.StringSliceVar(&s.Actions, "repack-actions", nil, "Ordered action pipeline override (comma-separated; default: repack)")
+	fs.StringSliceVar(&s.Plugins, "repack-plugins", nil,
+		"Repack capability plugin set; input order does not affect behavior (default: workloadscope,repackbudget,nodeconsolidation,workloaddisruption,gangdisruption,binpack)")
 	fs.IntVar(&s.MinNodesFreed, "repack-min-nodes-freed", 0, "Benefit gate: minimum whole nodes a plan must free (0 = engine default 1)")
 	fs.StringVar(&s.DefaultResource, "repack-default-resource", "", "Target resource when a RepackRun's spec.goals is empty (e.g. nvidia.com/gpu)")
 	fs.DurationVar(&s.NominationTTL, "repack-nomination-ttl", defaultNominationTTL, "How long an Execute nomination is re-asserted onto the replacement pod before expiring")

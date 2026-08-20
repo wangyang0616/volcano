@@ -16,8 +16,8 @@
 - `pkg/repackengine/planner/drain/drain.go`
 - `pkg/repackengine/adapter/snapshot_session.go`
 - `pkg/repackengine/framework/session.go`
-- `pkg/repackengine/plugins/base/base.go`
-- `pkg/repackengine/plugins/gang/gang.go`
+- `pkg/repackengine/plugins/workloaddisruption/workload_disruption.go`
+- `pkg/repackengine/plugins/gangdisruption/gang_disruption.go`
 
 ## 2. 先说结论
 
@@ -124,7 +124,7 @@ Domain 插件产生 `FreeableUnit`：
 2. 在仍可能腾空的节点中，优先填充未来腾空代价更高的节点；
 3. 其余情况使用 best-fit，优先选择目标资源剩余量更小的节点。
 
-节点的目标资源余量在规划开始时计算一次；每次提交迁移后只更新本轮新增占用。构造接收节点列表时，会提前排除已腾空节点、候选源节点，以及连最小 victim 都无法容纳的节点，避免把显然不可用的节点送入完整调度模拟。
+规划开始时先按目标资源分类节点：空节点和满卡节点不进入接收池，只有部分占用且具有 scheduler-visible 余量的节点参与后续处理。节点余量只计算一次；每次提交迁移后增量更新本轮新增占用。构造具体候选的接收节点列表时，再排除已腾空节点、候选源节点以及连最小 victim 都无法容纳的节点，避免把显然不可用的节点送入评分和完整调度模拟。
 
 这个顺序的目标是尽量把 Pod 放到本来就会保持占用的节点，并保护更容易在后续腾空的节点。
 
@@ -315,15 +315,16 @@ T2 的 Pod → R
 
 ![当前搜索不包含空节点中转和多跳交换，而全局方案可能依赖这些路径](images/repack/heuristic-limit-06-search-space.svg)
 
-当前算法只考虑 Domain 插件明确产生的单元。当前内置实现只产生 Node 单元；即使后续启用 HyperNode 等多节点 Domain，搜索范围仍仅限于插件明确给出的拓扑单元。以下方案不会被自动搜索：
+当前算法只考虑 Domain 插件明确产生且所有成员节点均为目标资源部分占用状态的单元。当前内置实现只产生 Node 单元；即使后续启用 HyperNode 等多节点 Domain，搜索范围仍仅限于插件明确给出的拓扑单元。以下方案不会被自动搜索：
 
 - 任意多个普通节点需要同时腾空才可行；
 - 一个不属于任何已注册拓扑单元的跨域节点组合；
 - 先迁移接收节点上的 Pod，再腾空目标节点；
 - 需要 Pod 交换、循环移动或多跳迁移的布局；
 - 需要临时占用一个加速卡空节点作为中转站的方案。
+- 迁移满卡节点上的全部 Pod、再利用其他部分占用节点释放该满卡节点的方案。
 
-特别是，当前不会把目标资源完全空闲的节点作为接收节点。直接把 Pod 移入空节点通常不会改善碎片，但全局算法可能把它作为临时缓冲区，在后续多跳迁移后再次腾空。当前算法有意不搜索这种“先变差、再变好”的路径。
+特别是，当前不会把目标资源完全空闲的节点作为接收节点，也不会把满卡节点作为待腾空源节点。空节点保持空闲，满卡节点视为已经完成装箱；即使全局算法可能通过中转或重排找到其他方案，Repack 也有意不搜索这种高扰动路径。
 
 ### 5.7 不可行缓存依赖单调性假设
 

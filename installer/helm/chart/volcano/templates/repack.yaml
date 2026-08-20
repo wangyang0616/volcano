@@ -10,6 +10,33 @@
 # Research preview: disabled by default (custom.repack_enable).
 # ---------------------------------------------------------------------------
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-repack-configmap
+  namespace: {{ .Release.Namespace }}
+data:
+  repack-engine.conf: |
+    {{- if .Values.custom.repack_config_override }}
+    {{- .Values.custom.repack_config_override | nindent 4 }}
+    {{- else }}
+    actions: "repack"
+    plugins:
+      - name: workloadscope
+      - name: repackbudget
+      - name: nodeconsolidation
+      - name: workloaddisruption
+        arguments:
+          affectedPodGroupsWeight: 1.0
+          movedResourceWeight: 0.3
+          movedPodsWeight: 0.1
+      - name: gangdisruption
+        arguments:
+          gangBreachesWeight: 0.8
+          damagedResourceWeight: 0.6
+      - name: binpack
+    {{- end }}
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ .Release.Name }}-repack-engine
@@ -155,12 +182,15 @@ spec:
           args:
             - --logtostderr
             - --scheduler-conf=/volcano.scheduler/{{ base .Values.basic.scheduler_config_file }}
+            - --repack-conf=/volcano.repack/repack-engine.conf
             - --leader-elect=true
             - --leader-elect-resource-namespace={{ .Release.Namespace }}
             - --resync-period={{ .Values.custom.repack_schedule_period }}
             - --repack-execute-cooldown={{ .Values.custom.repack_execute_cooldown | default "10m" }}
             - --repack-default-resource={{ .Values.custom.repack_default_resource }}
-            - --repack-algorithm={{ .Values.custom.repack_core }}
+            {{- if .Values.custom.repack_plugins }}
+            - --repack-plugins={{ join "," .Values.custom.repack_plugins }}
+            {{- end }}
             - --enable-healthz=true
             - --healthz-address=:11251
             - --enable-metrics=true
@@ -184,12 +214,17 @@ spec:
           volumeMounts:
             - name: scheduler-config
               mountPath: /volcano.scheduler
+            - name: repack-config
+              mountPath: /volcano.repack
       volumes:
         - name: scheduler-config
           configMap:
             # the SAME ConfigMap the volcano-scheduler uses (plugin tiers /
             # predicates), so the engine sees the cluster identically.
             name: {{ .Release.Name }}-scheduler-configmap
+        - name: repack-config
+          configMap:
+            name: {{ .Release.Name }}-repack-configmap
 ---
 # ---------------------------------------------------------------------------
 # Additive RBAC for the RepackRun controller + nomination reconciler, which runs

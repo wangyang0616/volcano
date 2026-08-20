@@ -33,8 +33,8 @@ func TestCandidateAdmissibleStopsAtFirstPluginVeto(t *testing.T) {
 		called = append(called, "allow")
 		return nil
 	})
-	ssn.AddCandidateFilterFn("budget", func(*api.PlanContext, *PlanningCandidate) *CandidateFilterResult {
-		called = append(called, "budget")
+	ssn.AddCandidateFilterFn("repackbudget", func(*api.PlanContext, *PlanningCandidate) *CandidateFilterResult {
+		called = append(called, "repackbudget")
 		return &CandidateFilterResult{Reason: "max_resource"}
 	})
 	ssn.AddCandidateFilterFn("must-not-run", func(*api.PlanContext, *PlanningCandidate) *CandidateFilterResult {
@@ -46,7 +46,7 @@ func TestCandidateAdmissibleStopsAtFirstPluginVeto(t *testing.T) {
 	if result == nil || result.Reason != "max_resource" {
 		t.Fatalf("result=%+v, want max_resource veto", result)
 	}
-	if got := fmt.Sprint(called); got != "[allow budget]" {
+	if got := fmt.Sprint(called); got != "[allow repackbudget]" {
 		t.Fatalf("callbacks=%s, want configured order with first-veto stop", got)
 	}
 }
@@ -71,11 +71,11 @@ func TestOrderVictimsComposesComparators(t *testing.T) {
 func TestOrderReceiversUsesPriorityAndEvaluatesEachRankOnce(t *testing.T) {
 	ssn := newSession(&fakeSnap{})
 	stabilityCalls, fitCalls := 0, 0
-	ssn.AddReceiverRankFn("bestFit", 30, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
+	ssn.AddReceiverRankFn("bestFit", ReceiverRankPhasePacking, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
 		fitCalls++
 		return ReceiverRank{-receiver.AvailableResource}
 	})
-	ssn.AddReceiverRankFn("stability", 10, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
+	ssn.AddReceiverRankFn("stability", ReceiverRankPhaseStability, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
 		stabilityCalls++
 		if receiver.StaysOccupied {
 			return ReceiverRank{1}
@@ -111,5 +111,26 @@ func TestReceiverPoolChainsWithoutMutatingCallerSlice(t *testing.T) {
 	}
 	if len(pool) != 1 || pool[0].Name != "b" {
 		t.Fatalf("pool=%v, want [b]", pool)
+	}
+}
+
+func TestReceiverPoolCannotReintroduceOrDuplicateNodes(t *testing.T) {
+	ssn := newSession(&fakeSnap{})
+	a, b, c := node("a", nil), node("b", nil), node("c", nil)
+	ssn.AddReceiverPoolFn(func(_ *api.PlanContext, _ []*schedapi.NodeInfo) []*schedapi.NodeInfo {
+		return []*schedapi.NodeInfo{a, c}
+	})
+	ssn.AddReceiverPoolFn(func(_ *api.PlanContext, current []*schedapi.NodeInfo) []*schedapi.NodeInfo {
+		// b was removed by the previous filter; repeated and foreign nodes must
+		// not be able to expand the pool or its capacity again.
+		return append(current, b, b, node("foreign", nil))
+	})
+
+	pool := ssn.ReceiverPool([]*schedapi.NodeInfo{a, b, b, c})
+	if len(pool) != 2 {
+		t.Fatalf("pool=%v, want two unique retained nodes", pool)
+	}
+	if got := fmt.Sprint([]string{pool[0].Name, pool[1].Name}); got != "[a c]" {
+		t.Fatalf("pool=%v, want the unique retained subset [a c]", got)
 	}
 }

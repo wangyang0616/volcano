@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package scope turns the resolved RepackRun workload authorization boundary
+// Package workloadscope turns the resolved RepackRun workload authorization boundary
 // into the standard Movable extension point.
-package scope
+package workloadscope
 
 import (
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -24,17 +24,19 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/framework"
 )
 
-const Name = "scope"
+const Name = "workloadscope"
 
 func init() {
-	framework.RegisterPlugin(Name, func() framework.Plugin { return &scopePlugin{} })
+	framework.RegisterPlugin(Name, framework.PluginRegistration{
+		Factory: func(framework.Arguments) framework.Plugin { return &workloadScopePlugin{} },
+	})
 }
 
-type scopePlugin struct{}
+type workloadScopePlugin struct{}
 
-func (*scopePlugin) Name() string { return Name }
+func (*workloadScopePlugin) Name() string { return Name }
 
-func (*scopePlugin) OnSessionOpen(ssn *framework.Session) {
+func (*workloadScopePlugin) OnSessionOpen(ssn *framework.Session) {
 	matcher := ssn.Scope()
 	if matcher == nil {
 		return
@@ -44,4 +46,4 @@ func (*scopePlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 }
 
-func (*scopePlugin) OnSessionClose(*framework.Session) {}
+func (*workloadScopePlugin) OnSessionClose(*framework.Session) {}

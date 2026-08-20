@@ -28,11 +28,10 @@ import (
 
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/base"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/budget"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/gang"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/resource"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/gangdisruption"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
 )
 
 const gpu = v1.ResourceName("nvidia.com/gpu")
@@ -149,7 +148,7 @@ func drainSession(snap framework.Snapshot, movable framework.MovableFn, minFreed
 }
 
 func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableFn, minFreed int, maxPG int, maxRes int64, plugins []string) *framework.Session {
-	plugins = append([]string{"resource", "budget", "binpack"}, plugins...)
+	plugins = append([]string{"repackbudget", "binpack"}, plugins...)
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Snapshot:      snap,
 		Resource:      gpu,
@@ -158,7 +157,7 @@ func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableF
 		MaxPodGroups:  maxPG,
 		MaxResource:   maxRes,
 		Free:          freeByCapMinusUsed,
-	}, plugins)
+	}, framework.PluginOptions(plugins...))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(movable)
 	return ssn
@@ -237,7 +236,7 @@ func TestDrain_PrefersLowerDisruptionCandidate(t *testing.T) {
 		"pg-b0": {Running: 1, MinAvailable: 1, Footprint: 2},
 	}}
 
-	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"workloaddisruption", "gangdisruption"}))
 	if !ok || plan == nil {
 		t.Fatal("expected both drain directions to be feasible")
 	}
@@ -262,7 +261,7 @@ func TestDrain_LazySelectionFallsBackToNextSchedulerFeasibleCandidate(t *testing
 		infeasibleSources: map[string]bool{"node-a": true},
 	}
 
-	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"workloaddisruption", "gangdisruption"}))
 	if !ok || plan == nil {
 		t.Fatal("expected the second-ranked candidate to be feasible")
 	}
@@ -286,7 +285,7 @@ func TestDrain_LazySelectionAt4000NodesRunsOneFullSimulation(t *testing.T) {
 	}
 	snap := &fakeSnap{nodes: nodes, views: views}
 
-	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"workloaddisruption", "gangdisruption"}))
 	if !ok || plan == nil || len(plan.FreedNodes) != 1 {
 		t.Fatalf("plan=%+v ok=%v, want one freed node", plan, ok)
 	}
@@ -318,7 +317,7 @@ func TestDrain_PreservesAlreadyAffectedGangNodesForLaterDrain(t *testing.T) {
 		},
 	}
 
-	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 2, 0, 0, []string{"base", "gang"}))
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 2, 0, 0, []string{"workloaddisruption", "gangdisruption"}))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible two-node drain plan")
 	}
@@ -393,7 +392,7 @@ func TestReceiverPreferenceAccountsForFutureMinAvailableBreach(t *testing.T) {
 			"job-c": {Running: 1, MinAvailable: 1, Footprint: 8},
 		},
 	}
-	session := drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"base", "gang"})
+	session := drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"workloaddisruption", "gangdisruption"})
 	defer framework.CloseSession(session)
 
 	nodesByName := make(map[string]*schedapi.NodeInfo, len(snap.nodes))
@@ -412,7 +411,7 @@ func TestReceiverPreferenceAccountsForFutureMinAvailableBreach(t *testing.T) {
 }
 
 func TestPreliminaryCandidateOrderUsesDisruptionScoreThenStableTieBreakers(t *testing.T) {
-	session := drainSessionWithPlugins(&fakeSnap{}, allMovable, 1, 0, 0, []string{"base"})
+	session := drainSessionWithPlugins(&fakeSnap{}, allMovable, 1, 0, 0, []string{"workloaddisruption"})
 	defer framework.CloseSession(session)
 	state := &drainState{ssn: session}
 
@@ -516,8 +515,9 @@ func TestDrain_ResourceCapacityPreflightSkipsFeasibilitySimulation(t *testing.T)
 
 func TestPreliminaryCandidatesExcludeAggregateCapacityFailuresBeforeScoring(t *testing.T) {
 	// The 16-card node cannot be drained because the two 8-card nodes provide only
-	// six cards of receiver slack. The smaller candidates remain eligible, proving
-	// that the aggregate capacity check runs before the scoring candidate set is built.
+	// six cards of receiver slack. The smaller partial candidate remains eligible,
+	// while the full node is excluded as a source before scoring. This proves both
+	// prefilters run before the scoring candidate set is built.
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
 		capNode("large", 16, gpuTask("large-task", "large-group", 12)),
 		capNode("small", 8, gpuTask("small-task", "small-group", 2)),
@@ -539,14 +539,81 @@ func TestPreliminaryCandidatesExcludeAggregateCapacityFailuresBeforeScoring(t *t
 		keys = append(keys, candidate.key)
 	}
 	sort.Strings(keys)
-	if got, want := fmt.Sprint(keys), fmt.Sprint([]string{"full", "small"}); got != want {
-		t.Fatalf("preliminary candidates=%v, want %v", keys, []string{"full", "small"})
+	if got, want := fmt.Sprint(keys), fmt.Sprint([]string{"small"}); got != want {
+		t.Fatalf("preliminary candidates=%v, want %v", keys, []string{"small"})
 	}
 	if !state.stuckUnits["large"] {
 		t.Fatal("aggregate-capacity failure must deactivate the large candidate")
 	}
 	if state.prunedByReason["insufficient_receiver_resource"] != 1 {
 		t.Fatalf("capacity prune count=%d, want 1", state.prunedByReason["insufficient_receiver_resource"])
+	}
+}
+
+func TestDrain_BaseEligibilityExcludesEmptyAndFullNodesWithoutBinpack(t *testing.T) {
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("partial-small", 8, gpuTask("small", "small-group", 2)),
+		capNode("partial-large", 8, gpuTask("large", "large-group", 6)),
+		capNode("empty", 8),
+		capNode("full", 8, gpuTask("full", "full-group", 8)),
+	}}
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Snapshot: snap, Resource: gpu, MinNodesFreed: 1, Free: freeByCapMinusUsed,
+	}, nil)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+	ssn.AddReceiverPoolFn(func(_ *api.PlanContext, nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo {
+		// A faulty/custom plugin must not be able to bypass the planner's base
+		// receiver invariant by adding empty or full nodes back into the pool.
+		return append(nodes, snap.nodes[2], snap.nodes[3])
+	})
+	defer framework.CloseSession(ssn)
+
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(snap.nodes))
+	for _, node := range snap.nodes {
+		nodesByName[node.Name] = node
+	}
+	state := newDrainState(snap.nodes, nodesByName, ssn, allMovable, gpu)
+	if got, want := fmt.Sprint(nodeNames(state.receiverNodes)), "[partial-small partial-large]"; got != want {
+		t.Fatalf("base receivers=%s, want %s", got, want)
+	}
+
+	plan, ok := finalizedPlan(ssn)
+	if !ok || plan == nil {
+		t.Fatal("expected partially occupied nodes to consolidate without binpack")
+	}
+	for _, move := range realMoves(plan) {
+		if move.From == "empty" || move.From == "full" || move.To == "empty" || move.To == "full" {
+			t.Fatalf("ineligible empty/full node participated in move: %+v", move)
+		}
+	}
+}
+
+func TestDrain_OnlyEmptyAndFullNodesSkipsSimulation(t *testing.T) {
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("empty", 8),
+		capNode("full", 8, gpuTask("full", "full-group", 8)),
+	}}
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Snapshot: snap, Resource: gpu, MinNodesFreed: 1, Free: freeByCapMinusUsed,
+	}, nil)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+	scoreCalls := 0
+	ssn.AddDisruptionScoreFn("mustNotRun", 1, func(*api.PlanContext, *api.CandidatePlan) float64 {
+		scoreCalls++
+		return 0
+	})
+	defer framework.CloseSession(ssn)
+
+	if plan := BuildPlan(ssn); plan != nil {
+		t.Fatalf("plan=%+v, want none when no partially occupied node exists", plan)
+	}
+	if snap.feasibilityCalls != 0 {
+		t.Fatalf("feasibility calls=%d, want no simulation for empty/full-only cluster", snap.feasibilityCalls)
+	}
+	if scoreCalls != 0 {
+		t.Fatalf("score calls=%d, want source eligibility pruning before candidate scoring", scoreCalls)
 	}
 }
 
@@ -562,7 +629,7 @@ func TestDrain_ExplicitZeroBudgetBlocks(t *testing.T) {
 		MaxPodGroups:   0,
 		LimitPodGroups: true,
 		Free:           freeByCapMinusUsed,
-	}, []string{"resource", "budget", "binpack"})
+	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 	if plan, ok := finalizedPlan(ssn); ok {
@@ -728,7 +795,7 @@ func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework
 		MinNodesFreed:             1,
 		MinFragImprovementPercent: minImprovePct,
 		Free:                      freeByCapMinusUsed,
-	}, []string{"resource", "budget", "binpack"})
+	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 	return ssn
@@ -790,7 +857,7 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Snapshot: snap, Resource: e2eNPU,
 		MinNodesFreed: 1, Free: freeNPU,
-	}, []string{"resource", "budget", "binpack"})
+	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 

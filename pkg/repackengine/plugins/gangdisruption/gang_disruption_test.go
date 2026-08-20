@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package gang
+package gangdisruption
 
 import (
 	"reflect"
@@ -44,6 +44,15 @@ func mv(t *schedapi.TaskInfo) *api.Move { return &api.Move{Task: t, From: "n0", 
 type fixedView struct{ view api.PodGroupView }
 
 func (f fixedView) PodGroupView(schedapi.JobID) api.PodGroupView { return f.view }
+
+type gangSnapshot struct{ nodes []*schedapi.NodeInfo }
+
+func (s *gangSnapshot) Nodes() []*schedapi.NodeInfo                { return s.nodes }
+func (*gangSnapshot) NodeInScope(*schedapi.NodeInfo) bool          { return true }
+func (*gangSnapshot) PodGroupView(schedapi.JobID) api.PodGroupView { return api.PodGroupView{} }
+func (*gangSnapshot) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	return nil, false
+}
 
 // gang g: Running=4, MinAvailable=3 → slack=1, Footprint=8.
 func gangCtx() *api.PlanContext {
@@ -93,14 +102,86 @@ func TestScoreFutureReceiverImpactUsesMarginalGangCost(t *testing.T) {
 	candidate := &framework.PlanningCandidate{Plan: &api.CandidatePlan{
 		Moves: []*api.Move{mv(tk("p0", "ns/g", 2))}, // consumes the gang's one-pod slack
 	}}
-	receiver := &framework.ReceiverCandidate{FutureMoves: map[schedapi.JobID]api.PodGroupMoveAggregate{
+	receiver := &framework.ReceiverCandidate{}
+	futureMoves := map[schedapi.JobID]api.PodGroupMoveAggregate{
 		"ns/g": {MovedPods: 1, MovedResource: 2},
-	}}
+	}
 
 	// Filling this receiver prevents a future drain that would newly breach the
 	// gang. Damaged resource grows from the two moved cards to the full footprint.
 	want := framework.ReceiverRank{1, 0, 6, 2, 1}
-	if got := scoreFutureReceiverImpact(ctx, candidate, receiver); !reflect.DeepEqual(got, want) {
+	if got := scoreFutureReceiverImpact(ctx, candidate, receiver, futureMoves); !reflect.DeepEqual(got, want) {
 		t.Fatalf("future receiver rank=%v, want %v", got, want)
+	}
+}
+
+func TestAggregateTasksByPodGroupBelongsToGangDisruptionPlugin(t *testing.T) {
+	aggregates := aggregateTasksByPodGroup([]*schedapi.TaskInfo{
+		tk("a", "ns/g", 2), tk("b", "ns/g", 3), tk("c", "ns/other", 1),
+	}, gpu)
+	if got := aggregates["ns/g"]; got.MovedPods != 2 || got.MovedResource != 5 {
+		t.Fatalf("ns/g aggregate=%+v, want 2 pods and 5 resources", got)
+	}
+	if got := aggregates["ns/other"]; got.MovedPods != 1 || got.MovedResource != 1 {
+		t.Fatalf("ns/other aggregate=%+v, want 1 pod and 1 resource", got)
+	}
+}
+
+func TestFutureMovesCacheOnlyScansRankedReceiver(t *testing.T) {
+	ranked := &schedapi.NodeInfo{
+		Name: "ranked",
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+			"ranked-task": tk("ranked-task", "ns/g", 2),
+		},
+	}
+	unranked := &schedapi.NodeInfo{
+		Name: "unranked",
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+			"unranked-task": tk("unranked-task", "ns/other", 2),
+		},
+	}
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Resource: gpu,
+		Snapshot: &gangSnapshot{nodes: []*schedapi.NodeInfo{ranked, unranked}},
+	}, nil)
+	defer framework.CloseSession(ssn)
+	movableCalls := 0
+	ssn.AddMovableFn(func(*schedapi.TaskInfo) bool {
+		movableCalls++
+		return true
+	})
+	plugin := &gangDisruptionPlugin{}
+
+	first := plugin.futureMovesForReceiver(ssn, ranked)
+	second := plugin.futureMovesForReceiver(ssn, ranked)
+	if first["ns/g"].MovedPods != 1 || second["ns/g"].MovedPods != 1 {
+		t.Fatalf("ranked receiver cache=%v/%v, want one ns/g move", first, second)
+	}
+	if movableCalls != 1 {
+		t.Fatalf("movable calls=%d, want ranked receiver scanned exactly once", movableCalls)
+	}
+	if _, found := plugin.futureMovesByNode[unranked.Name]; found {
+		t.Fatal("unranked receiver must not be scanned or cached")
+	}
+}
+
+func TestConfiguredGangWeights(t *testing.T) {
+	arguments := framework.Arguments{
+		argGangBreachesWeight:    1.5,
+		argDamagedResourceWeight: 0,
+	}
+	if err := framework.ValidatePluginArguments(Name, arguments); err != nil {
+		t.Fatalf("valid weights rejected: %v", err)
+	}
+	plugin, ok := framework.GetPlugin(Name, arguments)
+	if !ok {
+		t.Fatal("gangdisruption plugin is not registered")
+	}
+	configured := plugin.(*gangDisruptionPlugin)
+	if configured.gangBreachesWeight != 1.5 || configured.damagedResourceWeight != 0 {
+		t.Fatalf("configured weights=%+v, want 1.5/0", configured)
+	}
+	if err := framework.ValidatePluginArguments(Name, framework.Arguments{argGangBreachesWeight: -0.1}); err == nil {
+		t.Fatal("negative gang weight should be rejected")
 	}
 }

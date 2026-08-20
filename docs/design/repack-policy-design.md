@@ -1529,8 +1529,10 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
    (M,B,A)   ← MeasureResource(域内节点, R)         # 碎片度量，§4.12
    收益上界  ← B−A                                  # 理论最多可腾空节点数
 
-2. 一次性准备活动候选
-   active ← { n | NodeFreeable(n, movable) }         # 非空且目标资源 pod 全可动
+2. 一次性准备活动候选与接收池
+   active    ← { n | 0 < Used[n,R] < Allocatable[n,R] ∧ NodeFreeable(n, movable) }
+   receivers ← { n | 0 < Used[n,R] < Allocatable[n,R] ∧ FutureIdle[n,R] > 0 }
+   # 空节点保持空闲；满卡节点已完成装箱，不作为源节点或接收节点
    缓存每个候选的 victims、工作负载集合、迁移资源量
    缓存接收节点目标资源余量和工作负载聚合信息
 
@@ -1569,7 +1571,7 @@ repack 通过驱逐腾挪负载，必须兼容 **PodDisruptionBudget**（PDB）�
 | 第 1 步 | 碎片度量、理论最优 A、收益上界 B−A | `api/fragmentation.go`：`MeasureResource` / `OptimalNodes` / `WeightedFragRate`（后者多资源聚合，P1 预留） |
 | 第 2/3 步划片 | 可动判定、可腾空判定、victim 提取 | `api/movability.go`：`Movable` / `NodeFreeable` / `VictimsOf` |
 | 第 3 步落点+硬校验 | 克隆 node + cycle-state、`SimulatePredicateFn` 跑完整过滤栈模拟重落（INV-RESCHED） | `adapter/snapshot_session.go`：`FeasibleRelocation`。（纯 FFD+回溯求解器 `api/schedulability.go`：`Domain.Feasible` 保留为参考模型，仅单测 fake 复用） |
-| 第 5 步择优 | 归一化加权扰动预排序；沿排序惰性执行完整调度校验，首个可行候选胜出（§4.13.3/§4.16） | `framework/session.go`：`DisruptionScores`；`core/drain/drain.go`：`firstFeasibleCandidate`；评分项由 `plugins/base`、`plugins/gang` 注册 |
+| 第 5 步择优 | 归一化加权扰动预排序；沿排序惰性执行完整调度校验，首个可行候选胜出（§4.13.3/§4.16） | `framework/session.go`：`DisruptionScores`；`planner/drain/drain.go`：`firstFeasibleCandidate`；评分项由 `plugins/workloaddisruption`、`plugins/gangdisruption` 注册 |
 
 **整理前后效果（同一批作业拢紧、腾出 2 个整空节点、作业全程不停）：**
 
@@ -1875,13 +1877,13 @@ disruptionPolicy:
 
 | 维度 | 注册函数 | 语义 | 现有/预留实现 |
 |------|----------|------|----------------|
-| **可动性** | `AddMovableFn(task)→bool` | 某 task 能不能被搬（AND 否决） | `scope`（P0）；PDB / `minRunDuration`（P1） |
-| **可腾空单元** | `AddDomainFn(snap)→[]FreeableUnit` | 什么算一个可腾空单元 | `node`（P0，单节点）；hypernode/多级拓扑（P1，更大单元） |
-| **候选硬过滤** | `AddCandidateFilterFn(name,fn)` | 评分和调度模拟前低成本否决候选 | `resource` 总容量、`budget` maxPerRun（P0） |
-| **扰动软打分** | `AddDisruptionScoreFn(name,w,fn)` | 给候选计划的某个扰动维度打分（**只用于排序**，min-max 归一加权） | `base`(affectedPodGroups/movedCards/movedPods) + `gang`(gangBreaches/damagedGPU)（P0）；自定义权重（P1） |
-| **Victim 顺序** | `AddVictimOrderFn(name,fn)` | 决定完整调度模拟中的 Pod 尝试顺序 | `resource` 大请求优先（P0） |
-| **接收集合** | `AddReceiverPoolFn(fn)` | 规划开始时链式裁剪 receiver universe | `binpack` 排除目标资源空节点（P0） |
-| **接收排序** | `AddReceiverRankFn(name,priority,fn)` | 按显式优先级组成字典序 rank | `binpack` 保持占用/best-fit + `gang` 未来腾空成本（P0） |
+| **可动性** | `AddMovableFn(task)→bool` | 某 task 能不能被搬（AND 否决） | `workloadscope`（P0）；PDB / `minRunDuration`（P1） |
+| **可腾空单元** | `AddDomainFn(snap)→[]FreeableUnit` | 什么算一个可腾空单元 | `nodeconsolidation`（P0，单节点）；hypernode/多级拓扑（P1，更大单元） |
+| **候选硬过滤** | `AddCandidateFilterFn(name,fn)` | 评分和调度模拟前低成本否决候选 | `repackbudget` maxPerRun（P0）；接收总容量预检为 Planner 内置必要条件 |
+| **扰动软打分** | `AddDisruptionScoreFn(name,w,fn)` | 给候选计划的某个扰动维度打分（**只用于排序**，min-max 归一加权） | `workloaddisruption`(affectedPodGroups/movedCards/movedPods) + `gangdisruption`(gangBreaches/damagedGPU)（P0）；权重由 Repack Engine config 配置 |
+| **Victim 顺序** | `AddVictimOrderFn(name,fn)` | 决定完整调度模拟中的 Pod 尝试顺序 | `binpack` 大请求优先（P0） |
+| **接收集合** | `AddReceiverPoolFn(fn)` | 在 Planner 已排除空节点、满卡节点和无可调度余量节点后，继续链式裁剪 receiver universe | 预留给场景插件；`binpack` 不负责基础合法性（P0） |
+| **接收排序** | `AddReceiverRankFn(name,priority,fn)` | 按显式优先级组成字典序 rank | `binpack` 保持占用/best-fit + `gangdisruption` 未来腾空成本（P0） |
 | **计划硬约束闸** | `AddConstraintFn(plan)→bool` | 给**成品计划**的硬否决（AND，任一 false 即丢弃） | 内置收益门控 `MinNodesFreed`/`MinFragImprovementPercent`（P0）；`disruptionPolicy.maxDisruptionScore`（P1） |
 
 **② 策略注册表（不是插件维度）**
@@ -1892,6 +1894,8 @@ disruptionPolicy:
 | **搜索机制** | Action 直接调用 `planner/drain.BuildPlan` | 候选准备、增量状态、惰性 `FeasibleRelocation`；不承载场景策略 |
 
 > **为什么这么分**：`AddCandidateFilterFn` 在昂贵评分/模拟前做硬过滤，`AddDisruptionScoreFn` 对候选做软排序，`AddConstraintFn` 对成品计划做最终硬否决；三者分别对应不同成本和生命周期。Action 保持清晰的业务主流程，Planner 只维护高性能增量搜索，具体场景语义全部由 Plugin 注入。
+>
+> **能力完整性**：Action 通过 Capability 而不是插件名声明最低要求。`repack` 至少需要一个 `domain` provider；当前 `nodeconsolidation` 提供该能力。其余策略插件可独立关闭，未提供 Domain 时 Engine 在加载配置阶段直接报错，不进入静默空规划。
 >
 > **P1 目标泛化方式**：多级拓扑通过新的 `AddDomainFn` 贡献 HyperNode Unit；TP/EP 或推理 Role 卡数倍数通过候选过滤/成品计划约束表达；新的接收偏好通过 `AddReceiverRankFn` 表达，不修改 Drain 主循环。
 
@@ -1954,7 +1958,7 @@ func DefaultActions() []string { return []string{ActionRepack} } // P0 流水线
 | `relief` | 为解开 pending gang 反向找落点（§4.14.2 相位1）；victim 选择口径不同 | P1 | `RegisterAction("relief", …)` + 配置顺序加 `relief` |
 | `simulate` | 任务调度 **what-if 模拟器**：给定 pending 负载，模拟能否/落在哪，产出可调度性报告 | P1+ | 同上，独立 action，复用同一 `Snapshot`/predicate |
 
-> **关键解耦**：`framework.Session` 对 `Snapshot` 接口编程，不直接依赖 scheduler framework；Plugin 只注册策略回调，Planner 只消费聚合视图。Execute 提交仍走 Engine 注入的 Hook，生产为 Eviction 子资源、测试为 fake。Action 之间通过 Session 传递 Plan/Report，配置形态为 `repack.actions: ["repack"]`。
+> **关键解耦**：`framework.Session` 对 `Snapshot` 接口编程，不直接依赖 scheduler framework；Plugin 只注册策略回调，Planner 只消费聚合视图。Execute 提交仍走 Engine 注入的 Hook，生产为 Eviction 子资源、测试为 fake。Action 之间通过 Session 传递 Plan/Report；独立 `repack-conf` 中采用与 Scheduler 一致的字符串形式，例如 `actions: "repack"`，多个 Action 以逗号分隔。
 
 #### 4.16.5 集中度精修的可插拔策略 + config 权重（对接 §4.14.6）
 
@@ -1982,50 +1986,31 @@ net(move) = Σ_g wᵍ · gainFn_g(move)   −   λ · Σ_c wᶜ · costFn_c(move
 - **选择**：steepest-ascent 按 `net` 降序；平局再按"摩擦升序"(更该动便宜的)→稳定 ID（§determinism）。
 - **硬护栏（复用既有机制）**：`freezePriorityAbove`(优先级≥阈值的作业进 `Movable` frozen 集、永不搬，等同满节点锚定)、`maxMovesPerJob` / 大作业上限（对接 §4.15 `perJobRepackBudget`）。软成本是默认，硬护栏是可选。
 
-##### 两类配置的归属：「启用哪些插件」走 config，「怎么扰动/调多重」走 `disruptionPolicy`
+##### 配置归属：集群级评分权重走 Repack Engine config，执行预算走 RepackRun
 
-> **重要区分（避免把扰动调参塞进插件 config）**：
->
-> - **config（Volcano 插件 `arguments`）= 只管「这次 repack 用哪些插件」**——即把哪些 `gainFn` / `costFn`（集中度增益、`damagedGPU`/`priority`/`movedGPU`… 各扰动评分项）**注册进引擎**。它是集群级、与具体某次整理无关的"装配清单"。
-> - **扰动的调参（权重 / λ / 阈值 / bundlePolicy / 硬护栏）= 属于「扰动管理」，归 `RepackRun.spec.disruptionPolicy`（P1，§4.5.2）**，按**每次 Run** 给定；P0 不开放、用**引擎默认权重**（`DefaultWeightedDisruption`）。
-> - **受影响作业数上限**走用户面 **`maxPerRun.podGroups`**（引擎内部映射到 `ConsolidateOptions.MaxPodGroups` / `PlanOptions.MaxPodGroups`），不在 config 里。
-
-**① config（插件启用，集群级；只列启用项、不放权重值）**：
+Repack Engine 通过独立 `repack-conf`（由 ConfigMap 挂载的普通组件配置，不是 CR）选择 Action、Plugin，并为 `workloaddisruption`、`gangdisruption` Plugin 设置集群级中断成本权重：
 
 ```yaml
-# repack 插件 arguments：只声明启用哪些增益/扰动评分插件
-repack:
-  consolidate:
-    gainPlugins:    [ concentration ]                              # 收益侧：ΔΣused²
-    disruptionPlugins: [ affectedPodGroups, damagedGPU, priority,
-                         movedGPU, movedPods, gangBreaches ]        # 摩擦侧：注册哪些评分项
+actions: "repack"
+plugins:
+  - name: workloadscope
+  - name: repackbudget
+  - name: nodeconsolidation
+  - name: workloaddisruption
+    arguments:
+      affectedPodGroupsWeight: 1.0
+      movedResourceWeight: 0.3
+      movedPodsWeight: 0.1
+  - name: gangdisruption
+    arguments:
+      gangBreachesWeight: 0.8
+      damagedResourceWeight: 0.6
+  - name: binpack
 ```
 
-**② 扰动调参（每次 Run，`RepackRun.spec.disruptionPolicy`，P1；P0 用引擎默认）**：
+候选评分先对每个维度做当轮 min-max 归一化，再计算 `Σ(normalized × weight)`，总分越低越优。省略字段采用内置默认值，`0` 表示关闭该项；非法数值和未知参数会在 Engine 加载配置时被拒绝，运行时也保留防御性校验。该权重只决定可腾空候选的中断成本排序，不改变接收节点固定的 `Stability → Disruption → Packing` 字典序。
 
-```yaml
-# RepackRun.spec.disruptionPolicy —— 本次整理"怎么/能不能扰动在跑作业"
-disruptionPolicy:
-  bundlePolicy: SurplusPodsOnly     # 搬迁单元：只动盈余 pod / 整 job
-  minRunDuration: 30m               # 运行不足此时长的作业不搬
-  maxDisruptionScore: 80            # 中断代价分红线（§4.13.3）
-  # —— 扰动评分调参（P1 放开；P0 用 DefaultWeightedDisruption 默认值）——
-  lambda: "0.5"                     # 收益 vs 扰动 总摩擦系数
-  weights:                          # 各已启用扰动项的权重（仅对 config 注册了的项生效）
-    affectedPodGroups: "1.0"
-    damagedGPU: "0.6"               # gang 语义受损卡量：未破 minAvailable=搬走卡，破了=整 gang footprint
-    priority: "0.8"
-    movedGPU: "0.3"
-    movedPods: "0.1"
-    gangBreaches: "1.0"
-  hardFloors:                       # 可选硬护栏
-    freezePriorityAbove: 1000       # ≥此优先级的作业永不搬（frozen）
-    maxMovesPerJob: 2
-# 受影响作业数上限不在此处，走 spec.maxPerRun.podGroups
-```
-
-- **装配**：repack 插件 `OnSessionOpen` 读 **config** 决定**注册哪些** `gainFn`/`costFn`；权重/λ/护栏在 **P1** 由 `RepackRun.spec.disruptionPolicy` 逐次注入（`Use(name, weight, fn)`），**P0 用默认权重**。
-- **确定性不受影响**：无论权重来自默认还是 disruptionPolicy，都是该次 Run 的固定输入，整数/有理比较，净分排序确定（§4.14.6 / determinism）。
+配置文件给出集群级默认策略；单轮允许影响的工作负载数量和目标资源迁移量仍由 `RepackRun.spec.maxPerRun` 控制。若未来引入 Run 级 `disruptionPolicy`，其定位是覆盖单次执行策略，而不是替代组件默认配置。
 
 ##### 受影响 PodGroup 的判断与控制（**方案 A、B 通用**）
 
@@ -2047,7 +2032,7 @@ disruptionPolicy:
 
 > 即：**判断**用同一套 `WeightedDisruption` + `AffectedPodGroups()`；**控制**用同一组旋钮（`MaxPodGroups` 硬上限 + 划片/冻结/优先级地板 + 软成本权重），两方案一致。超额时——A 跳过会超预算的整节点 drain，B 跳过会开启新 gang 的 move——都保证最终受影响 PodGroup 数 ≤ `MaxPodGroups`。
 >
-> **这些旋钮的用户面来源**（不在插件 config 里）：`MaxPodGroups` ← `spec.maxPerRun.podGroups`；`FreezePriorityAbove`/`MaxMovesPerJob`/软成本权重/λ ← `spec.disruptionPolicy`（P1，P0 用引擎默认）；`Movable` ← `spec.scope`（含 exclude）+ PDB。`PlanOptions`/`ConsolidateOptions` 是引擎内部结构，由引擎接线时从上述 Run.spec 字段翻译填入（§4.16.5「两类配置的归属」）。
+> **当前实现的配置来源**：`MaxPodGroups` ← `spec.maxPerRun.podGroups`；可移动工作负载边界 ← `spec.scope`；五个软成本权重 ← `repack-conf` 中 `workloaddisruption`/`gangdisruption` 的 `arguments`。`FreezePriorityAbove`、`MaxMovesPerJob`、λ 和 Run 级 `disruptionPolicy` 仍属于后续能力，不应作为当前可用字段。
 
 #### 4.16.6 历史设计：算法级 Core 注册表（当前未采用）
 
@@ -2060,7 +2045,7 @@ disruptionPolicy:
 | 层级 | 插什么 | 选择方式 | 章节 |
 |---|---|---|---|
 | **算法级**（本节，外层） | **整个搜索范式**：A 节点腾空 / B 集中度爬山 | `repack.algorithm: drain \| concentration` | §4.16.6 |
-| **评分级**（§4.16.5，某 planner 内层） | gain / cost 评分项（集中度增益、damagedGPU/priority…）及其权重 | `gainPlugins`/`disruptionPlugins` + `disruptionPolicy` 权重(P1) | §4.16.5 |
+| **评分级**（§4.16.5，某 planner 内层） | 当前 `workloaddisruption`/`gangdisruption` 的中断成本评分项及权重 | `repack-conf` 的 Plugin 列表与 `arguments` | §4.16.5 |
 
 **接口与注册表**（对齐 Volcano 插件 `Registry` 风格；`PlanInput` = 算法无关入参，全部由 §4.5.2 Run.spec 翻译而来）：
 
@@ -3228,6 +3213,10 @@ status
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v11.8** | 2026-08-20 | **插件独立启停与节点基础边界收敛**：空目标资源节点禁止作为接收方，满卡节点禁止作为源节点或接收方；Planner 在任何候选评分和插件接收排序前一次性只保留部分占用且有可调度余量的接收节点，并对 Domain 输出做防御性源节点校验。`nodeconsolidation` 只贡献部分占用 Node Unit；`binpack` 删除接收池合法性过滤，只保留大 Pod 优先、稳定节点优先和 best-fit，因此关闭后只影响计划质量/性能，不影响正确性。Plugin 注册增加 Capability 元数据，`repack` Action 要求至少一个 `domain` provider，无 Domain 配置在启动阶段失败。补充节点分类、无 binpack、32 种可选插件组合和 Capability 校验测试。 |
+| **v11.7** | 2026-08-20 | **Repack Plugin 命名与配置语义收敛**：按云原生“对象 + 能力”命名，`scope`→`workloadscope`、`budget`→`repackbudget`、`node`→`nodeconsolidation`、`disruption`→`workloaddisruption`、`gang`→`gangdisruption`，`binpack` 沿用 Volcano Scheduler 术语。`workloadscope`、`repackbudget` 保持可选，不配置时对应能力不生效；默认仍启用全部六个插件。Plugin 列表改为顺序无关的能力集合，`OpenSession` 按插件名规范化后注册回调，避免 YAML 重排改变过滤、评分或接收策略；Action 列表仍保持有序流水线语义。同步包路径、注册名、默认配置、部署样例、设计文档和顺序置换回归测试。 |
+| **v11.6** | 2026-08-20 | **移除职责单薄的 `resource` Plugin**：接收总容量预检是所有整理场景都必须满足的性能与正确性不变量，收回 Planner 作为不可关闭的评分前 fast-fail；大资源 Pod 优先属于 First-Fit Decreasing 装箱策略，并入 `binpack` Plugin。删除 `resource` 注册、配置项和独立包，精简 `PlanningCandidate` 暴露字段；保留接收池裁剪后的精确容量复检和完整调度可行性模拟。同步默认配置、部署样例、架构文档及回归测试。 |
+| **v11.5** | 2026-08-20 | **Repack Engine 独立配置与中断成本权重开放**：新增由 ConfigMap 挂载的 `repack-conf`，以 `actions: "repack"` 和有序 `name + arguments` Plugin 列表配置执行管线；命令行仅作为显式覆盖。原语义不清晰的 `base` Plugin 重命名为 `disruption`；`disruption`/`gang` 开放 `affectedPodGroups`、`movedResource`、`movedPods`、`gangBreaches`、`damagedResource` 五项集群级权重，沿用逐维 min-max 归一化后加权求和；省略取默认、0 关闭，负数、非有限数值、字符串值和未知键在配置加载时拒绝。接收节点仍按 Stability → Disruption → Packing 固定字典序，不受评分权重影响。同步 Helm/独立部署样例、配置校验和单元测试。 |
 | **v11.4** | 2026-08-19 | **Action + Plugin 架构收敛**：移除仅有单实现且导致策略下沉的 Core 接口、注册表和算法参数；生产路径改为 `Engine → repack Action → planner/drain`。Action 统一负责碎片度量、计划构建、收益准入、扰动成本和 Report，Planner 只维护惰性搜索与增量状态。新增 `CandidateFilterFn`、`ReceiverPoolFn`、`VictimOrderFn`、`ReceiverRankFn`，将目标资源容量、maxPerRun、Scope、Gang 接收成本和 binpack 接收排序迁移到 `resource`/`budget`/`scope`/`gang`/`binpack` Plugin。接收 rank 每节点每插件只计算一次，保持 4000 节点惰性性能模型；目录由 `core/drain` 调整为 `planner/drain`，并补充 Framework、Action、Gang 和规模基准回归。 |
 | **v11.3** | 2026-07-27 | **CRD 文档与实现整体对齐**：以 Go API、生成 CRD、engine/controller 实际 status 写入路径为事实来源，删除当前章节中已不存在的 `relief`/`disruptionPolicy`/`profiles`、旧 `report`/`nominations`/`status.mode`/`triggerReason`；修正 scope 在 DryRun/Execute 中都可省略、空 matcher 与标准 LabelSelector 语义、`minFragImprovementPercent` 字段和整数单位；status 明确为 conditions 权威、phase 派生，终态同时保留 `Progressing=False` 与 `Complete=True`/`Failed=True`，并补齐 plan/result/relocations 双 journal、写入所有权与全字段示例。历史修订条目保留旧名但与当前 API 明确隔离。 |
 | **v11.2** | 2026-07-24 | **替身认领恢复与实现收敛**：已认领的 `Gated` / `AwaitingCapacity` / `Nominated` 替身在绑定前被删除或以新 UID 重建时，提名 reconciler 先通过冲突重试把旧 concrete claim 重置为 `Prepared`，再允许同一 PodGroup 内匹配调度等价类的新 Pod 接续；仍存活的认领者保持独占，并发扩容 Pod 不再因已占用 nomination 长时间持有 SchedulerGate。匹配入口收敛为 gate owner 指向的单个 RepackRun，potential-match 拆为明确的 PodGroup/workload-source 查询；未匹配 gate 仅在 patch 成功后产生一条原因事件。Execute 直接从 plan move 生成 nomination，SubGroup policy 查询从 disruption view 分离，victim Pod 缺失或 hash 生成失败在驱逐前终止；commit 后仅按 placement identity 过滤原 nomination，不重复生成 hash/TTL。补充同 PodGroup 替身删除恢复、并发扩容释放、SubGroup fail-closed、真实 SubGroup Execute hash 生产等 UT/E2E。 |

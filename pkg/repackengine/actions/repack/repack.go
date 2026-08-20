@@ -29,7 +29,10 @@ import (
 )
 
 func init() {
-	framework.RegisterAction(framework.ActionRepack, func() framework.Action { return &repackAction{} })
+	framework.RegisterAction(framework.ActionRepack, framework.ActionRegistration{
+		Factory:  func() framework.Action { return &repackAction{} },
+		Requires: []framework.PluginCapability{framework.CapabilityDomain},
+	})
 }
 
 type repackAction struct{}

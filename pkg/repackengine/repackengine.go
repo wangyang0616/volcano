@@ -47,9 +47,11 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,6 +74,7 @@ import (
 	state "volcano.sh/repack-controller/pkg/state"
 
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
 	"volcano.sh/volcano/pkg/scheduler"
 	schedcache "volcano.sh/volcano/pkg/scheduler/cache"
@@ -81,14 +84,20 @@ import (
 
 // Config holds the engine's runtime parameters.
 type Config struct {
-	SchedulerConf   string        // shared --scheduler-conf (same as volcano-scheduler)
-	ResyncPeriod    time.Duration // informer resync safety-net (0 = pure event-driven)
-	Cooldown        time.Duration // min gap after an Execute before the next may start
-	Plugins         []string      // capability plugins (default resource,scope,budget,node,base,gang,binpack)
-	Actions         []string      // action pipeline (default: repack)
-	MinNodesFreed   int           // benefit gate
-	DefaultResource string        // target when spec.goals is empty
-	NominationTTL   time.Duration // how long a nomination keeps being re-asserted
+	SchedulerConf   string                         // shared --scheduler-conf (same as volcano-scheduler)
+	RepackConf      string                         // engine-owned action/plugin configuration
+	ResyncPeriod    time.Duration                  // informer resync safety-net (0 = pure event-driven)
+	Cooldown        time.Duration                  // min gap after an Execute before the next may start
+	Plugins         []engineframework.PluginOption // capability plugins (default workloadscope,repackbudget,nodeconsolidation,workloaddisruption,gangdisruption,binpack)
+	Actions         []string                       // action pipeline (default: repack)
+	MinNodesFreed   int                            // benefit gate
+	DefaultResource string                         // target when spec.goals is empty
+	NominationTTL   time.Duration                  // how long a nomination keeps being re-asserted
+}
+
+type repackFileConfiguration struct {
+	Actions string                         `yaml:"actions"`
+	Plugins []engineframework.PluginOption `yaml:"plugins"`
 }
 
 // Engine drives RepackRuns against scheduler sessions, event-driven: each
@@ -98,6 +107,9 @@ type Engine struct {
 	schedulerCache schedcache.Cache
 	volcanoClient  vcclientset.Interface
 	config         Config
+	// Explicit command/programmatic overrides take precedence over repack-conf.
+	actionsExplicit bool
+	pluginsExplicit bool
 
 	informerFactory         vcinformers.SharedInformerFactory
 	repackRunLister         repacklisters.RepackRunLister
@@ -158,6 +170,7 @@ func newEventRecorder(config *rest.Config) record.EventRecorder {
 
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
 func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
+	actionsExplicit, pluginsExplicit := len(engineConfig.Actions) > 0, len(engineConfig.Plugins) > 0
 	// The engine reuses scheduler machinery (cache, plugins, predicates) that reads
 	// the scheduler's global options.ServerOpts — several accesses are unguarded
 	// (e.g. volume-binding, predicate/sharding helpers). The scheduler binary fills
@@ -171,7 +184,7 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 	}
 
 	if len(engineConfig.Plugins) == 0 {
-		engineConfig.Plugins = []string{"resource", "scope", "budget", "node", "base", "gang", "binpack"}
+		engineConfig.Plugins = defaultPluginOptions()
 	}
 	if engineConfig.NominationTTL <= 0 {
 		engineConfig.NominationTTL = defaultNominationTTL
@@ -197,6 +210,8 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 			schedoptions.ServerOpts.IgnoredCSIProvisioners, 0, 0),
 		volcanoClient:           volcanoClient,
 		config:                  engineConfig,
+		actionsExplicit:         actionsExplicit,
+		pluginsExplicit:         pluginsExplicit,
 		informerFactory:         informerFactory,
 		repackRunLister:         informer.Lister(),
 		repackRunInformerSynced: informer.Informer().HasSynced,
@@ -225,8 +240,9 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 	return e, nil
 }
 
-// Run loads the shared scheduler config, starts the cache + informer, and serves
-// RepackRun events with a single worker until ctx is cancelled.
+// Run loads the shared scheduler config and the independent Repack config,
+// starts the cache + informer, and serves RepackRun events with a single worker
+// until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer e.workQueue.ShutDown()
@@ -243,7 +259,7 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 	e.recoverOrphans(ctx) // fail runs left Running by a crashed predecessor
 	klog.V(3).InfoS("repack-engine started (event-driven)",
-		"plugins", e.config.Plugins,
+		"plugins", configuredPluginNames(e.config.Plugins),
 		"defaultResource", e.config.DefaultResource, "cooldown", e.config.Cooldown, "resyncPeriod", e.config.ResyncPeriod)
 	// Single worker: Execute runs serialize naturally (one reconcile at a time).
 	go func() {
@@ -267,7 +283,55 @@ func (e *Engine) loadConf() error {
 		return err
 	}
 	e.tiers, e.configurations = tiers, configurations
-	return nil
+	if e.config.RepackConf != "" {
+		repackRaw, err := os.ReadFile(e.config.RepackConf)
+		if err != nil {
+			return fmt.Errorf("read repack-conf: %w", err)
+		}
+		repackConfig, err := decodeRepackConfiguration(repackRaw)
+		if err != nil {
+			return fmt.Errorf("decode repack-conf: %w", err)
+		}
+		e.applyRepackConfiguration(repackConfig)
+	}
+	return validatePipelineConfiguration(e.config.Actions, e.config.Plugins)
+}
+
+func decodeRepackConfiguration(raw []byte) (repackFileConfiguration, error) {
+	var fileConfig repackFileConfiguration
+	if err := yaml.UnmarshalStrict(raw, &fileConfig); err != nil {
+		return repackFileConfiguration{}, err
+	}
+	return fileConfig, nil
+}
+
+func (e *Engine) applyRepackConfiguration(fileConfig repackFileConfiguration) {
+	if !e.actionsExplicit {
+		e.config.Actions = parseActionNames(fileConfig.Actions)
+	}
+	if !e.pluginsExplicit && len(fileConfig.Plugins) > 0 {
+		e.config.Plugins = fileConfig.Plugins
+	}
+}
+
+func parseActionNames(actions string) []string {
+	var names []string
+	for _, name := range strings.Split(actions, ",") {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			names = append(names, trimmed)
+		}
+	}
+	return names
+}
+
+func defaultPluginOptions() []engineframework.PluginOption {
+	return engineframework.PluginOptions("workloadscope", "repackbudget", "nodeconsolidation", "workloaddisruption", "gangdisruption", "binpack")
+}
+
+// PluginOptions converts the simple command-line plugin list into the richer
+// framework configuration used by repack-conf and programmatic callers.
+func PluginOptions(names []string) []engineframework.PluginOption {
+	return engineframework.PluginOptions(names...)
 }
 
 // enqueue adds a planning or in-flight placement RepackRun to the workqueue.

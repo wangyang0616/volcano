@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package scope
+package workloadscope
 
 import (
 	"testing"
@@ -38,7 +38,7 @@ func TestPluginRegistersScopeAsMovableBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ssn := framework.OpenSession(framework.SessionConfig{Scope: matcher}, []string{Name})
+	ssn := framework.OpenSession(framework.SessionConfig{Scope: matcher}, framework.PluginOptions(Name))
 	defer framework.CloseSession(ssn)
 
 	movable := ssn.Movable()
@@ -47,5 +47,24 @@ func TestPluginRegistersScopeAsMovableBoundary(t *testing.T) {
 	}
 	if movable(&schedapi.TaskInfo{Job: "ns/denied"}) {
 		t.Fatal("workload outside scope should be immovable")
+	}
+}
+
+func TestWorkloadScopeIsOptional(t *testing.T) {
+	matcher, err := framework.NewScopeMatcher(&repackv1alpha1.RepackScope{
+		PodGroups: &repackv1alpha1.RepackSelectorTerm{
+			Include: &repackv1alpha1.RepackSelector{Names: []string{"ns/allowed"}},
+		},
+	}, func(id schedapi.JobID) (string, labels.Labels, bool) {
+		return string(id), nil, true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssn := framework.OpenSession(framework.SessionConfig{Scope: matcher}, nil)
+	defer framework.CloseSession(ssn)
+
+	if !ssn.Movable()(&schedapi.TaskInfo{Job: "ns/outside"}) {
+		t.Fatal("workload scope must not apply when plugin is disabled")
 	}
 }

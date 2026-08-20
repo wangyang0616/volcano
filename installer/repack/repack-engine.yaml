@@ -6,6 +6,29 @@
 #
 # Apply AFTER the RepackRun CRD (see README) and the volcano-scheduler-configmap.
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: volcano-repack-engine-configmap
+  namespace: volcano-system
+data:
+  repack-engine.conf: |
+    actions: "repack"
+    plugins:
+      - name: workloadscope
+      - name: repackbudget
+      - name: nodeconsolidation
+      - name: workloaddisruption
+        arguments:
+          affectedPodGroupsWeight: 1.0
+          movedResourceWeight: 0.3
+          movedPodsWeight: 0.1
+      - name: gangdisruption
+        arguments:
+          gangBreachesWeight: 0.8
+          damagedResourceWeight: 0.6
+      - name: binpack
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: volcano-repack-engine
@@ -107,19 +130,24 @@ spec:
           args:
             - --logtostderr
             - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
+            - --repack-conf=/volcano.repack/repack-engine.conf
             - --leader-elect=true
             - --leader-elect-resource-namespace=volcano-system
             - --resync-period=5m
             # default accelerator when a RepackRun's spec.goals is empty:
             - --repack-default-resource=nvidia.com/gpu
-            - --repack-algorithm=drain
             - -v=3
           volumeMounts:
             - name: scheduler-config
               mountPath: /volcano.scheduler
+            - name: repack-config
+              mountPath: /volcano.repack
       volumes:
         - name: scheduler-config
           configMap:
             # the SAME ConfigMap the volcano-scheduler uses (plugin tiers /
             # predicates), so the engine sees the cluster identically.
             name: volcano-scheduler-configmap
+        - name: repack-config
+          configMap:
+            name: volcano-repack-engine-configmap

@@ -875,7 +875,7 @@ status:
 repack-engine 采用与 scheduler 一致的 **Action + Plugin + Session 回调**模型：
 
 - **Action** 维护稳定主流程。P0 的 `repack` Action 负责碎片度量、调用 Planner、收益准入、成本汇总和报告生成；Execute 副作用仍由 Engine 在计划持久化后提交。
-- **Plugin** 刻画可组合的场景策略。默认启用 `resource`、`scope`、`budget`、`node`、`base`、`gang`、`binpack`，分别负责资源容量、业务授权边界、爆炸半径、可释放单元、通用扰动、Gang 成本和接收节点装箱策略。
+- **Plugin** 刻画可组合的场景策略。默认启用 `workloadscope`、`repackbudget`、`nodeconsolidation`、`workloaddisruption`、`gangdisruption`、`binpack`，分别负责业务授权边界、单轮整理预算、Node 级整理、中断成本、Gang 中断成本和接收节点装箱策略。Plugin 配置按能力集合解释，调整 YAML 中的排列顺序不改变规划结果；Action 仍按配置顺序执行。接收端目标资源总容量预检是 Planner 的通用快速失败条件，不作为可关闭插件暴露。
 - **Planner** 只保留候选准备、增量状态和惰性调度模拟等搜索机制，不解释具体场景语义。
 
 当前不再提供 Core 注册表或算法选择参数。新增 Node/HyperNode、PDB、Gang 或接收节点策略时增加 Plugin；只有新增业务阶段时才增加 Action。详细契约见 [Repack Action + Plugin 架构设计](./repack-action-plugin-architecture.md)。
@@ -1208,13 +1208,13 @@ API 不声明字段、类型或 YAML 形状。
 
 `repack` Action 对**引擎 Session**（只读 `Snapshot` + Plugin 回调）编程。Action 先度量碎片，再调用 `planner/drain.BuildPlan`，最后执行 `PlanAdmissible`、扰动成本汇总和 Report 渲染。
 
-Drain Planner 采用**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 Unit、victim、工作负载聚合和节点目标资源余量。每一轮先通过 Plugin 执行预算与容量预检，再按“此前已提交 moves + 当前候选 victim”的完整计划扰动排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选。提交后增量更新接收端容量和活动集合，直到没有候选可提交。最终收益门槛由 Action 通过 Session 约束统一检查。
+Drain Planner 采用**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 Unit、victim、工作负载聚合和节点目标资源余量。每一轮先执行内置接收总容量预检，再通过 Plugin 检查执行预算，并按“此前已提交 moves + 当前候选 victim”的完整计划扰动排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选。提交后增量更新接收端容量和活动集合，直到没有候选可提交。最终收益门槛由 Action 通过 Session 约束统一检查。
 
 #### 当前 P0 多策略扰动预排序与惰性校验
 
 > **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 做**逐维 min-max 归一化的加权求和**。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
 
-默认启用 `resource + scope + budget + node + base + gang + binpack`。其中 `base` 与 `gang` 注册五个扰动维度：
+默认启用 `workloadscope + repackbudget + nodeconsolidation + workloaddisruption + gangdisruption + binpack`。其中 `workloaddisruption` 与 `gangdisruption` 注册五个扰动维度；`binpack` 负责大资源 Pod 优先和接收节点装箱：
 
 | 评分维度 | 默认权重 | 原始值 | 目的 |
 |---|---:|---|---|
@@ -1301,7 +1301,7 @@ flowchart TD
 
 ### 扰动控制
 
-- **动作/代价单位 = PodGroup（gang），软感知（非硬原子）**：破组代价以整 gang 评估，但**不要求整组 pod 一起搬**——只搬"腾节点所需"的那些 pod，破组与否由下面的阶跃函数计价，`node` 域 + 逐 task 装箱负责实际搬运。
+- **动作/代价单位 = PodGroup（gang），软感知（非硬原子）**：破组代价以整 gang 评估，但**不要求整组 pod 一起搬**——只搬"腾节点所需"的那些 pod，破组与否由下面的阶跃函数计价，`nodeconsolidation` 域 + 逐 task 装箱负责实际搬运。
 - **受损卡数按 gang 语义计（阶跃）**：搬走 Pod 未突破 `minAvailable` 时计该组已搬走的卡；一旦突破，整 gang 视为受损（按 footprint 计）。因此首次打破大 gang 的成本显著更高，默认评分会倾向少触及作业、避开大作业。
 - **评分看全计划而非单步增量**：每轮把此前已提交的 moves 与当前候选 moves 合并评分。破组 gang 的 footprint 不会被重复累计、受影响 gang 数也不会重复增加；但后续搬迁仍会增加 `movedResource` 和 `movedPods`，并非"边际为 0"。详见上方“当前 P0 多策略扰动评分”。
 - **封顶**：`maxPerRun.podGroups` / `.resources` 限定单轮规模；长优雅期作业可在挑 victim 时规避。
@@ -1329,7 +1329,7 @@ flowchart TD
 | `pkg/repackengine/api` | 纯模型与算法原语：`Move`、碎片度量、`RepackPlan`/`FreeableUnit`、可动性、扰动聚合，以及参考求解器 `Domain.Feasible`（仅单测 fake 复用，非生产路径）（零框架依赖） |
 | `pkg/repackengine/framework` | 引擎契约：`Session`、`Plugin`/`Action` 注册表、规划回调聚合、`Report`、`CommitPlan`、scope 解析 |
 | `pkg/repackengine/planner/drain` | 通用惰性 Drain 搜索机制与 4000 节点性能基准 |
-| `pkg/repackengine/plugins/{resource,scope,budget,node,base,gang,binpack}` | 场景策略插件（init 自注册）；`hypernode`/`pdb` 后续 |
+| `pkg/repackengine/plugins/{workloadscope,repackbudget,nodeconsolidation,workloaddisruption,gangdisruption,binpack}` | 场景策略插件（init 自注册）；`hypernode`/`pdb` 后续 |
 | `pkg/repackengine/actions/repack` | P0 主流程：度量、规划、收益准入、成本与 Report |
 | `pkg/repackengine/adapter` | 唯一耦合 `scheduler/framework` 的适配层：`SessionSnapshot`（含 `FeasibleRelocation` 克隆 feasibility check，走 `ssn.SimulatePredicateFn`）/`SessionGangScopeLookup`/`NodeFreeCapacity` |
 | `pkg/repackengine/repackengine.go` | 驱动：cache + `OpenSession`(tiers) + 跑 Plugin/Action + 写 status |

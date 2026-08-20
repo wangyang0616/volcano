@@ -33,18 +33,35 @@ type Action interface {
 	Execute(ssn *Session)
 }
 
-var actionRegistry = map[string]func() Action{}
+// ActionRegistration declares the implementation and semantic plugin
+// capabilities required to execute an Action meaningfully.
+type ActionRegistration struct {
+	Factory  func() Action
+	Requires []PluginCapability
+}
 
-// RegisterAction registers an action factory under a config name.
-func RegisterAction(name string, factory func() Action) { actionRegistry[name] = factory }
+var actionRegistry = map[string]ActionRegistration{}
+
+// RegisterAction registers an action factory and its capability requirements
+// under a config name.
+func RegisterAction(name string, registration ActionRegistration) {
+	registration.Requires = append([]PluginCapability(nil), registration.Requires...)
+	actionRegistry[name] = registration
+}
 
 // GetAction returns a fresh action for the config name, ok=false if unknown.
 func GetAction(name string) (Action, bool) {
-	f, ok := actionRegistry[name]
-	if !ok {
+	registration, ok := actionRegistry[name]
+	if !ok || registration.Factory == nil {
 		return nil, false
 	}
-	return f(), true
+	return registration.Factory(), true
+}
+
+// ActionRequires returns a copy of the plugin capabilities required by an
+// action. Unknown actions return nil and are rejected separately by validation.
+func ActionRequires(name string) []PluginCapability {
+	return append([]PluginCapability(nil), actionRegistry[name].Requires...)
 }
 
 // ActionNames lists registered action names, sorted.
