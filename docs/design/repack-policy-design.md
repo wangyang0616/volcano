@@ -1998,17 +1998,17 @@ plugins:
   - name: nodeconsolidation
   - name: workloaddisruption
     arguments:
-      affectedPodGroupsWeight: 1.0
-      movedResourceWeight: 0.3
-      movedPodsWeight: 0.1
+      affectedPodGroupsWeight: 10
+      movedResourceWeight: 3
+      movedPodsWeight: 1
   - name: gangdisruption
     arguments:
-      gangBreachesWeight: 0.8
-      damagedResourceWeight: 0.6
+      gangBreachesWeight: 8
+      damagedResourceWeight: 6
   - name: binpack
 ```
 
-候选评分先对每个维度做当轮 min-max 归一化，再计算 `Σ(normalized × weight)`，总分越低越优。省略字段采用内置默认值，`0` 表示关闭该项；非法数值和未知参数会在 Engine 加载配置时被拒绝，运行时也保留防御性校验。该权重只决定可腾空候选的中断成本排序，不改变接收节点固定的 `Stability → Disruption → Packing` 字典序。
+候选评分先将每个维度的原始中断成本在当轮候选之间反向归一化为 `0～100` 的整数偏好分，再计算 `Σ(strategyScore × weight)`，总分越高越优。省略字段采用内置默认值，`0` 表示关闭该项；小数、负数、字符串数值和未知参数会在 Engine 加载配置时被拒绝，运行时也保留防御性校验。该权重只决定可腾空候选的中断成本排序，不改变接收节点固定的 `Stability → Disruption → Packing` 字典序。
 
 配置文件给出集群级默认策略；单轮允许影响的工作负载数量和目标资源迁移量仍由 `RepackRun.spec.maxPerRun` 控制。若未来引入 Run 级 `disruptionPolicy`，其定位是覆盖单次执行策略，而不是替代组件默认配置。
 
@@ -3213,6 +3213,7 @@ status
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **v11.9** | 2026-08-21 | **候选评分语义对齐 Scheduler**：五项中断成本分别反向归一化为 `0～100` 的整数偏好分，以整数权重加权求和并按总分从高到低选择候选；默认权重按原比例调整为 `10/3/1/8/6`，`0` 仍表示关闭对应评分项。同步配置样例、可解释日志、单元测试和用户资料；接收节点固定字典序不变。 |
 | **v11.8** | 2026-08-20 | **插件独立启停与节点基础边界收敛**：空目标资源节点禁止作为接收方，满卡节点禁止作为源节点或接收方；Planner 在任何候选评分和插件接收排序前一次性只保留部分占用且有可调度余量的接收节点，并对 Domain 输出做防御性源节点校验。`nodeconsolidation` 只贡献部分占用 Node Unit；`binpack` 删除接收池合法性过滤，只保留大 Pod 优先、稳定节点优先和 best-fit，因此关闭后只影响计划质量/性能，不影响正确性。Plugin 注册增加 Capability 元数据，`repack` Action 要求至少一个 `domain` provider，无 Domain 配置在启动阶段失败。补充节点分类、无 binpack、32 种可选插件组合和 Capability 校验测试。 |
 | **v11.7** | 2026-08-20 | **Repack Plugin 命名与配置语义收敛**：按云原生“对象 + 能力”命名，`scope`→`workloadscope`、`budget`→`repackbudget`、`node`→`nodeconsolidation`、`disruption`→`workloaddisruption`、`gang`→`gangdisruption`，`binpack` 沿用 Volcano Scheduler 术语。`workloadscope`、`repackbudget` 保持可选，不配置时对应能力不生效；默认仍启用全部六个插件。Plugin 列表改为顺序无关的能力集合，`OpenSession` 按插件名规范化后注册回调，避免 YAML 重排改变过滤、评分或接收策略；Action 列表仍保持有序流水线语义。同步包路径、注册名、默认配置、部署样例、设计文档和顺序置换回归测试。 |
 | **v11.6** | 2026-08-20 | **移除职责单薄的 `resource` Plugin**：接收总容量预检是所有整理场景都必须满足的性能与正确性不变量，收回 Planner 作为不可关闭的评分前 fast-fail；大资源 Pod 优先属于 First-Fit Decreasing 装箱策略，并入 `binpack` Plugin。删除 `resource` 注册、配置项和独立包，精简 `PlanningCandidate` 暴露字段；保留接收池裁剪后的精确容量复检和完整调度可行性模拟。同步默认配置、部署样例、架构文档及回归测试。 |

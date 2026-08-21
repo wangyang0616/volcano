@@ -60,7 +60,9 @@ take precedence over the Repack configuration file. The file is mounted from
 `volcano-repack-engine-configmap`; it is plain component configuration, not a CR.
 The `workloaddisruption` and `gangdisruption` plugin arguments configure cluster-wide disruption-score
 weights. Omitted weights use the built-in defaults shown in the manifest; `0`
-disables a score term. Values must be finite, non-negative YAML numbers. These
+disables a score term. Values must be non-negative YAML integers. Each strategy
+converts its raw disruption cost to an integer score in `[0,100]` (higher is
+better), and the weighted sum ranks candidates from highest to lowest. These
 weights rank freeable candidates only; receiver nodes retain the fixed
 Stability, Disruption, then Packing lexicographic order.
 The configuration is parsed strictly: unknown or misspelled top-level fields,

@@ -77,7 +77,7 @@ actions: "prepare, repack"
 plugins:
   - name: workloaddisruption
     arguments:
-      movedPodsWeight: 0.25
+      movedPodsWeight: 25
   - name: binpack
 `))
 	if err != nil {
@@ -87,7 +87,7 @@ plugins:
 		t.Fatalf("actions=%q, want comma-separated source value", configured.Actions)
 	}
 	if len(configured.Plugins) != 2 || configured.Plugins[0].Name != "workloaddisruption" ||
-		configured.Plugins[0].Arguments["movedPodsWeight"] != 0.25 {
+		configured.Plugins[0].Arguments["movedPodsWeight"] != 25 {
 		t.Fatalf("plugins=%+v, want ordered plugins with arguments", configured.Plugins)
 	}
 
@@ -219,7 +219,7 @@ plugins:
   - name: repackbudget
   - name: workloaddisruption
     arguments:
-      movedPodsWeight: -0.1
+      movedPodsWeight: 0.1
 `), 0o600); err != nil {
 		t.Fatalf("write repack config: %v", err)
 	}

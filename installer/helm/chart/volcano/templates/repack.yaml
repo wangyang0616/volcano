@@ -26,13 +26,13 @@ data:
       - name: nodeconsolidation
       - name: workloaddisruption
         arguments:
-          affectedPodGroupsWeight: 1.0
-          movedResourceWeight: 0.3
-          movedPodsWeight: 0.1
+          affectedPodGroupsWeight: 10
+          movedResourceWeight: 3
+          movedPodsWeight: 1
       - name: gangdisruption
         arguments:
-          gangBreachesWeight: 0.8
-          damagedResourceWeight: 0.6
+          gangBreachesWeight: 8
+          damagedResourceWeight: 6
       - name: binpack
     {{- end }}
 ---

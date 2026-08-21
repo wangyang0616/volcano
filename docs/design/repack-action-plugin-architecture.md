@@ -99,13 +99,13 @@ plugins:
   - name: nodeconsolidation
   - name: workloaddisruption
     arguments:
-      affectedPodGroupsWeight: 1.0
-      movedResourceWeight: 0.3
-      movedPodsWeight: 0.1
+      affectedPodGroupsWeight: 10
+      movedResourceWeight: 3
+      movedPodsWeight: 1
   - name: gangdisruption
     arguments:
-      gangBreachesWeight: 0.8
-      damagedResourceWeight: 0.6
+      gangBreachesWeight: 8
+      damagedResourceWeight: 6
   - name: binpack
 ```
 
@@ -113,7 +113,7 @@ Plugin 列表按能力集合解释，配置排列不参与策略优先级。`Ope
 
 未指定 `--repack-conf` 时使用内置 Action 和 Plugin 默认值。`--repack-actions`、`--repack-plugins` 可用于命令行覆盖，并优先于独立配置文件；需要结构化 `arguments` 时使用 `repack-conf`。配置采用严格 YAML 解析，未知或拼写错误的顶层字段、Plugin 字段及参数都会导致加载失败，不会静默回退默认行为。`workloadscope`、`repackbudget`、`workloaddisruption`、`gangdisruption` 和 `binpack` 都是独立可选能力，删除后只关闭对应授权、预算、评分或装箱策略；空/满节点裁剪和完整调度校验仍然生效。`repack` Action 通过 Capability 而不是插件名要求至少一个 Domain provider；当前 `nodeconsolidation` 提供 `domain`，未来可由 HyperNode Domain 替代。Engine 在配置加载阶段检查静态 Capability 组合，并在每次 Session 打开后确认实际注册了对应回调；缺少 Domain provider、插件参数非法、能力依赖不满足或只声明能力但未注册回调时均失败关闭，避免静默产生空计划。静态编译进二进制的插件仍需在 `cmd/volcano-repack-engine/main.go` 导入注册，这一点与 Volcano Scheduler 的内置插件一致，但启停、排序和参数调整不再需要修改代码。
 
-`workloaddisruption` 和 `gangdisruption` 的权重用于多个可腾空候选之间的中断成本排序。每个评分项先在当轮候选集合内进行 min-max 归一化，再按权重求和，总分越低越优；候选在某项上全部相同时，该项贡献为 0。省略字段使用上述默认值，配置为 `0` 可关闭对应评分项；负数、非有限数值、字符串数值或未知参数会被视为配置错误。这里的权重不影响接收节点排序，接收节点仍按 `Stability → Disruption → Packing` 三个阶段进行固定字典序比较，避免不同量纲互相抵消。
+`workloaddisruption` 和 `gangdisruption` 的权重用于多个可腾空候选之间的中断成本排序。每个评分项先在当轮候选集合内反向归一化为 `0～100` 的整数偏好分，再按整数权重求和，总分越高越优；候选在某项上全部相同时均得 100 分，不改变相对顺序。省略字段使用上述默认值，配置为 `0` 可关闭对应评分项；小数、负数、字符串数值或未知参数会被视为配置错误。这里的权重不影响接收节点排序，接收节点仍按 `Stability → Disruption → Packing` 三个阶段进行固定字典序比较，避免不同量纲互相抵消。
 
 - `affectedPodGroupsWeight`：影响的工作负载（内部以 PodGroup 聚合）数量；
 - `movedResourceWeight`：迁移的目标资源总量；

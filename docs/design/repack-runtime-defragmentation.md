@@ -1212,28 +1212,29 @@ Drain Planner 采用**单趟动态贪心、惰性可行性评估、产出唯一 
 
 #### 当前 P0 多策略扰动预排序与惰性校验
 
-> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 做**逐维 min-max 归一化的加权求和**。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
+> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 将各维度反向归一化为 `0～100` 的整数偏好分，再做加权求和。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
 
 默认启用 `workloadscope + repackbudget + nodeconsolidation + workloaddisruption + gangdisruption + binpack`。其中 `workloaddisruption` 与 `gangdisruption` 注册五个扰动维度；`binpack` 负责大资源 Pod 优先和接收节点装箱：
 
 | 评分维度 | 默认权重 | 原始值 | 目的 |
 |---|---:|---|---|
-| `affectedPodGroups` | 1.0 | 全计划中实际迁移到的 distinct PodGroup 数 | 尽量少影响作业 |
-| `gangBreaches` | 0.8 | `movedPods > max(Running-MinAvailable, 0)` 的 PodGroup 数 | 避免打破 gang 下限 |
-| `damagedResource` | 0.6 | 未破组时计该组已搬迁卡数；破组时计整个 PodGroup footprint | 避免低估打破大 gang 的代价 |
-| `movedResource` | 0.3 | 全计划搬迁的目标资源总量 | 控制 GPU/NPU 搬迁规模 |
-| `movedPods` | 0.1 | 全计划实际重落的 Pod 数 | 控制 Pod churn |
+| `affectedPodGroups` | 10 | 全计划中实际迁移到的 distinct PodGroup 数 | 尽量少影响作业 |
+| `gangBreaches` | 8 | `movedPods > max(Running-MinAvailable, 0)` 的 PodGroup 数 | 避免打破 gang 下限 |
+| `damagedResource` | 6 | 未破组时计该组已搬迁卡数；破组时计整个 PodGroup footprint | 避免低估打破大 gang 的代价 |
+| `movedResource` | 3 | 全计划搬迁的目标资源总量 | 控制 GPU/NPU 搬迁规模 |
+| `movedPods` | 1 | 全计划实际重落的 Pod 数 | 控制 Pod churn |
 
 对本轮第 `i` 个活动候选、每个维度 `k`，先在本轮候选集合内归一化：
 
 ```text
-norm(i, k) = 0                                      if max(raw(*, k)) == min(raw(*, k))
-           = (raw(i, k) - min(raw(*, k))) / span    otherwise
+strategyScore(i, k) = 100                                               if max(raw(*, k)) == min(raw(*, k))
+                    = 100 - floor(100 × (raw(i, k) - min(raw(*, k)))
+                                         / (max(raw(*, k)) - min(raw(*, k)))) otherwise
 
-score(i) = Σ weight(k) × norm(i, k)
+totalScore(i) = Σ strategyScore(i, k) × weight(k)
 ```
 
-按 `score(i)` 从低到高尝试候选，选择第一个通过完整调度校验的候选。某维度在本轮所有候选都相同，说明它不能区分当前选择，归一化后贡献为 0；因此分数是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
+按 `totalScore(i)` 从高到低尝试候选，选择第一个通过完整调度校验的候选。原始中断成本越低，对应的策略得分越高；某维度在本轮所有候选都相同时，所有候选均得 100 分，因此不会改变相对顺序。分数仍是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
 
 把已提交 moves 纳入每个候选有两个关键效果：一是新触及一个 PodGroup 会增加 `affectedPodGroups`；二是一个 gang 已被打破后，继续搬其 Pod 不再增加 `gangBreaches`，`damagedResource` 也仍是该 gang 的一次 footprint 计费，但 `movedResource` 与 `movedPods` 仍会增加。该机制会倾向复用已有扰动面，却不会把后续迁移误判为零代价。
 

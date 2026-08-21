@@ -31,9 +31,9 @@ const Name = "workloaddisruption"
 // Default weights for the generic disruption dimensions. repack-conf plugin
 // arguments override them; a zero weight disables the corresponding term.
 const (
-	weightAffectedPodGroups = 1.0
-	weightMovedResource     = 0.3
-	weightMovedPods         = 0.1
+	weightAffectedPodGroups int64 = 10
+	weightMovedResource     int64 = 3
+	weightMovedPods         int64 = 1
 
 	argAffectedPodGroupsWeight = "affectedPodGroupsWeight"
 	argMovedResourceWeight     = "movedResourceWeight"
@@ -47,9 +47,9 @@ func init() {
 }
 
 type workloadDisruptionPlugin struct {
-	affectedPodGroupsWeight float64
-	movedResourceWeight     float64
-	movedPodsWeight         float64
+	affectedPodGroupsWeight int64
+	movedResourceWeight     int64
+	movedPodsWeight         int64
 }
 
 func newPlugin(arguments framework.Arguments) framework.Plugin {
@@ -60,8 +60,8 @@ func newPlugin(arguments framework.Arguments) framework.Plugin {
 	}
 }
 
-func configuredWeight(arguments framework.Arguments, key string, defaultValue float64) float64 {
-	value, err := arguments.NonNegativeFloat64(key, defaultValue)
+func configuredWeight(arguments framework.Arguments, key string, defaultValue int64) int64 {
+	value, err := arguments.NonNegativeInt(key, defaultValue)
 	if err != nil {
 		return defaultValue
 	}
@@ -74,13 +74,13 @@ func validateArguments(arguments framework.Arguments) error {
 	}
 	for _, item := range []struct {
 		key          string
-		defaultValue float64
+		defaultValue int64
 	}{
 		{argAffectedPodGroupsWeight, weightAffectedPodGroups},
 		{argMovedResourceWeight, weightMovedResource},
 		{argMovedPodsWeight, weightMovedPods},
 	} {
-		if _, err := arguments.NonNegativeFloat64(item.key, item.defaultValue); err != nil {
+		if _, err := arguments.NonNegativeInt(item.key, item.defaultValue); err != nil {
 			return err
 		}
 	}
@@ -90,14 +90,14 @@ func validateArguments(arguments framework.Arguments) error {
 func (*workloadDisruptionPlugin) Name() string { return Name }
 
 func (p *workloadDisruptionPlugin) OnSessionOpen(ssn *framework.Session) {
-	ssn.AddDisruptionScoreFn("affectedPodGroups", p.affectedPodGroupsWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.MoveAggregate(ctx).AffectedPodGroups)
+	ssn.AddDisruptionScoreFn("affectedPodGroups", p.affectedPodGroupsWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
+		return p.MoveAggregate(ctx).AffectedPodGroups
 	})
-	ssn.AddDisruptionScoreFn("movedResource", p.movedResourceWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.MoveAggregate(ctx).MovedResource)
+	ssn.AddDisruptionScoreFn("movedResource", p.movedResourceWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
+		return p.MoveAggregate(ctx).MovedResource
 	})
-	ssn.AddDisruptionScoreFn("movedPods", p.movedPodsWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
-		return float64(p.MoveAggregate(ctx).MovedPods)
+	ssn.AddDisruptionScoreFn("movedPods", p.movedPodsWeight, func(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
+		return p.MoveAggregate(ctx).MovedPods
 	})
 }
 

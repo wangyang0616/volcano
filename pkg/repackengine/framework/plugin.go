@@ -18,46 +18,54 @@ package framework
 
 import (
 	"fmt"
-	"math"
 	"sort"
 )
+
+// Keep weighted score multiplication comfortably inside int64 even when
+// several plugins contribute terms to the same candidate.
+const maxPluginWeight int64 = 1<<31 - 1
 
 // Arguments carries one plugin's configuration, matching the scheduler's
 // name-plus-arguments extension model.
 type Arguments map[string]interface{}
 
-// NonNegativeFloat64 returns a finite, non-negative numeric argument or the
-// supplied default when omitted. YAML may decode a whole number as int, so both
-// integer and floating-point forms are accepted. Zero intentionally disables a
-// weighted score term.
-func (a Arguments) NonNegativeFloat64(key string, defaultValue float64) (float64, error) {
+// NonNegativeInt returns a non-negative integer argument or the supplied
+// default when omitted. Score weights follow the Volcano Scheduler convention:
+// they are integers, zero disables the score term, and fractional values are
+// rejected instead of being silently rounded.
+func (a Arguments) NonNegativeInt(key string, defaultValue int64) (int64, error) {
 	value, ok := a[key]
 	if !ok {
 		return defaultValue, nil
 	}
-	var parsed float64
+	var parsed int64
 	switch typed := value.(type) {
-	case float64:
-		parsed = typed
-	case float32:
-		parsed = float64(typed)
 	case int:
-		parsed = float64(typed)
+		parsed = int64(typed)
 	case int64:
-		parsed = float64(typed)
+		parsed = typed
 	case int32:
-		parsed = float64(typed)
+		parsed = int64(typed)
 	case uint:
-		parsed = float64(typed)
+		if uint64(typed) > uint64(maxPluginWeight) {
+			return 0, fmt.Errorf("argument %q is too large: %v", key, value)
+		}
+		parsed = int64(typed)
 	case uint64:
-		parsed = float64(typed)
+		if typed > uint64(maxPluginWeight) {
+			return 0, fmt.Errorf("argument %q is too large: %v", key, value)
+		}
+		parsed = int64(typed)
 	case uint32:
-		parsed = float64(typed)
+		parsed = int64(typed)
 	default:
-		return 0, fmt.Errorf("argument %q must be a number, got %T", key, value)
+		return 0, fmt.Errorf("argument %q must be an integer, got %T", key, value)
 	}
-	if parsed < 0 || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-		return 0, fmt.Errorf("argument %q must be finite and non-negative, got %v", key, parsed)
+	if parsed < 0 {
+		return 0, fmt.Errorf("argument %q must be non-negative, got %v", key, parsed)
+	}
+	if parsed > maxPluginWeight {
+		return 0, fmt.Errorf("argument %q is too large: %v", key, value)
 	}
 	return parsed, nil
 }

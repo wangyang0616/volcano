@@ -35,10 +35,10 @@ func TestFormatCandidateOrderSummaryShowsOnlyThreeBestAndThreeWorst(t *testing.T
 				key:  nodeName,
 			},
 			score: framework.CandidateDisruptionScore{
-				Total: float64(index),
+				Total: int64(index),
 				Terms: []framework.DisruptionScoreTerm{{
-					Name: "movedPods", Weight: 0.1, Raw: float64(index),
-					Normalized: float64(index) / 7, Contribution: float64(index) / 70,
+					Name: "movedPods", Weight: 1, Raw: int64(index),
+					Score: int64(index), Contribution: int64(index),
 				}},
 			},
 		}
@@ -48,7 +48,7 @@ func TestFormatCandidateOrderSummaryShowsOnlyThreeBestAndThreeWorst(t *testing.T
 	if len(formatted) != 7 {
 		t.Fatalf("formatted entries=%d, want 7 (top 3 + marker + bottom 3): %v", len(formatted), formatted)
 	}
-	for index, want := range []string{"#1 node-0(score=0.000)", "#2 node-1(score=1.000)", "#3 node-2(score=2.000)"} {
+	for index, want := range []string{"#1 node-0(score=0)", "#2 node-1(score=1)", "#3 node-2(score=2)"} {
 		if !strings.Contains(formatted[index], want) {
 			t.Errorf("formatted[%d]=%q, want %q", index, formatted[index], want)
 		}
@@ -56,7 +56,7 @@ func TestFormatCandidateOrderSummaryShowsOnlyThreeBestAndThreeWorst(t *testing.T
 	if formatted[3] != "... 2 candidates omitted ..." {
 		t.Errorf("middle marker=%q, want omitted count 2", formatted[3])
 	}
-	for index, want := range []string{"#6 node-5(score=5.000)", "#7 node-6(score=6.000)", "#8 node-7(score=7.000)"} {
+	for index, want := range []string{"#6 node-5(score=5)", "#7 node-6(score=6)", "#8 node-7(score=7)"} {
 		if !strings.Contains(formatted[index+4], want) {
 			t.Errorf("formatted[%d]=%q, want %q", index+4, formatted[index+4], want)
 		}
@@ -91,7 +91,7 @@ func TestDisplayedCandidateIndexesIncludesSelectedMiddleCandidate(t *testing.T) 
 }
 
 func TestCandidateSelectionReasonExplainsDecision(t *testing.T) {
-	scored := func(key string, score, benefit float64) scoredCandidate {
+	scored := func(key string, score int64, benefit float64) scoredCandidate {
 		return scoredCandidate{
 			candidate: candidate{key: key, unit: api.FreeableUnit{Weight: benefit}},
 			score:     framework.CandidateDisruptionScore{Total: score},
@@ -110,28 +110,28 @@ func TestCandidateSelectionReasonExplainsDecision(t *testing.T) {
 			want:             "only active drain target",
 		},
 		{
-			name:             "lowest score",
-			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.2, 2)},
+			name:             "highest score",
+			ordered:          []scoredCandidate{scored("node-a", 200, 1), scored("node-b", 100, 2)},
 			selectedPosition: 1,
-			want:             "lowest disruption score",
+			want:             "highest weighted score",
 		},
 		{
 			name:             "benefit tie breaker",
-			ordered:          []scoredCandidate{scored("node-a", 0.1, 2), scored("node-b", 0.1, 1)},
+			ordered:          []scoredCandidate{scored("node-a", 100, 2), scored("node-b", 100, 1)},
 			selectedPosition: 1,
 			want:             "score tie; higher drain benefit",
 		},
 		{
 			name:             "name tie breaker",
-			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.1, 1)},
+			ordered:          []scoredCandidate{scored("node-a", 100, 1), scored("node-b", 100, 1)},
 			selectedPosition: 1,
 			want:             "score and drain benefit tie; lexical target name",
 		},
 		{
 			name:             "lazy feasibility fallback",
-			ordered:          []scoredCandidate{scored("node-a", 0.1, 1), scored("node-b", 0.2, 1)},
+			ordered:          []scoredCandidate{scored("node-a", 200, 1), scored("node-b", 100, 1)},
 			selectedPosition: 2,
-			want:             "first scheduler-feasible target in disruption order",
+			want:             "first scheduler-feasible target in score order",
 		},
 	}
 	for _, test := range tests {
@@ -160,11 +160,11 @@ func TestFormatPlanImpactUsesOperatorFriendlyNames(t *testing.T) {
 
 func TestFormatScoreContributionsHidesNormalizationMechanics(t *testing.T) {
 	terms := []framework.DisruptionScoreTerm{
-		{Name: "affectedPodGroups", Contribution: 1},
-		{Name: "movedResource", Contribution: 0.125},
+		{Name: "affectedPodGroups", Contribution: 1000},
+		{Name: "movedResource", Contribution: 125},
 	}
 	got := formatScoreContributions(terms, gpu)
-	want := "podGroups=+1.000 nvidia.com/gpu=+0.125"
+	want := "podGroups=1000 nvidia.com/gpu=125"
 	if got != want {
 		t.Fatalf("formatScoreContributions()=%q, want %q", got, want)
 	}

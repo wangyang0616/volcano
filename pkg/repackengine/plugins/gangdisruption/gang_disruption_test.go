@@ -167,7 +167,7 @@ func TestFutureMovesCacheOnlyScansRankedReceiver(t *testing.T) {
 
 func TestConfiguredGangWeights(t *testing.T) {
 	arguments := framework.Arguments{
-		argGangBreachesWeight:    1.5,
+		argGangBreachesWeight:    15,
 		argDamagedResourceWeight: 0,
 	}
 	if err := framework.ValidatePluginArguments(Name, arguments); err != nil {
@@ -178,10 +178,13 @@ func TestConfiguredGangWeights(t *testing.T) {
 		t.Fatal("gangdisruption plugin is not registered")
 	}
 	configured := plugin.(*gangDisruptionPlugin)
-	if configured.gangBreachesWeight != 1.5 || configured.damagedResourceWeight != 0 {
-		t.Fatalf("configured weights=%+v, want 1.5/0", configured)
+	if configured.gangBreachesWeight != 15 || configured.damagedResourceWeight != 0 {
+		t.Fatalf("configured weights=%+v, want 15/0", configured)
 	}
-	if err := framework.ValidatePluginArguments(Name, framework.Arguments{argGangBreachesWeight: -0.1}); err == nil {
+	if err := framework.ValidatePluginArguments(Name, framework.Arguments{argGangBreachesWeight: -1}); err == nil {
 		t.Fatal("negative gang weight should be rejected")
+	}
+	if err := framework.ValidatePluginArguments(Name, framework.Arguments{argGangBreachesWeight: 1.5}); err == nil {
+		t.Fatal("fractional gang weight should be rejected")
 	}
 }

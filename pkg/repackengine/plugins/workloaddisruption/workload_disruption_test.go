@@ -24,8 +24,8 @@ import (
 
 func TestConfiguredWorkloadDisruptionWeights(t *testing.T) {
 	arguments := framework.Arguments{
-		argAffectedPodGroupsWeight: 2.0,
-		argMovedResourceWeight:     0.5,
+		argAffectedPodGroupsWeight: 20,
+		argMovedResourceWeight:     5,
 		argMovedPodsWeight:         0,
 	}
 	if err := framework.ValidatePluginArguments(Name, arguments); err != nil {
@@ -36,15 +36,16 @@ func TestConfiguredWorkloadDisruptionWeights(t *testing.T) {
 		t.Fatal("workloaddisruption plugin is not registered")
 	}
 	configured := plugin.(*workloadDisruptionPlugin)
-	if configured.affectedPodGroupsWeight != 2 || configured.movedResourceWeight != 0.5 || configured.movedPodsWeight != 0 {
-		t.Fatalf("configured weights=%+v, want 2/0.5/0", configured)
+	if configured.affectedPodGroupsWeight != 20 || configured.movedResourceWeight != 5 || configured.movedPodsWeight != 0 {
+		t.Fatalf("configured weights=%+v, want 20/5/0", configured)
 	}
 }
 
 func TestWorkloadDisruptionWeightValidation(t *testing.T) {
 	for name, arguments := range map[string]framework.Arguments{
-		"negative": {argMovedPodsWeight: -1},
-		"unknown":  {"movedPodWeight": 1},
+		"negative":   {argMovedPodsWeight: -1},
+		"fractional": {argMovedPodsWeight: 0.5},
+		"unknown":    {"movedPodWeight": 1},
 	} {
 		if err := framework.ValidatePluginArguments(Name, arguments); err == nil {
 			t.Errorf("%s arguments should be rejected", name)

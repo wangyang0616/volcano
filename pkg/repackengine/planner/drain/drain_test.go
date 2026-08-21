@@ -433,8 +433,8 @@ func TestPreliminaryCandidateOrderUsesDisruptionScoreThenStableTieBreakers(t *te
 	scored := state.scoreCandidates([]candidate{moreDisruptive, lessDisruptive})
 	ordered := orderScoredCandidates(scored)
 	if len(ordered) != 2 || ordered[0].candidate.key != "node-b" ||
-		ordered[0].score.Total >= ordered[1].score.Total {
-		t.Fatalf("ordered=%+v, want node-b first with the lower disruption score", ordered)
+		ordered[0].score.Total <= ordered[1].score.Total {
+		t.Fatalf("ordered=%+v, want node-b first with the higher preference score", ordered)
 	}
 
 	// All scoring dimensions tie, so the larger freeable-unit benefit wins even
@@ -600,7 +600,7 @@ func TestDrain_OnlyEmptyAndFullNodesSkipsSimulation(t *testing.T) {
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
 	scoreCalls := 0
-	ssn.AddDisruptionScoreFn("mustNotRun", 1, func(*api.PlanContext, *api.CandidatePlan) float64 {
+	ssn.AddDisruptionScoreFn("mustNotRun", 1, func(*api.PlanContext, *api.CandidatePlan) int64 {
 		scoreCalls++
 		return 0
 	})

@@ -35,8 +35,8 @@ const Name = "gangdisruption"
 // Default weights for the gang-semantics disruption dimensions. repack-conf
 // plugin arguments override them; a zero weight disables the corresponding term.
 const (
-	weightGangBreaches    = 0.8
-	weightDamagedResource = 0.6
+	weightGangBreaches    int64 = 8
+	weightDamagedResource int64 = 6
 
 	argGangBreachesWeight    = "gangBreachesWeight"
 	argDamagedResourceWeight = "damagedResourceWeight"
@@ -49,8 +49,8 @@ func init() {
 }
 
 type gangDisruptionPlugin struct {
-	gangBreachesWeight    float64
-	damagedResourceWeight float64
+	gangBreachesWeight    int64
+	damagedResourceWeight int64
 	futureMovesByNode     map[string]map[schedapi.JobID]api.PodGroupMoveAggregate
 	futureMovable         api.Movable
 	futureResource        v1.ResourceName
@@ -63,8 +63,8 @@ func newPlugin(arguments framework.Arguments) framework.Plugin {
 	}
 }
 
-func configuredWeight(arguments framework.Arguments, key string, defaultValue float64) float64 {
-	value, err := arguments.NonNegativeFloat64(key, defaultValue)
+func configuredWeight(arguments framework.Arguments, key string, defaultValue int64) int64 {
+	value, err := arguments.NonNegativeInt(key, defaultValue)
 	if err != nil {
 		return defaultValue
 	}
@@ -75,10 +75,10 @@ func validateArguments(arguments framework.Arguments) error {
 	if err := arguments.ValidateKeys(argGangBreachesWeight, argDamagedResourceWeight); err != nil {
 		return err
 	}
-	if _, err := arguments.NonNegativeFloat64(argGangBreachesWeight, weightGangBreaches); err != nil {
+	if _, err := arguments.NonNegativeInt(argGangBreachesWeight, weightGangBreaches); err != nil {
 		return err
 	}
-	if _, err := arguments.NonNegativeFloat64(argDamagedResourceWeight, weightDamagedResource); err != nil {
+	if _, err := arguments.NonNegativeInt(argDamagedResourceWeight, weightDamagedResource); err != nil {
 		return err
 	}
 	return nil
@@ -135,7 +135,7 @@ func (p *gangDisruptionPlugin) futureMovesForReceiver(
 
 // scoreGangBreaches: number of gangs pushed below minAvailable (moved pods exceed
 // the gang's slack = Running − MinAvailable), risking gang eviction mid-repack.
-func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 	var breachedGangs int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
 		disruption := api.MeasurePodGroupDisruption(
@@ -145,13 +145,13 @@ func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 			breachedGangs++
 		}
 	}
-	return float64(breachedGangs)
+	return breachedGangs
 }
 
 // scoreDamagedResource: gang-semantics "damaged resource". Within slack → only the moved
 // cards count; breaching minAvailable → the whole gang Footprint counts (and
 // further pods of an already-breached gang add nothing).
-func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
+func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 	var damagedResource int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
 		disruption := api.MeasurePodGroupDisruption(
@@ -159,7 +159,7 @@ func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) float64 {
 		)
 		damagedResource += disruption.DamagedResource
 	}
-	return float64(damagedResource)
+	return damagedResource
 }
 
 // scoreFutureReceiverImpact prefers consuming a node whose own later drain would

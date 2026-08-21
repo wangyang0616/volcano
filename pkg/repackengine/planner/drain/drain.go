@@ -626,7 +626,7 @@ func (s *drainState) scoreCandidates(activeCandidates []candidate) []scoredCandi
 func orderScoredCandidates(scored []scoredCandidate) []scoredCandidate {
 	ordered := append([]scoredCandidate(nil), scored...)
 	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].score.Total < ordered[j].score.Total
+		return ordered[i].score.Total > ordered[j].score.Total
 	})
 	return ordered
 }

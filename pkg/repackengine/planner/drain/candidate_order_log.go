@@ -51,8 +51,8 @@ func (s *drainState) logCandidateOrder(step int, ordered []scoredCandidate, sele
 		"nodesToFree", selected.candidate.unit.Nodes,
 		"candidateCount", len(ordered),
 		"selectedPosition", selectedPosition,
-		"totalDisruptionScore", selected.score.Total,
-		"scorePreference", "lower-is-better",
+		"totalScore", selected.score.Total,
+		"scorePreference", "higher-is-better",
 		"additionalMoveCount", candidateMoveCount(selected.candidate),
 		"additionalMovedResource", selected.candidate.additionalResource,
 		"prospectivePlanImpact", formatPlanImpact(selected.score.Terms, s.resource),
@@ -81,7 +81,7 @@ func (s *drainState) logCandidateOrder(step int, ordered []scoredCandidate, sele
 			"targetLevel", entry.candidate.unit.Level,
 			"nodesToFree", entry.candidate.unit.Nodes,
 			"drainBenefitWeight", entry.candidate.unit.Weight,
-			"totalDisruptionScore", entry.score.Total,
+			"totalScore", entry.score.Total,
 			"additionalMoveCount", candidateMoveCount(entry.candidate),
 			"additionalMovedResource", entry.candidate.additionalResource,
 			"prospectivePlanImpact", formatPlanImpact(entry.score.Terms, s.resource),
@@ -132,7 +132,7 @@ func formatCandidateOrderSummary(ordered []scoredCandidate) []string {
 		return nil
 	}
 	formatAt := func(index int) string {
-		return fmt.Sprintf("#%d %s(score=%.3f)", index+1, ordered[index].candidate.key, ordered[index].score.Total)
+		return fmt.Sprintf("#%d %s(score=%d)", index+1, ordered[index].candidate.key, ordered[index].score.Total)
 	}
 	displayedIndexes, omittedCandidateCount := displayedCandidateIndexes(len(ordered), -1)
 	result := make([]string, 0, min(len(ordered), candidateOrderEdgeCount*2+1))
@@ -150,13 +150,13 @@ func candidateSelectionReason(ordered []scoredCandidate, selectedPosition int) s
 		return ""
 	}
 	if selectedPosition > 1 {
-		return "first scheduler-feasible target in disruption order"
+		return "first scheduler-feasible target in score order"
 	}
 	if len(ordered) == 1 {
 		return "only active drain target"
 	}
-	if ordered[0].score.Total < ordered[1].score.Total {
-		return "lowest disruption score"
+	if ordered[0].score.Total > ordered[1].score.Total {
+		return "highest weighted score"
 	}
 	if ordered[0].candidate.unit.Weight > ordered[1].candidate.unit.Weight {
 		return "score tie; higher drain benefit"
@@ -176,7 +176,7 @@ func formatScoreContributions(terms []framework.DisruptionScoreTerm, targetResou
 	contributions := make([]string, 0, len(terms))
 	for _, term := range terms {
 		contributions = append(contributions, fmt.Sprintf(
-			"%s=%+.3f", scoreTermDisplayName(term.Name, targetResource), term.Contribution))
+			"%s=%d", scoreTermDisplayName(term.Name, targetResource), term.Contribution))
 	}
 	return strings.Join(contributions, " ")
 }
@@ -196,8 +196,8 @@ func scoreTermDisplayName(termName string, targetResource v1.ResourceName) strin
 	}
 }
 
-func formatReadableScoreValue(value float64) string {
-	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.3f", value), "0"), ".")
+func formatReadableScoreValue(value int64) string {
+	return fmt.Sprintf("%d", value)
 }
 
 // logScoreFormula reserves normalization mechanics for V5. The values are only
@@ -217,7 +217,7 @@ func (s *drainState) logScoreFormula(step, position int, entry scoredCandidate) 
 			"term", term.Name,
 			"rawValue", term.Raw,
 			"weight", term.Weight,
-			"normalizedValue", term.Normalized,
+			"strategyScore", term.Score,
 			"weightedContribution", term.Contribution,
 			"normalizationScope", "current-step-candidates")
 	}

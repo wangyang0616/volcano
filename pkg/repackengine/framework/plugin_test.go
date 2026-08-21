@@ -17,7 +17,6 @@ limitations under the License.
 package framework
 
 import (
-	"math"
 	"reflect"
 	"testing"
 )
@@ -51,7 +50,7 @@ func TestOpenSessionPassesPluginArguments(t *testing.T) {
 	}})
 	CloseSession(ssn)
 
-	got, err := received.NonNegativeFloat64("weight", 0)
+	got, err := received.NonNegativeInt("weight", 0)
 	if err != nil || got != 2 {
 		t.Fatalf("plugin weight=%v, want 2", got)
 	}
@@ -83,24 +82,24 @@ func TestOpenSessionCanonicalizesPluginOrder(t *testing.T) {
 	}
 }
 
-func TestNonNegativeFloat64AndKeyValidation(t *testing.T) {
-	arguments := Arguments{"integer": 2, "zero": 0.0}
-	if got, err := arguments.NonNegativeFloat64("integer", 1); err != nil || got != 2 {
-		t.Fatalf("integer=%v err=%v, want 2", got, err)
+func TestNonNegativeInt(t *testing.T) {
+	arguments := Arguments{"integer": 2, "zero": 0}
+	for key, want := range map[string]int64{"integer": 2, "zero": 0} {
+		if got, err := arguments.NonNegativeInt(key, 1); err != nil || got != want {
+			t.Errorf("%s=%v err=%v, want %d", key, got, err, want)
+		}
 	}
-	if got, err := arguments.NonNegativeFloat64("zero", 1); err != nil || got != 0 {
-		t.Fatalf("zero=%v err=%v, want explicit zero", got, err)
-	}
-	if got, err := arguments.NonNegativeFloat64("omitted", 0.3); err != nil || got != 0.3 {
-		t.Fatalf("omitted=%v err=%v, want default 0.3", got, err)
+	if got, err := arguments.NonNegativeInt("omitted", 10); err != nil || got != 10 {
+		t.Fatalf("omitted=%v err=%v, want default 10", got, err)
 	}
 	for name, value := range map[string]interface{}{
-		"negative": -0.1,
-		"nan":      math.NaN(),
-		"infinite": math.Inf(1),
-		"string":   "1.0",
+		"negative":   -1,
+		"fractional": 0.5,
+		"float":      3.0,
+		"string":     "1",
+		"tooLarge":   int64(maxPluginWeight + 1),
 	} {
-		if _, err := (Arguments{"weight": value}).NonNegativeFloat64("weight", 1); err == nil {
+		if _, err := (Arguments{"weight": value}).NonNegativeInt("weight", 1); err == nil {
 			t.Errorf("%s value %v should be rejected", name, value)
 		}
 	}
