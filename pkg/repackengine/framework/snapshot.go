@@ -17,13 +17,15 @@ limitations under the License.
 // Package framework is the repack engine's plugin/action framework — the
 // analogue of pkg/scheduler/framework. It defines the engine Session (a plugin-
 // populated, action-consumed view of one repack pass), the Plugin and Action
-// extension contracts and their registries, plus the commit (evict/nominate) and
-// report plumbing. It depends only on pkg/repackengine/api (pure model) and
+// extension contracts and their registries, plus planning report plumbing. It
+// depends only on pkg/repackengine/api (pure model) and
 // pkg/scheduler/api (NodeInfo/TaskInfo) — never on the scheduler framework; the
 // live-Session coupling lives in pkg/repackengine/adapter.
 package framework
 
 import (
+	"context"
+
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -49,6 +51,7 @@ type Snapshot interface {
 	// onto receivers using the scheduler's full filter stack, returning the per-pod
 	// placements and whether every victim fit. committed are the moves already
 	// decided this pass (their pods count as present on their receivers). The
-	// implementation must be non-destructive (no shared-state mutation).
-	FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool)
+	// implementation must be non-destructive (no shared-state mutation) and stop
+	// promptly when ctx is cancelled.
+	FeasibleRelocation(ctx context.Context, committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool)
 }

@@ -21,7 +21,7 @@ import (
 )
 
 // Report is the search outcome rendered from a RepackPlan — the engine-side,
-// CRD-independent shape the driver projects into RepackRun.status.plan (§4.6).
+// CRD-independent shape projected into RepackRun.status.plan (§4.6).
 type Report struct {
 	NodesFreed             int   // realized node-level benefit (whole nodes freed)
 	MovedResource          int64 // target-resource units relocated

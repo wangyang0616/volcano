@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package metrics defines the volcano-repack-engine Prometheus metrics. They are
 // registered on the default registry (via promauto), which the engine's /metrics
-// endpoint serves. Emit points live in the driver (pkg/repackengine).
+// endpoint serves. Emit points live in the internal Engine runtime.
 package metrics
 
 import (

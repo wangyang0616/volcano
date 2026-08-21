@@ -17,6 +17,8 @@ limitations under the License.
 package framework
 
 import (
+	"context"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -29,8 +31,9 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 
 // fakeSnap is a minimal Snapshot for framework tests.
 type fakeSnap struct {
-	nodes []*schedapi.NodeInfo
-	views map[schedapi.JobID]api.PodGroupView
+	nodes           []*schedapi.NodeInfo
+	views           map[schedapi.JobID]api.PodGroupView
+	feasibleContext context.Context
 }
 
 func (f *fakeSnap) Nodes() []*schedapi.NodeInfo                     { return f.nodes }
@@ -39,7 +42,9 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView { return f.v
 
 // FeasibleRelocation is not exercised by the framework-level tests (they cover
 // session plumbing, not the drain planner), so this is an inert stand-in.
-func (f *fakeSnap) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+
+func (f *fakeSnap) FeasibleRelocation(ctx context.Context, _ []*api.Move, _ []*schedapi.TaskInfo, _ []*schedapi.NodeInfo) ([]*api.Move, bool) {
+	f.feasibleContext = ctx
 	return nil, false
 }
 

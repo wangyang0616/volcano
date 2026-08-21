@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 // Package repack is the planning action: run the plugin-driven lazy planner and
-// render the report. Execute side effects deliberately live in the engine
-// driver, after the plan and relocation journal have been durably persisted.
+// render the report. Execute side effects deliberately live in the Engine
+// runtime, after the plan and relocation journal have been durably persisted.
 // Future planning actions (relief, simulate) compose after it in the pipeline.
 package repack
 
@@ -75,7 +75,7 @@ func (*repackAction) Execute(ssn *framework.Session) {
 	ssn.SetPlan(plan)
 	report := framework.RenderReport(plan)
 	if plan == nil {
-		// No plan: still record the cluster's current fragmentation so the driver
+		// No plan: still record the cluster's current fragmentation so the Engine
 		// can tell NoFragmentation (clean) apart from BelowGoalThreshold (fragmented
 		// but no worthwhile plan). RenderReport(nil) leaves FragmentationRateBefore at 0.
 		currentFragmentationRate := before.FragmentationRate()

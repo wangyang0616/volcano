@@ -17,6 +17,7 @@ limitations under the License.
 package drain
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"testing"
@@ -68,7 +69,7 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 // node "fits" (no predicate constraints in tests), so feasibility is pure TargetResource
 // capacity (Allocatable − Used − pods already placed this pass), solved with the
 // pure api.Domain best-fit solver.
-func (f *fakeSnap) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (f *fakeSnap) FeasibleRelocation(_ context.Context, committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	f.feasibilityCalls++
 	if len(victims) > 0 && f.infeasibleSources[victims[0].NodeName] {
 		return nil, false
@@ -211,6 +212,33 @@ func TestDrain_FreesOneNode(t *testing.T) {
 	}
 	if plan.Benefit() != 1 {
 		t.Errorf("benefit=%v, want 1", plan.Benefit())
+	}
+}
+
+func TestDrainStopsBeforeSimulationWhenContextIsCancelled(t *testing.T) {
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("n0", 8, gpuTask("a", "g-a", 2)),
+		capNode("n1", 8, gpuTask("b", "g-b", 6)),
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ssn := framework.OpenSession(framework.SessionConfig{
+		Context:       ctx,
+		Snapshot:      snap,
+		Resource:      gpu,
+		Mode:          repackv1alpha1.RepackModeDryRun,
+		MinNodesFreed: 1,
+		Free:          freeByCapMinusUsed,
+	}, framework.PluginOptions("repackbudget", "binpack"))
+	defer framework.CloseSession(ssn)
+	ssn.AddDomainFn(nodeUnits)
+	ssn.AddMovableFn(allMovable)
+
+	if plan := BuildPlan(ssn); plan != nil {
+		t.Fatalf("cancelled planning returned plan %+v, want nil", plan)
+	}
+	if snap.feasibilityCalls != 0 {
+		t.Fatalf("scheduler simulations = %d, want 0 after cancellation", snap.feasibilityCalls)
 	}
 }
 
@@ -363,7 +391,7 @@ func TestReceiverPreferenceFallsBackWhenPreferredReceiverLacksCapacity(t *testin
 		t.Fatalf("receivers=%v, want [same-gang]: receiver unable to fit even the smallest victim must be pruned", nodeNames(receivers))
 	}
 
-	moves, feasible := snap.FeasibleRelocation(nil, []*schedapi.TaskInfo{victim}, receivers)
+	moves, feasible := snap.FeasibleRelocation(context.Background(), nil, []*schedapi.TaskInfo{victim}, receivers)
 	if !feasible || len(moves) != 1 {
 		t.Fatalf("feasible=%v moves=%+v, want fallback placement", feasible, moves)
 	}

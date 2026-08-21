@@ -17,6 +17,7 @@ limitations under the License.
 package gangdisruption
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -50,7 +51,7 @@ type gangSnapshot struct{ nodes []*schedapi.NodeInfo }
 func (s *gangSnapshot) Nodes() []*schedapi.NodeInfo                { return s.nodes }
 func (*gangSnapshot) NodeInScope(*schedapi.NodeInfo) bool          { return true }
 func (*gangSnapshot) PodGroupView(schedapi.JobID) api.PodGroupView { return api.PodGroupView{} }
-func (*gangSnapshot) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (*gangSnapshot) FeasibleRelocation(context.Context, []*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	return nil, false
 }
 

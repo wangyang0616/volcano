@@ -17,6 +17,7 @@ limitations under the License.
 package repack
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -46,7 +47,7 @@ func (*actionSnapshot) NodeInScope(*schedapi.NodeInfo) bool { return true }
 func (*actionSnapshot) PodGroupView(schedapi.JobID) api.PodGroupView {
 	return api.PodGroupView{MinAvailable: 1, Running: 1, Footprint: 1}
 }
-func (*actionSnapshot) FeasibleRelocation(_ []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (*actionSnapshot) FeasibleRelocation(_ context.Context, _ []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	if len(receivers) == 0 {
 		return nil, false
 	}

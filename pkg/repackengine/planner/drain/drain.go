@@ -145,6 +145,9 @@ func drainGreedy(
 			"prunedByReason", s.prunedByReason, "duration", time.Since(planningStartTime))
 	}()
 	for step := 1; ; step++ {
+		if ssn.Context().Err() != nil {
+			break
+		}
 		// 1. Rank all currently active candidates without constructing receiver
 		// lists, cloning scheduler state, or running predicates.
 		preliminary := s.preliminaryCandidates()
@@ -355,6 +358,9 @@ func (s *drainState) unitConsumed(unit api.FreeableUnit) bool {
 // first success. selectedPosition is one-based within the preliminary order.
 func (s *drainState) firstFeasibleCandidate(ordered []scoredCandidate) (candidate, int, bool) {
 	for index := range ordered {
+		if s.ssn.Context().Err() != nil {
+			return candidate{}, 0, false
+		}
 		candidate := ordered[index].candidate
 		candidate.victims = s.ssn.OrderVictims(candidate.victims)
 		receivers := s.receiversInPreferenceOrderWithPlan(candidate.inUnit, candidate.victims, candidate.prospectivePlan)
@@ -369,7 +375,7 @@ func (s *drainState) firstFeasibleCandidate(ordered []scoredCandidate) (candidat
 			"victims", taskNames(candidate.victims), "victimCount", len(candidate.victims),
 			"receivers", nodeNames(receivers), "receiverCount", len(receivers))
 		s.feasibilitySimulations++
-		placed, feasible := s.snapshot.FeasibleRelocation(s.moves, candidate.victims, receivers)
+		placed, feasible := s.snapshot.FeasibleRelocation(s.ssn.Context(), s.moves, candidate.victims, receivers)
 		if !feasible {
 			klog.V(4).InfoS("repack drain: unit INFEASIBLE — victims cannot all relocate onto receivers",
 				"unit", candidate.key, "victims", len(candidate.victims), "receivers", len(receivers))

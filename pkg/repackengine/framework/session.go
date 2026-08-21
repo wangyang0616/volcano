@@ -17,6 +17,7 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"sort"
 
 	v1 "k8s.io/api/core/v1"
@@ -84,8 +85,9 @@ const (
 	MaxCandidateScore int64 = 100
 )
 
-// SessionConfig is the per-run input the driver supplies to OpenSession.
+// SessionConfig is the per-run input the Engine supplies to OpenSession.
 type SessionConfig struct {
+	Context       context.Context
 	Snapshot      Snapshot
 	Run           *repackv1alpha1.RepackRun
 	Scope         *ScopeMatcher
@@ -120,7 +122,7 @@ type Session struct {
 	victimOrderFns     []namedVictimOrder
 	receiverRankFns    []namedReceiverRank
 
-	// results filled by the action, read by the driver
+	// results filled by the action, read by the Engine runtime
 	plan   *api.RepackPlan
 	report Report
 }
@@ -131,6 +133,9 @@ type Session struct {
 // names are ignored; the engine validates them before opening a production
 // session.
 func OpenSession(configuration SessionConfig, pluginOptions []PluginOption) *Session {
+	if configuration.Context == nil {
+		configuration.Context = context.Background()
+	}
 	ssn := &Session{
 		configuration: configuration,
 		capabilities:  make(map[PluginCapability]bool),
@@ -239,6 +244,7 @@ func (s *Session) PlanAdmissible(plan *api.RepackPlan) bool {
 // ---- config accessors ----
 
 func (s *Session) Snapshot() Snapshot              { return s.configuration.Snapshot }
+func (s *Session) Context() context.Context        { return s.configuration.Context }
 func (s *Session) Run() *repackv1alpha1.RepackRun  { return s.configuration.Run }
 func (s *Session) Scope() *ScopeMatcher            { return s.configuration.Scope }
 func (s *Session) Resource() v1.ResourceName       { return s.configuration.Resource }
@@ -267,7 +273,7 @@ func (s *Session) Nodes() []*schedapi.NodeInfo { return s.configuration.Snapshot
 // feasibility check: simulate evicting victims and greedily place them onto receivers with the
 // full scheduler filter stack. See Snapshot.FeasibleRelocation.
 func (s *Session) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
-	return s.configuration.Snapshot.FeasibleRelocation(committed, victims, receivers)
+	return s.configuration.Snapshot.FeasibleRelocation(s.configuration.Context, committed, victims, receivers)
 }
 
 // Movable returns an api.Movable that is the AND of all registered MovableFns
@@ -351,7 +357,7 @@ func (s *Session) DisruptionScores(candidates []*api.CandidatePlan) []CandidateD
 	return scores
 }
 
-// ---- result (set by the action, read by the driver) ----
+// ---- result (set by the action, read by the Engine runtime) ----
 
 func (s *Session) SetPlan(p *api.RepackPlan) { s.plan = p }
 func (s *Session) Plan() *api.RepackPlan     { return s.plan }

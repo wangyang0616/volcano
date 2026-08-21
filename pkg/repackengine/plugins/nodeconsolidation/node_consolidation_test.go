@@ -17,6 +17,7 @@ limitations under the License.
 package nodeconsolidation
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -39,7 +40,7 @@ func (consolidationSnapshot) NodeInScope(*schedapi.NodeInfo) bool { return true 
 func (consolidationSnapshot) PodGroupView(schedapi.JobID) api.PodGroupView {
 	return api.PodGroupView{}
 }
-func (consolidationSnapshot) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (consolidationSnapshot) FeasibleRelocation(context.Context, []*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	return nil, false
 }
 

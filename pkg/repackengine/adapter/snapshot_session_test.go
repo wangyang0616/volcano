@@ -17,6 +17,7 @@ limitations under the License.
 package adapter
 
 import (
+	"context"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -28,6 +29,16 @@ import (
 
 	"volcano.sh/volcano/pkg/repackengine/api"
 )
+
+func TestFeasibleRelocationStopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	snapshot := &SessionSnapshot{}
+	placements, feasible := snapshot.FeasibleRelocation(ctx, nil, []*schedapi.TaskInfo{{Name: "victim"}}, nil)
+	if feasible || placements != nil {
+		t.Fatalf("placements=%v feasible=%t, want cancellation before simulation", placements, feasible)
+	}
+}
 
 // SessionSnapshot.PodGroupView reads MinAvailable/Running/Priority/Footprint off
 // the live JobInfos; unknown gangs yield a zero view.

@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package adapter is the ONLY scheduler-framework-coupled layer of the repack
-// engine. It adapts a live volcano-scheduler Session into the framework's
+// Package adapter isolates scheduler-framework details from Repack planning
+// actions, plugins and planners. It adapts a live volcano-scheduler Session into the framework's
 // abstractions: a Snapshot (cluster view) and the gang-info source for scope
-// resolution. Keeping every scheduler/framework
-// import here lets api/ and framework/ stay pure and unit-testable.
+// resolution, allowing api/ and framework/ to remain independently testable.
 package adapter
 
 import (
@@ -85,7 +84,7 @@ func (s *SessionSnapshot) NodeInScope(n *schedapi.NodeInfo) bool {
 // defrag placement policy at the call site.
 //
 // Returns the per-victim placements (from -> to) and whether every victim fit.
-func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (s *SessionSnapshot) FeasibleRelocation(ctx context.Context, committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	// Pods already placed on each receiver in this pass (prior committed moves).
 	tasksPlacedByNode := map[string][]*schedapi.TaskInfo{}
 	for _, committedMove := range committed {
@@ -94,7 +93,6 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 		}
 	}
 
-	simulationContext := context.TODO()
 	relocationMoves := make([]*api.Move, 0, len(victims))
 	sourceTasksToRemove := make([]*schedapi.TaskInfo, 0, len(committed)+len(victims))
 	for _, committedMove := range committed {
@@ -104,17 +102,20 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 	}
 	sourceTasksToRemove = append(sourceTasksToRemove, victims...)
 	for _, victim := range victims {
+		if ctx.Err() != nil {
+			return nil, false
+		}
 		simulatedVictim := clearNodeBinding(victim)
 		// Build a plan-wide PreFilter state: every source victim is absent and
 		// every previously placed victim is present on its receiver. Without this,
 		// affinity/topology-spread filters would still see moved pods on old nodes
 		// and only see additions on the candidate receiver.
-		baseState, err := s.buildRelocationCycleState(simulationContext, simulatedVictim, sourceTasksToRemove, tasksPlacedByNode)
+		baseState, err := s.buildRelocationCycleState(ctx, simulatedVictim, sourceTasksToRemove, tasksPlacedByNode)
 		if err != nil {
 			return nil, false
 		}
 
-		target := s.firstFeasibleReceiver(simulationContext, simulatedVictim, baseState, receivers, tasksPlacedByNode)
+		target := s.firstFeasibleReceiver(ctx, simulatedVictim, baseState, receivers, tasksPlacedByNode)
 		if target == "" {
 			return nil, false
 		}
@@ -124,7 +125,10 @@ func (s *SessionSnapshot) FeasibleRelocation(committed []*api.Move, victims []*s
 	return relocationMoves, true
 }
 
-func (s *SessionSnapshot) buildRelocationCycleState(context context.Context, victim *schedapi.TaskInfo, sourceTasksToRemove []*schedapi.TaskInfo, tasksPlacedByNode map[string][]*schedapi.TaskInfo) (fwk.CycleState, error) {
+func (s *SessionSnapshot) buildRelocationCycleState(ctx context.Context, victim *schedapi.TaskInfo, sourceTasksToRemove []*schedapi.TaskInfo, tasksPlacedByNode map[string][]*schedapi.TaskInfo) (fwk.CycleState, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.ssn.PrePredicateFn(victim); err != nil {
 		return nil, err
 	}
@@ -136,6 +140,9 @@ func (s *SessionSnapshot) buildRelocationCycleState(context context.Context, vic
 	// node copy before processing the next removal.
 	sourceNodeCopies := make(map[string]*schedapi.NodeInfo)
 	for _, task := range sourceTasksToRemove {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if task == nil || task.NodeName == "" {
 			continue
 		}
@@ -148,12 +155,15 @@ func (s *SessionSnapshot) buildRelocationCycleState(context context.Context, vic
 			sourceNodeCopy = source.Clone()
 			sourceNodeCopies[task.NodeName] = sourceNodeCopy
 		}
-		if err := s.ssn.SimulateRemoveTaskFn(context, state, victim, task, sourceNodeCopy); err != nil {
+		if err := s.ssn.SimulateRemoveTaskFn(ctx, state, victim, task, sourceNodeCopy); err != nil {
 			return nil, err
 		}
 		sourceNodeCopy.RemoveTask(task)
 	}
 	for nodeName, pods := range tasksPlacedByNode {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		node := s.ssn.Nodes[nodeName]
 		if node == nil {
 			continue
@@ -161,7 +171,7 @@ func (s *SessionSnapshot) buildRelocationCycleState(context context.Context, vic
 		nodeCopy := node.Clone()
 		for _, task := range pods {
 			simulatedPlacement := clearNodeBinding(task)
-			if err := s.ssn.SimulateAddTaskFn(context, state, victim, simulatedPlacement, nodeCopy); err != nil {
+			if err := s.ssn.SimulateAddTaskFn(ctx, state, victim, simulatedPlacement, nodeCopy); err != nil {
 				return nil, err
 			}
 			if err := nodeCopy.AddTask(simulatedPlacement); err != nil {
@@ -192,9 +202,12 @@ func clearNodeBinding(task *schedapi.TaskInfo) *schedapi.TaskInfo {
 
 // firstFeasibleReceiver returns the first receiver (in the caller's preference
 // order) that passes the full scheduler filters for victim, or "" if none fit.
-func (s *SessionSnapshot) firstFeasibleReceiver(context context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, receivers []*schedapi.NodeInfo, tasksPlacedByNode map[string][]*schedapi.TaskInfo) string {
+func (s *SessionSnapshot) firstFeasibleReceiver(ctx context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, receivers []*schedapi.NodeInfo, tasksPlacedByNode map[string][]*schedapi.TaskInfo) string {
 	for _, node := range receivers {
-		if s.victimFitsReceiver(context, victim, baseState, node, tasksPlacedByNode[node.Name]) {
+		if ctx.Err() != nil {
+			return ""
+		}
+		if s.victimFitsReceiver(ctx, victim, baseState, node, tasksPlacedByNode[node.Name]) {
 			return node.Name
 		}
 	}
@@ -206,7 +219,10 @@ func (s *SessionSnapshot) firstFeasibleReceiver(context context.Context, victim 
 // FutureIdle (the scheduler's own accounting); everything else — taints, node
 // affinity, inter-pod affinity, topology spread, devices, volumes, DRA — is the
 // full SimulatePredicateFn stack.
-func (s *SessionSnapshot) victimFitsReceiver(context context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, node *schedapi.NodeInfo, previouslyPlacedTasks []*schedapi.TaskInfo) bool {
+func (s *SessionSnapshot) victimFitsReceiver(ctx context.Context, victim *schedapi.TaskInfo, baseState fwk.CycleState, node *schedapi.NodeInfo, previouslyPlacedTasks []*schedapi.TaskInfo) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	// A receiver that cannot fit the target accelerator request after prior
 	// placements cannot pass the full predicate either. Check that necessary
 	// condition before cloning its NodeInfo and CycleState; those clones dominate
@@ -227,7 +243,7 @@ func (s *SessionSnapshot) victimFitsReceiver(context context.Context, victim *sc
 	if !victim.InitResreq.LessEqual(nodeCopy.FutureIdle(), schedapi.Zero) {
 		return false
 	}
-	return s.ssn.SimulatePredicateFn(context, stateCopy, victim, nodeCopy) == nil
+	return s.ssn.SimulatePredicateFn(ctx, stateCopy, victim, nodeCopy) == nil
 }
 
 // receiverHasTargetResourceCapacity is a cheap necessary preflight for one

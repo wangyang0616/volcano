@@ -26,8 +26,8 @@ import (
 const ActionRepack = "repack"
 
 // Action is one ordered planning stage of a repack pass (mirrors
-// framework.Action in the scheduler). Side effects are committed by the engine
-// driver only after the resulting plan has been durably persisted.
+// framework.Action in the scheduler). Side effects are committed by the Engine
+// runtime only after the resulting plan has been durably persisted.
 type Action interface {
 	Name() string
 	Execute(ssn *Session)
@@ -85,6 +85,9 @@ func RunActions(names []string, ssn *Session) {
 		names = DefaultActions()
 	}
 	for _, name := range names {
+		if ssn == nil || ssn.Context().Err() != nil {
+			return
+		}
 		a, ok := GetAction(name)
 		if !ok {
 			klog.ErrorS(nil, "repack: unknown action in config, skipping", "action", name, "registered", ActionNames())

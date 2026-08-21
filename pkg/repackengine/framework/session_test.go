@@ -17,6 +17,7 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"testing"
 
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -45,6 +46,17 @@ func TestSession_MovableAND(t *testing.T) {
 func TestSession_MovableEmptyAllMovable(t *testing.T) {
 	if !newSession(&fakeSnap{}).Movable()(task("a", "g", 1)) {
 		t.Error("no fns → all movable")
+	}
+}
+
+func TestSessionForwardsPlanningContextToSnapshot(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "run-context")
+	snapshot := &fakeSnap{}
+	ssn := OpenSession(SessionConfig{Context: ctx, Snapshot: snapshot}, nil)
+	ssn.FeasibleRelocation(nil, nil, nil)
+	if snapshot.feasibleContext == nil || snapshot.feasibleContext.Value(contextKey{}) != "run-context" {
+		t.Fatalf("snapshot context = %v, want the RepackRun planning context", snapshot.feasibleContext)
 	}
 }
 

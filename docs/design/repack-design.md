@@ -59,7 +59,7 @@ Engine 和 controller 只通过 Kubernetes 对象协作，不建立私有 RPC。
 
 ```mermaid
 flowchart TB
-    D["Engine Driver\nwatch、gate、status、Execute"] --> S["Engine Session"]
+    D["Engine Runtime\nwatch、gate、status、Execute"] --> S["Engine Session"]
     S --> A["Action: repack\n度量 → 规划 → 收益准入 → 报告"]
     S --> P["Plugins\nScope / Budget / Domain / Score / Rank"]
     A --> L["Lazy Drain Planner\n候选、惰性模拟、增量提交"]
@@ -69,7 +69,7 @@ flowchart TB
 
 各层职责必须保持清晰：
 
-- Driver 管理外部副作用和持久状态；
+- Engine Runtime 管理外部副作用、工作队列与持久状态；
 - Action 表达稳定业务流程；
 - Plugin 表达可组合的场景策略；
 - Planner 只负责通用搜索和增量状态；
@@ -290,9 +290,9 @@ damagedResource(g) = movedResource(g),  if not breached
 2. 调用 Lazy Drain Planner；
 3. 通过 Session constraint 检查完整计划收益；
 4. 汇总工作负载影响与迁移成本；
-5. 生成 plan/report 交给 Driver 持久化。
+5. 生成 plan/report 交给 Engine Runtime 持久化。
 
-Action 不直接调用 Eviction。Execute 副作用只在 plan 和 relocation journal 持久化后由 Driver 提交。
+Action 不直接调用 Eviction。Execute 副作用只在 plan 和 relocation journal 持久化后由 Engine Runtime 提交。
 
 ### 7.2 Session 扩展点
 
@@ -678,7 +678,7 @@ Repack 的 RBAC 遵循最小权限：Engine 只获取规划所需资源、更新
 - Framework：Plugin 顺序无关、AND/Union/短路、Capability、整数权重和评分范围；
 - Plugin：Scope、预算、Node Domain、中断评分、Gang、binpack；
 - Planner：节点预分类、容量预检、候选顺序、完整模拟、增量状态和规模 benchmark；
-- Engine：gate、status、Eviction journal、context cancellation、终态收益；
+- Engine：gate、status、Eviction journal、规划与驱逐的 context cancellation、worker 优雅退出和终态收益；
 - Controller：replacement 匹配、PodGroup 代际、gate、nomination、TTL 和重启恢复。
 
 ### 14.2 组合测试
@@ -699,23 +699,42 @@ E2E 覆盖 DryRun、Execute、Scope、`maxPerRun`、PDB、VCJob、原生工作�
 ```text
 cmd/volcano-repack-engine/                 # Engine 进程入口
 pkg/repackengine/
+  repackengine.go                          # 稳定对外门面，仅暴露 Config、Engine、NewEngine
+  conf/                                    # 独立配置模型、默认值、严格解析与能力校验
+  cache/                                   # Scheduler Cache 构建、运行和只读 Session 生命周期
   actions/repack/                          # Action 主流程
   planner/drain/                           # Lazy Drain Planner 与性能基准
   plugins/                                 # 场景策略
   framework/                               # Session、Action、Plugin、回调聚合
   adapter/                                 # Scheduler Session/Snapshot 适配
   api/                                     # 纯模型、碎片度量、中断聚合
-  process.go                               # 单 Run 规划/执行流程
-  eviction.go                              # Eviction journal
-  placement.go                             # 实时接收节点选择
-  gate.go                                  # Execute K=1 与 cooldown
-  status.go                                # status 投影
+  executor/eviction/                       # Eviction API 请求构造和错误归一化
+  executor/placement/                      # replacement 落点判定、终态收益判定和 identity
+  status/                                  # status 投影、用户消息、冲突合并与持久化
+  metrics/                                 # Engine 指标
+  internal/engine/                         # 不对外暴露的 Engine 运行时实现
+    runtime.go                             # Engine 结构、构造、Informer 接线与 Run 生命周期
+    configuration.go                       # Scheduler/Repack 配置加载
+    reconcile.go                           # Workqueue、候选状态机与单 Run 协调入口
+    recovery.go                            # 终态写入恢复与异常 Running Run 恢复
+    planning.go                            # 打开 Session、执行 Action、持久化计划准备屏障
+    gate.go                                # Execute K=1 与 cooldown
+    eviction_reconcile.go                  # Eviction journal 的执行和逐 Pod 持久化
+    eviction_journal.go                    # journal 查询、汇总和恢复辅助逻辑
+    placement_lease.go                     # PodGroup placement lease 的准备、修复和清理
+    placement_reconcile.go                 # replacement Pod 接收节点选择与 nomination 写入
+    placement_result.go                    # actualNode、最终收益和超时结果校验
+    status_persistence.go                  # status 写入编排、终态重试与指标事件
+    owner_resolution.go                    # PodGroup 上层工作负载解析
+    events.go                              # Kubernetes Event 记录与 broadcaster 生命周期
 staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1/
                                             # RepackRun API
 staging/src/volcano.sh/repack-controller/   # TTL、replacement placement
 pkg/scheduler/                              # 复用的 cache/framework/filter
 test/e2e/repack/                            # 全量 E2E
 ```
+
+根包不承载规划、驱逐或状态机实现，`cmd` 和外部调用方只依赖稳定门面。`internal/engine` 只编排 Run 生命周期、持久化屏障、工作队列和 Kubernetes 写操作；可复用的 Eviction、placement 与 status 逻辑分别由 `executor` 和 `status` 承载。新增规划策略优先扩展 Plugin，同一文件只维护同一类状态与副作用，避免再次形成同时包含配置、缓存、规划和执行的大型入口文件。
 
 ## 16. 演进边界
 

@@ -17,6 +17,7 @@ limitations under the License.
 package binpack
 
 import (
+	"context"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -34,7 +35,7 @@ type binpackSnapshot struct{}
 func (binpackSnapshot) Nodes() []*schedapi.NodeInfo                  { return nil }
 func (binpackSnapshot) NodeInScope(*schedapi.NodeInfo) bool          { return true }
 func (binpackSnapshot) PodGroupView(schedapi.JobID) api.PodGroupView { return api.PodGroupView{} }
-func (binpackSnapshot) FeasibleRelocation([]*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
+func (binpackSnapshot) FeasibleRelocation(context.Context, []*api.Move, []*schedapi.TaskInfo, []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	return nil, false
 }
 
