@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package api implements the fragmentation index and pure model/contracts for
-// the repack (defragmentation) engine. See docs/design/repack-policy-design.md §4.12.
+// the repack (defragmentation) engine. See docs/design/repack-design.md §6.4.
 //
 // Per accelerator resource R (e.g. nvidia.com/gpu, huawei.com/Ascend910):
 //

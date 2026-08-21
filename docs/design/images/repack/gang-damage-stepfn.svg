@@ -88,5 +88,5 @@
 
 <!-- ===== 底部对比条：8卡 vs 1024卡 ===== -->
 <rect x="30" y="430" width="840" height="38" rx="6" fill="#f6f8fa" stroke="#d8dee4"/>
-<text x="48" y="454" font-size="12.5" fill="#1f2328">为什么重要：同样"破一个 gang"，<tspan font-weight="700" fill="#3b82f6">8 卡作业损 8</tspan> vs <tspan font-weight="700" fill="#dc2626">1024 卡作业损 1024</tspan>——damagedGPU 据此自动躲开大作业、优先只动盈余 pod。</text>
+<text x="48" y="454" font-size="12.5" fill="#1f2328">为什么重要：同样"破一个 Gang"，<tspan font-weight="700" fill="#3b82f6">8 卡任务损 8</tspan> vs <tspan font-weight="700" fill="#dc2626">1024 卡任务损 1024</tspan>——damagedResource 据此降低大任务被中断的概率。</text>
 </svg>

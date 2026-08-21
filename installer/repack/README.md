@@ -1,5 +1,11 @@
 # Repack (runtime defragmentation) — deployment
 
+The Repack documentation is organized around three sources of truth:
+
+- [Proposal](../../docs/design/repack-runtime-defragmentation.md): motivation, goals, architecture, and community-level design.
+- [Technical design](../../docs/design/repack-design.md): APIs, component interactions, algorithms, execution, recovery, performance, and testing.
+- [User guide](../../docs/user-guide/how_to_use_repack.md): prerequisites, constraints, feature walkthroughs, examples, status interpretation, and FAQ.
+
 Repack ships in two pieces:
 
 - **RepackRun controller + nomination reconciler** — manages the `RepackRun`

@@ -4,9 +4,25 @@
 
 本文面向集群管理员和平台运维人员，介绍 Repack 的适用场景、规划机制、安全控制、操作方法及 API 状态语义。
 
+本文是 Repack 的唯一用户文档。社区方案与技术实现分别见 [Repack Proposal](../design/repack-runtime-defragmentation.md) 和 [Repack 技术设计](../design/repack-design.md)。
+
 > **术语说明**：本文使用“工作负载”统称 VCJob、ModelServing、Deployment、StatefulSet 等由控制器管理的 Pod 集合；“PodGroup”仅指 Volcano 用于 Gang 调度的资源对象；“迁移”指驱逐原 Pod、由工作负载控制器创建新 Pod 并重新调度，不表示运行中的 Pod 被原地迁移。
 
-> **阅读建议**：首次评估只需阅读“背景、功能、前提条件、约束和限制、开启方式”；准备配置时，再按需查看“功能详解与配置示例”。“完整操作示例”提供从 VCJob/ModelServing 到 DryRun、Execute 和结果确认的一套连续流程。
+> **阅读建议**：首次评估只需阅读“背景、功能、前提条件、约束和限制、开启方式”；准备配置时，再按需查看“功能详解与配置示例”。“从最简用法到完整配置”提供从 VCJob/ModelServing 到 DryRun、Execute 和结果确认的一套连续流程。
+
+## 快速了解
+
+Repack 用于解决一种常见的容量问题：集群仍有空闲 NPU/GPU，但空闲卡分散在多个节点，无法直接满足完整节点或固定单 Pod 卡数的任务。它通过受控迁移现有工作负载，把零散占用收敛到部分节点，释放能够直接用于后续任务的完整节点容量。
+
+用户可以按三个步骤使用：
+
+1. 创建 `DryRun`，查看预计释放节点、迁移 Pod 和受影响工作负载；
+2. 根据报告收紧工作负载 Scope、节点池范围和 `maxPerRun`；
+3. 创建独立的 `Execute`，观察逐 Pod 驱逐、替身调度和最终收益。
+
+![Repack 将分散空闲卡转化为完整节点容量](../images/repack/repack-value-impact.svg)
+
+如果只想快速开始，可直接跳到[最简推荐用法](#1-最简推荐用法先执行-dryrun)；需要控制业务影响时，再阅读 [Scope](#2-使用-scope-限定驱逐范围)、[Gang 中断影响](#4-以-gang-语义评估工作负载中断影响)和[执行预算](#6-通过执行预算限制单次影响范围)。
 
 ## 背景
 
@@ -107,7 +123,7 @@ Repack 当前适合由平台主动发起的周期性碎片整理、大规格训�
 
 - `RepackRun` 是一次性任务，`spec` 创建后不可修改；调整目标、范围或预算需要创建新的 Run。
 - 每个 Run 当前只支持一种带 `/` 的扩展资源。`cpu`、`memory`、`ephemeral-storage` 和 `pods` 等原生资源不属于整理目标。
-- 为控制规划开销，Repack 基于当前集群快照采用启发式搜索，不承诺获得全局最优解。系统仅推荐预计能够释放完整目标资源节点并达到收益门槛的方案；实际收益以执行结果为准。详细的非全局最优场景、示例和设计取舍见 [Repack 启发式规划的约束、非全局最优场景与设计取舍](../design/repack-heuristic-planning-rationale.md)。
+- 为控制规划开销，Repack 基于当前集群快照采用启发式搜索，不承诺获得全局最优解。系统仅推荐预计能够释放完整目标资源节点并达到收益门槛的方案；实际收益以执行结果为准。算法边界与设计取舍见 [Repack 技术设计：启发式边界](../design/repack-design.md#88-启发式边界)。
 - Execute 在集群内串行执行；同一时刻只运行一个 Execute，并在完成后进入冷却时间。DryRun 不受该并发限制。
 - `scope.podGroups` 限定允许被驱逐的工作负载，`scope.nodes` 限定可腾空节点；`scope` 为空表示在全局范围评估。
 - Repack 只整理目标扩展资源。不申请目标资源的 DaemonSet、系统 Pod 和普通 Pod 不会被迁移，也不会阻止目标资源腾空。
@@ -183,8 +199,6 @@ goals:
 ```
 
 布局已足够紧凑时，Run 以 `NoFragmentation` 结束；存在碎片但无法达到收益门槛时，以 `InsufficientImprovement` 结束。两者都属于正常评估结果。
-
-![Repack 将分散空闲卡转化为完整可用容量](../images/repack/repack-value-impact.svg)
 
 ### 2. 使用 Scope 限定驱逐范围
 
@@ -397,7 +411,7 @@ kubectl get repackrun <run-name> \
 
 DryRun 重点审核 `status.plan` 和 `Complete` Condition；Execute 还要检查 `status.relocations`、`status.result`、工作负载状态和计划腾空节点。`metricsVerified=true` 表示最终收益来自重建 Pod 完成绑定后的一致 Scheduler 快照。
 
-## 完整操作示例
+## 从最简用法到完整配置
 
 以下示例以昇腾 NPU 资源 `huawei.com/ascend-1980` 为主。不同设备插件或驱动版本上报的资源名可能不同，请以节点 `status.allocatable` 中的实际资源名为准，并同步替换所有 YAML。GPU 集群的使用流程相同，只需将目标资源替换为 `nvidia.com/gpu`。
 

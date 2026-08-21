@@ -1,1353 +1,257 @@
-# Repack：运行期碎片整理设计
+# Volcano Repack：运行时异构资源碎片整理 Proposal
 
-Author: wangyang0616 · 2026-06-27
+## Summary
 
-> 状态：Proposal（征求意见）。本文是面向社区/开发者的方案说明；完整的推演与取舍记录见 [repack-policy-design.md](./repack-policy-design.md)。
->
-> **范围说明**：本提案对 **P0 与 P1 的方案设计一并敲定**。文中的 **P0 / P1 仅表示"实现落地顺序"**——先实现并验证 P0，再推进 P1 的编码；**不代表 P1 尚未设计**。"非目标"只列**确定不做**的项，不含 P1。
->
-> **实现一致性约定**：P0 `RepackRun` 的字段、枚举和校验以
-> `staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1/repackrun_types.go`
-> 及生成的 CRD schema 为准；状态语义以 `pkg/repackengine/status.go`、
-> `pkg/repackengine/placement.go` 和
-> `staging/src/volcano.sh/repack-controller/pkg/state` 为准。
-> 本文不再为已实现 API 维护另一套概念字段。
+本提案为 Volcano 引入 Repack：一套面向 NPU、GPU 等扩展资源的运行时碎片整理能力。Repack 通过 `RepackRun` 描述一次整理任务，在 Volcano Scheduler 的真实调度语义下评估 Pod 迁移可行性，并提供两种相互独立的执行模式：
 
----
+- `DryRun`：生成整理计划，不驱逐 Pod；
+- `Execute`：重新基于实时快照规划，通过 Kubernetes Eviction API 执行迁移并跟踪结果。
 
-## 1. 摘要（Summary）
+Repack 当前以释放完整目标资源节点为直接收益，以 Scope 和 `maxPerRun` 控制影响范围，以 PodGroup/Gang 语义评估工作负载中断影响。重建 Pod 的落点通过 `nominatedNodeName` 进行软性牵引，最终调度和绑定仍由 Volcano Scheduler 完成，不锁定或预留资源。
 
-在 GPU/NPU 等加速器集群中，作业反复创建与退出会让**空闲算力散落在很多节点上**：集群总空闲卡数明明够，但因为没有**连续的整机/整域空位**，需要整节点或跨节点 gang 调度的大作业**一直排队**。
+![Repack 端到端流程](images/repack/repack-end-to-end.svg)
 
-本设计提出 **Repack（运行期碎片整理）**：通过一个**独立部署、复用 `volcano-scheduler` 框架与插件**的执行组件 `volcano-repack-engine`，在**保证被驱逐 Pod 都能重新调度**的前提下，把零散负载**就近拢紧**、**腾出整空节点**，使排队中的大作业能被调度下来。
+## Motivation
 
-用户通过一个一次性 CRD **`RepackRun`** 触发整理，支持两种模式：
+### 运行中的集群会持续产生资源碎片
 
-- **DryRun**：只模拟、出"整理建议报告"，不动真实负载；
-- **Execute**：在用户认可的范围内真实驱逐 + 落点引导。
+装箱调度能够优化新 Pod 的初始放置，却无法避免集群在任务结束、扩缩容、滚动升级、失败重建和优先级变化后逐步偏离紧凑布局。对于加速卡资源，空闲设备总量相同并不代表能够承载相同的工作负载：任务可能要求固定的单 Pod 卡数、完整节点或多个 Pod 同时可用，分散在不同节点上的空闲卡无法直接组合。
 
-Repack 是**建议式（advisory）、尽力（best-effort）重排**，不做资源预留：驱逐前先做**规划时刻的可行性预检**（保证"若此刻执行，被驱逐 Pod 都有处可落"），但因不预留，**不保证运行期一定成功**——执行期若资源状态变化、或有更高优先级作业插入抢走空位，被整理的作业可能最终调度不下去（如实记录、可重试）。落点是软引导，腾出的空间**交还给调度器的排队队列**去消化——这正是减少"碎片性排队"的目的。
+结果是集群仍有较多空闲卡，大规格训练或推理扩容却因找不到满足请求的节点组合而持续 Pending。继续扩容硬件会掩盖布局问题并增加成本，人工迁移则难以同时判断工作负载影响、接收节点可行性和最终收益。
 
-## 2. 动机（Motivation）
+### AI 工作负载使迁移决策更复杂
 
-典型现象（AI 推理/训练混部尤为常见）：
+碎片整理不是简单地选择低利用率节点并驱逐 Pod。一个候选方案至少需要回答：
 
-- 集群空闲 GPU 充足，但分散在几十个节点上，每个节点只剩 1~2 卡；
-- 一个需要"整机 8 卡"或"跨机 64 卡 gang"的作业进入队列后，**找不到连续空位**，长期 Pending；
-- 运维只能手动驱逐、迁移负载来"挤"出空位，过程易错、不可复现、缺乏收益评估。
+1. 迁移后能否释放业务可使用的完整容量，而不是把碎片转移到其他节点；
+2. 所有被迁移 Pod 是否都能满足原有调度约束并获得接收位置；
+3. 会影响多少训练或推理工作负载，是否使 PodGroup 低于 `MinAvailable`；
+4. 单个 Pod 驱逐是否可能被上层控制器放大为多个 Pod 重建；
+5. 在规划与执行并发发生时，如何记录计划、实际落点和最终收益。
 
-Volcano 已有的 `networkTopology` / gang 调度解决的是"**新作业怎么放**"；但对"**已经在跑的负载怎么重排以消除碎片**"没有声明式能力。社区也缺少一个**带规划时可行性预检、可预览（DryRun）、可审计（CR 状态）**的碎片整理机制。
+因此，Repack 需要复用 Volcano 的调度语义，同时在调度器之外提供可审计、可限制、可独立执行的一次性资源整理流程。
 
-本设计补齐这一环：把"碎片整理"做成一等公民的、声明式、可灰度的能力。
+### 与现有能力的关系
 
-### 2.1 与现有方案的关系：`descheduler`
+- Repack 与 `binpack` 等装箱策略互补：装箱优化新任务放置，Repack 治理已经形成的存量碎片；
+- Repack 不是通用 Descheduler 的替代品，其目标是恢复目标扩展资源的可调度容量，并在迁移前验证完整落点；
+- Repack 不依赖已经停止演进的 `rescheduling` 路径，也不把整理逻辑嵌入常规调度周期；
+- Repack 复用 Volcano Scheduler 的缓存、Session、Predicate 和调度配置，避免维护另一套可行性语义。
 
-Volcano 已有基于 [kubernetes-sigs/descheduler](https://github.com/kubernetes-sigs/descheduler) 原型的 **`descheduler`**（按 `LowNodeUtilization`、`RemoveDuplicates` 等策略周期性驱逐 Pod）。**为什么不在它之上演进，而为 AI 场景另起新方案？** 关键差异有四：
+## Goals
 
-1. **调度一致性**：descheduler 用自带的调度/过滤模型，不复用 Volcano 的 `predicate`/`nodeorder`/HyperNode/队列配额——它判断的"能落下"未必等于 `volcano-scheduler` 实际怎么放，易出现"整理算的落点又被调度器拒掉"。Repack **复用调度器同一套 framework 与插件配置**，判断同源、同演进。
-2. **gang 感知**：descheduler 以单 Pod 为单位，不理解 PodGroup/gang（`minAvailable`、整组完整性）；逐 Pod 驱逐易破坏 gang。Repack 以 **gang 为动作与代价单位**，按 gang 语义计代价、护 `minAvailable`。
-3. **声明式整理**：descheduler 是按策略周期驱逐的 daemon，无"碎片整理"目标语义。Repack 用 **`RepackRun` CRD** 声明"整理什么/范围/多少/目标碎片率"并产出可读计划，把碎片整理作为一等目标。
-4. **可交互**：Repack 提供 **DryRun 预览 → 人工确认 → Execute** 两段式，全过程经 CR `status` 可见、可审计、可灰度；descheduler 无此闭环。
+本阶段目标如下：
 
-故**新建独立组件**（寄生于 Volcano scheduler framework、不引入第二套调度语义），而非嫁接到 descheduler。
+- 提供集群级、一次性的 `RepackRun` API，支持 `DryRun` 和 `Execute`；
+- 支持按扩展资源名称整理 NPU/GPU 资源，当前一次 Run 只处理一种资源；
+- 以完整目标资源节点释放和碎片率改善作为收益判定；
+- 通过工作负载与节点 Scope 限定允许驱逐的业务和允许腾空的节点；
+- 通过 `maxPerRun` 限制单次影响的工作负载数量和目标资源迁移量；
+- 复用 Volcano Scheduler 的完整调度过滤语义验证每个计划落点；
+- 感知 PodGroup/Gang 中断边界，减少受影响工作负载，并降低突破 `MinAvailable` 的概率；
+- 记录计划、逐 Pod 驱逐、替身 Pod 识别、建议节点、实际节点和实际收益；
+- 保持 Action 主流程稳定，通过 Plugin 扩展 Scope、预算、Domain、评分和装箱策略；
+- 在大规模集群中采用有界的启发式搜索，避免对全部候选执行全量调度模拟。
 
-> **长期定位**：Repack 是"整理目标 + 算法 + action"可插拔的重排框架（§5.3 / §6）。descheduler 的各类策略（利用率再平衡、副本去重、规则违规清理）都可表达为 Repack 的"目标画像 + 扰动评分 + action"插件，并天然获得规划时可行性预检、gang 感知、DryRun/审计与调度一致性。因此长期看 descheduler 类能力可逐步纳管进 Repack；本提案先聚焦最迫切的一个——**AI 场景下的碎片整理**（GPU/NPU 因 gang 作业频繁起停产生的碎片）。
+## Non-Goals
 
-### 2.2 用户故事（User Stories）
+本阶段不包含以下能力：
 
-聚焦两类直接使用者——**集群管理员**（对整集群负责）与**租户/队列负责人**（对本队列作业负责）；作业提交者多为透明受益方，不推荐其直接发起整理。每条标注实现阶段（P0/P1）。
+- 不承诺求解数学意义上的全局最优布局；
+- 不为迁移或后续工作负载预留资源，也不强制绑定重建 Pod；
+- 不自动监听 Pending 作业并触发整理；
+- 不执行抢占、节点 `cordon` 或通过污点独占释放容量；
+- 不修改工作负载的资源请求、并行度或拓扑约束；
+- 不提前搜索绕开 PDB 的替代驱逐组合；
+- 不对上层控制器的级联重建成本进行通用建模；
+- 当前不实现 HyperNode Domain、多节点联合腾空或多跳交换；这些能力通过 Domain Plugin 和后续状态模型演进。
 
-**集群管理员**
+## User Stories
 
-- 作为集群管理员，我想要在真正执行前先预览一次整理计划（迁移哪些作业、腾出几台整机、扰动多大），以便于评估收益、确认无误后再动手，避免误操作影响线上。 [P0]
-- 作为集群管理员，我想要一键把零散的 GPU/NPU 占用拢紧、腾出整机空节点，以便于让排队的大 gang 作业有连续空位，并释放整机用于维护、下线或节能。 [P0]
-- 作为集群管理员，我想要用统一的标签选择器（或点名）圈定整理范围，即使 Deployment/StatefulSet/自定义负载也无需感知底层 PodGroup，以便于不了解 Volcano 内部结构也能配置整理。 [P0]
-- 作为集群管理员，我想要限定参与整理的节点、并排除受保护对象，以便于把整理约束在安全边界内、按节点池分批推进。 [P0]
-- 作为集群管理员，我想要限定单轮最多动几个作业/几张卡、且执行全局串行并带冷静期，以便于控制爆炸半径、避免整理风暴冲击集群稳定。 [P0]
-- 作为集群管理员，我想要选择/配置不同的整理算法（节点腾空法、集中度法），以便于按场景选择最合适的整理目标。 [P0]
-- 作为集群管理员，我想要整理的可行性判断复用 volcano-scheduler 同一套 framework/predicate，以便于"算出来能落"与调度器"实际能放"一致、计划不落空。 [P0]
-- 作为集群管理员，我想要整理工单完成后按 TTL 自动清理，以便于不积压历史对象、保持集群整洁。 [P0]
-- 作为集群管理员，我想要在碎片率或排队水位超阈值时自动触发整理，以便于无人值守地持续控碎片、减少人工巡检。 [P1]
-- 作为集群管理员，我想要按周期定时发起整理，以便于在业务低峰窗口集中做碎片治理。 [P1]
-- 作为集群管理员，我想要设置集群级默认与硬护栏（最大扰动、冷静期等）来统一约束**所有人手写**的整理动作、防止越界，以便于多租户下安全放权。 [治理机制，待定——不在 RepackPolicy 内]
-- 作为集群管理员，我想要按 NVLink island / 超节点整域腾出连续空位，以便于满足大模型训练对拓扑连续算力的调度需求。 [P1]
+### 周期性治理
 
-**租户 / 队列负责人**
+平台运维人员定期观察目标节点池的碎片率。当碎片持续升高时，先创建小范围 `DryRun`，确认预计收益和受影响工作负载，再在低峰期创建独立的 `Execute`。
 
-- 作为租户负责人，我想要只整理本命名空间/队列内的作业，以便于自助解决本队列碎片、不影响其他租户。 [P0]
-- 作为租户负责人，我想要以"让我这个排队的大 gang 作业可调度"为目标反向整理出落点，以便于被碎片卡住的重要作业尽快跑起来。 [P1]
-- 作为租户负责人，我想要把关键作业标记为受保护、整理时不被搬迁，以便于保障核心业务不因整理而中断。 [P0：单次可按保护标签 `scope.exclude`；跨 Run 强制保护见治理机制（待定）]
-- 作为租户负责人，我想要为整理配置最小运行时长、最大中断分、PDB 兼容等扰动策略，以便于把对在跑作业的打扰控制在可接受范围。 [P1]
+### 大规格任务提交前准备容量
 
-#### 故事 → RepackRun / RepackPolicy 映射
+用户计划提交需要多个完整节点的训练任务。平台在任务提交前运行 Repack，将零散占用收敛到部分节点，增加能够直接承载该规格任务的完整节点数量。
 
-两个 CRD 分工：**`RepackRun`** 是"一次性工单"（人手动发起，或由 Policy 自动创建）；**`RepackPolicy`** 只做"**按触发条件生成 RepackRun**"（内嵌 RepackRun 模板，CronJob→Job 式；**不做集群级护栏**——那是治理，另议）。P0 只以当前 CRD 为准；relief 与可配扰动策略留待 P1 重新讨论，当前不声明字段。
+### 计划性推理扩容
 
-| 故事（能力） | 载体 | 关键字段（与最终 CRD 一致） | 阶段 |
-|---|---|---|---|
-| 预览计划再决定 | RepackRun | `mode: DryRun` → 读 `status.plan` | P0 |
-| 一键腾整机 | RepackRun | `mode: Execute` + `goals[].resource` | P0 |
-| 统一标签圈定范围 | RepackRun | `scope.podGroups.include.selector` | P0 |
-| 限定节点 / 排除受保护对象 | RepackRun | `scope.nodes` / `scope.podGroups.exclude` | P0 |
-| 控爆炸半径 | RepackRun | `maxPerRun.podGroups` / `maxPerRun.resources`（+引擎串行/冷静期） | P0 |
-| 扩展整理策略 | 引擎 Plugin | 通过 Session 回调组合 Scope、预算、Gang、接收节点等策略 | P0 |
-| 落点与调度器一致 | 引擎内建 | 复用 `scheduler-conf` / framework / predicate（无需配置） | P0 |
-| 完成后自动清理 | RepackRun | `ttlSecondsAfterFinished` | P0 |
-| 只整理本队列（租户自助） | RepackRun | `scope.podGroups.include.selector`（本 ns/队列标签） | P0 |
-| 定时 / 排队受阻 / 碎片率触发 | RepackPolicy | `trigger.cronSchedule` / `trigger.onPendingBlocked` / `trigger.onFragmentation` | P1 |
-| 生成 Run（模板） | RepackPolicy | `runTemplate.spec`（其 `mode` 决定 DryRun/Execute）；串行由引擎 K=1+冷静期兜底 | P1 |
-| 排除受保护对象（单次） | RepackRun | `scope.podGroups.exclude`（按保护标签） | P0 |
-| 拓扑整域腾空 | RepackRun | 拓扑目标画像插件（NVLink/超节点） | P1 |
-| 解救排队 gang | 待 P1 设计 | API 与语义均未定稿 | P1 |
-| 驱逐执行参数 | RepackRun（或经 RepackPolicy 的 `runTemplate`） | `eviction.gracePeriodSeconds` | P0 |
-| 可配扰动策略 | 待 P1 设计 | API 与语义均未定稿；PDB 扩展一并讨论 | P1 |
-| 集群级默认 + 硬护栏 / 跨 Run 强制保护 | 治理机制（另议） | CEL `ValidatingAdmissionPolicy` 或后续单开 CRD，**不在 RepackPolicy 内** | 待定 |
+模型服务预计在业务高峰前扩容。平台按业务标签限定允许迁移的工作负载，并通过执行预算控制本轮影响范围，提前整理所需容量。
 
-**示例 1 · 集群管理员：一键腾空 a100 节点池（P0，RepackRun）** — 对应故事"一键腾整机 / 统一标签圈定 / 限定节点排除保护 / 控爆炸半径 / 自动清理"
+### 节点池内受控整理
+
+集群包含多个资源池。平台通过节点标签限定一个节点池，通过工作负载标签声明允许驱逐的业务，确保整理不越过运维边界。
+
+## Proposal
+
+### API Overview
+
+新增 cluster-scoped、创建后 `spec` 不可变的 `RepackRun`：
 
 ```yaml
 apiVersion: repack.volcano.sh/v1alpha1
 kind: RepackRun
 metadata:
-  name: a100-drain
-spec:
-  mode: Execute                     # 预览则改 DryRun，读 status.plan
-  goals:
-    - resource: nvidia.com/gpu
-  scope:
-    podGroups:
-      include:                      # 统一按 PG 标签选，覆盖 vcjob/Deployment/自定义
-        selector:
-          matchLabels:
-            workload-type: batch
-      exclude:                      # 排除受保护对象
-        selector:
-          matchLabels:
-            repack.volcano.sh/protected: "true"
-    nodes:
-      include:                      # 限定参与节点
-        selector:
-          matchLabels:
-            volcano.sh/node-pool: a100
-  maxPerRun:                        # 控爆炸半径
-    podGroups: 10
-    resources:
-      nvidia.com/gpu: 64
-  ttlSecondsAfterFinished: 86400    # 完成后自动清理
-```
-
-**示例 2 · 租户负责人：只整理本队列（P0，RepackRun）** — 对应故事"只整理本命名空间/队列内的作业"
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackRun
-metadata:
-  name: team-foo-repack
-spec:
-  mode: DryRun                      # 先预览，读 status.plan 评估
-  goals:
-    - resource: nvidia.com/gpu      # 整理 GPU 碎片
-  scope:
-    podGroups:
-      include:                      # 只圈本租户的 gang（PG 标签 tenant=foo），不影响他人
-        selector:
-          matchLabels:
-            tenant: foo
-  ttlSecondsAfterFinished: 3600     # 报告留存 1h 后自动清理
-```
-
-**示例 3 · 自动触发（P1，RepackPolicy = 触发 + 内嵌 RepackRun 模板）** — 对应故事"碎片率/排队受阻自动触发 / 定时触发"
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackPolicy
-metadata:
-  name: a100-auto
-spec:
-  trigger:                          # 三种触发源，命中任一即触发（此处配了②③两种）
-    onFragmentation:                # ③ 碎片率 > 0.35 触发
-      fragAbovePercent: 35
-    onPendingBlocked:               # ② ≥1 个 gang 因碎片卡住 >10min
-      minPendingPodGroups: 1
-      minBlockedDuration: 10m
-  suspend: false                    # 可临时暂停触发
-  successfulRunsHistoryLimit: 3     # 派生 Run 保留数（扁平字段，对齐 CronJob）
-  runTemplate:                      # ← 内嵌一份 RepackRun（复用 RepackRunSpec）
-    spec:
-      mode: DryRun                  # DryRun=命中只自动出报告；改 Execute 则自动执行（引擎 K=1+冷静期兜底串行）
-      goals:
-        - resource: nvidia.com/gpu
-          minFragImprovementPercent: 5   # 碎片率至少改善 0.05 才值得
-      scope:
-        nodes:
-          include:
-            selector:
-              matchLabels:
-                volcano.sh/node-pool: a100
-      maxPerRun:
-        podGroups: 10
-        resources:
-          nvidia.com/gpu: 64
-      eviction:                     # P0：本次 Eviction 请求的执行参数
-        gracePeriodSeconds: 30      # 可选：不填则使用 Pod.spec.terminationGracePeriodSeconds
-```
-
-## 3. 目标（Goals）
-
-> 逐条列出**支持的能力**；每项标注实现阶段（**P0** 先落地、验证后再做 **P1**，均在本提案敲定，P0/P1 仅表示落地顺序）。
-
-**按触发方式**
-
-- 支持**一次性（手动）碎片整理**：建 `RepackRun`，`DryRun` 预览计划 + `Execute` 执行的两段式流程（**P0**）
-- 支持**定时触发的碎片整理**：`RepackPolicy` 按周期自动发起（**P1**）
-- 支持**缓解 Pending 作业自动触发的碎片整理**：碎片率 / 排队水位超阈值自动触发，或以"让指定排队 gang 可调度"为目标的解救式整理（relief）（**P1**）
-
-**按整理粒度**
-
-- 支持**节点级碎片整理**：拢紧零散占用、腾出整节点（内置节点腾空法 / 集中度法两种等价目标算法）（**P0**）
-- 支持 **HyperNode（拓扑）级碎片整理**：NVLink 节点内 island、超节点"整域空位"作为整理目标（**P1**）
-- 支持**可插拔的整理算法 / 目标**：新算法、新整理目标以插件接入，不改主流程（**P0**）
-
-**按整理语义与质量**
-
-- 支持 **Gang 感知的碎片整理**：以 PodGroup（gang）为动作与代价单位，按 gang 语义计"受损卡数"（**P0**）
-- 支持**任务中断成本感知的碎片整理**：扰动评分、单轮规模封顶、`Execute` 全局串行 + 冷静期（**P0**）；`eviction.gracePeriodSeconds` 可覆盖本次驱逐的优雅终止等待；可配置扰动策略留待 **P1** 讨论 API 与语义。
-- 支持**规划时可行性预检（尽力、非预留）**：驱逐前模拟"被驱逐 Pod 都有处可落"（INV-RESCHED），不过则不驱逐（**P0**）
-- 支持**动态 placement**：驱逐前写 PodGroup placement lease；替身 Pod 创建时由 webhook 注入 scheduling gate 并记录 Run UID owner，Engine 基于最新 Session 重算并持久化 receiver，controller 独占 gate 生命周期，写 `pod.status.nominatedNodeName` 后解除 gate、绑定观察后清理 owner；无稳定 identity 的原生负载扩容 Pod 在与替身不可区分的窗口内保持 gate，nomination 被认领或 Run 终态后放行；无可行 receiver 至 deadline 则解除本 gate 并显式降级（**P0**）
-- 支持**复用调度器判断**：与 `volcano-scheduler` 同一份插件配置、同一 `framework`/`predicate`，判断同源、同演进（**P0**）
-
-## 4. 非目标（Non-Goals）
-
-> 明确**不支持**的能力（P1 项不在此列，见 §3 各 P1 能力、§5.6、§6）。
-
-- **仅支持 GPU / NPU 资源的碎片整理**：以加速卡（GPU/NPU）为整理对象与收益口径，**不支持** CPU、内存等其他资源的碎片整理
-- **不支持抢占（preemption）**：repack 只搬可迁移作业，不按优先级抢占正在运行的作业
-- **不支持资源预留 / 占位（Reservation）**：腾出的空间交还调度器排队队列，不为某个未来 Pod 锁定容量
-- **不支持新作业的拓扑放置**：由现有 `networkTopology` / gang 调度负责，repack 不改其行为
-- **不支持跨资源联合整理**（一个 Run 同时整理 GPU+NPU 并跨资源合成收益）：
-  P2+ 预留。`goals[]` 的列表形状已留，但当前 status 没有逐资源结果层；后续还需
-  同时演进计划、结果和收益门控 schema，不能只放开 `maxItems`
-- **不迁移 DaemonSet pod**：DaemonSet pod 节点固定（每节点一个），搬走会立刻被重建回原节点，无整理意义
-
-## 5. 方案（Proposal）
-
-### 5.1 总体架构
-
-Repack 由**三个进程**协作，职责清晰分离：
-
-```mermaid
-flowchart LR
-    user["用户 / 运维"]
-    subgraph API["apiserver"]
-        cel["CEL/marker 校验<br/>（mode 枚举 / goals≤1 / 扩展资源 / spec 不可变）"]
-    end
-    subgraph CM["volcano-controller-manager"]
-        ctrl["RepackRun 控制器<br/>TTL 回收 + 替身认领/提名/绑定观察<br/>(+P1 RepackPolicy)"]
-    end
-    subgraph RR["RepackRun (CRD)"]
-        spec["spec: mode/scope/goals/maxPerRun/eviction/ttl"]
-        status["status: phase/conditions/plan/result/relocations"]
-    end
-    subgraph ENG["volcano-repack-engine (独立 Pod)"]
-        eng["事件驱动 watch RepackRun<br/>复用 schedcache + OpenSession(同一插件配置)<br/>门控(K=1+冷静期) + 整理算法 + 驱逐 + 写状态"]
-    end
-    subgraph SCHED["volcano-scheduler (现网)"]
-        alloc["allocate：honor nominatedNodeName<br/>排队作业调度进腾出的空间"]
-    end
-
-    user -->|CREATE| API -->|合法才落库| RR
-    RR -->|watch(事件)| eng
-    eng -->|写 plan/result/relocations + lifecycle| RR
-    RR -->|watch 执行状态| ctrl
-    ctrl -->|认领替身 / patch nominatedNodeName / 解除 placement gate| SCHED
-    eng -->|Evict victim| SCHED
-    alloc -->|消费空位| SCHED
-```
-
-- **apiserver（CEL 准入）**：`RepackRun` 的基本校验全部在创建期由 CRD 上的 CEL/marker 完成（mode 枚举、`goals≤1`、spec 不可变）；scope 两种 mode 均可省略（=全集群，迁移规模由引擎计划兜底）；非法对象根本不落库。**没有控制器准入步骤。**
-- **控制器**（在 controller-manager 内，轻量 client-go）：做 **TTL 回收**，并维护
-  `relocations[].replacementPodGroupName` 以及替身 Pod 的认领、提名、placement gate
-  生命周期和最终绑定观察；P1 的 `RepackPolicy` 也演进在这里。它会与 Engine 协作写
-  `status.relocations[].placement`，但不写 `plan`、`result`、顶层 lifecycle 或 eviction journal。
-- **`volcano-repack-engine`**（独立 Deployment）：**事件驱动** watch `RepackRun`，**复用调度器框架**打开 Session；跑门控（Execute 全局 K=1 + 冷静期）、规划、驱逐和执行期实时选点；两种 mode 都写 `status.plan`，Execute 额外维护顶层 lifecycle、`result`、eviction journal、placement deadline 以及 `selectedNodeName`。**不 bind Pod、不打污点、不做资源预留。**
-- **`volcano-scheduler`**（现网，不改造）：照常调度；通过原生 `nominatedNodeName` honor 路径，把重建的 Pod 与排队作业落到腾出的空间。
-
-> **关键设计：repack-engine = "只跑整理、不跑 allocate/bind 的迷你调度器"。** 它用 `schedcache.New` 建与调度器同源的缓存、用 `framework.OpenSession(tiers, conf)` 加载**同一份插件配置**，于是 predicate（亲和/污点/拓扑/NUMA/设备）与调度器**逐字一致、自动跟随演进**。
-
-### 5.2 RepackRun API
-
-新增一个 cluster-scoped、一次性、用户不可变（创建后 `spec` 冻结）的 CRD：**`RepackRun`**（group `repack.volcano.sh/v1alpha1`）。
-
-**spec 核心字段**
-
-| 字段 | 含义 | 必填 | 阶段 |
-|---|---|---|---|
-| `mode` | `DryRun`（模拟出报告）/ `Execute`（真实执行） | 是 | P0 |
-| `scope.podGroups` | 候选被搬迁的作业范围（include/exclude，`selector` 按 PG 标签 + `names` 点名 PG 的 `ns/name`）——**万物皆 PodGroup**（见下方说明） | 可选；省略即全部 PodGroup | P0 |
-| `scope.nodes` | 限定/排除参与整理的节点 | 可选 | P0 |
-| `goals[0].resource` | 整理哪类加速资源（如 `nvidia.com/gpu`），**单资源、至多一条** | 可选（留空=回落引擎 `--repack-default-resource`；皆空或默认值非法时以 `InvalidConfiguration` 失败） | P0 |
-| `goals[0].minFragImprovementPercent` | 碎片率最小改善阈值（百分点 0–100 整数），达不到不整理 | 可选 | P0 |
-| `maxPerRun.podGroups` / `.resources` | 单轮最多动几个作业 / 几张卡 | 可选 | P0 |
-| `eviction.gracePeriodSeconds` | 本次 Eviction 请求的优雅终止等待秒数；不填沿用各 Pod 的 `terminationGracePeriodSeconds`，`0` 请求立即终止 | 可选，仅 Execute 生效 | P0 |
-| `ttlSecondsAfterFinished` | 终态后自动清理（对齐 Job，由控制器执行） | 可选 | P0 |
-
-#### Eviction 与 PDB 的职责边界
-
-`eviction.gracePeriodSeconds` 是**执行请求参数**：引擎把它原样写入
-`policy/v1 Eviction.deleteOptions.gracePeriodSeconds`。未设置时 API Server 使用
-Pod 自己的 `spec.terminationGracePeriodSeconds`；显式 `0` 表示请求立即终止。它不表示
-引擎等待 Pod 消失、替身 Ready，或节点真正腾空的超时；这些闭环等待若需要，后续另设
-`terminationWaitTimeoutSeconds` / `replacementReadyTimeoutSeconds`，不得复用 grace period。
-
-PDB 与优雅终止同属 Eviction API 的执行面，但解决的是不同问题：前者决定当前是否允许
-中断，后者决定已获准中断后可保留多久。每一次实际驱逐都必须使用 Kubernetes Eviction API，
-因此**始终受 PDB 约束，不能提供绕过 PDB 的开关**。PDB 预检和被阻塞后的处理属于未来
-P1 的整体扰动/执行策略设计；在行为和 API 一并定稿前，P0 不提供任何相关字段。
-
-> **万物皆 PodGroup：工作负载选择统一到 PodGroup 维度**
-> repack 的动作/代价单位是 PodGroup（gang），因此**选择也统一表达在 PodGroup 上**：`selector`（PG 标签）与 `names`（PG 的 `ns/name`）指向同一种对象，语义自洽。这对三类负载一视同仁——Volcano 原生（vcjob）、K8s 原生（Deployment/StatefulSet…）、用户自定义 CRD。
->
-> 关键前提是**让 PodGroup 携带业务标签**。Volcano 的 pg-controller 为非 vcjob 负载自动创建 PodGroup（`podgroup-<controller-owner-UID>`，如 Deployment 下即 ReplicaSet 的 UID，一个 RS 的所有 pod 共用一个 PG），原本标签为空。**配套增强**（见 §5.2.1）让 pg-controller 把 pod 模板标签**继承**到 PG 上（剔除 `pod-template-hash`、`controller-revision-hash` 等系统/控制器标签），于是 PG 的 `selector` 就能覆盖所有负载类型。
->
-> 为什么不把选择锚点下沉到 Pod：因为本轴还有 `names` 点名列表，而 **`names` 天生是 PodGroup 维度**的（pod 名朝生暮死、无法稳定点名）；若 `selector` 去匹配 Pod、`names` 匹配 PodGroup，同一条轴两个字段指向两种对象，不自洽。统一到 PodGroup 后二者同源。
->
-> 边界：`names` 对**自动建的 PG 不实用**（名字 UID 派生、滚动升级换 RS 即变），主要服务 vcjob 这类确定性命名；Deployment/自定义负载日常靠 `selector`。语义上 `include/exclude` 各支持 `selector`∪`names`，`exclude` 优先；命中即选中整组 PodGroup。
-
-**status 核心字段**
-
-- `phase`：`Pending` / `Running` / `Succeeded` / `Failed`（由 `conditions` 派生，`conditions` 为权威）。
-- `conditions`：只使用 `Progressing` / `Complete` / `Failed` 三种 type。`Progressing=False`
-  表示 Execute 正在等待全局槽或冷静期；`Complete.reason` 同时承担成功结论/是否值得整理的机器可读判据。
-- `message` / `startTime` / `completionTime`：当前人读摘要、首次进入 `Running` 的时间和首次进入终态的时间；`completionTime` 是 TTL 回收锚点。
-- `plan`（**DryRun 与 Execute 同一字段、同一结构**）：不可变的计划时快照。`summary` 始终记录完整计划的预期收益（目标资源的**全集群**碎片率 before/预测 after、预计腾出节点数、计划搬卡数、动作 scope 解析计数）；`moves[]` 与 `freedNodes[]` 始终保留驱逐前的完整方案。Execute 即使部分驱逐被拒绝或最终落点降级，也不得覆盖这份审计基线。
-- `result`（**Execute 独有**）：实际执行结果。`movedCardCount` 是被 Eviction API 接受的 Pod 所对应卡数；`fragAfterPercent` / `freedNodeCount` / `freedNodes[]` 来自替身绑定后的全集群一致快照。`freedNodes[]` 明确列出已验证腾空的计划节点，成功时必须与 `plan.freedNodes[]` 集合完全一致；`metricsVerified=false` 表示未能可靠复测，此时碎片率保守回退为 plan before、实际腾空数为 0、实际节点集合为空。若 Execute 在任何驱逐被接受前失败，`result` 不出现。
-- `relocations`（**Execute 独有**）：每个计划被搬 Pod 一条 durable 执行记录，包含不可变的计划身份、engine-owned eviction journal 和协作维护的 replacement placement journal。驱逐结束后只保留 `Accepted` / `IndirectlyRemoved` 项；`Rejected` 项仍可从不可变的 `plan` 审计，但不会等待替身。`plannedNodeName` 是计划落点，`selectedNodeName` 是执行期基于最新 scheduler snapshot 选出的落点，`actualNodeName` 是最终绑定节点，三者允许不同。若 workload 重建了不同名称的 PodGroup，`replacementPodGroupName` 记录当前承接替身的最新一代，原 `podGroupName` 始终保留计划时身份。
-
-**status 写入所有权**
-
-| 字段 | 主要写入方 | 说明 |
-|---|---|---|
-| `phase` / `conditions` / `message` / 时间戳 | Engine | conditions 先更新，phase 再派生；Controller 只读取终态做 GC |
-| `plan` / `result` | Engine | plan 是不可变审计基线；result 是 Execute 的实际聚合结果 |
-| `relocations[].eviction` | Engine | `Pending → InProgress → Accepted \| IndirectlyRemoved \| Rejected` |
-| `replacementPodGroupName`、替身 Pod 身份、`actualNodeName` | Controller | 认领替身、推进 PodGroup 代际并观察最终绑定 |
-| `placement.selectedNodeName`、deadline/超时 | Engine | 从实时 Session 选择 receiver；到期后标记 `TimedOut` 并触发 gate 释放 |
-| `placement.phase` | Engine + Controller | Engine 初始化/等待选择/超时；Controller 持久化 `Nominated` / `Placed`。写入端按单调状态机合并，终态互不覆盖 |
-
-两个逐 Pod journal 相互独立，不能把 eviction phase 当作 placement phase 使用：
-
-```mermaid
-stateDiagram-v2
-    state "Eviction journal" as E {
-        [*] --> Pending
-        Pending --> InProgress
-        InProgress --> Accepted
-        Pending --> Rejected
-        InProgress --> Rejected
-        Pending --> IndirectlyRemoved
-        InProgress --> IndirectlyRemoved
-    }
-    state "Placement journal" as P {
-        [*] --> WaitingForReplacement
-        WaitingForReplacement --> WaitingForNodeSelection
-        WaitingForNodeSelection --> Nominated
-        WaitingForReplacement --> Placed: 已先行绑定时恢复
-        WaitingForNodeSelection --> Placed: 已先行绑定时恢复
-        Nominated --> Placed
-        WaitingForReplacement --> TimedOut
-        WaitingForNodeSelection --> TimedOut
-        Nominated --> TimedOut
-    }
-```
-
-`Accepted`、`IndirectlyRemoved`、`Rejected` 是 eviction 的兄弟终态；
-`Placed`、`TimedOut` 是 placement 的兄弟终态，终态之间不得互相覆盖。
-
-**RepackRun 结构体定义（Go，与 `types.go` 一致）**
-
-```go
-// group repack.volcano.sh/v1alpha1；cluster-scoped；一次性、spec 创建后不可变（CEL）
-type RepackRun struct {
-    metav1.TypeMeta   `json:",inline"`
-    metav1.ObjectMeta `json:"metadata,omitempty"`
-    Spec   RepackRunSpec   `json:"spec"`             // CEL: self == oldSelf（不可变）
-    Status RepackRunStatus `json:"status,omitempty"`
-}
-
-type RepackRunSpec struct {
-    Mode                    RepackMode        `json:"mode"`                              // DryRun | Execute（必填）
-    Scope                   *RepackScope      `json:"scope,omitempty"`                   // 整理范围（可省略；省略即整个集群）
-    Goals                   []RepackGoal      `json:"goals,omitempty"`                   // 单资源目标，maxItems=1
-    MaxPerRun               *MaxPerRun        `json:"maxPerRun,omitempty"`               // 单轮规模封顶
-    Eviction                *EvictionPolicy   `json:"eviction,omitempty"`                // Execute 的 Eviction 请求参数
-    TTLSecondsAfterFinished *int64            `json:"ttlSecondsAfterFinished,omitempty"` // 终态后自动删
-}
-
-// scope：万物皆 PodGroup，两轴（podGroups / nodes）同构
-type RepackScope struct {
-    PodGroups *RepackSelectorTerm `json:"podGroups,omitempty"`
-    Nodes     *RepackSelectorTerm `json:"nodes,omitempty"`
-}
-type RepackSelectorTerm struct { // exclude 优先
-    Include *RepackSelector `json:"include,omitempty"`
-    Exclude *RepackSelector `json:"exclude,omitempty"`
-}
-type RepackSelector struct { // selector ∪ names
-    Selector *metav1.LabelSelector `json:"selector,omitempty"` // PG 标签（pg-controller 从 pod 继承）/ 节点标签
-    Names    []string              `json:"names,omitempty"`    // PodGroup: "ns/name"；Node: 节点名
-}
-
-type RepackGoal struct {
-    Resource               v1.ResourceName `json:"resource"`                         // 如 nvidia.com/gpu
-    MinFragImprovementPercent int32        `json:"minFragImprovementPercent,omitempty"` // 碎片率最小改善阈值（百分点 0–100）
-}
-type MaxPerRun struct {
-    PodGroups *int32          `json:"podGroups,omitempty"` // 单轮最多动几个 PodGroup
-    Resources v1.ResourceList `json:"resources,omitempty"` // 单轮最多动几张卡（按资源）
-}
-type EvictionPolicy struct {
-    GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"` // nil=沿用 Pod.spec.terminationGracePeriodSeconds；0=立即终止
-}
-
-type RepackRunStatus struct {
-    Phase          RepackPhase        `json:"phase,omitempty"`          // 由 conditions 派生
-    Conditions     []metav1.Condition `json:"conditions,omitempty"`     // 权威事实（准入=CEL，无 Admitted 条件）
-    Message        string             `json:"message,omitempty"`        // Pending/Running/终态的一句话摘要
-    StartTime      *metav1.Time       `json:"startTime,omitempty"`
-    CompletionTime *metav1.Time       `json:"completionTime,omitempty"` // TTL 锚点
-    Plan           *RepackPlan        `json:"plan,omitempty"`           // 不可变完整计划（两种 mode 同构，均为计划时快照）
-    Result         *RepackResult      `json:"result,omitempty"`         // Execute 独有：实际接受量与替身绑定后的观测结果
-    Relocations    []PodRelocationStatus `json:"relocations,omitempty"` // Execute 独有：每个被迁移 Pod 的驱逐与替身放置状态
-}
-// 已精简（对齐 status 定义评审）：删除 mode（spec 不可变、恒可读，printer 用 spec.mode）、
-// observedGeneration（spec 被 CEL 冻结、generation 永不变）、triggerReason（P0 恒为 Manual，
-// 有区分度要等 RepackPolicy/P1）。三者均为「派生/恒定/P1」字段。
-
-// PodRelocationStatus 是一个被搬 Pod 的持久化执行记录（Execute 独有；每搬一个 Pod 一条）。
-// eviction 由 engine 维护；placement 由 engine/controller 按字段分工协作维护；
-// 记录可跨组件重启恢复。
-// 替身认领按「替身匹配契约」（§5.2.2）：已有 replacementPodUID → victimPodName
-// 精确快路径 → schedulingRequirementsHash → 同构 PodGroup 兜底。
-type PodRelocationStatus struct {
-    Namespace      string            `json:"namespace"`                      // 命名空间（PodGroup / victim pod 同此 ns）
-    PodGroupName   string            `json:"podGroupName,omitempty"`         // 计划时的原 PodGroup，执行中不改写
-    ReplacementPodGroupName string   `json:"replacementPodGroupName,omitempty"` // workload 整组重建后当前承接替身 Pod 的最新 PodGroup
-    VictimPodName  string            `json:"victimPodName,omitempty"`        // 被驱逐的旧 pod 名：审计 + 同名重建时的精确快路径
-    VictimPodUID   types.UID         `json:"victimPodUID,omitempty"`         // 计划时 Pod 实例；驱逐 UID precondition 与崩溃恢复依据
-    SchedulingRequirementsHash string `json:"schedulingRequirementsHash,omitempty"` // 仅显式使用 SubGroup 时记录；归一化调度需求的等价性摘要
-    PlannedNodeName string           `json:"plannedNodeName"`                // 计划时目标节点（不可变审计字段）
-    Eviction       PodEvictionStatus `json:"eviction"`                       // engine 独占写入
-    Placement      PodPlacementStatus `json:"placement"`                     // engine/controller 协作写入
-}
-type PodEvictionStatus struct {
-    Phase          PodEvictionPhase  `json:"phase"`                          // Pending/InProgress/Accepted/IndirectlyRemoved/Rejected
-    Message        string            `json:"message,omitempty"`              // 驱逐拒绝或恢复判断的人读说明
-}
-type PodPlacementStatus struct {
-    Phase          PodPlacementPhase `json:"phase"`                          // WaitingForReplacement/WaitingForNodeSelection/Nominated/Placed/TimedOut
-    SelectedNodeName string          `json:"selectedNodeName,omitempty"`     // 执行时基于最新快照选择的接收节点
-    ReplacementPodName string        `json:"replacementPodName,omitempty"`   // 已认领替身 Pod 名
-    ReplacementPodUID types.UID      `json:"replacementPodUID,omitempty"`    // 已认领替身 Pod UID，支持幂等恢复
-    ActualNodeName string            `json:"actualNodeName,omitempty"`       // 替身最终绑定节点
-    ExpirationTime *metav1.Time       `json:"expirationTime,omitempty"`       // 放置截止时间
-}
-// 只有 Accepted/IndirectlyRemoved 可认领替身 Pod；每次 Eviction API
-// 调用前先持久化 InProgress，重启后结合 victimPodUID、Pod 是否存在/terminating 幂等恢复。
-// ---- status 子结构 ----
-// RepackPlan：DryRun 与 Execute 同一结构，始终是完整、不可变的计划时快照。
-type RepackPlan struct {
-    Summary    *RepackSummary     `json:"summary,omitempty"`    // 扁平看板层
-    Moves      []RepackMove       `json:"moves,omitempty"`      // 每段搬迁：带 fromNode→toNode 计划落点
-    FreedNodes []string           `json:"freedNodes,omitempty"` // 计划腾空的节点名（Execute 实际腾空数见 status.result）
-}
-// RepackMove：一个 PodGroup 的迁移信息。fromNode/toNode 本质逐 pod（一个 gang 的 pod
-// 可散落多源节点、迁往多目标节点），故内含 pods[] 明细，PodGroup 级只留身份与合计。
-type RepackMove struct {
-    Namespace    string       `json:"namespace"`        // 本条所属命名空间（PodGroup/owner/pods 同此 ns）
-    PodGroupName string       `json:"podGroupName"`     // PodGroup 名（精确调度维度、匹配 scope）
-    Owner        *WorkloadRef `json:"owner,omitempty"`  // 用户可见拥有者（同 ns，故 WorkloadRef 只需 kind/name）
-    Cards        int64        `json:"cards,omitempty"`  // 本 PodGroup 本轮搬走卡数合计（= Σ pods[].cards）
-    Pods         []PodMove    `json:"pods,omitempty"`   // 逐 pod 迁移明细（各自 fromNode→toNode）
-}
-// PodMove：单个 pod 的迁移（纯计划：pods[] 只列被迁移的 pod，没搬的不出现）。
-// DryRun 与 Execute 同构；Execute 的实际落点/绑定交由 relocations[].placement + result 表达，
-// 不在此逐 pod 记 outcome/actualNode（结果导向：替代放置不纠正、成败看聚合腾空）。
-type PodMove struct {
-    Name     string `json:"name,omitempty"`     // pod 名（确定性命名精确对应；随机名为计划时快照）
-    FromNode string `json:"fromNode,omitempty"` // 该 pod 当前节点
-    ToNode   string `json:"toNode,omitempty"`   // ★ 该 pod 计划落点（DryRun 也有；软引导、不预留）
-    Cards    int64  `json:"cards,omitempty"`    // 该 pod 占用的卡数（GPU/NPU）
-}
-// WorkloadRef：拥有该 PodGroup 的工作负载。**直接透传 PodGroup 的 controller
-// ownerReference，不上溯**（引擎零额外 informer 依赖）——vcjob/StatefulSet/裸 Job
-// 即顶层；Deployment 的 pod 其 PG owner 是 ReplicaSet，故此处呈现 ReplicaSet（用户可再
-// 经 RS 的 ownerRef 找到 Deployment）。ownerless 裸 pod 留空。namespace 同本条 move，省略。
-type WorkloadRef struct {
-    APIVersion string `json:"apiVersion,omitempty"` // 如 apps/v1
-    Kind       string `json:"kind,omitempty"`       // 如 ReplicaSet / StatefulSet / Job
-    Name       string `json:"name,omitempty"`
-}
-// 单资源/Run（goals maxItems=1）：碎片率就是该资源的，无需按资源分列（多资源=P2+）
-type RepackSummary struct { // 扁平看板层（列表/告警读它）——纯度量，无 verdict
-    FragBeforePercent int32          `json:"fragBeforePercent"`           // 目标资源的全集群计划前碎片率（百分点 0–100）
-    FragAfterPercent  int32          `json:"fragAfterPercent"`            // 完整计划预测的碎片率
-    FreedNodeCount    int32          `json:"freedNodeCount"`              // 完整计划预计腾空数
-    MovedCardCount    int64          `json:"movedCardCount"`              // 完整计划搬卡数
-    ResolvedScope     *ResolvedScope `json:"resolvedScope,omitempty"`     // 解析后的有效范围计数
-}
-type RepackResult struct { // Execute-only；与 plan 分离，避免实际结果覆盖原始收益基线
-    FragAfterPercent int32    `json:"fragAfterPercent"`  // 实际复测值；未验证时等于 plan.fragBeforePercent
-    FreedNodeCount   int32    `json:"freedNodeCount"`    // plan.freedNodes 中实际空闲的节点数
-    FreedNodes       []string `json:"freedNodes,omitempty"` // 已验证空闲的计划节点名；排序且可与 plan 精确对比
-    MovedCardCount   int64    `json:"movedCardCount"`    // Eviction API 接受的 Pod 对应卡数
-    MetricsVerified  bool     `json:"metricsVerified"`   // fragAfter/freedNodeCount/freedNodes 是否来自一致快照
-}
-// 「值不值得整理」不放 summary，改由 conditions[Complete].reason 收口（conditions 权威、机器可读）：
-//   RepackRecommended  —— DryRun 找到划算方案（moves 非空）
-//   ExecutionCompleted —— Execute 已执行搬迁，且计划腾空节点集合已实现
-//   ExecutionCompletedWithAlternativePlacement —— 存在替代放置，但计划腾空节点集合仍完整实现
-//   NoFragmentation    —— 目标资源的全集群碎片率为 0，无需整理
-//   InsufficientImprovement —— 全集群有碎片，但当前 scope 内没有达到目标门控的可行方案
-// Execute 失败由 conditions[Failed].reason 区分 BenefitNotRealized /
-// PlacementTimedOut / ResultVerificationFailed。
-// 已精简（对齐评审）：moves 删 role/moveKind/disruptionScore/outcome/actualNode（可读性/常量/
-// 内部打分/替代放置不纠正；Execute 落点看 relocations[].placement）；
-// 逐 pod 明细收进 pods[]PodMove（纯计划）；plan.freedNodes 由 []FreedNode 塌缩为 []string，
-// 实际集合显式记录在 result.freedNodes，成功判据是二者集合完全一致；
-// summary 删 verdict（→ conditions.reason）/fragDeltaPercent（=before−after 派生）/
-// podGroupsToMove（=distinct moves 派生）。
-type ResolvedScope struct {
-    PodGroupCount int32 `json:"podGroupCount"` // podGroup scope 选中且正在消费目标资源的 PodGroup 数；后续约束仍可能否决迁移
-    NodeCount     int32 `json:"nodeCount"`     // scope 内、提供目标资源且可作 drain target 的节点数
-}
-```
-
-**status 示例**
-
-DryRun 终态（`status.plan` = 预测计划，`moves[].toNode` 让你看到计划落点）：
-
-```yaml
-status:
-  phase: Succeeded
-  message: "Repack recommended for nvidia.com/gpu: move 3 PodGroups and 35 cards to free 2 nodes; cluster fragmentation is expected to improve from 42% to 28%."
-  startTime: "2026-07-02T10:00:00Z"
-  completionTime: "2026-07-02T10:00:07Z"
-  conditions:
-    - type: Progressing
-      status: "False"
-      reason: RepackRecommended
-      message: "Repack recommended for nvidia.com/gpu: move 3 PodGroups and 35 cards to free 2 nodes; cluster fragmentation is expected to improve from 42% to 28%."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T10:00:07Z"
-    - type: Complete
-      status: "True"
-      reason: RepackRecommended       # ★「值不值得整理」的收口：找到划算方案
-      message: "Repack recommended for nvidia.com/gpu: move 3 PodGroups and 35 cards to free 2 nodes; cluster fragmentation is expected to improve from 42% to 28%."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T10:00:07Z"
-  plan:
-    summary:                          # 扁平看板层（纯度量）
-      fragBeforePercent: 42
-      fragAfterPercent: 28            # 改善 14 个百分点，自行相减
-      freedNodeCount: 2
-      movedCardCount: 35             # 搬走的卡数（该资源）
-      resolvedScope:                  # 解析后有效范围
-        podGroupCount: 24
-        nodeCount: 8
-    moves:                            # 每个 PodGroup 一条，内含逐 pod 的 fromNode→toNode
-      - namespace: ml                 # 本条 podGroup/owner/pods 同此 ns
-        podGroupName: train-a
-        owner:                        # 用户认得出的工作负载（此处为 vcjob，同 ns 故只需 kind/name）
-          apiVersion: batch.volcano.sh/v1alpha1
-          kind: Job
-          name: train-a
-        cards: 8                      # 本 PodGroup 搬走卡数合计
-        pods:                         # 逐 pod：支持散落多源节点、迁往多目标节点
-          - { name: train-a-worker-0, fromNode: node-a17, toNode: node-a08, cards: 4 }
-          - { name: train-a-worker-1, fromNode: node-a19, toNode: node-a30, cards: 4 }
-      - namespace: ml                 # 自动建的 PodGroup（Deployment 的 pod）
-        podGroupName: infer-b
-        owner:                        # 直接透传 PG ownerRef=pod 的 controller=ReplicaSet（不上溯）
-          apiVersion: apps/v1
-          kind: ReplicaSet
-          name: infer-b-7d9f
-        cards: 4
-        pods:
-          - { name: infer-b-7d9f-abcde, fromNode: node-a23, toNode: node-a05, cards: 4 }
-    freedNodes:                       # 计划腾空的节点名
-      - node-a17
-      - node-a23
-```
-
-Execute 终态（`status.plan` 保留完整原始计划与预期收益；`status.result` 呈现实际结果）：
-
-```yaml
-status:
-  phase: Succeeded
-  message: "Repack completed for nvidia.com/gpu: moved 3 PodGroups and 35 cards, actually freed 2 nodes; cluster fragmentation changed from 42% to 29%."
-  startTime: "2026-07-02T11:05:00Z"
-  completionTime: "2026-07-02T11:06:12Z"
-  conditions:
-    - type: Progressing
-      status: "False"
-      reason: ExecutionCompleted
-      message: "Repack completed for nvidia.com/gpu: moved 3 PodGroups and 35 cards, actually freed 2 nodes; cluster fragmentation changed from 42% to 29%."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T11:06:12Z"
-    - type: Complete
-      status: "True"
-      reason: ExecutionCompleted      # Execute 已执行搬迁并实现计划收益
-      message: "Repack completed for nvidia.com/gpu: moved 3 PodGroups and 35 cards, actually freed 2 nodes; cluster fragmentation changed from 42% to 29%."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T11:06:12Z"
-  plan:
-    summary:
-      fragBeforePercent: 42
-      fragAfterPercent: 28           # 完整计划的预测值，不被实际结果覆盖
-      freedNodeCount: 2              # 预计腾空数
-      movedCardCount: 35             # 完整计划搬卡数
-    moves:                            # 与 DryRun 同构（纯计划）；实际落点/绑定看 relocations[].placement
-      - namespace: ml
-        podGroupName: train-a
-        owner: { apiVersion: batch.volcano.sh/v1alpha1, kind: Job, name: train-a }
-        cards: 8
-        pods:
-          - { name: train-a-worker-0, fromNode: node-a17, toNode: node-a08, cards: 4 }
-          - { name: train-a-worker-1, fromNode: node-a19, toNode: node-a30, cards: 4 }
-      - namespace: ml
-        podGroupName: infer-b
-        owner: { apiVersion: apps/v1, kind: ReplicaSet, name: infer-b-7d9f }
-        cards: 4
-        pods:
-          - { name: infer-b-7d9f-abcde, fromNode: node-a23, toNode: node-a05, cards: 4 }
-      # 其余计划 move 省略；summary 仍是完整计划聚合
-    freedNodes:                       # 计划腾空节点名；实际腾空数看 status.result，
-      - node-a17                      # 落点绑定情况看 relocations[].placement
-      - node-a23
-  result:                             # Execute-only 实际结果
-    fragAfterPercent: 29              # 替身绑定后的全集群复测
-    freedNodeCount: 2
-    freedNodes: [node-a17, node-a23]  # 必须与 plan.freedNodes 集合一致才可成功
-    movedCardCount: 35                # 实际被接受的驱逐所对应卡数
-    metricsVerified: true
-  relocations:                        # 每搬一个 Pod 一条，分别呈现驱逐和替身放置
-    - namespace: ml
-      podGroupName: train-a
-      victimPodName: train-a-worker-0 # 旧 pod 名：审计 + 同名重建时精确快路径
-      plannedNodeName: node-a08        # 计划落点；执行期可因最新容量改选其他 receiver
-      eviction:
-        phase: Accepted
-      placement:
-        phase: Placed
-        selectedNodeName: node-a30
-        replacementPodName: train-a-worker-0
-        actualNodeName: node-a30
-        expirationTime: "2026-07-02T11:16:12Z"
-    # 其余 relocation 省略；result 仍是完整执行聚合
-```
-
-「无需整理」终态（成功、非失败；Execute 下为安全空操作）——「值不值得」由 `conditions[Complete].reason` 收口，不设 `verdict` 字段：
-
-```yaml
-status:
-  phase: Succeeded                    # 计算跑完、结论是「不值得动」，仍是成功
-  message: "No repack performed for nvidia.com/gpu: cluster fragmentation is 42%, but no feasible plan within the resolved scope met the required 10 percentage-point improvement."
-  conditions:
-    - type: Progressing
-      status: "False"
-      reason: InsufficientImprovement
-      message: "No repack performed for nvidia.com/gpu: cluster fragmentation is 42%, but no feasible plan within the resolved scope met the required 10 percentage-point improvement."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T12:00:07Z"
-    - type: Complete
-      status: "True"
-      reason: InsufficientImprovement # NoFragmentation（本就干净）| InsufficientImprovement（有碎片但够不着目标）
-      message: "No repack performed for nvidia.com/gpu: cluster fragmentation is 42%, but no feasible plan within the resolved scope met the required 10 percentage-point improvement."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-02T12:00:07Z"
-  plan:
-    summary:
-      fragBeforePercent: 42           # 照填 → 碎片率高却「无需整理」，一眼看出「有碎片整不动」
-      fragAfterPercent: 42            # 未采纳任何方案，等于 before
-      freedNodeCount: 0
-    moves: []                         # 空
-```
-
-#### 5.2.1 配套增强：pg-controller 继承 pod 标签到 PodGroup
-
-"万物皆 PodGroup"的选择模型依赖 PodGroup 携带业务标签。**现状盘点——PodGroup 有三条创建路径，标签继承情况各不相同**：
-
-| PG 创建路径 | 谁创建 | 是否继承负载业务标签 | 结论 |
-|-------------|--------|----------------------|------|
-| **vcjob** | vcjob 控制器 | **✓ 全量继承** vcjob 自身 `metadata.labels`（代码 `pg.Labels = job.Labels`，`job_controller_actions.go`） | `scope.podGroups.selector` 按业务标签选 vcjob **已可用，无需改动** |
-| **kthena（ModelServing）** | kthena Model Serving 控制器（自建 PG，不走通用 pg-controller） | 由 kthena 项目负责将 ModelServing 业务标签同步到其自建 PG | 能力依赖部署相应 kthena 版本；不在本仓库实现或验证 |
-| **Deployment / RS / StatefulSet / 裸 Job / 自定义负载** | 通用 **pg-controller** 自动创建（`podgroup-<controller-owner-UID>`，如 Deployment 下即 ReplicaSet UID；一个 RS 的所有 pod 共用一个 PG） | **✓ 继承稳定业务标签**；过滤控制器/实例标签和 `batch.kubernetes.io/*` | `scope.podGroups.selector` 可按模板业务标签选中 |
-
-即：vcjob 与通用 pg-controller 路径均已支持按业务标签选择；kthena 作为自建 PodGroup 的独立控制器，由其自身负责标签继承。
-
-**实现**：pg-controller 在创建和更新自动 PodGroup 时，把 pod 模板的稳定业务标签**继承**到 `PodGroup.Labels`，采用**全量继承 + 剔除系统标签**策略：
-
-- 继承 pod 上的业务标签（用户在负载模板里打的 `app` / `tier` / `tenant` 等）；
-- 剔除易变的系统/控制器注入标签：`pod-template-hash`、`controller-revision-hash`、`statefulset.kubernetes.io/pod-name`、`apps.kubernetes.io/pod-index`、`controller-uid`、`batch.kubernetes.io/*` 等（维护一个排除集/前缀规则），避免噪声与滚动升级抖动；
-- 自动创建的 PG 由 pg-controller 管理其标签并随 pod 模板标签变更同步；显式关联到其他 PG 的 Pod 不会被该控制器改写。
-
-**收益**：通用自动建 PG 的工作负载可通过 `scope.podGroups.selector` 统一选择；不止 repack，队列统计、策略、看板等 PG 消费方也能复用这些标签。
-
-**兼容与时序**：这是共享 pg-controller 的元数据同步行为。升级后，Pod 在下一次 reconcile 时会更新其自动 PodGroup 的标签；kthena 等自建 PodGroup 的控制器仍需自行保持标签同步。
-
-#### 5.2.2 替身匹配契约（replacement matching contract，P0）
-
-Execute 驱逐 victim Pod 后，工作负载控制器可能同时重建 PodGroup 和 Pod，且名称都发生变化。Repack 不识别 Deployment、StatefulSet、kthena 等具体负载类型，也不要求上层 controller 写入 Repack 专用 Pod identity。匹配只依赖 PodGroup、Pod 本身的调度需求和 RepackRun 中的持久状态。
-
-**匹配顺序（由强到弱）：**
-
-1. **已认领替身 UID**：`replacementPodName + replacementPodUID` 是控制器写入的最强关联，用于 API 冲突、进程重启等中断后的严格幂等恢复。
-2. **victimPodName 精确匹配**：在原 PodGroup 或已持久化的最新 replacement PodGroup 内匹配同名 Pod，覆盖 vcjob、StatefulSet 等确定性命名场景。
-3. **SchedulingRequirementsHash 等值匹配**：只对**显式配置 SubGroup policy** 的 PodGroup 记录。摘要由资源请求、亲和性、容忍、拓扑分布、调度器、优先级、RuntimeClass、ResourceClaim、HostPort 等稳定调度字段归一化计算；不包含 Pod 名称、UID、PodGroup 注解、SchedulerGate 等重建或协议元数据。它表达调度等价类，不表达业务身份。
-4. **同构 PodGroup 兜底**：未配置 SubGroup policy 时，约定一个 PodGroup 内的 Pod 同构且可互换，因此不写哈希，任一未认领的 Pending 替身可以消费下一条可用 nomination。
-
-哈希只解决“新 Pod 应消费哪一类旧 placement intent”，不是节点预留或可行性证明。`nominatedNodeName` 仍是软引导，Volcano Scheduler 会用当前资源和完整过滤条件校验；目标节点不可用时可选择其他可行节点并在 status 中记录漂移。扩缩容并发时，带哈希的 nomination 只保留相同哈希的候选 Pod gate；哈希不同的新副本会立即释放 gate，避免正常扩容被碎片整理阻塞。
-
-**workload 级 PodGroup 重建**：某些 workload controller 在驱逐一个 Pod 后会删除原 PodGroup 及其全部 Pod，再创建名称完全不同的新 PodGroup 与 Pod。Repack 以 `moves[].namespace + moves[].owner.{apiVersion,kind,name}` 识别同一 workload。当前约束同一 workload 下多个 PodGroup 必须是等价调度单元；当前组删除后，controller 按稳定顺序把新组映射到仍未完成的原组，并将最新组名写入每条 nomination 的 `replacementPodGroupName`。若最新 replacement PodGroup 在整理完成前再次被删除，controller 会在确认旧一代消失后推进映射，清除失效的具体 Pod/节点观测，并让下一代 Pod 重新认领同一批 durable placement intent。匹配只能在原组或已记录的最新组内发生。
-
-为关闭新 PodGroup 创建到异步 reconcile 之间的调度窗口，PodGroup CREATE webhook 在对象落库前原子注入 `repack.volcano.sh/placement-lease`；随后 Pod webhook 读取该 lease 并给替身 Pod 注入 SchedulerGate。Webhook 只修改 admission 中的对象，不更新 RepackRun status；旧组到新组的 durable 映射仍由单 worker nomination reconciler 串行写入。Engine 仅在存在未完成 workload placement 时执行漏注入 lease 的兜底修复，并以独立 30 秒周期限制 namespace 级 PodGroup 扫描；终态按 Run owner 扫描并清理原组、替换组及未被认领的扩容候选组。
-
-当前 P0 不使用 workload owner UID。因而不支持在 Execute 期间删除 workload 对象后以相同 namespace、apiVersion、kind、name 重建；这种新对象可能被视为原 workload 的延续。PodGroup/Pod 在同一 workload 生命周期内的删除重建属于支持范围。
-
-**为何这样能统一管理**：Repack 只识别通用 PodGroup 关联、SubGroup policy 和 Kubernetes PodSpec 调度字段，不查 ownerRef 链、不硬编码 workload kind，也不依赖任何框架的私有 label scheme。新增负载类型只要遵守“未配置 SubGroup 即组内同构；非同构时显式配置 SubGroup”的约束即可接入。
-
-#### 5.2.3 全字段参考示例（必选 / 可选标注）
-
-以下两例把 `spec` 与 `status` 的**全部字段**都赋值，行尾注明**必选 / 可选**（及 P1 标注），供使用者对照理解。实际使用时**只需填必选 + 按需可选**；`status` 全部由控制器/引擎写、用户只读。
-
-**示例一：`RepackRun`（spec 全字段，Execute 模式）**
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1        # 必选
-kind: RepackRun                               # 必选
-metadata:
-  name: pool-a100-defrag-20260704             # 必选：Run 名（cluster-scoped，无 namespace）
-  labels:                                     # 可选：自定义标签
-    team: platform
-spec:                                         # 必选；创建后整体不可变（CEL self==oldSelf）
-  mode: Execute                               # 必选：DryRun | Execute
-  scope:                                      # 可选整体；两种 mode 省略都表示全集群
-    podGroups:                                # 可选：不填=全部 PodGroup
-      include:                                # 可选：不填=全域
-        selector:                             # 可选：PG 标签选择器（与 names 取并集）
-          matchLabels: { tenant: research }
-        names:                                # 可选：PodGroup "namespace/name" 列表
-          - ml/train-a
-          - ml/train-b
-      exclude:                                # 可选：排除项（exclude 优先于 include）
-        selector:
-          matchLabels: { protected: "true" }
-        names:
-          - ml/critical-job
-    nodes:                                    # 可选：节点维度，与 podGroups 同构
-      include:
-        selector:
-          matchLabels: { pool: a100 }
-        names:
-          - node-a17
-      exclude:
-        names:
-          - node-a01
-  goals:                                      # 可选：maxItems=1（不填=回落引擎 --repack-default-resource；解析失败时 InvalidConfiguration）
-    - resource: nvidia.com/gpu                # 必选（goals 内）：整理哪类资源
-      minFragImprovementPercent: 10           # 可选：碎片率最小改善阈值（百分点 0-100）
-  maxPerRun:                                  # 可选：单轮规模封顶（blast radius）
-    podGroups: 20                             # 可选：单轮最多动几个 PodGroup
-    resources:                                # 可选：单轮最多动几张卡（按资源）
-      nvidia.com/gpu: 128
-  eviction:                                   # 可选：仅 Execute 生效，控制 Eviction 请求
-    gracePeriodSeconds: 30                    # 不填=沿用每个 Pod 的 terminationGracePeriodSeconds；0=立即终止
-  ttlSecondsAfterFinished: 3600               # 可选：终态后自动回收（秒）；不填=不自动删
-```
-
-**示例二：`status`（全字段，Execute 终态）** —— 全部由控制器/引擎写，用户只读
-
-```yaml
-status:
-  phase: Succeeded                            # 由 conditions 派生（Pending/Running/Succeeded/Failed）
-  message: "整理完成：搬迁 1 个 PodGroup(8 GPU)，腾出 1 台整机；GPU 碎片率 42→31"  # 可选：一句话人读结论
-  startTime: "2026-07-04T10:05:00Z"           # 可选：进入 Running 的时刻
-  completionTime: "2026-07-04T10:08:42Z"      # 可选：到达终态时刻（TTL 锚点）
-  conditions:                                 # 权威事实（准入=CEL，无 Admitted 条件）
-    - type: Progressing                       # 终态保留，并置 False
-      status: "False"
-      reason: ExecutionCompleted
-      message: "Repack completed..."
-      observedGeneration: 1
-      lastTransitionTime: "2026-07-04T10:08:42Z"
-    - type: Complete                          # 必选（condition 内）
-      status: "True"                          # 必选（condition 内）
-      reason: ExecutionCompleted              # 必选：稳定的机器可读结论
-      message: "Repack completed..."          # 必选（condition 内）：人读说明
-      observedGeneration: 1                   # 可选：由状态写入方填当前 generation
-      lastTransitionTime: "2026-07-04T10:08:42Z"  # 必选（condition 内）
-  plan:                                       # 可选整体：DryRun/Execute 同一不可变完整计划
-    summary:                                  # 可选：扁平看板（纯度量）
-      fragBeforePercent: 42                   # summary 内必选：碎片率整数百分点 0-100
-      fragAfterPercent: 28                    # summary 内必选：完整计划预测值
-      freedNodeCount: 1                       # summary 内必选：完整计划预计腾出数
-      movedCardCount: 8                       # summary 内必选：完整计划搬卡数
-      resolvedScope:                          # 可选：解析后有效范围
-        podGroupCount: 2                      # resolvedScope 内必选
-        nodeCount: 2                          # resolvedScope 内必选
-    moves:                                    # 可选：每个 PodGroup 一条
-      - namespace: ml                         # 必选（move 内）
-        podGroupName: train-a                 # 必选（move 内）
-        owner:                                # 可选：用户可见拥有者（ownerless 裸 pod 留空）
-          apiVersion: batch.volcano.sh/v1alpha1  # 可选
-          kind: Job                           # 可选
-          name: train-a                       # 可选
-        cards: 8                              # 可选：本 PodGroup 搬走卡数合计
-        pods:                                 # 可选：逐 pod 明细（只列被迁移的 pod）
-          - name: train-a-worker-3            # 可选：pod 名（随机名为计划时快照）
-            fromNode: node-3                  # 可选
-            toNode: node-7                    # 可选：★计划落点
-            cards: 8                          # 可选
-    freedNodes:                               # 可选：计划腾空的节点名（[]string）
-      - node-3
-  result:                                     # 可选（Execute 独有）：实际接受量与复测结果
-    fragAfterPercent: 31                      # result 内必选
-    freedNodeCount: 1                         # result 内必选
-    freedNodes:
-      - node-3
-    movedCardCount: 8                         # result 内必选；这里只统计 Eviction API 接受的 Pod
-    metricsVerified: true                     # result 内必选
-  relocations:                                # 可选（Execute 独有）：逐 Pod 执行记录
-    - namespace: ml                           # 必选（relocation 内）
-      podGroupName: train-a                   # 可选：所属 PodGroup
-      replacementPodGroupName: train-a-v2     # 可选：整组重建后最新承接替身的 PodGroup
-      victimPodName: train-a-worker-3         # 可选：旧 pod 名（审计 + 同名重建快路径）
-      victimPodUID: 9062...                    # 可选：计划时 UID；驱逐 precondition/恢复依据
-      schedulingRequirementsHash: Gx4...Qw    # 可选：仅显式使用 SubGroup 时记录
-      plannedNodeName: node-7                 # 必选：计划时目标节点
-      eviction:
-        phase: Accepted                       # Pending/InProgress/Accepted/IndirectlyRemoved/Rejected
-        message: "Eviction API accepted..."   # 可选：拒绝或恢复细节
-      placement:
-        phase: Placed                         # WaitingForReplacement/WaitingForNodeSelection/Nominated/Placed/TimedOut
-        selectedNodeName: node-8              # 可选：执行时最新快照选择的节点
-        replacementPodName: train-a-v2-8fcd   # 可选：已认领替身 Pod
-        replacementPodUID: 4ca3...            # 可选：替身 UID，用于幂等恢复
-        actualNodeName: node-8                # 可选：最终绑定节点
-        expirationTime: "2026-07-04T10:18:42Z" # 可选：放置截止时间
-```
-
-> **DryRun 与 Execute 的差异**：两者 `plan` 都是完整预测计划；DryRun **无 `result` / `relocations`**。Execute 的 `result` 记录实际接受量和复测收益；`relocations` 保留驱逐被接受或间接移除后仍需等待替身的计划 Pod。
-
-#### 5.2.4 外部负载接入指导（llm-d / kubeflow 等自定义 operator 的推荐做法）
-
-任何外部框架/operator 想让自己的负载被 repack 整理，需满足下面 **4 条**（repack **不感知具体负载类型**，全靠通用 PodGroup 契约对齐）：
-
-**① 有 PodGroup（gang 调度单元）。** 两种接法：
-- **A. 依赖 Volcano 通用 pg-controller 自动建**：pod 用 `schedulerName: volcano` + 带 `scheduling.k8s.io/group-name` 注解，pg-controller 自动建 PG（一个 controller-owner 一个 PG）。最省，但**业务标签继承依赖 §5.2.1 增强合入**。
-- **B. operator 自建 PodGroup**（vcjob / kthena 的做法，推荐给有自己 CRD 的框架）：完全可控。
-
-**② PodGroup 带业务标签**（供 `scope.podGroups.selector` 选中）。
-- 自建 PG（接法 B）→ 把负载自身的业务标签**拷到 `PodGroup.Labels`**（vcjob 即 `pg.Labels = job.Labels`）。
-- 依赖 pg-controller（接法 A）→ 把业务标签打在 **pod 模板**上，§5.2.1 合入后自动继承。
-
-**③ 明确 PodGroup 是否同构。**
-- 未配置 SubGroup policy → Repack 认为组内 Pod 同构且可互换，不需要专用身份 label；
-- 显式配置 SubGroup policy → Repack 自动为每条 relocation 记录 `schedulingRequirementsHash`，按 PodSpec 调度需求等价类匹配改名后的替身；
-- 外部 controller 不需要感知 Repack，也不需要生成稳定 ordinal 或 `repack.volcano.sh/pod-identity`。
-
-**④ pod 可被追溯到其 PodGroup**：pod 带 `scheduling.k8s.io/group-name` 注解（pg-controller 会打；自建 PG 的 operator 需自己打），提名 reconciler 靠它把重建 pod 归到对应 PG。
-
-**常见框架映射（供参考）：**
-
-| 框架 | PG 由谁建 | 业务标签继承 | Pod 同构约束 | 接入建议 |
-|------|-----------|--------------|----------------|----------|
-| **vcjob** | vcjob 控制器 | ✓ `job.Labels` | 稳定 Pod 名优先精确匹配；非同构组应配置 SubGroup | 已完备 |
-| **kthena** | ModelServing 控制器（自建） | 需继承 ModelServing 标签 | 同一 workload 下多个 PG 等价；组内非同构时配置 SubGroup | 无需 Repack 专用身份逻辑 |
-| **kubeflow**（training-operator） | operator（自建 PG，已有 Volcano 集成） | 把 `training.kubeflow.org/*` 或用户业务标签拷到 PG | 多角色放入同一 PG 时配置 SubGroup | 自建路径补 ② |
-| **llm-d**（P/D 分离） | 多为按 role 分独立 Deployment → 走 pg-controller | 业务标签打 pod 模板（靠 §5.2.1）；或 operator 聚合成 gang PG 时自拷 | 单角色 PG 默认同构；多角色同 PG 配置 SubGroup | 无需私有身份适配 |
-| **通用 Deployment/RS/裸 Job** | 通用 pg-controller | 靠 §5.2.1 | 默认同构 | 打业务标签在 pod 模板即可 |
-
-**一句话**：**vcjob 开箱即用；自建 CRD 的框架保证 PG 继承业务标签，并在组内非同构时使用 SubGroup；纯 Deployment 类走通用 pg-controller。** Repack 不为任何框架写死负载类型或身份标签。
-
-### 5.3 扩展点：Action + Plugin
-
-repack-engine 采用与 scheduler 一致的 **Action + Plugin + Session 回调**模型：
-
-- **Action** 维护稳定主流程。P0 的 `repack` Action 负责碎片度量、调用 Planner、收益准入、成本汇总和报告生成；Execute 副作用仍由 Engine 在计划持久化后提交。
-- **Plugin** 刻画可组合的场景策略。默认启用 `workloadscope`、`repackbudget`、`nodeconsolidation`、`workloaddisruption`、`gangdisruption`、`binpack`，分别负责业务授权边界、单轮整理预算、Node 级整理、中断成本、Gang 中断成本和接收节点装箱策略。Plugin 配置按能力集合解释，调整 YAML 中的排列顺序不改变规划结果；Action 仍按配置顺序执行。接收端目标资源总容量预检是 Planner 的通用快速失败条件，不作为可关闭插件暴露。
-- **Planner** 只保留候选准备、增量状态和惰性调度模拟等搜索机制，不解释具体场景语义。
-
-当前不再提供 Core 注册表或算法选择参数。新增 Node/HyperNode、PDB、Gang 或接收节点策略时增加 Plugin；只有新增业务阶段时才增加 Action。详细契约见 [Repack Action + Plugin 架构设计](./repack-action-plugin-architecture.md)。
-
-### 5.4 执行与落点引导
-
-Execute 的落子链（**使用 scheduling gate 协调，但不做资源预留、不打污点**）：
-
-1. **规划时可行性预检**：驱逐前在只读 Session 的克隆节点/cycle-state 上确认所有 victim
-   都能重落（INV-RESCHED）；CPU、内存、目标扩展资源以及完整 predicate 都参与判断。
-2. **持久化 prepare barrier**：Engine 先写完整 `status.plan` 和逐 Pod
-   `status.relocations[]`，再给受影响 PodGroup 写 placement lease，并发布 active Run
-   discovery label。任何 Eviction API 调用都发生在这些状态可见之后。
-3. **驱逐 journal**：每次调用 Eviction API 前先将对应 eviction phase 写为
-   `InProgress`，再根据 API/对象观察推进为 `Accepted`、`IndirectlyRemoved` 或
-   `Rejected`，从而支持崩溃后按 victim UID 幂等恢复。
-4. **替身 gate 与认领**：Pod admission webhook 根据 PodGroup lease 给替身 Pod
-   注入 `repack.volcano.sh/placement` scheduling gate；Controller 按
-   replacement UID → victim 名 → scheduling requirements hash → 同构组兜底的顺序认领替身。
-5. **执行期实时选点**：Engine 重新打开最新 scheduler Session，排除本 Run 计划腾空的
-   节点，优先计划落点，再从其余当前可用节点选择 receiver，并持久化
-   `placement.selectedNodeName`。这一结果允许不同于 `plannedNodeName`。
-6. **提名并放行**：Controller 把 selected node 写入
-   `pod.status.nominatedNodeName`，持久化 `Nominated` 后解除 scheduling gate；
-   调度器最终绑定后记录 `actualNodeName` 和 `Placed`。
-7. **结果验证**：所有 replacement 终止后，Engine 从一个一致的 scheduler snapshot
-   计算 `status.result`，并严格比较 `result.freedNodes` 与 `plan.freedNodes`。
-
-> **诚实边界（gate 不是 reservation）**：scheduling gate 关闭了“替身在选点前被调度”
-> 的竞态，但不会锁住 receiver 的 CPU/GPU。gate 解除后到实际绑定之间，其他工作仍可能
-> 消耗资源，调度器也可能选择 alternative node。因此计划落点、执行期选点和实际绑定分别
-> 保存在 `plannedNodeName`、`selectedNodeName`、`actualNodeName`。无可行 receiver
-> 持续到 `expirationTime` 时，Engine 将 placement 标为 `TimedOut`，Controller 释放本
-> Run 的 gate，让 Pod 回到正常调度；Run 以 `PlacementTimedOut` 失败，而不是永久阻塞工作负载。
-
-替身 Pod 的识别方式见 [§6 落点提名](#落点提名替身-pod-的识别)。
-
-### 5.5 典型用法（多种路径）
-
-`RepackRun` 是一次性工单，`mode` 与 `scope` 自由组合，支持以下几种运维路径——它们都基于同一套 CRD，不互相依赖：
-
-| 路径 | 适用 | 流程 |
-|---|---|---|
-| **A. 预览→执行** | 不确定该动谁，先看建议 | 建 DryRun → 读 `plan` → 抄认可的范围建 Execute |
-| **B. 直接执行** | 已按节点池/业务自行筛好范围 | 直接建 Execute（指定 `scope`，跳过 DryRun） |
-| **C. 仅预览→人工处置** | 只想要"整理建议"，自己决定怎么落地 | 只建 DryRun → 读 `plan` → **人工删除/迁移作业**（repack 不动手） |
-
-> 三条路径正交：DryRun 与 Execute 是独立的一次性 Run（DryRun 的 `plan` 仅作参考，Execute 在自己的 `scope` 内**重新规划**，不引用某次 DryRun）。
-
-#### 路径 A — 预览→执行
-
-**A-1 DryRun 预览**（宽范围探查）：
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackRun
-metadata:
-  name: a100-pool-dryrun
+  name: ascend-pool-dryrun
 spec:
   mode: DryRun
+  scope:
+    podGroups:
+      include:
+        selector:
+          matchLabels:
+            repack.example.com/allowed: "true"
+    nodes:
+      include:
+        selector:
+          matchLabels:
+            accelerator-pool: ascend-a
   goals:
-    - resource: nvidia.com/gpu
+    - resource: huawei.com/ascend-1980
       minFragImprovementPercent: 5
-  scope:
-    nodes:
-      include:
-        selector:
-          matchLabels:
-            volcano.sh/node-pool: a100
   maxPerRun:
-    podGroups: 10
+    podGroups: 2
     resources:
-      nvidia.com/gpu: 64
-```
-
-读 `status.plan`（例：`message: "可整理：迁移 3 个 PodGroup(35 GPU)，腾出 2 台整机；GPU 碎片率 0.42→0.28"`；`plan.moves[]` 里能看到每个 gang 计划迁往哪个 `toNode`），把认可的 gang（`plan.moves[].namespace` + `podGroupName`）抄进下一步。
-
-**A-2 认可后 Execute**：
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackRun
-metadata:
-  name: a100-pool-exec
-spec:
-  mode: Execute
-  goals:
-    - resource: nvidia.com/gpu
-  scope:                            # 可选；此处显式收窄到用户认可的 PodGroup/节点池
-    podGroups:
-      include:                      # 抄 DryRun 认可的 gang，按 PG 名点名
-        names:
-          - ns1/job-a
-          - ns1/job-b
-          - ns2/job-c
-    nodes:
-      include:
-        selector:
-          matchLabels:
-            volcano.sh/node-pool: a100
+      huawei.com/ascend-1980: 16
   ttlSecondsAfterFinished: 86400
 ```
 
-#### 路径 B — 直接执行（运维已自行筛好范围，无需 DryRun）
-
-当运维已按**节点池 / 业务标签**圈定了要整理的对象，可跳过 DryRun 直接 Execute（仍有 INV-RESCHED 规划时预检：预检不过不驱逐；但不预留，非运行期保证）：
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackRun
-metadata:
-  name: tenant-foo-exec
-spec:
-  mode: Execute
-  goals:
-    - resource: nvidia.com/gpu
-  scope:
-    podGroups:
-      include:                      # 按 PG 标签选（pg-controller 已从 pod 模板继承），覆盖 Deployment/STS/vcjob
-        selector:
-          matchLabels:
-            workload-type: batch
-      exclude:                      # 带此标签的 PodGroup 不动
-        selector:
-          matchLabels:
-            repack.volcano.sh/protected: "true"
-    nodes:
-      include:
-        selector:
-          matchLabels:
-            volcano.sh/node-pool: a100
-  maxPerRun:
-    podGroups: 5
-  ttlSecondsAfterFinished: 86400
-```
-
-#### 路径 C — 仅 DryRun，人工处置
-
-只想拿到"整理建议"、由人来决定如何落地（例如人工删除/迁移作业、或走自有运维流程）。建一个 DryRun，读 `plan` 后**自行处置**，repack **不执行任何驱逐**：
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackRun
-metadata:
-  name: a100-pool-advice-only
-spec:
-  mode: DryRun
-  goals:
-    - resource: nvidia.com/gpu
-  scope:
-    nodes:
-      include:
-        selector:
-          matchLabels:
-            volcano.sh/node-pool: a100
-  ttlSecondsAfterFinished: 3600     # 报告留存 1h 后自动清理
-```
-
-`plan` 给出"建议迁哪些作业、腾出哪些节点"；运维据此**人工删除/迁移作业**完成整理。这条路径下 repack 纯粹是"碎片诊断 + 整理建议"工具。
-
-### 5.6 P1 能力设计（方案已敲定，实现在 P0 验证后推进）
-
-以下能力的**方案在本提案一并敲定**，仅实现顺序排在 P0 之后。它们都建立在 P0 同一套引擎/CRD 词汇之上，是**叠加**而非改写。
-
-#### 5.6.1 自动触发：`RepackPolicy`（模板生成，CronJob→Job 式）
-
-新增 cluster-scoped CRD **`RepackPolicy`**，职责**单一**：**按触发条件生成 `RepackRun`**。它**内嵌一份 `RepackRun` 模板**（`runTemplate.spec` 即 `RepackRunSpec` 本体，单一事实来源、零 schema 漂移，且 `RepackRunSpec` 上的 CEL/校验自动传导到模板路径），再叠加"何时触发 / 历史保留 / 暂停"这些**调度专属**字段。关系严格类比 `CronJob`→`Job`。
-
-> **职责边界（定稿）**：RepackPolicy **只做模板生成**，不承担"钳制用户手写 RepackRun 的集群级默认/硬护栏"——那是**治理/准入**语义，作用对象不同，另行处理（K8s `ValidatingAdmissionPolicy`(CEL) 或后续单开 CRD），不混入本 CRD。
-
-**字段级定义**
-
-```go
-type RepackPolicySpec struct {
-    // Trigger 何时触发（三种触发源，命中任一即触发）。
-    Trigger RepackTrigger `json:"trigger"`
-
-    // RunTemplate 派生 RepackRun 的模板（复用 RepackRunSpec）。
-    // 生成的 Run 是 DryRun 还是 Execute 完全由 runTemplate.spec.mode 决定
-    // （只想自动出报告就设 mode: DryRun）；Execute 的串行/冷静期由引擎兜底。
-    RunTemplate RepackRunTemplateSpec `json:"runTemplate"`
-
-    // Suspend 暂停触发（不影响已生成的 Run）。默认 false。
-    // +optional
-    Suspend *bool `json:"suspend,omitempty"`
-
-    // 保留最近多少个成功/失败的派生 Run（扁平，对齐 CronJob，默认各 3）。
-    // +optional
-    SuccessfulRunsHistoryLimit *int32 `json:"successfulRunsHistoryLimit,omitempty"`
-    // +optional
-    FailedRunsHistoryLimit *int32 `json:"failedRunsHistoryLimit,omitempty"`
-}
-
-type RepackRunTemplateSpec struct {
-    // +optional
-    ObjectMeta metav1.ObjectMeta `json:"metadata,omitempty"` // 派生 Run 的 labels/annotations
-    Spec       RepackRunSpec     `json:"spec"`               // ← 内嵌 RepackRun 的 spec 本体
-}
-
-// RepackTrigger 三种触发源，配了哪个就启用哪个，命中任一即触发。
-// 反应式条件（onPendingBlocked/onFragmentation）的评估周期是**控制器级配置**
-// （启动 flag / 控制器配置文件，全局一份，性质同 Execute 冷静期），不在本 CRD 内。
-// +kubebuilder:validation:XValidation:rule="has(self.cronSchedule) || has(self.onPendingBlocked) || has(self.onFragmentation)",message="trigger must set at least one of cronSchedule/onPendingBlocked/onFragmentation"
-type RepackTrigger struct {
-    // CronSchedule 定时触发：cron 表达式，到点即触发。
-    // +optional
-    CronSchedule string `json:"cronSchedule,omitempty"`
-
-    // OnPendingBlocked 有作业因碎片调度不下去时触发（反应式）。
-    // 判定为"因碎片"= 存在一个 repack 计划能让它调度下来（repack 真能帮上忙），
-    // 而非集群真满；避免无效触发。
-    // +optional
-    OnPendingBlocked *PendingBlockedTrigger `json:"onPendingBlocked,omitempty"`
-
-    // OnFragmentation 碎片率高于阈值时触发（反应式）。
-    // +optional
-    OnFragmentation *FragmentationTrigger `json:"onFragmentation,omitempty"`
-}
-
-type PendingBlockedTrigger struct {
-    // MinPendingPodGroups 至少这么多 PodGroup（gang）因碎片被卡住才触发。默认 1。
-    // +optional
-    MinPendingPodGroups *int32 `json:"minPendingPodGroups,omitempty"`
-    // MinBlockedDuration 且已持续卡住超过这么久才触发（去抖）。
-    // +optional
-    MinBlockedDuration *metav1.Duration `json:"minBlockedDuration,omitempty"`
-}
-
-type FragmentationTrigger struct {
-    // FragAbovePercent 碎片率高于此百分比（0–100 整数）触发（FragRate 为本设计的碎片度量）。
-    FragAbovePercent int32 `json:"fragAbovePercent"`
-    // MinPendingPodGroups 可选附加门槛：同时至少这么多 PodGroup 在排队才触发。
-    // +optional
-    MinPendingPodGroups *int32 `json:"minPendingPodGroups,omitempty"`
-}
-
-// status：LastEvaluationTime / LastTriggerTime / Active([]ObjectReference) / Conditions
-// （对齐 CronJob 的 active[]；LastTriggerTime 因触发源多样，未沿用 lastScheduleTime）
-```
-
-**示例**
-
-```yaml
-apiVersion: repack.volcano.sh/v1alpha1
-kind: RepackPolicy
-metadata:
-  name: a100-auto
-spec:
-  trigger:                          # 三种触发源，命中任一即触发
-    cronSchedule: "0 2 * * *"       # ① 定时：每天 02:00
-    onPendingBlocked:               # ② 有作业因碎片调度不下去
-      minPendingPodGroups: 1
-      minBlockedDuration: 10m       #    且已卡住超过 10 分钟（去抖）
-    onFragmentation:                # ③ 碎片率超阈值
-      fragAbovePercent: 35
-  successfulRunsHistoryLimit: 3
-  failedRunsHistoryLimit: 3
-  runTemplate:                      # ← 就是一份 RepackRun
-    metadata:
-      labels:
-        origin: a100-auto
-    spec:
-      mode: DryRun                  # DryRun=只自动出报告；改 Execute 则自动执行（引擎 K=1+冷静期兜底串行）
-      goals:
-        - resource: nvidia.com/gpu
-          minFragImprovementPercent: 5
-      scope:
-        nodes:
-          include:
-            selector:
-              matchLabels:
-                volcano.sh/node-pool: a100
-      maxPerRun:
-        podGroups: 10
-        resources:
-          nvidia.com/gpu: 64
-      ttlSecondsAfterFinished: 86400
-```
+核心字段分工：
 
-- 控制器评估 `trigger`（`cronSchedule` 到点、或反应式条件命中），用 `runTemplate` **CREATE 一个 `RepackRun`**（`ownerReferences` 指向 Policy，随 Policy 删除级联清理）。
-- **生成的 Run 是 DryRun 还是 Execute 只看 `runTemplate.spec.mode`**（无独立审批开关）；Execute 的串行/去重由**引擎 K=1 + 冷静期**兜底，控制器默认"上个派生 Run 未结束不新建"，故无需 Policy 级并发字段。
-- **反应式条件的评估周期是控制器级配置**：由 RepackPolicy 控制器的启动 flag / 配置文件设定（如 `--repack-policy-eval-interval`，全局一份），与引擎的 `--repack-execute-cooldown` 同属运维调优项，不进 CRD。
-- **对 P0 引擎零改动**：引擎只认 `RepackRun.spec`；RepackPolicy 是纯粹的"Run 生产者"，全部逻辑在 Policy 控制器内。
+- `mode` 决定只规划还是实际执行；
+- `scope.podGroups` 是允许被驱逐的工作负载边界，内部按 PodGroup 聚合；
+- `scope.nodes` 是允许作为待腾空目标的节点范围；
+- `goals` 声明目标扩展资源和最低碎片改善阈值；
+- `maxPerRun` 限制单次影响范围；
+- `eviction` 只控制 Eviction API 的提交参数；
+- `status.plan` 保存不可变的计划快照；
+- `status.result` 和 `status.relocations` 保存 Execute 的实际结果和逐 Pod 过程。
 
-#### 5.6.2 解救式整理（P1 待设计）
+完整字段定义、状态机和写入所有权由[统一技术设计](./repack-design.md)维护，用户配置示例由[用户指南](../user-guide/how_to_use_repack.md)维护，本 Proposal 不重复展开。
 
-P0 目标是"降碎片/腾空节点"（consolidation-driven）。以指定排队 gang 可调度为目标的
-解救式整理（relief-driven）留待 P1 讨论：当前不声明字段、状态输出或 YAML 形状。
+### Architecture Overview
 
-#### 5.6.3 后续扰动策略与 PDB
+Repack 由既有 Kubernetes/Volcano 组件和一个独立 Engine 协作完成：
 
-P0 使用引擎内置扰动评分，并通过 `scope`、`maxPerRun` 和 INV-RESCHED 控制风险。解救
-排队 workload、可配置扰动策略以及 PDB 预检/阻塞处理均留待 P1 统一讨论；当前 CRD 和 Go
-API 不声明字段、类型或 YAML 形状。
+![Repack Engine 架构与扩展点](images/repack/repack-engine-architecture.svg)
 
-#### 5.6.4 AI 拓扑感知整理目标
+- API Server 保存 `RepackRun`、PodGroup、Pod 和 Node 状态，并通过 CRD/CEL 校验不可变性和字段边界；
+- `volcano-repack-engine` 监听 Run，复用 scheduler cache 和 scheduler 配置完成规划，Execute 时调用 Eviction API；
+- Volcano Controller Manager 内置 Repack controller，负责 TTL、替身 Pod 认领、placement gate、提名和绑定结果观察；
+- Volcano Scheduler 仍是唯一调度与绑定组件，按照实时集群状态处理重建 Pod；
+- 工作负载控制器负责在 Pod 被驱逐后创建替身 Pod，Repack 不直接创建业务 Pod。
 
-把"整空节点"泛化为拓扑维度的整理目标（复用调度器 HyperNode/拓扑信息）：**NVLink 节点内 island** 拢紧、**超节点（HyperNode）"整域空位"**（每个超节点腾出 k 个整空节点或其倍数）。作为新的"整理目标画像（target profile）"插件接入算法层的收益/代价口径，不改主循环。
+组件之间仅通过 Kubernetes API 对象协作，不建立私有 RPC。
 
-## 6. 设计细节（Design Details）
+### Planning Overview
 
-### API types
+一次规划采用“低成本裁剪、候选评分、惰性完整校验”的增量流程：
 
-- **RepackRun** 完整结构体定义（spec + status）见 [§5.2](#52-repackrun-api)。
-- **RepackPolicy** 结构体定义（P1，触发 + 内嵌 RepackRun 模板）见 [§5.6.1](#561-自动触发repackpolicy模板生成cronjobjob-式)。
-- `RepackPlan` / `RepackMove` / `RepackSummary` 等完整字段见仓库 `staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1`。
+1. 从 scheduler snapshot 解析目标资源、Scope、PodGroup 和节点状态；
+2. 排除空目标资源节点、满卡节点和包含不可迁移目标资源 Pod 的节点；
+3. Domain Plugin 生成可腾空 Unit，当前实现为单节点；
+4. 在评分前检查执行预算和接收端目标资源总容量；
+5. 从工作负载影响、Gang 破坏、受损资源、迁移资源和 Pod 数等维度计算候选分数；
+6. 按总分从高到低依次对候选执行完整 Scheduler 可行性模拟；
+7. 提交第一个完整可行的候选，增量更新容量与累计影响后继续下一轮；
+8. 计划必须达到完整节点释放和碎片改善门槛，否则不推荐执行。
 
-### 碎片度量（Fragmentation Index）
+每个评分策略的得分为 `0～100` 的整数，分越高表示候选越优；综合分为策略得分与整数权重的加权和。评分仅用于同一规划轮次内的相对排序。
 
-定义资源 R 的碎片率 `FragRate(R) = (B − A) / M`：
+### Gang-Aware Disruption
 
-- `M`：域内提供 R 的节点数；
-- `B`：当前承载现有负载实际占用的"节点份数"；
-- `A`：在不改变各 gang 需求的前提下，理论最优打包所需的最少节点数。
+Repack 以 PodGroup 作为工作负载影响统计单元。对于每个候选计划，系统比较计划迁移 Pod 数与 `Running-MinAvailable`：
 
-`B − A` 即"因碎片多占用的节点数"。整理的收益 = 整理后 `FragRate` 的下降 / 腾出的整空节点数。`A` 在"请求与容量均为 2 的幂"时有闭式解，一般场景用 FFD 近似，二者均已用 Python 对暴力最优做过交叉校验。
+- 未突破 `MinAvailable` 时，受影响资源按实际迁移量计算；
+- 突破 `MinAvailable` 时，该 PodGroup 被记为 Gang breach，并按整个 PodGroup 的目标资源规模计算受损资源。
 
-### 可调度性兜底（INV-RESCHED）
+该模型不把破坏 Gang 作为绝对禁止条件，而是让系统在多个可行候选之间优先选择影响工作负载更少、Gang 中断成本更低的方案。不可中断业务必须由 Scope 排除。
 
-**规划时判据**：在驱逐前确认"若此刻执行，每个被驱逐 Pod 都能在域内重新调度"。实现为一个**可调度性检查** `Snapshot.FeasibleRelocation`：在**克隆**出的节点副本 + cycle-state 上模拟驱逐这批 victim、再按接收方偏好逐个重落，落点用调度器**完整过滤栈** `ssn.SimulatePredicateFn`（亲和/污点/拓扑/设备…）+ 节点 `FutureIdle` 判定；全程只读、不碰真集群。任一 Pod 无解 → 本轮不驱逐。（纯 FFD + best-fit + 回溯的装箱求解器 `api.Domain.Feasible` 保留为**参考模型**，供 drain 单测 fake 复用，不在生产路径。）
+![Gang 中断成本模型](images/repack/gang-damage-stepfn.svg)
 
-它与 descheduler 的"纯策略驱逐"区别在于：repack **不会在'当前明显放不下'时还去驱逐**。但**这不是运行期保证**——因为不预留：
+### DryRun and Execute
 
-- **状态漂移**：驱逐到替身落下之间，集群可用量可能变化（其它作业退出/扩容/缩容），使原本可行的落点不再成立；
-- **高优插队**：更高优先级作业在窗口内下发，可能抢走计划目标空位；
+`DryRun` 和 `Execute` 是两种独立模式。`Execute` 不复用某个历史 DryRun 的计划，而是基于实时快照重新规划，避免执行过期方案。两种模式使用相同的 planner 和收益语义，因此输出的 `status.plan` 结构一致。
 
-此时被整理作业会**停在 Pending**，由调度器后续在有空位时再调度；repack 据实记录漂移、`maxPerRun`+冷静期限代价、下一轮重新规划。**要真正消除该窗口需 Reservation——本设计明确不做（§4）。**
+Execute 在驱逐前持久化完整 plan 和逐 Pod relocation journal，形成 prepare barrier；随后调用 Eviction API。替身 Pod 由工作负载控制器创建，经 placement gate 暂停后，由 controller 认领并请求 Engine 基于实时 Scheduler Session 选择接收节点。controller 写入 `nominatedNodeName` 并释放 gate，Scheduler 决定最终绑定位置。
 
-### 整理算法详解
+这一过程保留两类事实：
 
-`repack` Action 对**引擎 Session**（只读 `Snapshot` + Plugin 回调）编程。Action 先度量碎片，再调用 `planner/drain.BuildPlan`，最后执行 `PlanAdmissible`、扰动成本汇总和 Report 渲染。
+- `selectedNodeName`：Repack 在实时选择时建议的接收节点；
+- `actualNodeName`：Scheduler 最终绑定的节点。
 
-Drain Planner 采用**单趟动态贪心、惰性可行性评估、产出唯一 plan**。规划开始时一次性准备可腾空 Unit、victim、工作负载聚合和节点目标资源余量。每一轮先执行内置接收总容量预检，再通过 Plugin 检查执行预算，并按“此前已提交 moves + 当前候选 victim”的完整计划扰动排序；随后沿排序依次调用 `FeasibleRelocation`，原子提交第一个通过完整调度校验的候选。提交后增量更新接收端容量和活动集合，直到没有候选可提交。最终收益门槛由 Action 通过 Session 约束统一检查。
+二者不同表示发生了替代调度，并不一定代表整理失败；最终是否释放计划节点由终态快照验证。
 
-#### 当前 P0 多策略扰动预排序与惰性校验
+### Safety Boundaries
 
-> **实现口径（权威）**：drain 不使用"已破组 gang 后续迁移记 0"的字典序算法；每轮均以 `CandidatePlan = CommittedMoves + ProspectiveMoves` 计算全计划扰动，并通过 `Session.DisruptionScores` 将各维度反向归一化为 `0～100` 的整数偏好分，再做加权求和。评分在通过静态、预算和总容量预检的活动候选之间形成确定性顺序；完整 `FeasibleRelocation` 沿该顺序惰性执行，首个可行候选胜出。INV-RESCHED 和 `maxPerRun` 均未放宽。
+- Scope 和 `maxPerRun` 是硬约束，候选评分不能突破；
+- 每个计划迁移都必须通过完整 Scheduler 可行性检查；
+- Execute 通过 Eviction API 遵守 PDB；
+- 单集群 Execute 采用 K=1 串行门控并带冷却时间；
+- 计划不预留资源，运行时竞争可能使实际结果偏离计划；
+- 计划与实际结果分离保存，部分执行失败不会覆盖原始决策；
+- Run、PodGroup lease、placement gate 和 relocation journal 支持组件重启后的恢复和清理；
+- Engine 使用根 context 停止主循环、缓存和工作队列；进行中 Eviction 的取消和事件 broadcaster 生命周期仍需按技术设计中的已知差距继续收敛。
 
-默认启用 `workloadscope + repackbudget + nodeconsolidation + workloaddisruption + gangdisruption + binpack`。其中 `workloaddisruption` 与 `gangdisruption` 注册五个扰动维度；`binpack` 负责大资源 Pod 优先和接收节点装箱：
+## Design and Implementation
 
-| 评分维度 | 默认权重 | 原始值 | 目的 |
-|---|---:|---|---|
-| `affectedPodGroups` | 10 | 全计划中实际迁移到的 distinct PodGroup 数 | 尽量少影响作业 |
-| `gangBreaches` | 8 | `movedPods > max(Running-MinAvailable, 0)` 的 PodGroup 数 | 避免打破 gang 下限 |
-| `damagedResource` | 6 | 未破组时计该组已搬迁卡数；破组时计整个 PodGroup footprint | 避免低估打破大 gang 的代价 |
-| `movedResource` | 3 | 全计划搬迁的目标资源总量 | 控制 GPU/NPU 搬迁规模 |
-| `movedPods` | 1 | 全计划实际重落的 Pod 数 | 控制 Pod churn |
+本 Proposal 只维护社区评审所需的稳定边界。以下实现细节统一收敛到[Repack 技术设计](./repack-design.md)：
 
-对本轮第 `i` 个活动候选、每个维度 `k`，先在本轮候选集合内归一化：
+- 组件读写矩阵和完整时序；
+- RepackRun API、状态机和字段所有权；
+- Action、Plugin、Session、Planner 与 Snapshot Adapter；
+- 节点分类、候选评分、接收节点排序和调度模拟；
+- Eviction、替身匹配、placement lease、gate 与 nomination；
+- 并发、恢复、可观测性、性能和测试策略。
 
-```text
-strategyScore(i, k) = 100                                               if max(raw(*, k)) == min(raw(*, k))
-                    = 100 - floor(100 × (raw(i, k) - min(raw(*, k)))
-                                         / (max(raw(*, k)) - min(raw(*, k)))) otherwise
+## Alternatives Considered
 
-totalScore(i) = Σ strategyScore(i, k) × weight(k)
-```
+### 直接使用 Kubernetes Descheduler
 
-按 `totalScore(i)` 从高到低尝试候选，选择第一个通过完整调度校验的候选。原始中断成本越低，对应的策略得分越高；某维度在本轮所有候选都相同时，所有候选均得 100 分，因此不会改变相对顺序。分数仍是**本轮相对排序值**，不能跨 Run 当作绝对风险等级。
+Descheduler 擅长按策略驱逐 Pod，但 Repack 需要基于 Volcano 的 PodGroup、Gang 和调度插件验证完整迁移计划。独立维护一套调度可行性逻辑容易与真实 Scheduler 漂移，因此不采用。
 
-把已提交 moves 纳入每个候选有两个关键效果：一是新触及一个 PodGroup 会增加 `affectedPodGroups`；二是一个 gang 已被打破后，继续搬其 Pod 不再增加 `gangBreaches`，`damagedResource` 也仍是该 gang 的一次 footprint 计费，但 `movedResource` 与 `movedPods` 仍会增加。该机制会倾向复用已有扰动面，却不会把后续迁移误判为零代价。
+### 在 Volcano Scheduler 周期内执行整理
 
-若总分相同，候选在进入评分前已按 `FreeableUnit.Weight` 降序、unit key 字典序升序排列，稳定排序保留该顺序；这为未来 HyperNode 等更高 Weight 的 unit 留出确定性同分决策。Weight 不是硬优先级：低 Weight 候选若总扰动更低，仍可排在前面。
+整理包含用户 Scope、执行预算、DryRun 报告、Eviction 和长生命周期结果跟踪，持续时间和副作用都明显长于一次调度周期。将其放入 Scheduler 会扩大调度关键路径和故障边界，因此采用独立 Engine，并只复用调度框架。
 
-### 引擎扩展模型与流水线
+### 为每次迁移预留或锁定资源
 
-repack-engine 不复用调度器的 `actions`（allocate/preempt/backfill），而有自己镜像 `scheduler/framework` 的 **Action + Plugin** 扩展模型。Plugin 在 `OnSessionOpen` 注册回调，Action 消费聚合后的 Session，Planner 只执行通用搜索机制。
+资源预留可以降低计划漂移，但需要解决超时回收、死锁、队列公平性和与正常调度竞争等问题。本阶段使用 nomination 软性牵引，保持 Scheduler 为唯一资源分配者。
 
-整体架构与扩展点（对照 volcano-scheduler 的经典架构图形式）：
+### 求解全局最优布局
 
-![repack-engine 架构与扩展点](images/repack/repack-engine-architecture.svg)
+完整搜索需要联合考虑候选节点组合、Pod—Node 映射、Gang、预算和 Scheduler 插件，复杂度随集群规模快速增长；在线状态也会使长时间求得的最优解迅速过期。本阶段采用每步有直接收益的启发式方法，优先保证时延和可解释性。
 
-P0 流水线只有一个 action `repack`：
+## Risks and Mitigations
 
-```mermaid
-flowchart TD
-    P["OpenSession：跑各 plugin.OnSessionOpen<br/>注册 域 / 可动性 / 评分 回调"] --> A["action: repack"]
-    A --> B["度量 → drain.BuildPlan<br/>Plugin 过滤/排序 → 惰性 FeasibleRelocation → 收益准入 → Report"]
-    B --> C{"mode?"}
-    C -->|DryRun| E["RenderPlan → status.plan"]
-    C -->|Execute| F["prepare barrier + Evict + 动态选点/提名 → status.plan/result/relocations"]
-```
+- **计划漂移**：不锁定快照；通过 Execute 重新规划、实时选点和终态验证降低影响；
+- **业务中断扩大**：通过 Scope、预算和 Gang 成本降低风险，同时明确上层控制器级联重建属于用户需评估的边界；
+- **大集群规划耗时**：通过节点预分类、容量预检、惰性模拟和缓存控制 Scheduler Filter 调用量；
+- **组件重启**：通过持久化 relocation journal、lease owner 和幂等状态转换恢复；
+- **错误配置**：CRD/CEL 和严格的 Engine 配置解析在启动或创建阶段快速失败。
 
-新场景策略增加 Plugin，新业务阶段增加 Action；两者不修改 Planner 的增量搜索主循环。
+## Rollout Plan
 
-### 复用 scheduler 框架与插件
+Repack 默认关闭，通过 Helm 显式开启。建议按以下顺序逐步放量：
 
-| 复用构件 | 作用 |
-|---|---|
-| `--scheduler-conf` + `UnmarshalSchedulerConf` | 读取**与调度器同一份**插件配置（同一 ConfigMap），得到 `tiers`/`configurations` |
-| `schedcache.New` + `cache.Run` | 与调度器同源的 informer 热缓存 |
-| `framework.OpenSession(cache, tiers, conf)` | 用同一插件集打开 Session，得到真实 `Nodes`/`Jobs` + `SimulatePredicateFn`（模拟落点的完整过滤栈） |
-| 克隆式重排可行性检查 `Snapshot.FeasibleRelocation` | 克隆 node + cycle-state，用 `ssn.SimulatePredicateFn` 跑完整过滤栈模拟"驱逐 victim → 逐个重落"；DryRun/Execute 同源，只读、不碰真集群（取代早期设计里的 `framework.Statement` 沙箱事务——后者因 `unPipeline` 置空 `NodeName` 无法用于 repack） |
+1. 在测试集群验证目标设备、工作负载控制器和 Scheduler 配置；
+2. 在生产集群只运行限定节点池和少量工作负载的 DryRun；
+3. 设置严格的 Scope 与 `maxPerRun`，在低峰期执行小规模 Execute；
+4. 对比 `status.plan`、`status.result`、业务就绪状态和碎片指标；
+5. 根据实际恢复时间逐步扩大范围。
 
-只复用 `tiers/configurations`（过滤/打分能力），**忽略 `actions`**（repack 有自己的 action）。这样 predicate 语义与调度器同源同演进，避免"整理算出的落点被调度器拒掉"的不一致。
+## Future Work
 
-### 落点提名：替身 Pod 的识别
-
-被驱逐的 victim 会消亡，提名必须写到工作负载重建出的**替身 Pod** 上。识别分两种：
-
-| 场景 | 替身 Pod 名 | 匹配方式 |
-|---|---|---|
-| **同名重建（主路径）** | 与被驱逐者**完全同名** | 按 `namespace/name` 精确匹配后 patch。适用 Volcano vcjob（`<job>-<task>-<index>`，确定性命名）、StatefulSet（`<sts>-<ordinal>`）——即 gang/AI 主场景 |
-| **随机名重建（同构 PG）** | 新随机名 | 在原组或 replacement PodGroup 中消费下一条未认领意图。适用 Deployment/RS/裸 Job |
-| **随机名重建（SubGroup PG）** | 新随机名 | 按 `schedulingRequirementsHash` 等值匹配旧 placement intent；无需识别 workload 类型或私有角色标签 |
-
-**注入由谁做、在哪做**：注入动作放在 **repack-controller 的提名 reconciler**，**不放 PodGroup/workload controller**。原因：(1) 覆盖面——原生 Deployment/StatefulSet/Job 的替身 Pod 由 kube 控制器创建、改不了，统一的 Pod informer + status patch 对所有 workload 一视同仁；(2) 解耦——repack 是可选能力，不应把读取整理意图、注入提名的逻辑焊进各类 workload controller；(3) `nominatedNodeName` 是 `pod.status` 字段（非创建期 spec），即便由 workload controller 创建也得另发一次 status patch，并不省事；(4) 提名 reconciler 统一维护 `status.relocations[]` 的替身认领、冲突重试和 SchedulerGate 生命周期。
-
-流程：
-
-1. Execute 在任何驱逐前，把完整 plan 中每个 Pod move 转换并持久化到 **`RepackRun.status.relocations[]`**（每搬一个 Pod 一条；显式使用 SubGroup 的组额外写 `schedulingRequirementsHash`，durable 跨引擎重启和优雅删除窗口）。SubGroup victim 缺失或摘要生成失败时必须在驱逐前终止，不能静默退化为同构匹配。
-2. repack-controller 的**提名 reconciler** informer 监听受影响 gang 的 **Pending 且未绑定** Pod → 按**替身匹配契约（§5.2.2）**认领替身：已有 replacement Pod UID → `victimPodName` → `schedulingRequirementsHash` → 同构 PG 兜底。Controller 先持久化替身 UID；Engine 再基于最新 Session 选择并持久化 `selectedNodeName`；Controller 随后 patch `pod.status.nominatedNodeName` 并移除 SchedulerGate。任一步失败均由双方 reconcile 幂等恢复，直至绑定、降级或到期。
-3. 若已认领的替身 Pod 在绑定前被删除，reconciler 会先持久化释放旧 `replacementPodName/UID`，再允许同一 PodGroup 内符合匹配契约的新 Pod 接续；仍存活的认领者不会被并发扩容 Pod 抢占。
-
-提名是**软引导**：替身 Pod 刚 Pending 到被 patch 之间有极短竞态，调度器可能先调度它 → 记漂移、下轮重规划（用 informer 事件即时 patch 把窗口压到最小）。若要把竞态压到 0，可加 pod CREATE 的 mutating webhook 打 annotation + 调度侧识别（P1 可选，因 `nominatedNodeName` 是 status、webhook 创建期写不了它）。
-
-### 生命周期与并发
-
-- **准入**：全部在 apiserver 由 CEL/marker 完成（无控制器准入步骤、无 `Admitted` condition）。
-- **状态机**：`conditions`（Progressing/Complete/Failed，对齐 Job 风格）为权威，`phase` 由其派生；引擎首次看到 Run 即落 `Pending`（可见性）。
-- **并发（由引擎负责）**：**Execute 全局串行（K=1）**+ 可配**冷静期**；**DryRun 不排队**。引擎**事件驱动**、单 worker + leader 选举天然串行；被挡住的 Execute 保持 `Pending`，并用 `Progressing=False` 的 reason 说明等待原因后重试。"谁干活谁串行"——门控就在执行方，不再跨组件。
-- **崩溃兜底**：引擎启动时把上个实例遗留的 `Running`（孤儿）标 `Failed`，释放 K=1 槽并交 TTL 回收（"卡在 Running"由此兜底，不设 `activeDeadlineSeconds` 超时字段）。
-- **清理**：控制器按 `ttlSecondsAfterFinished` 终态后自动删除（对齐 Job）。
-
-### 扰动控制
-
-- **动作/代价单位 = PodGroup（gang），软感知（非硬原子）**：破组代价以整 gang 评估，但**不要求整组 pod 一起搬**——只搬"腾节点所需"的那些 pod，破组与否由下面的阶跃函数计价，`nodeconsolidation` 域 + 逐 task 装箱负责实际搬运。
-- **受损卡数按 gang 语义计（阶跃）**：搬走 Pod 未突破 `minAvailable` 时计该组已搬走的卡；一旦突破，整 gang 视为受损（按 footprint 计）。因此首次打破大 gang 的成本显著更高，默认评分会倾向少触及作业、避开大作业。
-- **评分看全计划而非单步增量**：每轮把此前已提交的 moves 与当前候选 moves 合并评分。破组 gang 的 footprint 不会被重复累计、受影响 gang 数也不会重复增加；但后续搬迁仍会增加 `movedResource` 和 `movedPods`，并非"边际为 0"。详见上方“当前 P0 多策略扰动评分”。
-- **封顶**：`maxPerRun.podGroups` / `.resources` 限定单轮规模；长优雅期作业可在挑 victim 时规避。
-
-### 实现分期
-
-> P0 API 与行为已经定稿；P1 项目仅保留能力方向，具体 API 需在后续单独讨论。
-
-| 能力 | 设计 | 实现 |
-|---|---|---|
-| `RepackRun`（DryRun/Execute）、单资源、节点腾空/集中度算法、INV-RESCHED、提名落点、K=1+冷静期、TTL | ✅ 敲定 | **P0** |
-| `RepackPolicy`（自动触发 + 集群级默认/护栏，§5.6.1） | ✅ 敲定 | **P1** |
-| 解救式整理（§5.6.2） | API 待定 | **P1** |
-| 可配置扰动策略与 PDB（§5.6.3） | API 待定 | **P1** |
-| AI 拓扑感知整理目标（NVLink/超节点，§5.6.4）、提名 reconciler 软优先 | ✅ 敲定 | **P1** |
-| 跨资源**联合**整理（一个 Run 同时整理多种加速资源、跨资源合成收益） | 🔒 schema 预留 | **P2+** |
-
-### 代码结构（Code map）
-
-| 路径 | 内容 |
-|---|---|
-| `staging/src/volcano.sh/apis/.../repack/v1alpha1` | `RepackRun` CRD 类型 |
-| `staging/src/volcano.sh/repack-controller` | **独立模块**：RepackRun TTL 控制器 + placement/nominator reconciler（替身认领、PodGroup 代际、gate、提名与绑定观察）+ 纯决策 `state` 包（含 `EvaluateGate`，由引擎调用） |
-| `pkg/controllers/repack` | 主模块 shim：`framework.Controller` 适配器，把上面的库注册进 volcano-controller-manager（默认随其编译运行） |
-| `pkg/repackengine/api` | 纯模型与算法原语：`Move`、碎片度量、`RepackPlan`/`FreeableUnit`、可动性、扰动聚合，以及参考求解器 `Domain.Feasible`（仅单测 fake 复用，非生产路径）（零框架依赖） |
-| `pkg/repackengine/framework` | 引擎契约：`Session`、`Plugin`/`Action` 注册表、规划回调聚合、`Report`、`CommitPlan`、scope 解析 |
-| `pkg/repackengine/planner/drain` | 通用惰性 Drain 搜索机制与 4000 节点性能基准 |
-| `pkg/repackengine/plugins/{workloadscope,repackbudget,nodeconsolidation,workloaddisruption,gangdisruption,binpack}` | 场景策略插件（init 自注册）；`hypernode`/`pdb` 后续 |
-| `pkg/repackengine/actions/repack` | P0 主流程：度量、规划、收益准入、成本与 Report |
-| `pkg/repackengine/adapter` | 唯一耦合 `scheduler/framework` 的适配层：`SessionSnapshot`（含 `FeasibleRelocation` 克隆 feasibility check，走 `ssn.SimulatePredicateFn`）/`SessionGangScopeLookup`/`NodeFreeCapacity` |
-| `pkg/repackengine/repackengine.go` | 驱动：cache + `OpenSession`(tiers) + 跑 Plugin/Action + 写 status |
-| `cmd/volcano-repack-engine` | 独立引擎二进制入口（leader + 周期驱动；提名 reconciler 在控制器模块内） |
-
-### 未来考虑（Future considerations）
-
-> 解救式整理和可配置扰动策略/PDB 的 API 均待 P1 单独设计，不在当前 CRD 中预留声明。
-
-- **跨资源联合整理**（P2+）：一个 `RepackRun` 同时整理 GPU+NPU 并跨资源合成收益；
-  `goals[]` 已预留列表形状，但还需新增逐资源 plan/result 与组合门控语义。
-- **提名 reconciler 的调度侧软优先**：窗口内让调度器更偏好被提名 Pod 落到目标节点（不饿死、不预留），作为 P1 提名机制的命中率增强。
-- **整理收益的在线度量与自适应触发**：用历史 Run 的实际腾空/漂移反馈调整 `RepackPolicy` 触发阈值。
+- HyperNode Domain 和按训练 TP/EP、推理 Prefill/Decode role 所需卡数倍数定义的拓扑收益；
+- 规划期 PDB 感知与更多工作负载中断成本信号；
+- 自动触发和策略化周期运行；
+- 多资源联合整理；
+- 在保持规划时延边界的前提下改进全局计划质量。
 
 ## References
 
-- 完整推演记录：[repack-policy-design.md](./repack-policy-design.md)
-- 网络拓扑感知调度：[Network Topology Aware Scheduling](./Network%20Topology%20Aware%20Scheduling.md)
-- kubernetes-sigs/descheduler：<https://github.com/kubernetes-sigs/descheduler>（含 [Policy and Strategies](https://github.com/kubernetes-sigs/descheduler#policy-and-strategies)）
-- Issue: TBD（提交社区时补充）
+- [Repack 技术设计](./repack-design.md)
+- [Repack 用户指南](../user-guide/how_to_use_repack.md)
+- [RepackRun API 类型](../../staging/src/volcano.sh/apis/pkg/apis/repack/v1alpha1/repackrun_types.go)
