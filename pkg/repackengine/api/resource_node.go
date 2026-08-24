@@ -34,6 +34,22 @@ const (
 	TargetResourceNodeFull        TargetResourceNodeClass = "full"
 )
 
+// NodeFreeCapacity returns the immediately available resources computed from
+// the authoritative Allocatable and Used ledgers. Repack cannot rely only on
+// NodeInfo.Idle: when an extended resource is added to node status after pods
+// bind, the scheduler cache can already expose the new Allocatable value while
+// Idle still lacks that resource until the node snapshot is rebuilt.
+func NodeFreeCapacity(node *schedapi.NodeInfo) *schedapi.Resource {
+	if node == nil || node.Allocatable == nil {
+		return schedapi.EmptyResource()
+	}
+	free := node.Allocatable.Clone()
+	if node.Used != nil {
+		free.SubWithoutAssert(node.Used)
+	}
+	return free
+}
+
 // ClassifyTargetResourceNode classifies a node from the scheduler snapshot's
 // Allocatable and Used values. Used values at or above Allocatable are treated
 // as full defensively.

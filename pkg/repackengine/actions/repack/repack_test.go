@@ -18,12 +18,16 @@ package repack
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+	state "volcano.sh/repack-controller/pkg/state"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -34,7 +38,74 @@ import (
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloadscope"
+	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 )
+
+type fakeActionRuntime struct {
+	cycle            *framework.PlanningCycle
+	openErr          error
+	statusUpdates    int
+	terminalUpdates  int
+	prepared         int
+	evictions        int
+	resumedEvictions int
+	placements       int
+	cleanups         int
+	failReason       string
+	calls            []string
+	panicPrepare     bool
+	prepareErr       error
+	evictionResult   framework.RuntimeResult
+}
+
+func (f *fakeActionRuntime) OpenPlanningCycle(context.Context, *repackv1alpha1.RepackRun) (*framework.PlanningCycle, error) {
+	return f.cycle, f.openErr
+}
+func (f *fakeActionRuntime) UpdateStatus(context.Context, *repackv1alpha1.RepackRun) error {
+	f.statusUpdates++
+	f.calls = append(f.calls, "status")
+	return nil
+}
+func (f *fakeActionRuntime) UpdateTerminalStatus(context.Context, *repackv1alpha1.RepackRun) error {
+	f.terminalUpdates++
+	return nil
+}
+func (f *fakeActionRuntime) Fail(_ context.Context, _ *repackv1alpha1.RepackRun, reason string, _ error) error {
+	f.failReason = reason
+	return nil
+}
+func (*fakeActionRuntime) ResolveMoveOwners(context.Context, *api.RepackPlan) map[string]*repackv1alpha1.WorkloadRef {
+	return nil
+}
+func (f *fakeActionRuntime) PrepareExecution(context.Context, *repackv1alpha1.RepackRun, *api.RepackPlan, framework.Snapshot) error {
+	f.prepared++
+	f.calls = append(f.calls, "prepare")
+	if f.panicPrepare {
+		panic("prepare panic")
+	}
+	return f.prepareErr
+}
+func (f *fakeActionRuntime) ExecutePreparedEvictions(context.Context, *repackv1alpha1.RepackRun, v1.ResourceName) framework.RuntimeResult {
+	f.evictions++
+	f.calls = append(f.calls, "evict")
+	if f.evictionResult.Requeue || f.evictionResult.RequeueAfter > 0 || f.evictionResult.Err != nil {
+		return f.evictionResult
+	}
+	return framework.RuntimeResult{RequeueAfter: time.Second}
+}
+func (f *fakeActionRuntime) ResumePreparedEvictions(context.Context, *repackv1alpha1.RepackRun) framework.RuntimeResult {
+	f.resumedEvictions++
+	return framework.RuntimeResult{}
+}
+func (f *fakeActionRuntime) ReconcilePlacement(context.Context, *repackv1alpha1.RepackRun) framework.RuntimeResult {
+	f.placements++
+	return framework.RuntimeResult{}
+}
+func (f *fakeActionRuntime) CleanupPlacement(context.Context, *repackv1alpha1.RepackRun) error {
+	f.cleanups++
+	return nil
+}
+func (*fakeActionRuntime) RecordPlanComputed(*repackv1alpha1.RepackRun) {}
 
 const testResource = v1.ResourceName("nvidia.com/gpu")
 
@@ -95,9 +166,6 @@ func actionSessionWithPlugins(minNodesFreed int, plugins []string) *framework.Se
 		Resource:      testResource,
 		Mode:          repackv1alpha1.RepackModeDryRun,
 		MinNodesFreed: minNodesFreed,
-		Free: func(node *schedapi.NodeInfo) *schedapi.Resource {
-			return actionResource(api.Scalar(node.Allocatable, testResource) - api.Scalar(node.Used, testResource))
-		},
 	}, framework.PluginOptions(plugins...))
 }
 
@@ -105,7 +173,7 @@ func TestRepackActionOwnsPlanAdmissionAndReport(t *testing.T) {
 	ssn := actionSession(1)
 	defer framework.CloseSession(ssn)
 
-	(&repackAction{}).Execute(ssn)
+	buildPlan(ssn)
 
 	if ssn.Plan() == nil || ssn.Report().NodesFreed != 1 {
 		t.Fatalf("plan=%v report=%+v, want one admitted freed node", ssn.Plan(), ssn.Report())
@@ -119,7 +187,7 @@ func TestRepackActionRejectsBelowBenefitButPreservesCurrentMetric(t *testing.T) 
 	ssn := actionSession(2)
 	defer framework.CloseSession(ssn)
 
-	(&repackAction{}).Execute(ssn)
+	buildPlan(ssn)
 
 	if ssn.Plan() != nil {
 		t.Fatalf("plan=%v, want benefit constraint rejection", ssn.Plan())
@@ -143,8 +211,8 @@ func TestPluginConfigurationOrderDoesNotAffectPlan(t *testing.T) {
 	reversedSession := actionSessionWithPlugins(1, reversed)
 	defer framework.CloseSession(reversedSession)
 
-	(&repackAction{}).Execute(forwardSession)
-	(&repackAction{}).Execute(reversedSession)
+	buildPlan(forwardSession)
+	buildPlan(reversedSession)
 
 	if !reflect.DeepEqual(forwardSession.Plan(), reversedSession.Plan()) {
 		t.Fatalf("plugin order changed plan:\nforward=%+v\nreversed=%+v", forwardSession.Plan(), reversedSession.Plan())
@@ -166,7 +234,7 @@ func TestOptionalPluginCombinationsPreserveMainFlowAndReceiverInvariants(t *test
 			}
 		}
 		ssn := actionSessionWithPlugins(1, plugins)
-		(&repackAction{}).Execute(ssn)
+		buildPlan(ssn)
 		plan := ssn.Plan()
 		framework.CloseSession(ssn)
 
@@ -179,5 +247,202 @@ func TestOptionalPluginCombinationsPreserveMainFlowAndReceiverInvariants(t *test
 				t.Fatalf("plugins=%v produced invalid move=%+v; empty/full nodes must never participate", plugins, move)
 			}
 		}
+	}
+}
+
+func TestRepackActionOwnsDryRunWorkflow(t *testing.T) {
+	ssn := actionSession(1)
+	runtime := &fakeActionRuntime{cycle: &framework.PlanningCycle{
+		Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+	}}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeDryRun}}
+	result := (&repackAction{}).Execute(&framework.ActionContext{
+		Context: context.Background(), Run: run, Runtime: runtime,
+	})
+	if result.Err != nil || !result.Stop {
+		t.Fatalf("result=%+v, want successful terminal Action result", result)
+	}
+	if runtime.statusUpdates != 1 || runtime.terminalUpdates != 1 {
+		t.Fatalf("status updates=%d terminal=%d, want 1/1", runtime.statusUpdates, runtime.terminalUpdates)
+	}
+	if run.Status.Plan == nil || run.Status.Phase != repackv1alpha1.RepackSucceeded {
+		t.Fatalf("status=%+v, want persisted DryRun plan and succeeded phase", run.Status)
+	}
+}
+
+func TestRepackActionOwnsExecuteModeBranch(t *testing.T) {
+	ssn := actionSession(1)
+	runtime := &fakeActionRuntime{cycle: &framework.PlanningCycle{
+		Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+	}}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	result := (&repackAction{}).Execute(&framework.ActionContext{
+		Context: context.Background(), Run: run, Runtime: runtime,
+	})
+	if result.Err != nil || !result.Stop {
+		t.Fatalf("result=%+v, want in-flight Execute Action result", result)
+	}
+	if runtime.prepared != 1 || runtime.evictions != 1 || runtime.terminalUpdates != 0 {
+		t.Fatalf("prepared=%d evictions=%d terminal=%d, want 1/1/0", runtime.prepared, runtime.evictions, runtime.terminalUpdates)
+	}
+	if run.Status.Plan == nil {
+		t.Fatal("Execute Action must persist the same computed plan before execution")
+	}
+	if !reflect.DeepEqual(runtime.calls, []string{"status", "prepare", "evict"}) {
+		t.Fatalf("calls=%v, want status -> prepare barrier -> eviction", runtime.calls)
+	}
+	if result.RequeueAfter != time.Second {
+		t.Fatalf("requeueAfter=%v, want Runtime result propagated", result.RequeueAfter)
+	}
+}
+
+func TestRepackActionCompletesExecuteWithoutWorthwhilePlan(t *testing.T) {
+	ssn := actionSession(2)
+	runtime := &fakeActionRuntime{cycle: &framework.PlanningCycle{
+		Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+	}}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	result := (&repackAction{}).Execute(&framework.ActionContext{Context: context.Background(), Run: run, Runtime: runtime})
+	if result.Err != nil || runtime.prepared != 0 || runtime.terminalUpdates != 1 {
+		t.Fatalf("result=%+v runtime=%+v, want terminal no-op Execute", result, runtime)
+	}
+	if got := enginestatus.TerminalOutcome(run); got != state.ReasonInsufficientImprovement {
+		t.Fatalf("outcome=%q, want %q", got, state.ReasonInsufficientImprovement)
+	}
+	if run.Status.Result == nil || !run.Status.Result.MetricsVerified {
+		t.Fatalf("result=%+v, want verified no-op Execute result", run.Status.Result)
+	}
+}
+
+func TestRepackActionHoldsExecuteSlotBeforePreparePanic(t *testing.T) {
+	ssn := actionSession(1)
+	runtime := &fakeActionRuntime{panicPrepare: true, cycle: &framework.PlanningCycle{
+		Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+	}}
+	actionCtx := &framework.ActionContext{
+		Context: context.Background(),
+		Run:     &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}},
+		Runtime: runtime,
+	}
+	var recovered interface{}
+	func() {
+		defer func() { recovered = recover() }()
+		(&repackAction{}).Execute(actionCtx)
+	}()
+	if recovered == nil {
+		t.Fatal("prepare panic was not observed")
+	}
+	if !actionCtx.ExecuteSlotHeld() {
+		t.Fatal("Execute slot must be held before a prepare-stage panic can unwind to Engine")
+	}
+}
+
+func TestRepackActionPropagatesImmediateRuntimeRequeue(t *testing.T) {
+	ssn := actionSession(1)
+	runtime := &fakeActionRuntime{
+		evictionResult: framework.RuntimeResult{Requeue: true},
+		cycle: &framework.PlanningCycle{
+			Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+		},
+	}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	result := (&repackAction{}).Execute(&framework.ActionContext{Context: context.Background(), Run: run, Runtime: runtime})
+	if result.Err != nil || !result.Stop || !result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("result=%+v, want immediate Runtime requeue propagated through ActionResult", result)
+	}
+}
+
+func TestRepackActionPreservesRuntimeFailureReason(t *testing.T) {
+	runtime := &fakeActionRuntime{openErr: framework.NewActionError(state.ReasonInvalidConfiguration, errors.New("bad resource"))}
+	run := &repackv1alpha1.RepackRun{}
+	result := (&repackAction{}).Execute(&framework.ActionContext{Context: context.Background(), Run: run, Runtime: runtime})
+	if result.Err != nil || runtime.failReason != state.ReasonInvalidConfiguration {
+		t.Fatalf("result=%+v failReason=%q, want terminal invalid-configuration failure", result, runtime.failReason)
+	}
+}
+
+func TestRepackActionDispatchesRecoveryStages(t *testing.T) {
+	plan := &repackv1alpha1.RepackPlan{}
+	tests := []struct {
+		name         string
+		run          *repackv1alpha1.RepackRun
+		want         func(*fakeActionRuntime) int
+		wantSlotHeld bool
+	}{
+		{name: "eviction", run: &repackv1alpha1.RepackRun{
+			Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+			Status: repackv1alpha1.RepackRunStatus{Phase: repackv1alpha1.RepackRunning, Plan: plan,
+				Relocations: []repackv1alpha1.PodRelocationStatus{{Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionPending}}}},
+		}, want: func(f *fakeActionRuntime) int { return f.resumedEvictions }, wantSlotHeld: true},
+		{name: "placement", run: &repackv1alpha1.RepackRun{
+			Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+			Status: repackv1alpha1.RepackRunStatus{Phase: repackv1alpha1.RepackRunning, Plan: plan,
+				Relocations: []repackv1alpha1.PodRelocationStatus{{Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted}}},
+				Conditions:  []metav1.Condition{{Type: state.CondProgressing, Status: metav1.ConditionTrue, Reason: state.ReasonReconcilingPlacements}}},
+		}, want: func(f *fakeActionRuntime) int { return f.placements }, wantSlotHeld: true},
+		{name: "cleanup", run: &repackv1alpha1.RepackRun{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{repackv1alpha1.PlacementActiveLabel: "true"}},
+			Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+			Status: repackv1alpha1.RepackRunStatus{Phase: repackv1alpha1.RepackSucceeded,
+				Relocations: []repackv1alpha1.PodRelocationStatus{{}}},
+		}, want: func(f *fakeActionRuntime) int { return f.cleanups }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &fakeActionRuntime{}
+			actionCtx := &framework.ActionContext{Context: context.Background(), Run: test.run, Runtime: runtime}
+			result := (&repackAction{}).Execute(actionCtx)
+			if result.Err != nil || test.want(runtime) != 1 {
+				t.Fatalf("result=%+v runtime=%+v, want stage handler called once", result, runtime)
+			}
+			if actionCtx.ExecuteSlotHeld() != test.wantSlotHeld {
+				t.Fatalf("execute slot held=%t, want %t for %s stage", actionCtx.ExecuteSlotHeld(), test.wantSlotHeld, test.name)
+			}
+		})
+	}
+}
+
+func TestRepackActionTerminalizesDeterministicExecutionPreparationFailure(t *testing.T) {
+	ssn := actionSession(1)
+	runtime := &fakeActionRuntime{
+		prepareErr: framework.NewActionError(state.ReasonExecutionPreparationFailed, errors.New("invalid move")),
+		cycle: &framework.PlanningCycle{
+			Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+		},
+	}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	actionCtx := &framework.ActionContext{Context: context.Background(), Run: run, Runtime: runtime}
+	result := (&repackAction{}).Execute(actionCtx)
+
+	if result.Err != nil || !result.Stop {
+		t.Fatalf("result=%+v, want deterministic preparation failure handled as terminal", result)
+	}
+	if runtime.failReason != state.ReasonExecutionPreparationFailed {
+		t.Fatalf("failReason=%q, want %q", runtime.failReason, state.ReasonExecutionPreparationFailed)
+	}
+	if !actionCtx.ExecuteSlotHeld() {
+		t.Fatal("deterministic preparation failure must retain the Execute slot until terminal cleanup")
+	}
+}
+
+func TestRepackActionRetriesRecoverableExecutionPreparationFailure(t *testing.T) {
+	ssn := actionSession(1)
+	prepareErr := errors.New("temporary PodGroup API outage")
+	runtime := &fakeActionRuntime{prepareErr: prepareErr, cycle: &framework.PlanningCycle{
+		Session: ssn, Resource: testResource, Close: func() { framework.CloseSession(ssn) },
+	}}
+	run := &repackv1alpha1.RepackRun{Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute}}
+	actionCtx := &framework.ActionContext{Context: context.Background(), Run: run, Runtime: runtime}
+	result := (&repackAction{}).Execute(actionCtx)
+
+	if !errors.Is(result.Err, prepareErr) || !result.Stop {
+		t.Fatalf("result=%+v, want recoverable preparation error returned to workqueue", result)
+	}
+	if runtime.failReason != "" || runtime.terminalUpdates != 0 {
+		t.Fatalf("failReason=%q terminalUpdates=%d, preparation infrastructure failure must remain recoverable",
+			runtime.failReason, runtime.terminalUpdates)
+	}
+	if !actionCtx.ExecuteSlotHeld() {
+		t.Fatal("recoverable preparation must retain the Execute slot")
 	}
 }

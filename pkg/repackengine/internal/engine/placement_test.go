@@ -18,6 +18,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -25,7 +26,9 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -41,11 +44,14 @@ func TestPlacementReceiversExcludeFreedNodesAndRequireImmediateIdleCapacity(t *t
 	resourceOf := func(quantity int64) *schedapi.Resource {
 		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(quantity)}}
 	}
+	node := func(name string, capacity int64) *schedapi.NodeInfo {
+		return &schedapi.NodeInfo{Name: name, Allocatable: resourceOf(capacity), Used: resourceOf(0), Idle: resourceOf(capacity)}
+	}
 	nodes := []*schedapi.NodeInfo{
-		{Name: "planned", Idle: resourceOf(2)},
-		{Name: "freeing", Idle: resourceOf(8)},
-		{Name: "too-small", Idle: resourceOf(1)},
-		{Name: "alternative", Idle: resourceOf(4)},
+		node("planned", 2),
+		node("freeing", 8),
+		node("too-small", 1),
+		node("alternative", 4),
 	}
 	task := &schedapi.TaskInfo{InitResreq: resourceOf(2)}
 
@@ -146,6 +152,130 @@ func TestCleanupPlacementFindsUnclaimedWebhookLeaseAndClearsDiscoveryLabel(t *te
 	}
 	if updatedRun.Labels[repackv1alpha1.PlacementActiveLabel] != "" {
 		t.Fatalf("placement discovery label was not removed: %+v", updatedRun.Labels)
+	}
+}
+
+func TestCleanupPlacementClearsUnperformedJournalOnlyAfterLeaseCleanup(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackFailed,
+			Plan: &repackv1alpha1.RepackPlan{Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "pg",
+			}}},
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", VictimPodName: "pod",
+				Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionPending},
+			}},
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pg",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	client := vcfake.NewSimpleClientset(run.DeepCopy(), podGroup)
+	engine := &Engine{volcanoClient: client}
+
+	if err := engine.cleanupPlacement(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	updatedPodGroup, err := client.SchedulingV1beta1().PodGroups("ns").Get(
+		context.Background(), "pg", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedPodGroup.Annotations[repackv1alpha1.PlacementLeaseAnnotation] != "" {
+		t.Fatalf("placement lease was not removed: %+v", updatedPodGroup.Annotations)
+	}
+	updatedRun, err := client.RepackV1alpha1().RepackRuns().Get(
+		context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updatedRun.Status.Relocations) != 0 || updatedRun.Status.Result != nil {
+		t.Fatalf("unperformed execution state was not cleared after cleanup: %+v", updatedRun.Status)
+	}
+	if enginestatus.ResolveStage(updatedRun) != enginestatus.StageNone {
+		t.Fatalf("stage=%q, want cleanup to converge to StageNone", enginestatus.ResolveStage(updatedRun))
+	}
+	if err := engine.cleanupPlacement(context.Background(), updatedRun.DeepCopy()); err != nil {
+		t.Fatalf("repeated cleanup must remain idempotent: %v", err)
+	}
+}
+
+func TestCleanupPlacementRetainsUnperformedJournalWhenLeaseCleanupFails(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
+		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackFailed,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Namespace: "ns", PodGroupName: "pg", VictimPodName: "pod",
+				Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionPending},
+			}},
+		},
+	}
+	podGroup := &schedulingv1beta1.PodGroup{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "pg",
+		Annotations: map[string]string{repackv1alpha1.PlacementLeaseAnnotation: "run/run-uid"},
+	}}
+	client := vcfake.NewSimpleClientset(run.DeepCopy(), podGroup)
+	client.PrependReactor("update", "podgroups", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("simulated PodGroup API outage")
+	})
+	engine := &Engine{volcanoClient: client}
+
+	if err := engine.cleanupPlacement(context.Background(), run.DeepCopy()); err == nil {
+		t.Fatal("cleanupPlacement() error = nil, want lease cleanup failure")
+	}
+	updatedRun, err := client.RepackV1alpha1().RepackRuns().Get(
+		context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updatedRun.Status.Relocations) != 1 ||
+		updatedRun.Status.Relocations[0].Eviction.Phase != repackv1alpha1.PodEvictionPending {
+		t.Fatalf("unperformed journal must remain as cleanup recovery evidence: %+v", updatedRun.Status.Relocations)
+	}
+	if enginestatus.ResolveStage(updatedRun) != enginestatus.StageCleanup {
+		t.Fatalf("stage=%q, want failed cleanup to remain recoverable", enginestatus.ResolveStage(updatedRun))
+	}
+}
+
+func TestCleanupPlacementPreservesAttemptedExecutionJournal(t *testing.T) {
+	run := &repackv1alpha1.RepackRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "run", UID: types.UID("run-uid"),
+			Labels: map[string]string{repackv1alpha1.PlacementActiveLabel: "true"},
+		},
+		Spec: repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
+		Status: repackv1alpha1.RepackRunStatus{
+			Phase: repackv1alpha1.RepackSucceeded,
+			Relocations: []repackv1alpha1.PodRelocationStatus{{
+				Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			}},
+		},
+	}
+	client := vcfake.NewSimpleClientset(run.DeepCopy())
+	engine := &Engine{volcanoClient: client}
+
+	if err := engine.cleanupPlacement(context.Background(), run.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := client.RepackV1alpha1().RepackRuns().Get(context.Background(), run.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Status.Relocations) != 1 ||
+		updated.Status.Relocations[0].Eviction.Phase != repackv1alpha1.PodEvictionAccepted {
+		t.Fatalf("attempted execution journal must be retained: %+v", updated.Status.Relocations)
+	}
+	if updated.Labels[repackv1alpha1.PlacementActiveLabel] != "" {
+		t.Fatalf("placement-active label was not cleared: %+v", updated.Labels)
+	}
+	if enginestatus.ResolveStage(updated) != enginestatus.StageNone {
+		t.Fatalf("stage=%q, want completed cleanup to stop reconciling", enginestatus.ResolveStage(updated))
 	}
 }
 

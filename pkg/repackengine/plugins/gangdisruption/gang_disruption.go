@@ -56,6 +56,15 @@ type gangDisruptionPlugin struct {
 	futureResource        v1.ResourceName
 }
 
+// podGroupDisruption is the Gang policy's interpretation of moving Pods from
+// one PodGroup. It deliberately stays private to this plugin: treating a
+// minAvailable breach as damage to the whole footprint is a scoring policy,
+// not a fact of the shared candidate model.
+type podGroupDisruption struct {
+	breached        bool
+	damagedResource int64
+}
+
 func newPlugin(arguments framework.Arguments) framework.Plugin {
 	return &gangDisruptionPlugin{
 		gangBreachesWeight:    configuredWeight(arguments, argGangBreachesWeight, weightGangBreaches),
@@ -138,10 +147,10 @@ func (p *gangDisruptionPlugin) futureMovesForReceiver(
 func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 	var breachedGangs int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
-		disruption := api.MeasurePodGroupDisruption(
+		disruption := measurePodGroupDisruption(
 			ctx.PodGroupView(podGroupID), moved.MovedPods, moved.MovedResource,
 		)
-		if disruption.Breached {
+		if disruption.breached {
 			breachedGangs++
 		}
 	}
@@ -154,10 +163,10 @@ func scoreGangBreaches(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 	var damagedResource int64
 	for podGroupID, moved := range p.MoveAggregate(ctx).ByPodGroup {
-		disruption := api.MeasurePodGroupDisruption(
+		disruption := measurePodGroupDisruption(
 			ctx.PodGroupView(podGroupID), moved.MovedPods, moved.MovedResource,
 		)
-		damagedResource += disruption.DamagedResource
+		damagedResource += disruption.damagedResource
 	}
 	return damagedResource
 }
@@ -189,16 +198,27 @@ func scoreFutureReceiverImpact(
 			affected++
 		}
 		view := ctx.PodGroupView(podGroup)
-		before := api.MeasurePodGroupDisruption(view, movedPodsBefore, movedResourceBefore)
-		after := api.MeasurePodGroupDisruption(view, afterMovedPods, afterMovedResource)
-		if !before.Breached && after.Breached {
+		before := measurePodGroupDisruption(view, movedPodsBefore, movedResourceBefore)
+		after := measurePodGroupDisruption(view, afterMovedPods, afterMovedResource)
+		if !before.breached && after.breached {
 			breaches++
 		}
-		damagedResource += after.DamagedResource - before.DamagedResource
+		damagedResource += after.damagedResource - before.damagedResource
 		movedResource += futureMove.MovedResource
 		movedPods += futureMove.MovedPods
 	}
 	return framework.ReceiverRank{breaches, affected, damagedResource, movedResource, movedPods}
+}
+
+func measurePodGroupDisruption(view api.PodGroupView, movedPods, movedResource int64) podGroupDisruption {
+	slack := int64(view.Running) - int64(view.MinAvailable)
+	if slack < 0 {
+		slack = 0
+	}
+	if movedPods > slack {
+		return podGroupDisruption{breached: true, damagedResource: view.Footprint}
+	}
+	return podGroupDisruption{damagedResource: movedResource}
 }
 
 func aggregateTasksByPodGroup(

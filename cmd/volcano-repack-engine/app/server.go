@@ -118,6 +118,7 @@ func Run(opt *options.ServerOption) error {
 		return err
 	}
 	broadcaster := record.NewBroadcaster()
+	defer broadcaster.Shutdown()
 	broadcaster.StartRecordingToSink(&corev1.EventSinkImpl{Interface: leaderElectionClient.CoreV1().Events(opt.LeaderElection.ResourceNamespace)})
 	eventRecorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: componentName})
 

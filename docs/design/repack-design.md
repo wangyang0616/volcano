@@ -48,7 +48,7 @@ flowchart LR
 组件职责：
 
 - **API Server**：保存 Run 和运行对象；CRD/CEL 校验 `mode`、单目标资源和 spec 不可变等规则；
-- **Repack Engine**：Run 生命周期驱动者，负责快照、规划、计划持久化、Eviction、实时接收节点选择和结果度量；
+- **Repack Engine**：Run 生命周期驱动者；Runtime 负责工作队列、门禁和持久化执行能力，Repack Action 负责编排规划、DryRun/Execute 分流、Eviction、实时接收节点选择和结果度量；
 - **Repack controller**：默认内置于 Volcano Controller Manager，负责 TTL、PodGroup placement lease、替身 Pod 认领、gate 释放、nomination 和实际绑定观察；
 - **Volcano Scheduler**：对重建 Pod 执行真实调度和绑定；
 - **工作负载控制器**：在 Pod 被驱逐后负责重建业务 Pod，Repack 不直接创建业务实例。
@@ -59,18 +59,20 @@ Engine 和 controller 只通过 Kubernetes 对象协作，不建立私有 RPC。
 
 ```mermaid
 flowchart TB
-    D["Engine Runtime\nwatch、gate、status、Execute"] --> S["Engine Session"]
-    S --> A["Action: repack\n度量 → 规划 → 收益准入 → 报告"]
+    D["Engine Runtime\nwatch、workqueue、gate"] --> C["ActionContext\nRun + Runtime ports"]
+    C --> A["Action: repack\n规划 → 模式分流 → 执行/恢复 → 终态"]
+    A --> S["Planning Session\n按需打开，只读快照"]
     S --> P["Plugins\nScope / Budget / Domain / Score / Rank"]
     A --> L["Lazy Drain Planner\n候选、惰性模拟、增量提交"]
+    A --> X["Execution Runtime\nstatus barrier / eviction / placement"]
     L --> SA["Snapshot Adapter\nScheduler Session + 完整 Filter"]
     SA --> SC["Scheduler Cache"]
 ```
 
 各层职责必须保持清晰：
 
-- Engine Runtime 管理外部副作用、工作队列与持久状态；
-- Action 表达稳定业务流程；
+- Engine Runtime 管理 informer、工作队列、Execute 门禁，并通过 Runtime 接口提供持久化和执行原语；
+- Action 是单次 RepackRun 的唯一业务入口，表达稳定工作流并决定 DryRun/Execute 路径；
 - Plugin 表达可组合的场景策略；
 - Planner 只负责通用搜索和增量状态；
 - Adapter 将 Scheduler Session 暴露为 Repack 所需的只读快照与可行性接口；
@@ -233,9 +235,11 @@ Conditions 是权威状态：
 
 - 请求目标扩展资源；
 - `schedulerName` 属于 Engine 复用的 Volcano Scheduler；
-- 能映射到 Scheduler `JobInfo`/PodGroup；
+- 具有规范的 `namespace/name` PodGroup 身份，且与 Pod namespace 一致；
 - 位于 `scope.podGroups` 授权范围；
 - 不是不可重建或其他 Movable Plugin 否决的对象。
+
+该 PodGroup 身份校验属于 Framework 的不可关闭安全边界，不依赖 `workloadscope`。Execute 在生成 relocation journal 时再次校验，校验失败不会进入 Eviction；后续 placement lease 准备负责确认 PodGroup 对象仍然存在。
 
 不请求目标资源的 DaemonSet、系统 Pod 和普通 Pod 不参与迁移，也不会因为自身存在阻止目标资源腾空。请求目标资源但不可移动的 Pod 会使所在 Unit 不可腾空。
 
@@ -286,13 +290,13 @@ damagedResource(g) = movedResource(g),  if not breached
 
 当前实现只有 `repack` Action：
 
-1. 计算整理前碎片；
-2. 调用 Lazy Drain Planner；
-3. 通过 Session constraint 检查完整计划收益；
-4. 汇总工作负载影响与迁移成本；
-5. 生成 plan/report 交给 Engine Runtime 持久化。
+1. 根据 RepackRun 的持久化状态识别 Planning、Evicting、Placing 或 Cleanup 阶段；
+2. Planning 阶段按需打开 Session，调用 Lazy Drain Planner，并通过 constraint 检查完整计划收益；
+3. 持久化 plan/report，然后根据 `mode` 进入 DryRun 终态或 Execute；
+4. Execute 在持久化 relocation journal 和 placement lease 后调用 Eviction Runtime；
+5. 后续 Reconcile 仍进入同一 Action，由 Action 恢复 eviction journal、跟踪 replacement placement 并完成终态清理。
 
-Action 不直接调用 Eviction。Execute 副作用只在 plan 和 relocation journal 持久化后由 Engine Runtime 提交。
+Engine 的 `reconcile` 是控制器技术入口，负责对象读取、K=1 gate 和 ActionResult 重试；Repack Action 是业务入口。Planner 不感知执行模式，DryRun 和 Execute 使用相同计划语义。Runtime 只提供状态写入、Eviction 和 placement 等可靠执行原语，不决定业务调用顺序。Eviction/placement Runtime 通过 `RuntimeResult` 返回立即或延迟重试意图，只有 Engine 修改 workqueue；Action 在进入持久化 Execute 屏障前同步标记执行槽，即使 Runtime panic，也不会错误释放执行槽或提前进入 cooldown。
 
 ### 7.2 Session 扩展点
 
@@ -309,11 +313,13 @@ Action 不直接调用 Eviction。Execute 副作用只在 plan 和 relocation jo
 
 Plugin 配置顺序不表达策略优先级。Framework 复制配置并按插件名规范化后打开 Session，确保 YAML 重排不改变结果。
 
+Plugin 回调可以保持简洁，但策略语义必须由对应 Plugin 拥有。`api` 只提供不可变候选视图和迁移 Pod 数、目标资源量、受影响 PodGroup 等客观摘要，供多个 Plugin 共享且避免重复扫描；如何解释这些事实属于 Plugin，例如“突破 `minAvailable` 后按整个 PodGroup 资源量计算损失”只由 `gangdisruption` 定义。Planner 只维护搜索状态和不可关闭的正确性边界，不承载 Scope、Gang 或装箱偏好。
+
 ### 7.3 内置 Plugin
 
 | Plugin | 责任 | 关闭后的影响 |
 |---|---|---|
-| `workloadscope` | 工作负载授权边界 | 不应用用户工作负载 Scope |
+| `workloadscope` | 工作负载授权边界 | 不应用用户工作负载 Scope；合法 PodGroup 身份基础边界仍生效 |
 | `repackbudget` | `maxPerRun` 候选过滤 | 不应用对应预算 |
 | `nodeconsolidation` | 提供部分占用 Node Unit | 当前无 Domain，Action 配置校验失败 |
 | `workloaddisruption` | 工作负载数、迁移资源、Pod 数评分 | 关闭通用中断偏好 |
@@ -570,9 +576,11 @@ Engine 采用单 worker 和 K=1 Execute gate：
 
 - Running 且 plan 未持久化：允许重新规划；
 - plan/relocations 已持久化：禁止重算并覆盖，恢复 eviction journal；
+- Execute 准备阶段的基础设施错误：保留全 `Pending` relocation journal 并重试；已写入的 lease 可重复回滚；
 - concrete replacement 消失：清除失效 claim，允许新 Pod 接续；
 - replacement PodGroup 重建：推进 generation mapping；
-- Run 已终态或删除：清理 lease、gate 和 active index；
+- Run 已终态或删除：幂等清理 lease、gate 和 active index；重复执行不会影响其他 Run 的 lease；
+- 准备阶段尚未发起 Eviction 的终态 Run：外部清理成功后再清除全 `Pending` journal；已尝试执行的 journal 保留用于审计；
 - terminal status 写失败：重试相同终态投影，不重新执行副作用。
 
 ### 10.3 优雅退出
@@ -583,10 +591,10 @@ Engine 采用单 worker 和 K=1 Execute gate：
 2. 停止接收新 work item；
 3. 让进行中的 API 请求感知取消；
 4. 关闭 scheduler cache、informers 和 workqueue；
-5. 调用 event broadcaster `Stop()`；
+5. 调用 event broadcaster `Shutdown()`；
 6. 等待 worker 退出。
 
-当前实现已使用根 context 停止 Engine 主循环、scheduler cache、informers 和 workqueue，但仍有两项需要继续收敛：`hooksFor` 内的 Eviction 请求使用 `context.Background()`，不能响应 Engine shutdown；Engine 和 leader-election 创建的 event broadcaster 没有保存为可停止的生命周期成员。实现这两项前，不能把“进行中 Eviction 可取消”和“broadcaster goroutine 已回收”作为现有保证。
+当前实现将根 context 透传给 Eviction API，并在 Engine 与 leader-election 生命周期结束时关闭各自的 event broadcaster；主循环、scheduler cache、informers、workqueue 和进行中的 Eviction 请求均响应同一 shutdown 信号。
 
 锁只保护 Execute gate、冷却锚点和极少量跨回调共享状态；单 worker 所有的 map 不重复加锁，避免无效同步开销。
 
@@ -662,7 +670,7 @@ Engine 对 plan computed、execute prepared、eviction accepted/rejected 和 ter
 | Scope 解析失败 | Run Failed，不驱逐 |
 | 无可行候选 | 正常以 `InsufficientImprovement` 完成 |
 | plan 状态写失败 | 不进入 Eviction，重试持久化 |
-| lease 或 active index 写失败 | 不驱逐，清理已准备 lease |
+| lease 或 active index 写失败 | 不驱逐；保留全 `Pending` journal 并重试准备，已写 lease 可幂等回滚；进入终态后先完成外部清理，再清除未执行 journal |
 | Eviction 被 PDB 拒绝 | relocation 记 Rejected；根据接受情况汇总最终结果 |
 | replacement 未出现 | 等待至 expirationTime，随后 TimedOut 并释放 gate |
 | Scheduler 选择其他节点 | 记录 selected/actual 差异并验证计划源节点是否真正释放 |
@@ -702,22 +710,28 @@ pkg/repackengine/
   repackengine.go                          # 稳定对外门面，仅暴露 Config、Engine、NewEngine
   conf/                                    # 独立配置模型、默认值、严格解析与能力校验
   cache/                                   # Scheduler Cache 构建、运行和只读 Session 生命周期
-  actions/repack/                          # Action 主流程
+  actions/repack/                          # 完整 Repack Action：规划、模式分流、执行与恢复编排
   planner/drain/                           # Lazy Drain Planner 与性能基准
   plugins/                                 # 场景策略
-  framework/                               # Session、Action、Plugin、回调聚合
+  framework/                               # Session、Action、Plugin 及候选/受害者/接收节点扩展契约
+    session.go                             # 按需创建的单轮 Planning Session 与插件生命周期
+    action.go / plugin.go                  # ActionContext/ActionResult/Runtime、Plugin 接口及注册表
+    candidate.go                           # 腾空候选过滤、受害 Pod 排序与中断评分扩展点
+    receiver.go                            # 接收节点集合与优先级扩展点
+    constraint.go                          # 最终计划约束扩展点
   adapter/                                 # Scheduler Session/Snapshot 适配
-  api/                                     # 纯模型、碎片度量、中断聚合
+  api/                                     # 策略无关模型、候选迁移摘要、资源事实与规划报告
+  scope/                                   # 节点和工作负载 Scope 的编译与匹配
   executor/eviction/                       # Eviction API 请求构造和错误归一化
   executor/placement/                      # replacement 落点判定、终态收益判定和 identity
-  status/                                  # status 投影、用户消息、冲突合并与持久化
+  status/                                  # status 投影、工作流阶段解析、用户消息、冲突合并与持久化
   metrics/                                 # Engine 指标
   internal/engine/                         # 不对外暴露的 Engine 运行时实现
     runtime.go                             # Engine 结构、构造、Informer 接线与 Run 生命周期
     configuration.go                       # Scheduler/Repack 配置加载
-    reconcile.go                           # Workqueue、候选状态机与单 Run 协调入口
+    reconcile.go                           # Workqueue、Execute gate、RunActions 与 ActionResult 处理
+    action_runtime.go                      # Action 所需 Session、状态和执行 Runtime 适配
     recovery.go                            # 终态写入恢复与异常 Running Run 恢复
-    planning.go                            # 打开 Session、执行 Action、持久化计划准备屏障
     gate.go                                # Execute K=1 与 cooldown
     eviction_reconcile.go                  # Eviction journal 的执行和逐 Pod 持久化
     eviction_journal.go                    # journal 查询、汇总和恢复辅助逻辑
@@ -734,7 +748,7 @@ pkg/scheduler/                              # 复用的 cache/framework/filter
 test/e2e/repack/                            # 全量 E2E
 ```
 
-根包不承载规划、驱逐或状态机实现，`cmd` 和外部调用方只依赖稳定门面。`internal/engine` 只编排 Run 生命周期、持久化屏障、工作队列和 Kubernetes 写操作；可复用的 Eviction、placement 与 status 逻辑分别由 `executor` 和 `status` 承载。新增规划策略优先扩展 Plugin，同一文件只维护同一类状态与副作用，避免再次形成同时包含配置、缓存、规划和执行的大型入口文件。
+根包不承载规划、驱逐或状态机实现，`cmd` 和外部调用方只依赖稳定门面。`internal/engine` 负责控制器生命周期并实现 Action 使用的 Runtime 原语；完整业务调用顺序集中在 `actions/repack`。可复用的 Eviction、placement 与 status 逻辑分别由 `executor` 和 `status` 承载。新增规划策略优先扩展 Plugin，同一文件只维护同一类状态与副作用，避免再次形成同时包含配置、缓存、规划和执行的大型入口文件。
 
 ## 16. 演进边界
 

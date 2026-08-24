@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -62,13 +63,21 @@ func (f *fakeSnap) NodeInScope(n *schedapi.NodeInfo) bool {
 	return !f.notInScope[n.Name]
 }
 func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
-	return f.views[id]
+	if view, found := f.views[id]; found {
+		return view
+	}
+	// Most historical fixtures key views by the short PodGroup name. Tasks use
+	// the production namespace/name JobID form so the mandatory Repack ownership
+	// boundary is exercised by every planner test.
+	if separator := strings.IndexByte(string(id), '/'); separator >= 0 {
+		return f.views[schedapi.JobID(string(id)[separator+1:])]
+	}
+	return api.PodGroupView{}
 }
 
 // FeasibleRelocation is a capacity-only stand-in for the scheduler feasibility check: every
-// node "fits" (no predicate constraints in tests), so feasibility is pure TargetResource
-// capacity (Allocatable − Used − pods already placed this pass), solved with the
-// pure api.Domain best-fit solver.
+// node "fits" (no predicate constraints in tests), so feasibility is pure target-resource
+// capacity (Allocatable − Used − pods already placed this pass).
 func (f *fakeSnap) FeasibleRelocation(_ context.Context, committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool) {
 	f.feasibilityCalls++
 	if len(victims) > 0 && f.infeasibleSources[victims[0].NodeName] {
@@ -81,22 +90,49 @@ func (f *fakeSnap) FeasibleRelocation(_ context.Context, committed []*api.Move, 
 			placed[m.To] += api.Scalar(m.Task.InitResreq, res)
 		}
 	}
-	return api.NewDomain(receivers, capacityPolicy{resource: res, placed: placed}).Feasible(victims)
+	return placeByCapacity(victims, receivers, res, placed)
 }
 
-// capacityPolicy is the test ReceiverPolicy: capacity minus pods already placed
-// this pass, no Fit constraint, neutral (best-fit) preference.
-type capacityPolicy struct {
-	resource v1.ResourceName
-	placed   map[string]int64
+// placeByCapacity is a small test double for the production scheduler-faithful
+// Snapshot implementation. It performs exhaustive target-resource placement
+// without creating a second exported feasibility engine.
+func placeByCapacity(victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo, resource v1.ResourceName, placed map[string]int64) ([]*api.Move, bool) {
+	ordered := append([]*schedapi.TaskInfo(nil), victims...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return api.Scalar(ordered[i].InitResreq, resource) > api.Scalar(ordered[j].InitResreq, resource)
+	})
+	remaining := make(map[string]int64, len(receivers))
+	for _, receiver := range receivers {
+		remaining[receiver.Name] = api.Scalar(receiver.Allocatable, resource) -
+			api.Scalar(receiver.Used, resource) - placed[receiver.Name]
+	}
+	moves := make([]*api.Move, 0, len(ordered))
+	var assign func(int) bool
+	assign = func(index int) bool {
+		if index == len(ordered) {
+			return true
+		}
+		victim := ordered[index]
+		requested := api.Scalar(victim.InitResreq, resource)
+		for _, receiver := range receivers {
+			if remaining[receiver.Name] < requested {
+				continue
+			}
+			remaining[receiver.Name] -= requested
+			moves = append(moves, &api.Move{Task: victim, From: victim.NodeName, To: receiver.Name})
+			if assign(index + 1) {
+				return true
+			}
+			moves = moves[:len(moves)-1]
+			remaining[receiver.Name] += requested
+		}
+		return false
+	}
+	if !assign(0) {
+		return nil, false
+	}
+	return moves, true
 }
-
-func (p capacityPolicy) Free(n *schedapi.NodeInfo) *schedapi.Resource {
-	free := api.Scalar(n.Allocatable, p.resource) - api.Scalar(n.Used, p.resource) - p.placed[n.Name]
-	return scalarRes(p.resource, free)
-}
-func (p capacityPolicy) Fit(*schedapi.TaskInfo, *schedapi.NodeInfo) bool { return true }
-func (p capacityPolicy) Prefer(*schedapi.NodeInfo) int                   { return 0 }
 
 func gpuRes(n int64) *schedapi.Resource { return scalarRes(gpu, n) }
 
@@ -105,7 +141,12 @@ func scalarRes(name v1.ResourceName, n int64) *schedapi.Resource {
 }
 
 func gpuTask(name, gang string, g int64) *schedapi.TaskInfo {
-	return &schedapi.TaskInfo{Name: name, Job: schedapi.JobID(gang), InitResreq: gpuRes(g)}
+	jobID := gang
+	if !strings.ContainsRune(jobID, '/') {
+		jobID = "ns/" + jobID
+	}
+	namespace := jobID[:strings.IndexByte(jobID, '/')]
+	return &schedapi.TaskInfo{Name: name, Namespace: namespace, Job: schedapi.JobID(jobID), InitResreq: gpuRes(g)}
 }
 
 // sysTask is a non-accelerator pod (e.g. a system DaemonSet): CPU-only request,
@@ -123,12 +164,6 @@ func capNode(name string, capGPU int64, tasks ...*schedapi.TaskInfo) *schedapi.N
 		used += int64(t.InitResreq.ScalarResources[gpu] + 0.5)
 	}
 	return &schedapi.NodeInfo{Name: name, Tasks: m, Allocatable: gpuRes(capGPU), Used: gpuRes(used)}
-}
-
-// freeByCapMinusUsed gives each node free TargetResource = Allocatable − Used, so tests need
-// not wrangle NodeInfo.Idle/FutureIdle.
-func freeByCapMinusUsed(n *schedapi.NodeInfo) *schedapi.Resource {
-	return gpuRes(int64(n.Allocatable.ScalarResources[gpu] - n.Used.ScalarResources[gpu]))
 }
 
 // nodeUnits is the node-domain contribution (one single-node unit per in-scope
@@ -157,7 +192,6 @@ func drainSessionWithPlugins(snap framework.Snapshot, movable framework.MovableF
 		MinNodesFreed: minFreed,
 		MaxPodGroups:  maxPG,
 		MaxResource:   maxRes,
-		Free:          freeByCapMinusUsed,
 	}, framework.PluginOptions(plugins...))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(movable)
@@ -228,7 +262,6 @@ func TestDrainStopsBeforeSimulationWhenContextIsCancelled(t *testing.T) {
 		Resource:      gpu,
 		Mode:          repackv1alpha1.RepackModeDryRun,
 		MinNodesFreed: 1,
-		Free:          freeByCapMinusUsed,
 	}, framework.PluginOptions("repackbudget", "binpack"))
 	defer framework.CloseSession(ssn)
 	ssn.AddDomainFn(nodeUnits)
@@ -355,7 +388,7 @@ func TestDrain_PreservesAlreadyAffectedGangNodesForLaterDrain(t *testing.T) {
 		t.Fatalf("freed=%v, want %s: continue draining the already affected job", freed, want)
 	}
 	for _, move := range realMoves(plan) {
-		if move.Task.Job != "job-a" {
+		if move.Task.Job != "ns/job-a" {
 			t.Fatalf("move=%s/%s:%s->%s affects a second job; all moves must remain within job-a",
 				move.Task.Job, move.Task.Name, move.From, move.To)
 		}
@@ -586,7 +619,7 @@ func TestDrain_BaseEligibilityExcludesEmptyAndFullNodesWithoutBinpack(t *testing
 		capNode("full", 8, gpuTask("full", "full-group", 8)),
 	}}
 	ssn := framework.OpenSession(framework.SessionConfig{
-		Snapshot: snap, Resource: gpu, MinNodesFreed: 1, Free: freeByCapMinusUsed,
+		Snapshot: snap, Resource: gpu, MinNodesFreed: 1,
 	}, nil)
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
@@ -623,7 +656,7 @@ func TestDrain_OnlyEmptyAndFullNodesSkipsSimulation(t *testing.T) {
 		capNode("full", 8, gpuTask("full", "full-group", 8)),
 	}}
 	ssn := framework.OpenSession(framework.SessionConfig{
-		Snapshot: snap, Resource: gpu, MinNodesFreed: 1, Free: freeByCapMinusUsed,
+		Snapshot: snap, Resource: gpu, MinNodesFreed: 1,
 	}, nil)
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
@@ -656,7 +689,6 @@ func TestDrain_ExplicitZeroBudgetBlocks(t *testing.T) {
 		MinNodesFreed:  1,
 		MaxPodGroups:   0,
 		LimitPodGroups: true,
-		Free:           freeByCapMinusUsed,
 	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
@@ -673,7 +705,7 @@ func TestDrain_FrozenNodeSkippedAsTarget(t *testing.T) {
 	b := gpuTask("b", "g-b", 6)
 	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{capNode("n0", 8, a), capNode("n1", 8, b)}}
 
-	frozen := func(t *schedapi.TaskInfo) bool { return t.Job != "g-a" } // g-a frozen
+	frozen := func(t *schedapi.TaskInfo) bool { return t.Job != "ns/g-a" } // g-a frozen
 	plan, ok := finalizedPlan(drainSession(snap, frozen, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected n1 to be freed (n0 frozen but usable as receiver)")
@@ -746,7 +778,7 @@ func TestDrain_PrefersStayingReceiver(t *testing.T) {
 		capNode("n3", 8, gpuTask("m", "g-m", 2)),
 		capNode("n2", 8, gpuTask("f", "g-f", 2)),
 	}}
-	movable := func(tk *schedapi.TaskInfo) bool { return tk.Job != "g-f" } // g-f frozen
+	movable := func(tk *schedapi.TaskInfo) bool { return tk.Job != "ns/g-f" } // g-f frozen
 	plan, ok := finalizedPlan(drainSession(snap, movable, 1, 0, 0))
 	if !ok || plan == nil {
 		t.Fatal("expected a feasible plan")
@@ -813,6 +845,24 @@ func TestDrain_SystemPodDoesNotBlockFreeing(t *testing.T) {
 	}
 }
 
+// A target-resource Pod without a PodGroup is outside Repack's execution
+// contract even when workloadscope is disabled. Its node must never become a
+// drain target because no PodGroup lease or replacement tracking can protect
+// the eviction.
+func TestDrain_TargetResourcePodWithoutPodGroupBlocksFreeing(t *testing.T) {
+	unmanaged := &schedapi.TaskInfo{Name: "kube-scheduled-npu", InitResreq: gpuRes(2)}
+	receiverWorkload := gpuTask("receiver", "g-b", 8)
+	snap := &fakeSnap{nodes: []*schedapi.NodeInfo{
+		capNode("n0", 8, unmanaged),
+		capNode("n1", 8, receiverWorkload),
+	}}
+
+	plan, ok := finalizedPlan(drainSession(snap, allMovable, 1, 0, 0))
+	if ok || plan != nil {
+		t.Fatalf("plan=%+v ok=%t, want no plan for a target-resource Pod without PodGroup ownership", plan, ok)
+	}
+}
+
 // drainSessionFragGate mirrors drainSession but sets the per-run frag-improvement
 // gate (spec.goals[0].minFragImprovementPercent).
 func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework.Session {
@@ -822,7 +872,6 @@ func drainSessionFragGate(snap framework.Snapshot, minImprovePct int) *framework
 		Mode:                      repackv1alpha1.RepackModeDryRun,
 		MinNodesFreed:             1,
 		MinFragImprovementPercent: minImprovePct,
-		Free:                      freeByCapMinusUsed,
 	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)
@@ -857,7 +906,7 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{e2eNPU: n}}
 	}
 	npuTask := func(name, gang string, cards float64) *schedapi.TaskInfo {
-		return &schedapi.TaskInfo{Name: name, Job: schedapi.JobID(gang), InitResreq: npuRes(cards)}
+		return &schedapi.TaskInfo{Name: name, Namespace: "ns", Job: schedapi.JobID("ns/" + gang), InitResreq: npuRes(cards)}
 	}
 	capNPUNode := func(name string, cap, used float64, tasks ...*schedapi.TaskInfo) *schedapi.NodeInfo {
 		m := map[schedapi.TaskID]*schedapi.TaskInfo{}
@@ -871,10 +920,6 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 			Used:        npuRes(used),
 		}
 	}
-	freeNPU := func(n *schedapi.NodeInfo) *schedapi.Resource {
-		return npuRes(n.Allocatable.ScalarResources[e2eNPU] - n.Used.ScalarResources[e2eNPU])
-	}
-
 	a := npuTask("a", "g-a", 4000)
 	b := npuTask("b", "g-b", 2000)
 	snap := &fakeSnap{resource: e2eNPU, nodes: []*schedapi.NodeInfo{
@@ -884,7 +929,7 @@ func TestDrain_E2EMilliNPULayout(t *testing.T) {
 	}}
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Snapshot: snap, Resource: e2eNPU,
-		MinNodesFreed: 1, Free: freeNPU,
+		MinNodesFreed: 1,
 	}, framework.PluginOptions("repackbudget", "binpack"))
 	ssn.AddDomainFn(nodeUnits)
 	ssn.AddMovableFn(allMovable)

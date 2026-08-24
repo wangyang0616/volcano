@@ -40,7 +40,7 @@ func TestFeasibleRelocationStopsOnCancelledContext(t *testing.T) {
 	}
 }
 
-// SessionSnapshot.PodGroupView reads MinAvailable/Running/Priority/Footprint off
+// SessionSnapshot.PodGroupView reads MinAvailable/Running/Footprint off
 // the live JobInfos; unknown gangs yield a zero view.
 func TestSessionSnapshot_PodGroupView(t *testing.T) {
 	tasks := schedapi.TasksMap{
@@ -61,7 +61,7 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 
 	got := snap.PodGroupView("ns/big")
 	want := api.PodGroupView{
-		MinAvailable: 2, Running: 2, Priority: 10, Footprint: 8,
+		MinAvailable: 2, Running: 2, Footprint: 8,
 	}
 	if got != want {
 		t.Errorf("view=%+v want %+v", got, want)
@@ -113,6 +113,7 @@ func TestSessionSnapshot_Nodes(t *testing.T) {
 func TestSessionSnapshot_ReceiverHasTargetResourceCapacity(t *testing.T) {
 	snap := &SessionSnapshot{resource: gpu}
 	node := capNode("n0", 8)
+	node.Used = gpuRes(2)
 	node.Idle = gpuRes(6)
 	node.Releasing = schedapi.EmptyResource()
 	node.Pipelined = schedapi.EmptyResource()
@@ -122,5 +123,10 @@ func TestSessionSnapshot_ReceiverHasTargetResourceCapacity(t *testing.T) {
 	}
 	if snap.receiverHasTargetResourceCapacity(gpuTask(0, "", 5), node, []*schedapi.TaskInfo{gpuTask(1, "", 2)}) {
 		t.Fatal("5 GPUs must not fit after 2 GPUs already placed on a receiver with 6 GPUs free")
+	}
+
+	node.Idle = schedapi.EmptyResource()
+	if !snap.receiverHasTargetResourceCapacity(gpuTask(0, "", 4), node, nil) {
+		t.Fatal("4 GPUs should fit from Allocatable-Used even when Idle lacks the extended resource")
 	}
 }

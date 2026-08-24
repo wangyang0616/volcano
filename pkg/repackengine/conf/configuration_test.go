@@ -21,7 +21,6 @@ import (
 	"strings"
 	"testing"
 
-	_ "volcano.sh/volcano/pkg/repackengine/actions/repack"
 	"volcano.sh/volcano/pkg/repackengine/framework"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/gangdisruption"
@@ -32,6 +31,24 @@ import (
 )
 
 type capabilityTestPlugin struct{ name string }
+
+type configurationTestAction struct{}
+
+func (*configurationTestAction) Name() string { return framework.ActionRepack }
+
+func (*configurationTestAction) Execute(*framework.ActionContext) framework.ActionResult {
+	return framework.ActionResult{Stop: true}
+}
+
+func init() {
+	// Configuration validation only needs the action's declared capability.
+	// Registering a local stub keeps this package independent of the concrete
+	// Repack action and prevents a status -> conf -> action -> status test cycle.
+	framework.RegisterAction(framework.ActionRepack, framework.ActionRegistration{
+		Factory:  func() framework.Action { return &configurationTestAction{} },
+		Requires: []framework.PluginCapability{framework.CapabilityDomain},
+	})
+}
 
 func (p *capabilityTestPlugin) Name() string                    { return p.name }
 func (*capabilityTestPlugin) OnSessionOpen(*framework.Session)  {}

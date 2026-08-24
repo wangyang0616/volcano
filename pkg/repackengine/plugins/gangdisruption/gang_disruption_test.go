@@ -63,19 +63,42 @@ func gangCtx() *api.PlanContext {
 	}
 }
 
+func TestMeasurePodGroupDisruptionBelongsToGangPolicy(t *testing.T) {
+	view := api.PodGroupView{Running: 4, MinAvailable: 2, Footprint: 16}
+	tests := []struct {
+		name                string
+		movedPods           int64
+		movedResource       int64
+		wantBreached        bool
+		wantDamagedResource int64
+	}{
+		{name: "within running slack", movedPods: 2, movedResource: 8, wantDamagedResource: 8},
+		{name: "breaches minAvailable", movedPods: 3, movedResource: 12, wantBreached: true, wantDamagedResource: 16},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := measurePodGroupDisruption(view, test.movedPods, test.movedResource)
+			if got.breached != test.wantBreached || got.damagedResource != test.wantDamagedResource {
+				t.Fatalf("disruption=%+v, want breached=%v damagedResource=%d",
+					got, test.wantBreached, test.wantDamagedResource)
+			}
+		})
+	}
+}
+
 // ScoreDamagedResource is a step function: within slack only the moved cards count;
 // once minAvailable is breached the whole gang Footprint counts.
 func TestScoreDamagedGPU_StepFunction(t *testing.T) {
 	ctx := gangCtx()
 
-	within := &api.CandidatePlan{Moves: []*api.Move{mv(tk("p0", "ns/g", 2))}} // 1 pod ≤ slack 1
+	within := api.NewCandidatePlan(nil, []*api.Move{mv(tk("p0", "ns/g", 2))}) // 1 pod ≤ slack 1
 	if s := scoreDamagedResource(ctx, within); s != 2 {
 		t.Errorf("within slack: damaged=%v, want 2 (moved cards)", s)
 	}
 
-	breach := &api.CandidatePlan{Moves: []*api.Move{
+	breach := api.NewCandidatePlan(nil, []*api.Move{
 		mv(tk("p0", "ns/g", 2)), mv(tk("p1", "ns/g", 2)), // 2 pods > slack 1
-	}}
+	})
 	if s := scoreDamagedResource(ctx, breach); s != 8 {
 		t.Errorf("breach: damaged=%v, want 8 (whole footprint)", s)
 	}
@@ -85,14 +108,14 @@ func TestScoreDamagedGPU_StepFunction(t *testing.T) {
 func TestScoreGangBreaches(t *testing.T) {
 	ctx := gangCtx()
 
-	noBreach := &api.CandidatePlan{Moves: []*api.Move{mv(tk("p0", "ns/g", 1))}} // 1 ≤ slack 1
+	noBreach := api.NewCandidatePlan(nil, []*api.Move{mv(tk("p0", "ns/g", 1))}) // 1 ≤ slack 1
 	if s := scoreGangBreaches(ctx, noBreach); s != 0 {
 		t.Errorf("no breach: %v, want 0", s)
 	}
 
-	breach := &api.CandidatePlan{Moves: []*api.Move{
+	breach := api.NewCandidatePlan(nil, []*api.Move{
 		mv(tk("p0", "ns/g", 1)), mv(tk("p1", "ns/g", 1)), // 2 > slack 1
-	}}
+	})
 	if s := scoreGangBreaches(ctx, breach); s != 1 {
 		t.Errorf("breach: %v, want 1", s)
 	}
@@ -100,9 +123,8 @@ func TestScoreGangBreaches(t *testing.T) {
 
 func TestScoreFutureReceiverImpactUsesMarginalGangCost(t *testing.T) {
 	ctx := gangCtx()
-	candidate := &framework.PlanningCandidate{Plan: &api.CandidatePlan{
-		Moves: []*api.Move{mv(tk("p0", "ns/g", 2))}, // consumes the gang's one-pod slack
-	}}
+	candidate := &framework.PlanningCandidate{Plan: api.NewCandidatePlan(nil,
+		[]*api.Move{mv(tk("p0", "ns/g", 2))})} // consumes the gang's one-pod slack
 	receiver := &framework.ReceiverCandidate{}
 	futureMoves := map[schedapi.JobID]api.PodGroupMoveAggregate{
 		"ns/g": {MovedPods: 1, MovedResource: 2},

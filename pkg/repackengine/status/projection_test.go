@@ -30,7 +30,7 @@ import (
 	state "volcano.sh/repack-controller/pkg/state"
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
-	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	enginescope "volcano.sh/volcano/pkg/repackengine/scope"
 	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
@@ -140,7 +140,7 @@ func TestMovesOf(t *testing.T) {
 }
 
 func TestSummaryOf(t *testing.T) {
-	s := enginestatus.BuildRepackSummary(engineframework.Report{FragmentationRateBefore: 0.4, FragmentationRateAfter: 0.2, NodesFreed: 3})
+	s := enginestatus.BuildRepackSummary(engineapi.Report{FragmentationRateBefore: 0.4, FragmentationRateAfter: 0.2, NodesFreed: 3})
 	if s.FragBeforePercent != 40 || s.FragAfterPercent != 20 || s.FreedNodeCount != 3 {
 		t.Errorf("summary=%+v", s)
 	}
@@ -218,7 +218,7 @@ func TestBuildResolvedScope(t *testing.T) {
 		},
 		{Name: "cpu-only", Allocatable: schedapi.EmptyResource()},
 	}
-	scope, err := engineframework.NewScopeMatcher(
+	scope, err := enginescope.NewMatcher(
 		&repackv1alpha1.RepackScope{
 			PodGroups: &repackv1alpha1.RepackSelectorTerm{
 				Include: &repackv1alpha1.RepackSelector{Names: []string{"ns/a"}},
@@ -346,6 +346,27 @@ func TestBuildPodRelocations(t *testing.T) {
 	}); err == nil {
 		t.Fatal("SubGroup placement without a victim Pod must fail before eviction")
 	}
+
+	invalidPodGroups := []struct {
+		name string
+		task *schedapi.TaskInfo
+	}{
+		{name: "missing PodGroup", task: &schedapi.TaskInfo{Name: "victim", Namespace: "ns"}},
+		{name: "malformed PodGroup", task: &schedapi.TaskInfo{Name: "victim", Namespace: "ns", Job: "g"}},
+		{name: "namespace mismatch", task: &schedapi.TaskInfo{Name: "victim", Namespace: "other", Job: "ns/g"}},
+	}
+	for _, testCase := range invalidPodGroups {
+		t.Run(testCase.name, func(t *testing.T) {
+			invalidPlan := &engineapi.RepackPlan{Moves: []*engineapi.Move{{
+				Task: testCase.task, From: "n0", To: "n2",
+			}}}
+			if _, err := enginestatus.BuildPodRelocations(
+				invalidPlan, time.Hour, baseTime, testPodGroupPlacementPolicies{},
+			); err == nil {
+				t.Fatal("invalid PodGroup identity must fail execution preparation before eviction")
+			}
+		})
+	}
 }
 
 func TestApplyPlan(t *testing.T) {
@@ -353,7 +374,7 @@ func TestApplyPlan(t *testing.T) {
 		Moves:      []*engineapi.Move{mkMove("a", "ns/g", 3, "n0", "n1")},
 		FreedNodes: []string{"n0"},
 	}
-	report := engineframework.Report{FragmentationRateBefore: 0.5, FragmentationRateAfter: 0.25, NodesFreed: 1}
+	report := engineapi.Report{FragmentationRateBefore: 0.5, FragmentationRateAfter: 0.25, NodesFreed: 1}
 
 	// DryRun: plan populated, no relocation execution records.
 	dry := &repackv1alpha1.RepackRun{}

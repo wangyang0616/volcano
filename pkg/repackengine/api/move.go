@@ -16,19 +16,12 @@ limitations under the License.
 
 package api
 
-import (
-	"testing"
-)
+import schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
-// OptimalNodes is the fragmentation packing bound — the hot inner call of every
-// MeasureResourceFragmentation. Bench a large mixed request set.
-func BenchmarkOptimalNodes(b *testing.B) {
-	reqs := make([]int64, 0, 2000)
-	for i := 0; i < 2000; i++ {
-		reqs = append(reqs, int64(1<<(i%4))) // 1,2,4,8 cards
-	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		OptimalNodes(reqs, 8)
-	}
+// Move is one policy-neutral task relocation selected by a planner or the
+// scheduler-faithful placement simulation.
+type Move struct {
+	Task *schedapi.TaskInfo
+	From string // current node, "" if the task is pending/unscheduled
+	To   string // chosen destination node
 }

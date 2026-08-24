@@ -22,12 +22,11 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// PodGroupView exposes the gang/priority facts a disruption strategy needs about
+// PodGroupView exposes the Gang availability facts a disruption strategy needs about
 // one PodGroup. The session fills it from api.JobInfo; tests fake it.
 type PodGroupView struct {
 	MinAvailable int32 // gang floor: this many pods must stay running
 	Running      int32 // pods currently running for the PodGroup
-	Priority     int32 // PodGroup priority (higher = more important to keep)
 	Footprint    int64 // gang's total accelerator cards (whole-gang blast radius)
 }
 
@@ -52,10 +51,11 @@ func (context *PlanContext) PodGroupView(podGroupID api.JobID) PodGroupView {
 	return context.PodGroupViews.PodGroupView(podGroupID)
 }
 
-// Resource returns the target accelerator, defaulting to nvidia.com/gpu.
+// Resource returns the target resource selected by the RepackRun. Configuration
+// validation, not the policy-neutral model, is responsible for requiring it.
 func (context *PlanContext) Resource() v1.ResourceName {
-	if context == nil || context.TargetResource == "" {
-		return v1.ResourceName("nvidia.com/gpu")
+	if context == nil {
+		return ""
 	}
 	return context.TargetResource
 }
@@ -66,36 +66,27 @@ func (context *PlanContext) Resource() v1.ResourceName {
 // committed prefix for every candidate during disruption scoring. Aggregates are
 // computed once and cached.
 type CandidatePlan struct {
-	CommittedMoves []*Move
-	Moves          []*Move
-	aggregate      *PlanMoveAggregate
+	committedMoves    []*Move
+	moves             []*Move
+	aggregateResource v1.ResourceName
+	aggregate         *PlanMoveAggregate
+}
+
+// NewCandidatePlan creates an immutable candidate view for plugins. The private,
+// full slice expressions freeze the visible lengths without copying the growing
+// committed prefix for every candidate; callers retain ownership and must treat
+// existing Move records as immutable after construction.
+func NewCandidatePlan(committedMoves, moves []*Move) *CandidatePlan {
+	return &CandidatePlan{
+		committedMoves: committedMoves[:len(committedMoves):len(committedMoves)],
+		moves:          moves[:len(moves):len(moves)],
+	}
 }
 
 // PodGroupMoveAggregate is the per-PodGroup move aggregate.
 type PodGroupMoveAggregate struct {
 	MovedPods     int64
 	MovedResource int64
-}
-
-// PodGroupDisruption is the gang impact of moving some Pods from one PodGroup.
-type PodGroupDisruption struct {
-	Breached        bool
-	DamagedResource int64
-}
-
-// MeasurePodGroupDisruption applies the shared minAvailable semantics used by
-// both plan scoring and drain receiver preference. Moves within the PodGroup's
-// running slack damage only the moved resource; once minAvailable is breached,
-// the whole PodGroup footprint is considered damaged.
-func MeasurePodGroupDisruption(view PodGroupView, movedPods, movedResource int64) PodGroupDisruption {
-	slack := int64(view.Running) - int64(view.MinAvailable)
-	if slack < 0 {
-		slack = 0
-	}
-	if movedPods > slack {
-		return PodGroupDisruption{Breached: true, DamagedResource: view.Footprint}
-	}
-	return PodGroupDisruption{DamagedResource: movedResource}
 }
 
 // PlanMoveAggregate is the whole-plan move aggregate, with a per-PodGroup breakdown.
@@ -109,17 +100,22 @@ type PlanMoveAggregate struct {
 // MoveAggregate computes (and caches) the move aggregate for the given context.
 // Exported so disruption score functions in plugin packages can build on it.
 func (plan *CandidatePlan) MoveAggregate(context *PlanContext) *PlanMoveAggregate {
-	if plan.aggregate != nil {
+	if plan == nil {
+		return &PlanMoveAggregate{ByPodGroup: map[api.JobID]*PodGroupMoveAggregate{}}
+	}
+	resource := context.Resource()
+	if plan.aggregate != nil && plan.aggregateResource == resource {
 		return plan.aggregate
 	}
 	moveAggregate := &PlanMoveAggregate{ByPodGroup: map[api.JobID]*PodGroupMoveAggregate{}}
-	for _, move := range plan.CommittedMoves {
+	for _, move := range plan.committedMoves {
 		moveAggregate.addMove(context, move)
 	}
-	for _, move := range plan.Moves {
+	for _, move := range plan.moves {
 		moveAggregate.addMove(context, move)
 	}
 	moveAggregate.AffectedPodGroups = int64(len(moveAggregate.ByPodGroup))
+	plan.aggregateResource = resource
 	plan.aggregate = moveAggregate
 	return moveAggregate
 }
@@ -131,6 +127,9 @@ func (moveAggregate *PlanMoveAggregate) addMove(context *PlanContext, move *Move
 	requestedResource := Scalar(move.Task.InitResreq, context.Resource())
 	moveAggregate.MovedPods++
 	moveAggregate.MovedResource += requestedResource
+	if move.Task.Job == "" {
+		return
+	}
 	podGroupAggregate := moveAggregate.ByPodGroup[move.Task.Job]
 	if podGroupAggregate == nil {
 		podGroupAggregate = &PodGroupMoveAggregate{}
@@ -150,7 +149,7 @@ type DisruptionCost struct {
 
 // CalculateDisruptionCost summarizes a move set's default dimensions for targetResource.
 func CalculateDisruptionCost(moves []*Move, targetResource v1.ResourceName) DisruptionCost {
-	plan := &CandidatePlan{Moves: moves}
+	plan := NewCandidatePlan(nil, moves)
 	moveAggregate := plan.MoveAggregate(&PlanContext{TargetResource: targetResource})
 	return DisruptionCost{
 		AffectedPodGroups: moveAggregate.AffectedPodGroups,

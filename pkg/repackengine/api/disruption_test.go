@@ -19,24 +19,28 @@ package api
 import (
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
 // gpuJobTask builds a task of gang `gang` requesting g GPUs (gpuRes/gpu come from
 // the package's other test files).
 func gpuJobTask(name, gang string, g int64) *api.TaskInfo {
-	return &api.TaskInfo{Name: name, Job: api.JobID(gang), InitResreq: gpuRes(g)}
+	return &api.TaskInfo{Name: name, Job: api.JobID(gang), InitResreq: &api.Resource{
+		ScalarResources: map[v1.ResourceName]float64{gpu: float64(g)},
+	}}
 }
 
 // MoveAggregate counts real relocations per gang; To==From is ignored.
 func TestAggregate(t *testing.T) {
 	ctx := &PlanContext{TargetResource: gpu}
-	cp := &CandidatePlan{Moves: []*Move{
+	cp := NewCandidatePlan(nil, []*Move{
 		{Task: gpuJobTask("a", "g1", 2), From: "n0", To: "n1"},
 		{Task: gpuJobTask("b", "g1", 3), From: "n0", To: "n1"},
 		{Task: gpuJobTask("c", "g2", 4), From: "n0", To: "n1"},
 		{Task: gpuJobTask("d", "g2", 1), From: "n0", To: "n0"}, // no-op
-	}}
+	})
 	a := cp.MoveAggregate(ctx)
 	if a.AffectedPodGroups != 2 {
 		t.Errorf("affectedPGs=%d, want 2", a.AffectedPodGroups)
@@ -57,47 +61,40 @@ func TestAggregate(t *testing.T) {
 
 func TestAggregateIncludesCommittedAndIncrementalMoves(t *testing.T) {
 	ctx := &PlanContext{TargetResource: gpu}
-	plan := &CandidatePlan{
-		CommittedMoves: []*Move{{Task: gpuJobTask("committed", "g1", 2), From: "n0", To: "n1"}},
-		Moves:          []*Move{{Task: gpuJobTask("candidate", "g2", 3), From: "n2", To: "n3"}},
-	}
+	plan := NewCandidatePlan(
+		[]*Move{{Task: gpuJobTask("committed", "g1", 2), From: "n0", To: "n1"}},
+		[]*Move{{Task: gpuJobTask("candidate", "g2", 3), From: "n2", To: "n3"}},
+	)
 	aggregate := plan.MoveAggregate(ctx)
 	if aggregate.MovedPods != 2 || aggregate.MovedResource != 5 || aggregate.AffectedPodGroups != 2 {
 		t.Fatalf("aggregate=%+v, want two moves across two PodGroups", aggregate)
 	}
 }
 
-func TestMeasurePodGroupDisruption(t *testing.T) {
-	view := PodGroupView{Running: 4, MinAvailable: 2, Footprint: 16}
-	tests := []struct {
-		name                string
-		movedPods           int64
-		movedResource       int64
-		wantBreached        bool
-		wantDamagedResource int64
-	}{
-		{
-			name:                "within running slack",
-			movedPods:           2,
-			movedResource:       8,
-			wantDamagedResource: 8,
-		},
-		{
-			name:                "breaches minAvailable",
-			movedPods:           3,
-			movedResource:       12,
-			wantBreached:        true,
-			wantDamagedResource: 16,
-		},
+func TestCandidatePlanFreezesMoveCountAndScopesAggregateCacheByResource(t *testing.T) {
+	npu := v1.ResourceName("huawei.com/ascend-1980")
+	task := gpuJobTask("candidate", "g1", 2)
+	task.InitResreq.ScalarResources[npu] = 4
+	moves := []*Move{{Task: task, From: "n0", To: "n1"}}
+	plan := NewCandidatePlan(nil, moves)
+
+	// Later planner progress may append to its committed slice, but must not add
+	// moves to an already-created candidate view.
+	moves = append(moves, &Move{Task: gpuJobTask("later", "g2", 8), From: "n2", To: "n3"})
+	if got := plan.MoveAggregate(&PlanContext{TargetResource: gpu}).MovedResource; got != 2 {
+		t.Fatalf("GPU aggregate=%d, want frozen candidate total 2", got)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := MeasurePodGroupDisruption(view, test.movedPods, test.movedResource)
-			if got.Breached != test.wantBreached || got.DamagedResource != test.wantDamagedResource {
-				t.Fatalf("disruption=%+v, want breached=%v damagedResource=%d",
-					got, test.wantBreached, test.wantDamagedResource)
-			}
-		})
+	if got := plan.MoveAggregate(&PlanContext{TargetResource: npu}).MovedResource; got != 4 {
+		t.Fatalf("NPU aggregate=%d, want resource-keyed cache recomputation to 4", got)
+	}
+}
+
+func TestAggregateDoesNotInventPodGroupForUnownedTask(t *testing.T) {
+	task := gpuJobTask("standalone", "", 2)
+	aggregate := NewCandidatePlan(nil, []*Move{{Task: task, From: "n0", To: "n1"}}).
+		MoveAggregate(&PlanContext{TargetResource: gpu})
+	if aggregate.MovedPods != 1 || aggregate.MovedResource != 2 || aggregate.AffectedPodGroups != 0 || len(aggregate.ByPodGroup) != 0 {
+		t.Fatalf("aggregate=%+v, want moved Pod/resource without a synthetic empty PodGroup", aggregate)
 	}
 }
 

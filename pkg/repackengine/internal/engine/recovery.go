@@ -52,10 +52,10 @@ func (e *Engine) forgetPendingTerminalStatus(name string) {
 	delete(e.pendingTerminalStatuses, name)
 }
 
-// recoverOrphans fails an interrupted planning/eviction run. Placement runs are
-// intentionally recoverable: their durable lease, replacement identity, and
-// deadline let a new engine instance safely resume receiver selection without
-// repeating any eviction.
+// recoverOrphans fails an interrupted planning run. Durable eviction and
+// placement stages are intentionally recoverable: their journal, lease,
+// replacement identity and deadline let the Repack Action resume without
+// recalculating the plan or repeating an accepted eviction.
 func (e *Engine) recoverOrphans(ctx context.Context) {
 	runs, err := e.repackRunLister.List(labels.Everything())
 	if err != nil {
@@ -66,10 +66,11 @@ func (e *Engine) recoverOrphans(ctx context.Context) {
 		if r.Status.Phase != repackv1alpha1.RepackRunning {
 			continue
 		}
-		if isEvictionCandidate(r) || isPlacementCandidate(r) {
+		stage := enginestatus.ResolveStage(r)
+		if stage == enginestatus.StageEvicting || stage == enginestatus.StagePlacing {
 			e.workQueue.Add(r.Name)
 			klog.V(3).InfoS("recovered in-progress Execute run",
-				"run", r.Name, "evictionRecovery", isEvictionCandidate(r))
+				"run", r.Name, "stage", stage)
 			continue
 		}
 		work := r.DeepCopy()

@@ -24,100 +24,24 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	state "volcano.sh/repack-controller/pkg/state"
 
-	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
+	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 )
 
 // enqueue adds a planning or in-flight placement RepackRun to the workqueue.
 func (e *Engine) enqueue(obj interface{}) {
 	run, ok := obj.(*repackv1alpha1.RepackRun)
-	if !ok || (!isCandidate(run) && !isPlacementCleanupCandidate(run)) {
+	if !ok || !enginestatus.ShouldReconcile(run) {
 		return
 	}
 	e.workQueue.Add(run.Name)
-}
-
-// isCandidate reports whether a run is ready for initial planning or for the
-// post-eviction placement protocol. A Running Execute with a persisted plan is
-// revisited only while it has durable placement records; it never repeats the
-// eviction commit.
-func isCandidate(run *repackv1alpha1.RepackRun) bool {
-	if isEvictionCandidate(run) {
-		return true
-	}
-	if isPlacementCandidate(run) {
-		return true
-	}
-	p := run.Status.Phase
-	return p == "" || p == repackv1alpha1.RepackPending ||
-		(p == repackv1alpha1.RepackRunning && run.Status.Plan == nil)
-}
-
-func isEvictionCandidate(run *repackv1alpha1.RepackRun) bool {
-	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute ||
-		run.Status.Phase != repackv1alpha1.RepackRunning || run.Status.Plan == nil {
-		return false
-	}
-	evictionJournalPresent := false
-	for index := range run.Status.Relocations {
-		if run.Status.Relocations[index].Eviction.Phase != "" {
-			evictionJournalPresent = true
-		}
-		switch run.Status.Relocations[index].Eviction.Phase {
-		case repackv1alpha1.PodEvictionPending,
-			repackv1alpha1.PodEvictionInProgress:
-			return true
-		}
-	}
-	if !evictionJournalPresent {
-		return false
-	}
-	for index := range run.Status.Conditions {
-		condition := &run.Status.Conditions[index]
-		if condition.Type == state.CondProgressing &&
-			condition.Status == metav1.ConditionTrue &&
-			condition.Reason == state.ReasonReconcilingPlacements {
-			return false
-		}
-	}
-	// All per-Pod outcomes may be final while the accepted subset and the
-	// ReconcilingPlacements barrier are not yet durable. Resume finalization.
-	return true
-}
-
-func isPlacementCandidate(run *repackv1alpha1.RepackRun) bool {
-	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
-		run.Status.Phase == repackv1alpha1.RepackRunning && run.Status.Plan != nil &&
-		len(run.Status.Relocations) > 0 && !isEvictionCandidate(run)
-}
-
-// isPlacementCleanupCandidate admits an already-terminal Execute Run only to
-// retry idempotent removal of its gate-owner markers and PodGroup leases. It
-// never re-enters planning or eviction.
-func isPlacementCleanupCandidate(run *repackv1alpha1.RepackRun) bool {
-	if run == nil || run.Spec.Mode != repackv1alpha1.RepackModeExecute {
-		return false
-	}
-	// A failure before the first eviction clears relocations but can still leave
-	// the admission discovery label or an original PodGroup lease behind. The
-	// metadata label therefore also makes a terminal Run cleanup-retryable.
-	if len(run.Status.Relocations) == 0 &&
-		run.Labels[repackv1alpha1.PlacementActiveLabel] != "true" {
-		return false
-	}
-	switch run.Status.Phase {
-	case repackv1alpha1.RepackSucceeded, repackv1alpha1.RepackFailed:
-		return true
-	default:
-		return false
-	}
 }
 
 // maxReconcileRetries caps how many times a failing RepackRun is retried before
@@ -154,8 +78,9 @@ func (e *Engine) processNext(ctx context.Context) bool {
 			e.workQueue.AddRateLimited(key)
 			return true
 		}
-		// Poison pill: stop retrying and fail the run so it does not loop forever
-		// (and its Execute slot, if any, was already released by process's defer).
+		// Poison pill: stop retrying and fail the run so it does not loop forever.
+		// A Run that crossed the Execute barrier deliberately retained its slot;
+		// the terminal fail path releases it only after Failed status is durable.
 		e.workQueue.Forget(key)
 		e.failByName(ctx, key, state.ReasonReconcileFailed, fmt.Errorf("gave up after %d retries: %w", maxReconcileRetries, err))
 		return true
@@ -170,8 +95,9 @@ func reconcileErrorConsumesRetryBudget(err error) bool {
 
 // reconcileSafely runs reconcile with panic recovery so a single bad RepackRun
 // (e.g. a plugin/snapshot panic) cannot crash the engine's worker goroutine. The
-// panic is converted to an error; process's own defers (slot release, session
-// close) still run during unwinding before it reaches here.
+// panic is converted to an error; reconcile's defers still run during unwind.
+// Before the Execute barrier they release the slot; after the Action marks the
+// barrier they retain it so the same Run recovers its durable journal.
 func (e *Engine) reconcileSafely(ctx context.Context, name string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -197,9 +123,9 @@ func (e *Engine) failByName(ctx context.Context, name, reason string, cause erro
 	}
 }
 
-// reconcile processes one RepackRun: re-check it's still a candidate, apply the
-// Execute serialization gate (one-at-a-time + cooldown — it lives here, in the
-// worker that actually evicts), then plan/act.
+// reconcile is the controller driver: load/admit the Run, invoke configured
+// Actions, and apply their retry/Execute-slot result. Repack business stages are
+// dispatched only by the Repack Action.
 func (e *Engine) reconcile(ctx context.Context, name string) error {
 	run, err := e.repackRunLister.Get(name)
 	if apierrors.IsNotFound(err) {
@@ -216,16 +142,16 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 			return err
 		}
 		if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
-			e.markExecuteDone(work.Name)
-			e.requeueGatedRuns()
-			return e.cleanupPlacement(ctx, work)
+			if e.markExecuteDone(work.Name) {
+				e.requeueGatedRuns()
+			}
 		}
-		return nil
+		result := engineframework.RunActions(e.config.Actions, &engineframework.ActionContext{
+			Context: ctx, Run: work, Runtime: e.actionRuntime(),
+		})
+		return result.Err
 	}
-	if isPlacementCleanupCandidate(run) {
-		return e.cleanupPlacement(ctx, run.DeepCopy())
-	}
-	if !isCandidate(run) {
+	if !enginestatus.ShouldReconcile(run) {
 		return nil // already picked up / terminal
 	}
 	klog.V(4).InfoS("reconciling RepackRun", "run", name, "mode", run.Spec.Mode)
@@ -240,9 +166,19 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		}
 	}
 
+	stage := enginestatus.ResolveStage(work)
+	// A terminal status is the durable release barrier. Usually the Runtime that
+	// wrote it releases the slot immediately; this path closes the small panic
+	// window between that status write and the in-memory release.
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute && stage == enginestatus.StageCleanup {
+		if e.markExecuteDone(work.Name) {
+			e.requeueGatedRuns()
+		}
+	}
 	active, lastFinish := false, time.Time{}
 	gate := state.GateDecision{Admit: true} // DryRun is never serialized by Execute.
-	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+	// Terminal cleanup does not consume the global Execute slot.
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute && stage != enginestatus.StageCleanup {
 		gate, active, lastFinish = e.tryAcquireExecute(work.Name, e.now())
 	}
 	klog.V(4).InfoS("repack: execute gate evaluated", "run", work.Name, "mode", work.Spec.Mode,
@@ -270,30 +206,24 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		}
 		return nil
 	}
-	if work.Spec.Mode == repackv1alpha1.RepackModeExecute {
+	if work.Spec.Mode == repackv1alpha1.RepackModeExecute && stage != enginestatus.StageCleanup {
 		klog.V(3).InfoS("repack: Execute slot acquired", "run", work.Name, "cooldown", e.config.Cooldown)
 	}
-	if isEvictionCandidate(work) {
-		// The prepared status may have been persisted immediately before a crash,
-		// while lease publication was still in progress. Re-establish both halves
-		// of the admission barrier idempotently before resuming any API call.
-		if err := e.preparePlacementLeases(ctx, work); err != nil {
-			return fmt.Errorf("resume placement leases before eviction: %w", err)
+	releaseExecuteSlot := work.Spec.Mode == repackv1alpha1.RepackModeExecute && stage != enginestatus.StageCleanup
+	actionCtx := &engineframework.ActionContext{Context: ctx, Run: work, Runtime: e.actionRuntime()}
+	defer func() {
+		if releaseExecuteSlot && !actionCtx.ExecuteSlotHeld() {
+			if e.markExecuteDone(work.Name) {
+				e.requeueGatedRuns()
+			}
 		}
-		if err := e.setPlacementActive(ctx, work, true); err != nil {
-			return fmt.Errorf("resume placement discovery before eviction: %w", err)
-		}
-		return e.executePreparedEvictions(ctx, work, work.Generation, engineconf.ResolveResource(work, e.config.DefaultResource))
+	}()
+	result := engineframework.RunActions(e.config.Actions, actionCtx)
+	if result.Requeue {
+		e.workQueue.Add(work.Name)
 	}
-	if isPlacementCandidate(work) {
-		// A crash can occur after the accepted relocation subset becomes durable
-		// but before leases for rejected PodGroups are released. Reconcile that
-		// one-way cleanup before placement; retained groups remain protected.
-		groupsToRelease := placementGroupsDifference(plannedPodGroups(work), placementPodGroups(work))
-		if err := e.releasePlacementLeases(ctx, work, groupsToRelease); err != nil {
-			return fmt.Errorf("release unused placement leases before placement recovery: %w", err)
-		}
-		return e.reconcilePlacement(ctx, work)
+	if result.RequeueAfter > 0 {
+		e.workQueue.AddAfter(work.Name, result.RequeueAfter)
 	}
-	return e.planRun(ctx, work)
+	return result.Err
 }

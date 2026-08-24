@@ -60,10 +60,10 @@ func TestRepackBudgetPluginChecksWholeProspectivePlan(t *testing.T) {
 	}, framework.PluginOptions(Name))
 	defer framework.CloseSession(ssn)
 
-	candidate := &framework.PlanningCandidate{Plan: &api.CandidatePlan{
-		CommittedMoves: []*api.Move{budgetMove("committed", "ns/a", 2)},
-		Moves:          []*api.Move{budgetMove("candidate", "ns/b", 2)},
-	}}
+	candidate := &framework.PlanningCandidate{Plan: api.NewCandidatePlan(
+		[]*api.Move{budgetMove("committed", "ns/a", 2)},
+		[]*api.Move{budgetMove("candidate", "ns/b", 2)},
+	)}
 	if got := ssn.CandidateAdmissible(candidate); got == nil || got.Reason != "max_pod_groups" {
 		t.Fatalf("result=%+v, want whole-plan max_pod_groups rejection", got)
 	}
@@ -84,9 +84,8 @@ func TestRepackBudgetIsOptional(t *testing.T) {
 	}, nil)
 	defer framework.CloseSession(ssn)
 
-	candidate := &framework.PlanningCandidate{Plan: &api.CandidatePlan{
-		Moves: []*api.Move{budgetMove("candidate", "ns/a", 2)},
-	}}
+	candidate := &framework.PlanningCandidate{Plan: api.NewCandidatePlan(nil,
+		[]*api.Move{budgetMove("candidate", "ns/a", 2)})}
 	if got := ssn.CandidateAdmissible(candidate); got != nil {
 		t.Fatalf("repack budget must not apply when plugin is disabled, got %+v", got)
 	}

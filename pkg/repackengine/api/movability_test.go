@@ -26,6 +26,34 @@ import (
 
 var movabilityGPU = v1.ResourceName("nvidia.com/gpu")
 
+func TestPodGroupIdentity(t *testing.T) {
+	tests := []struct {
+		name          string
+		task          *schedapi.TaskInfo
+		wantNamespace string
+		wantName      string
+		wantValid     bool
+	}{
+		{name: "nil"},
+		{name: "empty JobID", task: &schedapi.TaskInfo{}},
+		{name: "missing namespace", task: &schedapi.TaskInfo{Job: "group"}},
+		{name: "missing name", task: &schedapi.TaskInfo{Job: "ns/"}},
+		{name: "extra separator", task: &schedapi.TaskInfo{Job: "ns/group/extra"}},
+		{name: "namespace mismatch", task: &schedapi.TaskInfo{Namespace: "other", Job: "ns/group"}},
+		{name: "valid without task namespace", task: &schedapi.TaskInfo{Job: "ns/group"}, wantNamespace: "ns", wantName: "group", wantValid: true},
+		{name: "valid matching namespace", task: &schedapi.TaskInfo{Namespace: "ns", Job: "ns/group"}, wantNamespace: "ns", wantName: "group", wantValid: true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			namespace, name, valid := PodGroupIdentity(testCase.task)
+			if namespace != testCase.wantNamespace || name != testCase.wantName || valid != testCase.wantValid {
+				t.Fatalf("identity=(%q,%q,%t), want (%q,%q,%t)",
+					namespace, name, valid, testCase.wantNamespace, testCase.wantName, testCase.wantValid)
+			}
+		})
+	}
+}
+
 func TestEvaluateNodeFreeability(t *testing.T) {
 	resource := func(gpu float64) *schedapi.Resource {
 		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{movabilityGPU: gpu}}

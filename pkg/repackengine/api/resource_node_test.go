@@ -49,3 +49,20 @@ func TestClassifyTargetResourceNode(t *testing.T) {
 		})
 	}
 }
+
+func TestNodeFreeCapacityIgnoresStaleIdle(t *testing.T) {
+	resourceName := v1.ResourceName("example.com/accelerator")
+	node := &schedapi.NodeInfo{
+		Allocatable: &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resourceName: 8000}},
+		Used:        &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resourceName: 4000}},
+		Idle:        schedapi.EmptyResource(),
+		Releasing:   schedapi.EmptyResource(),
+		Pipelined:   schedapi.EmptyResource(),
+	}
+	if got := Scalar(NodeFreeCapacity(node), resourceName); got != 4000 {
+		t.Fatalf("free accelerator = %d, want 4000", got)
+	}
+	if got := Scalar(node.FutureIdle(), resourceName); got != 0 {
+		t.Fatalf("FutureIdle accelerator = %d, want 0 to demonstrate stale Idle", got)
+	}
+}

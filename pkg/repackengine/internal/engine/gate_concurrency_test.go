@@ -71,3 +71,27 @@ func TestTryAcquireExecute_ConcurrentK1(t *testing.T) {
 		t.Errorf("slot should be reusable after release, gate=%+v last=%v", gate, last)
 	}
 }
+
+func TestMarkExecuteDoneIsOwnerCheckedAndIdempotent(t *testing.T) {
+	first := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+	now := first
+	e := &Engine{activeExecuteRunName: "owner", now: func() time.Time { return now }}
+
+	if e.markExecuteDone("other") {
+		t.Fatal("a different Run must not release the active Execute slot")
+	}
+	if e.activeExecuteRunName != "owner" || !e.lastExecuteFinishTime.IsZero() {
+		t.Fatalf("foreign release changed state: active=%q finish=%v", e.activeExecuteRunName, e.lastExecuteFinishTime)
+	}
+	if !e.markExecuteDone("owner") {
+		t.Fatal("the current owner must release the Execute slot")
+	}
+	now = second
+	if e.markExecuteDone("owner") {
+		t.Fatal("an idempotent retry must not report another release")
+	}
+	if e.lastExecuteFinishTime != first {
+		t.Fatalf("idempotent release moved cooldown anchor to %v, want %v", e.lastExecuteFinishTime, first)
+	}
+}

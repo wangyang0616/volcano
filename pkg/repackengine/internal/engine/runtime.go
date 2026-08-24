@@ -38,7 +38,6 @@ import (
 
 	enginecache "volcano.sh/volcano/pkg/repackengine/cache"
 	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
-	placementexecutor "volcano.sh/volcano/pkg/repackengine/executor/placement"
 	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 )
@@ -81,7 +80,7 @@ type Engine struct {
 	// worker starts.
 	pendingTerminalStatuses map[string]*repackv1alpha1.RepackRunStatus
 
-	placementRepairLimiter placementexecutor.RepairLimiter
+	placementRepairLimiter placementRepairLimiter
 }
 
 // NewEngine builds the engine, wires the RepackRun informer, and applies defaults.
@@ -120,8 +119,9 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 			// controller (Gated -> Nominated -> Placed), so it must be requeued on
 			// a real update as well. Initial planning still ignores its own status
 			// writes; a same-RV update remains the informer-resync safety net.
-			if oldRun.ResourceVersion == newRun.ResourceVersion || isEvictionCandidate(newRun) ||
-				isPlacementCandidate(newRun) || isPlacementCleanupCandidate(newRun) {
+			stage := enginestatus.ResolveStage(newRun)
+			if oldRun.ResourceVersion == newRun.ResourceVersion || stage == enginestatus.StageEvicting ||
+				stage == enginestatus.StagePlacing || stage == enginestatus.StageCleanup {
 				e.enqueue(newRun)
 			}
 		},

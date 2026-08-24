@@ -33,11 +33,12 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/adapter"
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
-func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
+func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
 	placementTimedOut := false
 	resultSnapshotUnavailable := false
 	for index := range run.Status.Relocations {
@@ -61,8 +62,7 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 			// scheduler cache applies the same Pod update. Wait for one coherent
 			// snapshot before publishing cluster-wide actual metrics.
 			if !placementexecutor.ObservationDeadlinePassed(run, e.now()) {
-				e.workQueue.AddAfter(run.Name, placementRetryInterval)
-				return nil
+				return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
 			}
 			resultSnapshotUnavailable = true
 			placementexecutor.MarkBenefitUnverified(run)
@@ -87,8 +87,7 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 					"missingFreedNodes", comparison.Missing,
 					"unexpectedFreedNodes", comparison.Unexpected,
 					"retryAfter", placementRetryInterval)
-				e.workQueue.AddAfter(run.Name, placementRetryInterval)
-				return nil
+				return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
 			}
 		}
 	}
@@ -119,18 +118,19 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		state.MarkFailed(run, decision.Reason, message)
 	}
 	if err := e.updateStatusTerminal(ctx, run); err != nil {
-		return err
+		return runtimeError(err)
 	}
 	// Placement is terminal even if API cleanup needs a retry. Do not hold the
 	// global Execute slot while only removing our own metadata and gates.
-	e.markExecuteDone(run.Name)
-	e.requeueGatedRuns()
+	if e.markExecuteDone(run.Name) {
+		e.requeueGatedRuns()
+	}
 	// The terminal result is durable before cleanup. Returning an error makes the
 	// workqueue retry the idempotent cleanup without ever repeating eviction.
 	if err := e.cleanupPlacement(ctx, run); err != nil {
-		return fmt.Errorf("cleanup placement after terminal result: %w", err)
+		return runtimeError(fmt.Errorf("cleanup placement after terminal result: %w", err))
 	}
-	return nil
+	return engineframework.RuntimeResult{}
 }
 
 func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.NodeInfo, targetResource v1.ResourceName) {

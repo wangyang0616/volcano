@@ -19,8 +19,11 @@ package placement
 import (
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	state "volcano.sh/repack-controller/pkg/state"
+	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
 func TestCandidatesRequireConcreteReplacement(t *testing.T) {
@@ -31,6 +34,29 @@ func TestCandidatesRequireConcreteReplacement(t *testing.T) {
 	candidates := Candidates(run)
 	if len(candidates) != 1 || candidates[0].VictimPodName != "ready" {
 		t.Fatalf("Candidates()=%v, want only concrete replacement", candidates)
+	}
+}
+
+func TestReceiversPreferPlannedNodeWhenIdleLedgerIsStale(t *testing.T) {
+	resourceName := v1.ResourceName("example.com/accelerator")
+	resource := func(value float64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resourceName: value}}
+	}
+	node := func(name string) *schedapi.NodeInfo {
+		return &schedapi.NodeInfo{
+			Name: name, Allocatable: resource(8000), Used: resource(0),
+			Idle: schedapi.EmptyResource(), Releasing: schedapi.EmptyResource(), Pipelined: schedapi.EmptyResource(),
+		}
+	}
+	planned, alternative := node("planned"), node("alternative")
+	task := &schedapi.TaskInfo{InitResreq: resource(2000)}
+
+	receivers := Receivers([]*schedapi.NodeInfo{alternative, planned}, nil, planned.Name, task)
+	if len(receivers) != 2 {
+		t.Fatalf("Receivers() returned %d nodes, want 2", len(receivers))
+	}
+	if receivers[0].Name != planned.Name {
+		t.Fatalf("first receiver=%q, want planned node %q", receivers[0].Name, planned.Name)
 	}
 }
 

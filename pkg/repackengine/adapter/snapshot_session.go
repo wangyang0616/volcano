@@ -31,6 +31,7 @@ import (
 
 	"volcano.sh/volcano/pkg/repackengine/api"
 	"volcano.sh/volcano/pkg/repackengine/framework"
+	enginescope "volcano.sh/volcano/pkg/repackengine/scope"
 )
 
 // SessionSnapshot adapts a live scheduler Session to framework.Snapshot. The
@@ -40,14 +41,14 @@ import (
 type SessionSnapshot struct {
 	ssn      *schedframework.Session
 	resource v1.ResourceName
-	scope    *framework.ScopeMatcher // nil = all nodes in scope
+	scope    *enginescope.Matcher // nil = all nodes in scope
 }
 
 var _ framework.Snapshot = (*SessionSnapshot)(nil)
 
 // NewSessionSnapshot wraps a Session for the given target resource. scope gates
 // drain targets (nil = all in scope); it does NOT filter the receiver set.
-func NewSessionSnapshot(ssn *schedframework.Session, resource v1.ResourceName, scope *framework.ScopeMatcher) *SessionSnapshot {
+func NewSessionSnapshot(ssn *schedframework.Session, resource v1.ResourceName, scope *enginescope.Matcher) *SessionSnapshot {
 	return &SessionSnapshot{ssn: ssn, resource: resource, scope: scope}
 }
 
@@ -253,7 +254,7 @@ func (s *SessionSnapshot) receiverHasTargetResourceCapacity(victim *schedapi.Tas
 	if victim == nil || node == nil || node.Idle == nil || node.Releasing == nil || node.Pipelined == nil {
 		return false
 	}
-	available := api.Scalar(node.FutureIdle(), s.resource)
+	available := api.Scalar(api.NodeFreeCapacity(node), s.resource)
 	for _, task := range previouslyPlacedTasks {
 		if task != nil {
 			available -= api.Scalar(task.InitResreq, s.resource)
@@ -281,7 +282,6 @@ func (s *SessionSnapshot) PodGroupView(id schedapi.JobID) api.PodGroupView {
 	return api.PodGroupView{
 		MinAvailable: ji.MinAvailable,
 		Running:      running,
-		Priority:     ji.Priority,
 		Footprint:    footprint,
 	}
 }

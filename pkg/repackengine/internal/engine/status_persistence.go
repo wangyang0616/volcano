@@ -49,8 +49,9 @@ func (e *Engine) fail(ctx context.Context, run *repackv1alpha1.RepackRun, genera
 	// Pod-level gate cleanup is driven by the placement controller from this
 	// terminal status. Return lease cleanup failures so the terminal-only
 	// reconcile path can retry without replaying an eviction.
-	e.markExecuteDone(run.Name)
-	e.requeueGatedRuns()
+	if e.markExecuteDone(run.Name) {
+		e.requeueGatedRuns()
+	}
 	if err := e.cleanupPlacement(ctx, run); err != nil {
 		return fmt.Errorf("cleanup placement after failure: %w", err)
 	}

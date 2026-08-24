@@ -23,11 +23,6 @@ limitations under the License.
 //	  providing nodes = nodes with Allocatable[R] > 0
 //	  occupied nodes = providing nodes with Used[R] > 0
 //	  optimal occupied nodes = theoretical minimum for R's demand (see OptimalNodes)
-//
-// The cluster KPI WeightedFragmentationRate aggregates per-resource rates weighted by
-// providing-node count; since a node provides exactly one accelerator type the
-// node-count weighting collapses to the total excess occupied nodes divided by
-// the total providing nodes.
 package api
 
 import (
@@ -174,23 +169,6 @@ func MeasureResourceFragmentation(nodes []*api.NodeInfo, targetResource v1.Resou
 		fragmentation.OptimalOccupiedNodeCount = fragmentation.OccupiedNodeCount
 	}
 	return fragmentation
-}
-
-// WeightedFragmentationRate aggregates per-resource fragmentation into the cluster KPI
-// using the default node-count weighting, which collapses to
-// total excess occupied nodes divided by total providing nodes because accelerator
-// nodes are disjoint per resource
-// (design §4.6.2 / §4.16 FragWeightFn). Returns 0 when no resource nodes exist.
-func WeightedFragmentationRate(fragmentationByResource map[v1.ResourceName]ResourceFragmentation) float64 {
-	var fragmentationExcess, providingNodeCount int64
-	for _, fragmentation := range fragmentationByResource {
-		fragmentationExcess += fragmentation.OccupiedNodeCount - fragmentation.OptimalOccupiedNodeCount
-		providingNodeCount += fragmentation.ProvidingNodeCount
-	}
-	if providingNodeCount == 0 {
-		return 0
-	}
-	return float64(fragmentationExcess) / float64(providingNodeCount)
 }
 
 // scalar reads an accelerator (scalar) resource amount as a rounded int64.

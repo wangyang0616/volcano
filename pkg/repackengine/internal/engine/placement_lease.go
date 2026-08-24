@@ -31,7 +31,32 @@ import (
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	"volcano.sh/repack-controller/pkg/placement"
+
+	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 )
+
+// placementRepairLimiter independently rate-limits the fallback scan that
+// repairs placement leases on recreated PodGroups.
+type placementRepairLimiter struct {
+	runIdentity string
+	lastRepair  time.Time
+}
+
+// allow records an accepted repair scan. When rejected, next is the earliest
+// time the same RepackRun may scan again.
+func (limiter *placementRepairLimiter) allow(run *repackv1alpha1.RepackRun, now time.Time, interval time.Duration) (allowed bool, next time.Time) {
+	if run == nil {
+		return false, time.Time{}
+	}
+	runIdentity := run.Name + "/" + string(run.UID)
+	next = limiter.lastRepair.Add(interval)
+	if limiter.runIdentity == runIdentity && now.Before(next) {
+		return false, next
+	}
+	limiter.runIdentity = runIdentity
+	limiter.lastRepair = now
+	return true, now.Add(interval)
+}
 
 // preparePlacementLeases marks every affected PodGroup before any victim is
 // evicted. The Pod mutating webhook reads this lease and injects a scheduling
@@ -226,7 +251,21 @@ func (e *Engine) cleanupPlacement(ctx context.Context, run *repackv1alpha1.Repac
 	if err := e.releasePlacementLeases(ctx, run, groups); err != nil {
 		return err
 	}
-	return e.setPlacementActive(ctx, run, false)
+	if err := e.setPlacementActive(ctx, run, false); err != nil {
+		return err
+	}
+	if !enginestatus.ExecutePreparationCleanupPending(run) {
+		return nil
+	}
+	// Pending-only relocations describe execution preparation, not attempted
+	// evictions. Clear them only after external cleanup has converged. If this
+	// status write fails, the same journal deliberately drives another harmless,
+	// idempotent cleanup pass.
+	enginestatus.MarkExecuteNotPerformed(run)
+	if err := e.updateStatus(ctx, run); err != nil {
+		return fmt.Errorf("persist completed Execute preparation cleanup: %w", err)
+	}
+	return nil
 }
 
 // ownedPlacementLeaseGroups includes both status-recorded groups and admission-
@@ -388,7 +427,7 @@ func (e *Engine) placementLeaseRepairDue(run *repackv1alpha1.RepackRun) bool {
 	if e.now != nil {
 		now = e.now()
 	}
-	allowed, nextRepairTime := e.placementRepairLimiter.Allow(run, now, placementLeaseRepairInterval)
+	allowed, nextRepairTime := e.placementRepairLimiter.allow(run, now, placementLeaseRepairInterval)
 	if !allowed {
 		klog.V(5).InfoS("repack: recreated PodGroup lease repair scan rate-limited",
 			"run", run.Name, "nextRepairTime", nextRepairTime)

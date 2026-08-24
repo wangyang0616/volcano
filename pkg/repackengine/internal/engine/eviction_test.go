@@ -132,9 +132,9 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 	}
 	t.Cleanup(engine.workQueue.ShutDown)
 
-	err := engine.executePreparedEvictionsWithClient(
+	result := engine.executePreparedEvictionsWithClient(
 		context.Background(), run.DeepCopy(), run.Generation, "example.com/accelerator", kubeClient)
-	if err == nil {
+	if result.Err == nil {
 		t.Fatal("first execution unexpectedly succeeded despite simulated accepted-status outage")
 	}
 	if evictionCalls != 1 {
@@ -149,10 +149,10 @@ func TestExecutePreparedEvictionsRecoversAcceptedRequestAfterStatusFailure(t *te
 		t.Fatalf("phase after failed accepted write = %q, want InProgress", got)
 	}
 
-	if err := engine.executePreparedEvictionsWithClient(
+	if result := engine.executePreparedEvictionsWithClient(
 		context.Background(), persisted.DeepCopy(), persisted.Generation,
-		"example.com/accelerator", kubeClient); err != nil {
-		t.Fatalf("recovery execution failed: %v", err)
+		"example.com/accelerator", kubeClient); result.Err != nil {
+		t.Fatalf("recovery execution failed: %v", result.Err)
 	}
 	if evictionCalls != 1 {
 		t.Fatalf("Eviction API calls after recovery = %d, want no replay", evictionCalls)

@@ -31,9 +31,8 @@ const gpu = v1.ResourceName("nvidia.com/gpu")
 
 // fakeSnap is a minimal Snapshot for framework tests.
 type fakeSnap struct {
-	nodes           []*schedapi.NodeInfo
-	views           map[schedapi.JobID]api.PodGroupView
-	feasibleContext context.Context
+	nodes []*schedapi.NodeInfo
+	views map[schedapi.JobID]api.PodGroupView
 }
 
 func (f *fakeSnap) Nodes() []*schedapi.NodeInfo                     { return f.nodes }
@@ -44,7 +43,6 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView { return f.v
 // session plumbing, not the drain planner), so this is an inert stand-in.
 
 func (f *fakeSnap) FeasibleRelocation(ctx context.Context, _ []*api.Move, _ []*schedapi.TaskInfo, _ []*schedapi.NodeInfo) ([]*api.Move, bool) {
-	f.feasibleContext = ctx
 	return nil, false
 }
 

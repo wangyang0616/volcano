@@ -21,8 +21,17 @@ import (
 	"os"
 
 	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/scheduler"
 )
+
+func configuredPluginNames(options []engineframework.PluginOption) []string {
+	names := make([]string, 0, len(options))
+	for _, option := range options {
+		names = append(names, option.Name)
+	}
+	return names
+}
 
 // loadConf loads the scheduler filter stack and the independent Repack action
 // and plugin pipeline. Explicit flags keep precedence over file values.

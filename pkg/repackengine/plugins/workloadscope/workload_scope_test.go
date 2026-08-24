@@ -25,10 +25,11 @@ import (
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/framework"
+	enginescope "volcano.sh/volcano/pkg/repackengine/scope"
 )
 
 func TestPluginRegistersScopeAsMovableBoundary(t *testing.T) {
-	matcher, err := framework.NewScopeMatcher(&repackv1alpha1.RepackScope{
+	matcher, err := enginescope.NewMatcher(&repackv1alpha1.RepackScope{
 		PodGroups: &repackv1alpha1.RepackSelectorTerm{
 			Include: &repackv1alpha1.RepackSelector{Names: []string{"ns/allowed"}},
 		},
@@ -51,7 +52,7 @@ func TestPluginRegistersScopeAsMovableBoundary(t *testing.T) {
 }
 
 func TestWorkloadScopeIsOptional(t *testing.T) {
-	matcher, err := framework.NewScopeMatcher(&repackv1alpha1.RepackScope{
+	matcher, err := enginescope.NewMatcher(&repackv1alpha1.RepackScope{
 		PodGroups: &repackv1alpha1.RepackSelectorTerm{
 			Include: &repackv1alpha1.RepackSelector{Names: []string{"ns/allowed"}},
 		},
@@ -66,5 +67,8 @@ func TestWorkloadScopeIsOptional(t *testing.T) {
 
 	if !ssn.Movable()(&schedapi.TaskInfo{Job: "ns/outside"}) {
 		t.Fatal("workload scope must not apply when plugin is disabled")
+	}
+	if ssn.Movable()(&schedapi.TaskInfo{}) {
+		t.Fatal("disabling workloadscope must not disable the mandatory PodGroup ownership boundary")
 	}
 }

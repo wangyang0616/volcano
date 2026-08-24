@@ -33,7 +33,7 @@ import (
 
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	placementexecutor "volcano.sh/volcano/pkg/repackengine/executor/placement"
-	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	enginescope "volcano.sh/volcano/pkg/repackengine/scope"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
@@ -69,7 +69,7 @@ func StampLifecycle(run *repackv1alpha1.RepackRun, now time.Time) {
 // this audit record.
 func ApplyPlan(
 	run *repackv1alpha1.RepackRun,
-	report engineframework.Report,
+	report engineapi.Report,
 	plan *engineapi.RepackPlan,
 	targetResource v1.ResourceName,
 	owners map[string]*repackv1alpha1.WorkloadRef,
@@ -97,7 +97,7 @@ func ApplyPlan(
 // BuildResolvedScope summarizes the two independent action-scope axes. The
 // fragmentation report remains cluster-wide: node scope limits drain targets,
 // while PodGroup scope limits which accelerator consumers may be moved.
-func BuildResolvedScope(nodes []*schedapi.NodeInfo, scope *engineframework.ScopeMatcher, targetResource v1.ResourceName) *repackv1alpha1.ResolvedScope {
+func BuildResolvedScope(nodes []*schedapi.NodeInfo, scope *enginescope.Matcher, targetResource v1.ResourceName) *repackv1alpha1.ResolvedScope {
 	resolved := &repackv1alpha1.ResolvedScope{}
 	podGroups := make(map[schedapi.JobID]struct{})
 	for _, node := range nodes {
@@ -287,7 +287,7 @@ func SortedFreedNodeNames(plan *engineapi.RepackPlan) []string {
 // here — it is folded into the terminal condition's reason. MovedCardCount is
 // filled by ApplyPlan from moves; FragBefore/After are the target resource's
 // cluster-wide rates and do not use resolved scope as their denominator.
-func BuildRepackSummary(report engineframework.Report) *repackv1alpha1.RepackSummary {
+func BuildRepackSummary(report engineapi.Report) *repackv1alpha1.RepackSummary {
 	return &repackv1alpha1.RepackSummary{
 		FragBeforePercent: PercentagePoints(report.FragmentationRateBefore),
 		FragAfterPercent:  PercentagePoints(report.FragmentationRateAfter),
@@ -331,7 +331,12 @@ func BuildPodRelocations(
 			continue
 		}
 		task := move.Task
-		_, podGroupName := SplitPodGroupID(string(task.Job))
+		namespace, podGroupName, valid := engineapi.PodGroupIdentity(task)
+		if !valid {
+			return nil, fmt.Errorf(
+				"planned victim Pod %s/%s has invalid PodGroup identity %q",
+				task.Namespace, task.Name, task.Job)
+		}
 		var victimPodUID types.UID
 		if task.Pod != nil {
 			victimPodUID = task.Pod.UID
@@ -350,7 +355,7 @@ func BuildPodRelocations(
 				"schedulingRequirementsHash", schedulingRequirementsHash)
 		}
 		relocations = append(relocations, repackv1alpha1.PodRelocationStatus{
-			Namespace:                  task.Namespace,
+			Namespace:                  namespace,
 			PodGroupName:               podGroupName,
 			VictimPodName:              task.Name,
 			VictimPodUID:               victimPodUID,

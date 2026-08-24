@@ -145,6 +145,8 @@ Repack 由既有 Kubernetes/Volcano 组件和一个独立 Engine 协作完成：
 
 组件之间仅通过 Kubernetes API 对象协作，不建立私有 RPC。
 
+Engine 的 Reconcile 负责对象读取、Execute 串行门禁和 ActionResult 重试；配置的 `repack` Action 是单次 RepackRun 的业务入口。新建 Run、Eviction journal 恢复、replacement placement 跟踪和终态清理都进入同一 Action，再由 Action 调用 Planner、Plugin 和 Runtime 执行原语，避免正常路径与恢复路径形成两套流程。Runtime 不直接操作 workqueue，只返回重试意图；Action 在进入持久化 Execute 屏障前同步持有执行槽，异常恢复不会提前释放执行槽或启动 cooldown。
+
 ### Planning Overview
 
 一次规划采用“低成本裁剪、候选评分、惰性完整校验”的增量流程：
@@ -192,8 +194,8 @@ Execute 在驱逐前持久化完整 plan 和逐 Pod relocation journal，形成 
 - 单集群 Execute 采用 K=1 串行门控并带冷却时间；
 - 计划不预留资源，运行时竞争可能使实际结果偏离计划；
 - 计划与实际结果分离保存，部分执行失败不会覆盖原始决策；
-- Run、PodGroup lease、placement gate 和 relocation journal 支持组件重启后的恢复和清理；
-- Engine 使用根 context 停止主循环、缓存和工作队列；进行中 Eviction 的取消和事件 broadcaster 生命周期仍需按技术设计中的已知差距继续收敛。
+- Run、PodGroup lease、placement gate 和 relocation journal 支持组件重启后的恢复和幂等清理；Execute 准备未完成时保留全 `Pending` journal 作为恢复依据，外部清理完成后才清除，已发起 Eviction 的 journal 则保留用于审计；
+- Engine 使用根 context 停止主循环、缓存、工作队列和进行中的 Eviction 请求，并在退出时关闭 Engine 与 leader-election 的 event broadcaster。
 
 ## Design and Implementation
 
@@ -229,7 +231,7 @@ Descheduler 擅长按策略驱逐 Pod，但 Repack 需要基于 Volcano 的 PodG
 - **计划漂移**：不锁定快照；通过 Execute 重新规划、实时选点和终态验证降低影响；
 - **业务中断扩大**：通过 Scope、预算和 Gang 成本降低风险，同时明确上层控制器级联重建属于用户需评估的边界；
 - **大集群规划耗时**：通过节点预分类、容量预检、惰性模拟和缓存控制 Scheduler Filter 调用量；
-- **组件重启**：通过持久化 relocation journal、lease owner 和幂等状态转换恢复；
+- **组件重启**：通过持久化 relocation journal、lease owner 和幂等状态转换恢复；重复清理只移除当前 Run 拥有的 lease，不依赖额外完成标记；
 - **错误配置**：CRD/CEL 和严格的 Engine 配置解析在启动或创建阶段快速失败。
 
 ## Rollout Plan

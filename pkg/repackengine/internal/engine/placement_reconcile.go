@@ -35,13 +35,14 @@ import (
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
 	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
+	enginescope "volcano.sh/volcano/pkg/repackengine/scope"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
-func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {
+func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
 	if run == nil {
-		return nil
+		return engineframework.RuntimeResult{}
 	}
 	selectedNodePlacements, alternativeNodePlacements, timedOutPlacements := enginestatus.PlacementOutcomeCounts(run)
 	klog.V(4).InfoS("repack: reconciling replacement placement",
@@ -50,13 +51,12 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		"alternativeNodePlacementCount", alternativeNodePlacements,
 		"timedOutPlacementCount", timedOutPlacements)
 	if err := e.repairRecreatedPodGroupLeasesIfDue(ctx, run); err != nil {
-		return fmt.Errorf("reconcile recreated PodGroup leases: %w", err)
+		return runtimeError(fmt.Errorf("reconcile recreated PodGroup leases: %w", err))
 	}
 	if expired, err := e.expirePlacements(ctx, run); err != nil {
-		return err
+		return runtimeError(err)
 	} else if expired {
-		e.workQueue.Add(run.Name)
-		return nil
+		return engineframework.RuntimeResult{Requeue: true}
 	}
 	if placementexecutor.Complete(run) {
 		return e.finishPlacement(ctx, run)
@@ -66,18 +66,17 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		// A replacement controller may need time to create the Pod. Keep polling
 		// until the durable deadline so an absent replacement cannot bypass the
 		// expiration escape hatch.
-		e.workQueue.AddAfter(run.Name, placementRetryInterval)
 		klog.V(4).InfoS("repack: no selectable replacement Pod observed yet; placement requeued",
 			"run", run.Name, "retryAfter", placementRetryInterval)
-		return nil
+		return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
 	}
 
 	targetResource := engineconf.ResolveResource(run, e.config.DefaultResource)
 	schedulerSession := e.clusterCache.OpenSession(e.tiers, e.configurations)
 	defer schedframework.CloseSessionReadOnly(schedulerSession)
-	scope, err := engineframework.NewScopeMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
+	scope, err := enginescope.NewMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
 	if err != nil {
-		return err
+		return runtimeError(err)
 	}
 	snapshot := adapter.NewSessionSnapshot(schedulerSession, targetResource, scope)
 	excludedFreedNodes := enginestatus.RealizedFreedNodeNames(run)
@@ -92,7 +91,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return err
+			return runtimeError(err)
 		}
 		if pod.UID != relocation.Placement.ReplacementPodUID || pod.Spec.NodeName != "" {
 			continue
@@ -110,7 +109,10 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			klog.V(3).InfoS("repack: replacement is waiting for a feasible receiver node",
 				"run", run.Name, "pod", relocation.Namespace+"/"+relocation.Placement.ReplacementPodName,
 				"plannedNode", relocation.PlannedNodeName, "receiverCount", len(receivers))
-			return e.markWaitingForNodeSelection(ctx, run.Name, pending)
+			if err := e.markWaitingForNodeSelection(ctx, run.Name, pending); err != nil {
+				return runtimeError(err)
+			}
+			return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
 		}
 		committed = append(committed, placements[0])
 		selected[placementexecutor.IdentityForRelocation(relocation)] = placements[0].To
@@ -119,10 +121,9 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			"plannedNode", relocation.PlannedNodeName, "selectedNode", placements[0].To)
 	}
 	if len(selected) == 0 {
-		e.workQueue.AddAfter(run.Name, placementRetryInterval)
-		return nil
+		return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
 	}
-	return e.writePlacementSelection(ctx, run.Name, selected)
+	return runtimeError(e.writePlacementSelection(ctx, run.Name, selected))
 }
 
 func (e *Engine) writePlacementSelection(
@@ -191,9 +192,6 @@ func (e *Engine) markWaitingForNodeSelection(ctx context.Context, runName string
 		updatedRun, err = e.volcanoClient.RepackV1alpha1().RepackRuns().UpdateStatus(ctx, run, metav1.UpdateOptions{})
 		return err
 	})
-	if err == nil {
-		e.workQueue.AddAfter(runName, placementRetryInterval)
-	}
 	if err == nil && placementStateChanged && updatedRun != nil {
 		message := enginestatus.PlacementProgressMessage(updatedRun, engineconf.ResolveResource(updatedRun, e.config.DefaultResource))
 		klog.V(3).InfoS("repack: replacement placement waiting for node selection",

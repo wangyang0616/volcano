@@ -17,7 +17,7 @@ limitations under the License.
 // Package framework is the repack engine's plugin/action framework — the
 // analogue of pkg/scheduler/framework. It defines the engine Session (a plugin-
 // populated, action-consumed view of one repack pass), the Plugin and Action
-// extension contracts and their registries, plus planning report plumbing. It
+// extension contracts and their registries, plus planning extension points. It
 // depends only on pkg/repackengine/api (pure model) and
 // pkg/scheduler/api (NodeInfo/TaskInfo) — never on the scheduler framework; the
 // live-Session coupling lives in pkg/repackengine/adapter.
@@ -45,7 +45,7 @@ type Snapshot interface {
 	// include − exclude). Out-of-scope nodes stay as (preferred) receivers.
 	// True when no node scope is set.
 	NodeInScope(node *schedapi.NodeInfo) bool
-	// PodGroupView returns gang/priority facts for a PodGroup (zero if absent).
+	// PodGroupView returns Gang availability facts for a PodGroup (zero if absent).
 	PodGroupView(schedapi.JobID) api.PodGroupView
 	// FeasibleRelocation simulates evicting victims and greedily relocating them
 	// onto receivers using the scheduler's full filter stack, returning the per-pod

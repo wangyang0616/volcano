@@ -54,14 +54,18 @@ func (e *Engine) tryAcquireExecute(currentRunName string, now time.Time) (gate s
 	return gate, executeActive, latestExecuteFinishTime
 }
 
-// markExecuteDone releases the slot and stamps the cooldown anchor.
-func (e *Engine) markExecuteDone(name string) {
+// markExecuteDone releases the slot and stamps the cooldown anchor only when
+// name still owns it. The boolean lets terminal recovery wake gated Runs once
+// without extending cooldown on an idempotent cleanup retry.
+func (e *Engine) markExecuteDone(name string) bool {
 	e.executeStateMutex.Lock()
-	if e.activeExecuteRunName == name {
-		e.activeExecuteRunName = ""
+	defer e.executeStateMutex.Unlock()
+	if e.activeExecuteRunName != name {
+		return false
 	}
+	e.activeExecuteRunName = ""
 	e.lastExecuteFinishTime = e.now()
-	e.executeStateMutex.Unlock()
+	return true
 }
 
 // persistedExecuteState scans the lister for the Execute gate: whether another Execute is

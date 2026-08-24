@@ -400,10 +400,7 @@ func (s *drainState) firstFeasibleCandidate(ordered []scoredCandidate) (candidat
 func (s *drainState) planningCandidate(candidate candidate) *framework.PlanningCandidate {
 	return &framework.PlanningCandidate{
 		Unit: candidate.unit,
-		Plan: &api.CandidatePlan{
-			CommittedMoves: s.moves,
-			Moves:          candidate.scoringMoves,
-		},
+		Plan: api.NewCandidatePlan(s.moves, candidate.scoringMoves),
 	}
 }
 
@@ -484,7 +481,7 @@ func (s *drainState) receiversInPreferenceOrderWithPlan(
 		})
 	}
 	if prospectivePlan == nil {
-		prospectivePlan = &api.CandidatePlan{CommittedMoves: s.moves, Moves: prospectiveMoves(candidateVictims)}
+		prospectivePlan = api.NewCandidatePlan(s.moves, prospectiveMoves(candidateVictims))
 	}
 	planningCandidate := &framework.PlanningCandidate{Plan: prospectivePlan}
 	ranked := s.ssn.OrderReceivers(planningCandidate, receivers)
@@ -525,24 +522,11 @@ func minTaskResource(tasks []*schedapi.TaskInfo, targetResource v1.ResourceName)
 	return minimum
 }
 
-// receiverSlack is the target-resource free capacity used to best-fit sort receivers.
-// Prefer FutureIdle (scheduler cache); fall back to Allocatable−Used for test nodes
-// that only set Used/Allocatable without initializing Idle.
+// receiverSlack is the immediately available target-resource capacity used to
+// best-fit sort receivers. Allocatable-Used remains valid when a newly added
+// extended resource has not yet been reflected in NodeInfo.Idle.
 func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
-	if n == nil {
-		return 0
-	}
-	if n.Idle != nil {
-		return api.Scalar(n.FutureIdle(), targetResource)
-	}
-	if n.Allocatable == nil {
-		return 0
-	}
-	free := n.Allocatable.Clone()
-	if n.Used != nil {
-		free.SubWithoutAssert(n.Used)
-	}
-	return api.Scalar(free, targetResource)
+	return api.Scalar(api.NodeFreeCapacity(n), targetResource)
 }
 
 // eligibleReceiverNodes performs the snapshot-stable receiver prefilter before
@@ -618,7 +602,7 @@ func (s *drainState) scoreCandidates(activeCandidates []candidate) []scoredCandi
 		}
 		candidatePlans[index] = orderedCandidates[index].prospectivePlan
 		if candidatePlans[index] == nil {
-			candidatePlans[index] = &api.CandidatePlan{CommittedMoves: s.moves, Moves: moves}
+			candidatePlans[index] = api.NewCandidatePlan(s.moves, moves)
 		}
 	}
 	scores := s.ssn.DisruptionScores(candidatePlans)

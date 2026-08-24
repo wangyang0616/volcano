@@ -18,6 +18,7 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -25,10 +26,19 @@ type contextAwareTestAction struct {
 	executions *int
 }
 
+func TestActionErrorPreservesReasonAndCause(t *testing.T) {
+	cause := errors.New("invalid target")
+	err := NewActionError("InvalidConfiguration", cause)
+	if ActionErrorReason(err) != "InvalidConfiguration" || !errors.Is(err, cause) {
+		t.Fatalf("error=%v reason=%q, want preserved reason and cause", err, ActionErrorReason(err))
+	}
+}
+
 func (*contextAwareTestAction) Name() string { return "context-aware-test" }
 
-func (action *contextAwareTestAction) Execute(*Session) {
+func (action *contextAwareTestAction) Execute(*ActionContext) ActionResult {
 	(*action.executions)++
+	return ActionResult{}
 }
 
 func TestRunActionsStopsWhenContextIsCancelled(t *testing.T) {
@@ -39,8 +49,19 @@ func TestRunActionsStopsWhenContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	RunActions([]string{"context-aware-test"}, OpenSession(SessionConfig{Context: ctx}, nil))
+	RunActions([]string{"context-aware-test"}, &ActionContext{Context: ctx})
 	if executions != 0 {
 		t.Fatalf("action executions = %d, want 0 after cancellation", executions)
+	}
+}
+
+func TestActionContextHoldsExecuteSlotSynchronously(t *testing.T) {
+	ctx := &ActionContext{}
+	if ctx.ExecuteSlotHeld() {
+		t.Fatal("new ActionContext must not hold the Execute slot")
+	}
+	ctx.HoldExecuteSlot()
+	if !ctx.ExecuteSlotHeld() {
+		t.Fatal("HoldExecuteSlot must be visible immediately to reconcile's defer path")
 	}
 }

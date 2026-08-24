@@ -17,6 +17,8 @@ limitations under the License.
 package api
 
 import (
+	"strings"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -29,6 +31,26 @@ import (
 // The engine Session aggregates the MovableFns registered by plugins (AND: any
 // plugin may veto a move) into a single Movable for planners to consume.
 type Movable func(task *api.TaskInfo) bool
+
+// PodGroupIdentity returns the canonical namespace/name identity of the
+// PodGroup which owns task. Repack execution is PodGroup based: a task without
+// this identity cannot participate in a plan, independently of optional policy
+// plugins such as workloadscope.
+func PodGroupIdentity(task *api.TaskInfo) (namespace, name string, valid bool) {
+	if task == nil {
+		return "", "", false
+	}
+	jobID := string(task.Job)
+	separator := strings.IndexByte(jobID, '/')
+	if separator <= 0 || separator == len(jobID)-1 || strings.IndexByte(jobID[separator+1:], '/') >= 0 {
+		return "", "", false
+	}
+	namespace, name = jobID[:separator], jobID[separator+1:]
+	if task.Namespace != "" && task.Namespace != namespace {
+		return "", "", false
+	}
+	return namespace, name, true
+}
 
 // NodeFreeabilityReason explains why a node cannot be drained in the current
 // planning pass. An empty value means the node is freeable.
@@ -95,13 +117,6 @@ func EvaluateNodeFreeability(node *api.NodeInfo, state NodeFreeabilityState, mov
 		return NodeFreeability{Reason: HasImmovableTargetResourcePodReason, ImmovableTasks: immovableTasks}
 	}
 	return NodeFreeability{Freeable: true}
-}
-
-// NodeFreeable is a compatibility helper for callers that only need the
-// eligibility bit. New callers that need an explanation should use
-// EvaluateNodeFreeability so decision and diagnostics never diverge.
-func NodeFreeable(node *api.NodeInfo, movable Movable, res v1.ResourceName) bool {
-	return EvaluateNodeFreeability(node, NodeFreeabilityState{}, movable, res).Freeable
 }
 
 // VictimsOf returns the movable target-resource (res) tasks that vacating node

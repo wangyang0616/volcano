@@ -26,6 +26,7 @@ import (
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	state "volcano.sh/repack-controller/pkg/state"
 
+	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 )
 
@@ -68,7 +69,7 @@ func Receivers(nodes []*schedapi.NodeInfo, freedNodes []string, plannedNode stri
 		if node == nil {
 			return
 		}
-		if _, excluded := freed[node.Name]; excluded || !task.InitResreq.LessEqual(node.Idle, schedapi.Zero) {
+		if _, excluded := freed[node.Name]; excluded || !task.InitResreq.LessEqual(engineapi.NodeFreeCapacity(node), schedapi.Zero) {
 			return
 		}
 		receivers = append(receivers, node)

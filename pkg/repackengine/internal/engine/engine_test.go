@@ -28,6 +28,7 @@ import (
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
+	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 	commonutil "volcano.sh/volcano/pkg/util"
 )
 
@@ -55,11 +56,11 @@ func TestPlacementCleanupCandidateRetainsLabelOnlyFailure(t *testing.T) {
 			Phase: repackv1alpha1.RepackFailed,
 		},
 	}
-	if !isPlacementCleanupCandidate(run) {
+	if enginestatus.ResolveStage(run) != enginestatus.StageCleanup {
 		t.Fatal("terminal Execute with placement-active label must retry cleanup even when relocations were cleared")
 	}
 	delete(run.Labels, repackv1alpha1.PlacementActiveLabel)
-	if isPlacementCleanupCandidate(run) {
+	if enginestatus.ResolveStage(run) == enginestatus.StageCleanup {
 		t.Fatal("terminal Execute without relocations or active label needs no placement cleanup")
 	}
 }

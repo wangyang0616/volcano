@@ -161,17 +161,12 @@ func TestOptimalNodes_LowerBound_NonPow2(t *testing.T) {
 	}
 }
 
-func TestFragRateAndWeighted(t *testing.T) {
-	per := map[v1.ResourceName]ResourceFragmentation{
-		gpu:                    {Resource: gpu, ProvidingNodeCount: 20, OccupiedNodeCount: 18, OptimalOccupiedNodeCount: 16},
-		"huawei.com/Ascend910": {Resource: "huawei.com/Ascend910", ProvidingNodeCount: 8, OccupiedNodeCount: 5, OptimalOccupiedNodeCount: 5},
+func TestFragmentationRate(t *testing.T) {
+	fragmentation := ResourceFragmentation{
+		Resource: gpu, ProvidingNodeCount: 20, OccupiedNodeCount: 18, OptimalOccupiedNodeCount: 16,
 	}
-	if got := per[gpu].FragmentationRate(); math.Abs(got-0.10) > 1e-9 {
+	if got := fragmentation.FragmentationRate(); math.Abs(got-0.10) > 1e-9 {
 		t.Errorf("gpu FragmentationRate=%v want 0.10", got)
-	}
-	// Weighted rate = total excess occupied nodes / total providing nodes = (2+0)/(20+8).
-	if got := WeightedFragmentationRate(per); math.Abs(got-2.0/28.0) > 1e-9 {
-		t.Errorf("WeightedFragmentationRate=%v want %v", got, 2.0/28.0)
 	}
 }
 

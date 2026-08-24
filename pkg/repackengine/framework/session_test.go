@@ -17,7 +17,6 @@ limitations under the License.
 package framework
 
 import (
-	"context"
 	"testing"
 
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -29,34 +28,41 @@ import (
 func TestSession_MovableAND(t *testing.T) {
 	ssn := newSession(&fakeSnap{})
 	ssn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return t.Name != "x" })
-	ssn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return t.Job != "frozen" })
+	ssn.AddMovableFn(func(t *schedapi.TaskInfo) bool { return t.Job != "ns/frozen" })
 	mv := ssn.Movable()
-	if !mv(task("a", "g", 1)) {
+	if !mv(task("a", "ns/g", 1)) {
 		t.Error("a should be movable")
 	}
-	if mv(task("x", "g", 1)) {
+	if mv(task("x", "ns/g", 1)) {
 		t.Error("x vetoed by first fn")
 	}
-	if mv(task("a", "frozen", 1)) {
+	if mv(task("a", "ns/frozen", 1)) {
 		t.Error("frozen vetoed by second fn")
 	}
 }
 
-// No MovableFn registered → everything movable.
-func TestSession_MovableEmptyAllMovable(t *testing.T) {
-	if !newSession(&fakeSnap{}).Movable()(task("a", "g", 1)) {
-		t.Error("no fns → all movable")
+func TestSession_MovableAlwaysEnforcesPodGroupIdentity(t *testing.T) {
+	movable := newSession(&fakeSnap{}).Movable()
+	if !movable(task("a", "ns/g", 1)) {
+		t.Error("valid PodGroup task should be movable when no policy callbacks are registered")
 	}
-}
-
-func TestSessionForwardsPlanningContextToSnapshot(t *testing.T) {
-	type contextKey struct{}
-	ctx := context.WithValue(context.Background(), contextKey{}, "run-context")
-	snapshot := &fakeSnap{}
-	ssn := OpenSession(SessionConfig{Context: ctx, Snapshot: snapshot}, nil)
-	ssn.FeasibleRelocation(nil, nil, nil)
-	if snapshot.feasibleContext == nil || snapshot.feasibleContext.Value(contextKey{}) != "run-context" {
-		t.Fatalf("snapshot context = %v, want the RepackRun planning context", snapshot.feasibleContext)
+	tests := []struct {
+		name string
+		task *schedapi.TaskInfo
+	}{
+		{name: "nil task"},
+		{name: "no PodGroup", task: task("a", "", 1)},
+		{name: "missing namespace", task: task("a", "g", 1)},
+		{name: "missing name", task: task("a", "ns/", 1)},
+		{name: "multiple separators", task: task("a", "ns/g/extra", 1)},
+		{name: "namespace mismatch", task: &schedapi.TaskInfo{Name: "a", Namespace: "other", Job: "ns/g"}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if movable(testCase.task) {
+				t.Fatalf("task %+v should be rejected by the mandatory PodGroup boundary", testCase.task)
+			}
+		})
 	}
 }
 
@@ -75,85 +81,5 @@ func TestSession_FreeableUnitsUnion(t *testing.T) {
 	})
 	if u := ssn.FreeableUnits(); len(u) != 2 {
 		t.Fatalf("union len=%d, want 2", len(u))
-	}
-}
-
-func TestSession_DisruptionScoresExplainNormalizationAndWeighting(t *testing.T) {
-	ssn := newSession(&fakeSnap{})
-	ssn.AddDisruptionScoreFn("movedPods", 1, func(ctx *api.PlanContext, plan *api.CandidatePlan) int64 {
-		return plan.MoveAggregate(ctx).MovedPods
-	})
-	ssn.AddDisruptionScoreFn("constantRisk", 2, func(*api.PlanContext, *api.CandidatePlan) int64 {
-		return 7
-	})
-	cheap := &api.CandidatePlan{Moves: []*api.Move{
-		move(task("a", "ga", 1), "n0", "n1"),
-	}}
-	costly := &api.CandidatePlan{Moves: []*api.Move{
-		move(task("b", "gb", 1), "n0", "n1"),
-		move(task("c", "gc", 1), "n0", "n1"),
-	}}
-
-	scores := ssn.DisruptionScores([]*api.CandidatePlan{costly, cheap})
-	if len(scores) != 2 || len(scores[0].Terms) != 2 || len(scores[1].Terms) != 2 {
-		t.Fatalf("scores=%+v, want two candidates with two term explanations each", scores)
-	}
-	if scores[0].Total != 200 || scores[1].Total != 300 {
-		t.Fatalf("totals=(%v,%v), want (200,300)", scores[0].Total, scores[1].Total)
-	}
-	movedPods := scores[0].Terms[0]
-	if movedPods.Name != "movedPods" || movedPods.Raw != 2 || movedPods.Weight != 1 ||
-		movedPods.Score != 0 || movedPods.Contribution != 0 {
-		t.Errorf("costly movedPods explanation=%+v", movedPods)
-	}
-	constantRisk := scores[0].Terms[1]
-	if constantRisk.Name != "constantRisk" || constantRisk.Raw != 7 ||
-		constantRisk.Score != 100 || constantRisk.Contribution != 200 {
-		t.Errorf("constant term explanation=%+v; tied terms must receive the same maximum score", constantRisk)
-	}
-	if cheapMovedPods := scores[1].Terms[0]; cheapMovedPods.Score != 100 || cheapMovedPods.Contribution != 100 {
-		t.Errorf("cheap movedPods explanation=%+v, want score=100 contribution=100", cheapMovedPods)
-	}
-}
-
-func TestSession_DisruptionScoresSkipZeroWeight(t *testing.T) {
-	ssn := newSession(&fakeSnap{})
-	calls := 0
-	ssn.AddDisruptionScoreFn("disabled", 0, func(*api.PlanContext, *api.CandidatePlan) int64 {
-		calls++
-		return 100
-	})
-
-	scores := ssn.DisruptionScores([]*api.CandidatePlan{{}, {}})
-	if calls != 0 {
-		t.Fatalf("disabled score function called %d times, want 0", calls)
-	}
-	for index, score := range scores {
-		if score.Total != 0 || len(score.Terms) != 0 {
-			t.Errorf("score[%d]=%+v, want no contribution or explanation for disabled term", index, score)
-		}
-	}
-}
-
-func TestSession_DisruptionScoresUseIntegerRange(t *testing.T) {
-	ssn := newSession(&fakeSnap{})
-	ssn.AddDisruptionScoreFn("cost", 3, func(_ *api.PlanContext, plan *api.CandidatePlan) int64 {
-		return int64(len(plan.Moves))
-	})
-
-	candidates := []*api.CandidatePlan{
-		{Moves: []*api.Move{{}}},
-		{Moves: []*api.Move{{}, {}}},
-		{Moves: []*api.Move{{}, {}, {}, {}}},
-	}
-	scores := ssn.DisruptionScores(candidates)
-	wantStrategyScores := []int64{100, 67, 0}
-	for index, want := range wantStrategyScores {
-		if got := scores[index].Terms[0].Score; got != want {
-			t.Errorf("candidate[%d] strategy score=%d, want %d", index, got, want)
-		}
-		if got := scores[index].Total; got != want*3 {
-			t.Errorf("candidate[%d] total=%d, want %d", index, got, want*3)
-		}
 	}
 }

@@ -17,20 +17,140 @@ limitations under the License.
 package framework
 
 import (
+	"context"
+	"errors"
 	"sort"
+	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+
+	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
+
+	"volcano.sh/volcano/pkg/repackengine/api"
 )
 
 // Built-in action names (config repack.actions).
 const ActionRepack = "repack"
 
-// Action is one ordered planning stage of a repack pass (mirrors
-// framework.Action in the scheduler). Side effects are committed by the Engine
-// runtime only after the resulting plan has been durably persisted.
+// Action is one ordered Repack workflow entry (mirrors framework.Action in the
+// scheduler). An Action owns the business flow; Runtime supplies the controller
+// primitives required to persist and execute that flow.
 type Action interface {
 	Name() string
-	Execute(ssn *Session)
+	Execute(ctx *ActionContext) ActionResult
+}
+
+// ActionContext is the per-RepackRun input shared by configured actions. A
+// planning Session is opened lazily by Runtime so eviction/placement recovery
+// does not rebuild a cluster-wide scheduler snapshot unnecessarily.
+type ActionContext struct {
+	Context context.Context
+	Run     *repackv1alpha1.RepackRun
+	Runtime Runtime
+
+	holdExecuteSlot bool
+}
+
+// HoldExecuteSlot marks that this Action has entered a durable Execute stage.
+// It must be called before invoking a Runtime operation that may panic or return
+// asynchronously; the Engine reads the flag from its defer path as well as the
+// normal return path, so a recovered panic cannot accidentally start cooldown.
+func (c *ActionContext) HoldExecuteSlot() {
+	if c != nil {
+		c.holdExecuteSlot = true
+	}
+}
+
+func (c *ActionContext) ExecuteSlotHeld() bool {
+	return c != nil && c.holdExecuteSlot
+}
+
+// ActionResult tells the Engine how to drive the controller after an Action
+// returns. Execute-slot ownership is marked synchronously on ActionContext so it
+// also survives a panic before an ActionResult can be returned.
+type ActionResult struct {
+	Stop         bool
+	Requeue      bool
+	RequeueAfter time.Duration
+	Err          error
+}
+
+// RuntimeResult is returned by long-lived execution primitives. Runtime
+// observes the detailed state; Action maps the result into its workflow result;
+// Engine remains the only component that mutates the workqueue.
+type RuntimeResult struct {
+	Requeue      bool
+	RequeueAfter time.Duration
+	Err          error
+}
+
+// PlanningCycle owns the plugin-populated planning Session and its backing
+// scheduler snapshot. Close must be called exactly once when planning ends.
+type PlanningCycle struct {
+	Session       *Session
+	Resource      v1.ResourceName
+	ResolvedScope *repackv1alpha1.ResolvedScope
+	Close         func()
+}
+
+// Runtime groups the controller ports used by Actions. Keeping the groups
+// separate makes dependency ownership explicit without exposing Kubernetes
+// clients, queues or the Engine implementation to an Action.
+type Runtime interface {
+	PlanningRuntime
+	StatusRuntime
+	ExecutionRuntime
+}
+
+type PlanningRuntime interface {
+	OpenPlanningCycle(context.Context, *repackv1alpha1.RepackRun) (*PlanningCycle, error)
+	ResolveMoveOwners(context.Context, *api.RepackPlan) map[string]*repackv1alpha1.WorkloadRef
+	RecordPlanComputed(*repackv1alpha1.RepackRun)
+}
+
+// ActionError carries the terminal Condition reason for a failure discovered by
+// a Runtime primitive without making the Action infer it from an error string.
+type ActionError struct {
+	Reason string
+	Err    error
+}
+
+func (e *ActionError) Error() string {
+	if e == nil || e.Err == nil {
+		return "repack action failed"
+	}
+	return e.Err.Error()
+}
+func (e *ActionError) Unwrap() error { return e.Err }
+
+func NewActionError(reason string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ActionError{Reason: reason, Err: err}
+}
+
+func ActionErrorReason(err error) string {
+	var actionErr *ActionError
+	if errors.As(err, &actionErr) {
+		return actionErr.Reason
+	}
+	return ""
+}
+
+type StatusRuntime interface {
+	UpdateStatus(context.Context, *repackv1alpha1.RepackRun) error
+	UpdateTerminalStatus(context.Context, *repackv1alpha1.RepackRun) error
+	Fail(context.Context, *repackv1alpha1.RepackRun, string, error) error
+}
+
+type ExecutionRuntime interface {
+	PrepareExecution(context.Context, *repackv1alpha1.RepackRun, *api.RepackPlan, Snapshot) error
+	ExecutePreparedEvictions(context.Context, *repackv1alpha1.RepackRun, v1.ResourceName) RuntimeResult
+	ResumePreparedEvictions(context.Context, *repackv1alpha1.RepackRun) RuntimeResult
+	ReconcilePlacement(context.Context, *repackv1alpha1.RepackRun) RuntimeResult
+	CleanupPlacement(context.Context, *repackv1alpha1.RepackRun) error
 }
 
 // ActionRegistration declares the implementation and semantic plugin
@@ -77,22 +197,29 @@ func ActionNames() []string {
 // DefaultActions is the default pipeline when config names none.
 func DefaultActions() []string { return []string{ActionRepack} }
 
-// RunActions executes the named planning actions in order against the session.
-// Unknown names are skipped with a warning (startup validation is responsible
-// for rejecting invalid production configuration).
-func RunActions(names []string, ssn *Session) {
+// RunActions executes the named workflow actions in order. The first Action to
+// request Stop terminates the pipeline. Unknown names are skipped with a warning;
+// startup validation rejects them in production.
+func RunActions(names []string, ctx *ActionContext) ActionResult {
 	if len(names) == 0 {
 		names = DefaultActions()
 	}
 	for _, name := range names {
-		if ssn == nil || ssn.Context().Err() != nil {
-			return
+		if ctx == nil || ctx.Context == nil || ctx.Context.Err() != nil {
+			if ctx != nil && ctx.Context != nil {
+				return ActionResult{Stop: true, Err: ctx.Context.Err()}
+			}
+			return ActionResult{Stop: true}
 		}
 		a, ok := GetAction(name)
 		if !ok {
 			klog.ErrorS(nil, "repack: unknown action in config, skipping", "action", name, "registered", ActionNames())
 			continue
 		}
-		a.Execute(ssn)
+		result := a.Execute(ctx)
+		if result.Err != nil || result.Stop {
+			return result
+		}
 	}
+	return ActionResult{}
 }

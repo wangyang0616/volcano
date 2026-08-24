@@ -33,6 +33,7 @@ import (
 	engineapi "volcano.sh/volcano/pkg/repackengine/api"
 	evictionexecutor "volcano.sh/volcano/pkg/repackengine/executor/eviction"
 	placementexecutor "volcano.sh/volcano/pkg/repackengine/executor/placement"
+	engineframework "volcano.sh/volcano/pkg/repackengine/framework"
 	"volcano.sh/volcano/pkg/repackengine/metrics"
 	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -63,7 +64,7 @@ func (e *Engine) executePreparedEvictions(
 	run *repackv1alpha1.RepackRun,
 	generation int64,
 	targetResource v1.ResourceName,
-) error {
+) engineframework.RuntimeResult {
 	return e.executePreparedEvictionsWithClient(
 		ctx, run, generation, targetResource, e.clusterCache.Client())
 }
@@ -74,21 +75,21 @@ func (e *Engine) executePreparedEvictionsWithClient(
 	generation int64,
 	targetResource v1.ResourceName,
 	kubernetesClient kubernetes.Interface,
-) error {
+) engineframework.RuntimeResult {
 	if run == nil || run.Status.Plan == nil {
-		return fmt.Errorf("resume evictions: durable plan is missing")
+		return runtimeError(fmt.Errorf("resume evictions: durable plan is missing"))
 	}
 	preparedPlacementGroups := plannedPodGroups(run)
 	victims := plannedVictims(run)
 	if len(victims) == 0 {
-		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
-			fmt.Errorf("resume evictions: durable plan contains no matching relocation"))
+		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed,
+			fmt.Errorf("resume evictions: durable plan contains no matching relocation")))
 	}
 
 	executor := evictionexecutor.New(run, kubernetesClient)
 	if executor == nil {
-		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
-			fmt.Errorf("resume evictions: eviction hook is not configured"))
+		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed,
+			fmt.Errorf("resume evictions: eviction hook is not configured")))
 	}
 
 	missingVictims := make(map[int]string)
@@ -104,14 +105,14 @@ func (e *Engine) executePreparedEvictionsWithClient(
 			if relocation.Eviction.Phase == repackv1alpha1.PodEvictionInProgress {
 				if err := e.persistEvictionOutcome(ctx, run, relocation, repackv1alpha1.PodEvictionAccepted,
 					"Victim Pod disappeared after the durable eviction intent; treating the request as accepted during recovery."); err != nil {
-					return err
+					return runtimeError(err)
 				}
 			} else {
 				missingVictims[victim.relocationIndex] = "Victim Pod was absent before this eviction attempt."
 			}
 			continue
 		case err != nil:
-			return fmt.Errorf("observe victim Pod %s/%s before eviction: %w", victim.namespace, victim.podName, err)
+			return runtimeError(fmt.Errorf("observe victim Pod %s/%s before eviction: %w", victim.namespace, victim.podName, err))
 		}
 
 		originalInstanceGone := relocation.VictimPodUID != "" && pod.UID != relocation.VictimPodUID
@@ -121,7 +122,7 @@ func (e *Engine) executePreparedEvictionsWithClient(
 			if relocation.Eviction.Phase == repackv1alpha1.PodEvictionInProgress {
 				if err := e.persistEvictionOutcome(ctx, run, relocation, repackv1alpha1.PodEvictionAccepted,
 					"The original victim is terminating or gone after the durable eviction intent; treating the request as accepted during recovery."); err != nil {
-					return err
+					return runtimeError(err)
 				}
 			} else {
 				missingVictims[victim.relocationIndex] = "The planned victim was already terminating or had been replaced before this eviction attempt."
@@ -135,7 +136,7 @@ func (e *Engine) executePreparedEvictionsWithClient(
 		relocation.Eviction.Phase = repackv1alpha1.PodEvictionInProgress
 		relocation.Eviction.Message = "Eviction intent is durable; the Eviction API request may now be issued."
 		if err := e.updateStatus(ctx, run); err != nil {
-			return fmt.Errorf("persist eviction intent for Pod %s/%s: %w", victim.namespace, victim.podName, err)
+			return runtimeError(fmt.Errorf("persist eviction intent for Pod %s/%s: %w", victim.namespace, victim.podName, err))
 		}
 
 		task := schedapi.NewTaskInfo(pod.DeepCopy())
@@ -153,7 +154,7 @@ func (e *Engine) executePreparedEvictionsWithClient(
 			}
 		}
 		if err := e.persistEvictionOutcome(ctx, run, relocation, phase, message); err != nil {
-			return err
+			return runtimeError(err)
 		}
 		klog.V(4).InfoS("repack: durable eviction outcome recorded",
 			"run", run.Name, "pod", victim.namespace+"/"+victim.podName,
@@ -168,7 +169,7 @@ func (e *Engine) executePreparedEvictionsWithClient(
 	// classification is deterministic regardless of Pod order.
 	if classifyMissingVictims(run.Status.Relocations, missingVictims) {
 		if err := e.updateStatus(ctx, run); err != nil {
-			return fmt.Errorf("persist indirect victim removal classification: %w", err)
+			return runtimeError(fmt.Errorf("persist indirect victim removal classification: %w", err))
 		}
 	}
 
@@ -192,29 +193,29 @@ func (e *Engine) executePreparedEvictionsWithClient(
 	// entering placement. This is the commit barrier for the complete eviction
 	// journal, including the all-groups-retained case.
 	if err := e.updateStatus(ctx, run); err != nil {
-		return fmt.Errorf("persist completed eviction journal before lease cleanup: %w", err)
+		return runtimeError(fmt.Errorf("persist completed eviction journal before lease cleanup: %w", err))
 	}
 	if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
 		placementexecutor.MarkBenefitUnverified(run)
-		return e.fail(ctx, run, generation, state.ReasonEvictionFailed, err)
+		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed, err))
 	}
 
 	realizedFreedNodes := enginestatus.RealizedFreedNodeNames(run)
 	if summary.accepted == 0 {
 		e.observeEvictionSummary(run, summary)
-		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
-			fmt.Errorf("all %d planned evictions were rejected; no Pods were moved", summary.rejected))
+		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed,
+			fmt.Errorf("all %d planned evictions were rejected; no Pods were moved", summary.rejected)))
 	}
 	if len(realizedFreedNodes) == 0 {
 		e.observeEvictionSummary(run, summary)
-		return e.fail(ctx, run, generation, state.ReasonEvictionFailed,
+		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed,
 			fmt.Errorf("Eviction API accepted %d Pods and workload recreation removed %d additional planned Pods, but no planned node was fully vacated (%d requests rejected)",
-				summary.accepted, summary.indirectlyRemoved, summary.rejected))
+				summary.accepted, summary.indirectlyRemoved, summary.rejected)))
 	}
 
 	state.MarkRunning(run, state.ReasonReconcilingPlacements, enginestatus.PlacementProgressMessage(run, targetResource))
 	if err := e.updateStatus(ctx, run); err != nil {
-		return fmt.Errorf("persist awaiting placement status: %w", err)
+		return runtimeError(fmt.Errorf("persist awaiting placement status: %w", err))
 	}
 	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonReconcilingPlacements,
 		enginestatus.PlacementProgressMessage(run, targetResource))
@@ -224,8 +225,11 @@ func (e *Engine) executePreparedEvictionsWithClient(
 		"indirectlyRemovedCount", summary.indirectlyRemoved,
 		"rejectedCount", summary.rejected, "realizedFreedNodes", realizedFreedNodes,
 		"relocationCount", len(run.Status.Relocations))
-	e.workQueue.AddAfter(run.Name, placementRetryInterval)
-	return nil
+	return engineframework.RuntimeResult{RequeueAfter: placementRetryInterval}
+}
+
+func runtimeError(err error) engineframework.RuntimeResult {
+	return engineframework.RuntimeResult{Err: err}
 }
 
 func (e *Engine) observeEvictionSummary(run *repackv1alpha1.RepackRun, summary evictionSummary) {
