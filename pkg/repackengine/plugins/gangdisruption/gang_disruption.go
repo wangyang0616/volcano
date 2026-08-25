@@ -98,8 +98,8 @@ func (*gangDisruptionPlugin) Name() string { return Name }
 func (p *gangDisruptionPlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddDisruptionScoreFn("gangBreaches", p.gangBreachesWeight, scoreGangBreaches)
 	ssn.AddDisruptionScoreFn("damagedResource", p.damagedResourceWeight, scoreDamagedResource)
-	ssn.AddReceiverRankFn("futureGangImpact", framework.ReceiverRankPhaseDisruption,
-		func(ctx *api.PlanContext, candidate *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverRank {
+	ssn.AddReceiverPreferenceFn("futureGangImpact", framework.ReceiverPreferencePhaseDisruption,
+		func(ctx *api.PlanContext, candidate *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverPreference {
 			var futureMoves map[schedapi.JobID]api.PodGroupMoveAggregate
 			if receiver != nil && receiver.Node != nil {
 				futureMoves = p.futureMovesForReceiver(ssn, receiver.Node)
@@ -115,7 +115,7 @@ func (p *gangDisruptionPlugin) OnSessionClose(*framework.Session) {
 }
 
 // futureMovesForReceiver builds the Gang look-ahead cache on demand for nodes
-// that actually reach receiver ranking. Empty, full, unavailable, and filtered
+// that actually reach receiver ordering. Empty, full, unavailable, and filtered
 // nodes therefore incur no task scan or cache allocation. Initialization remains
 // lazy so every plugin has completed OnSessionOpen before the composed Movable
 // policy is captured.
@@ -172,16 +172,16 @@ func scoreDamagedResource(ctx *api.PlanContext, p *api.CandidatePlan) int64 {
 }
 
 // scoreFutureReceiverImpact prefers consuming a node whose own later drain would
-// add more disruption. The rank preserves the old strict comparison order:
+// add more disruption. The preference preserves the old strict comparison order:
 // breaches, affected PodGroups, damaged resource, moved resource, moved Pods.
 func scoreFutureReceiverImpact(
 	ctx *api.PlanContext,
 	candidate *framework.PlanningCandidate,
 	receiver *framework.ReceiverCandidate,
 	futureMoves map[schedapi.JobID]api.PodGroupMoveAggregate,
-) framework.ReceiverRank {
+) framework.ReceiverPreference {
 	if candidate == nil || candidate.Plan == nil || receiver == nil || receiver.StaysOccupied {
-		return framework.ReceiverRank{}
+		return framework.ReceiverPreference{}
 	}
 	aggregate := candidate.Plan.MoveAggregate(ctx)
 	var breaches, affected, damagedResource, movedResource, movedPods int64
@@ -207,7 +207,7 @@ func scoreFutureReceiverImpact(
 		movedResource += futureMove.MovedResource
 		movedPods += futureMove.MovedPods
 	}
-	return framework.ReceiverRank{breaches, affected, damagedResource, movedResource, movedPods}
+	return framework.ReceiverPreference{breaches, affected, damagedResource, movedResource, movedPods}
 }
 
 func measurePodGroupDisruption(view api.PodGroupView, movedPods, movedResource int64) podGroupDisruption {

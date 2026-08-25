@@ -48,16 +48,16 @@ func (*binpackPlugin) OnSessionOpen(ssn *framework.Session) {
 	ssn.AddVictimOrderFn("largestTargetResourceFirst", func(left, right *schedapi.TaskInfo) int {
 		return cmp.Compare(api.Scalar(right.InitResreq, resourceName), api.Scalar(left.InitResreq, resourceName))
 	})
-	ssn.AddReceiverRankFn("staysOccupied", framework.ReceiverRankPhaseStability,
-		func(_ *api.PlanContext, _ *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverRank {
+	ssn.AddReceiverPreferenceFn("staysOccupied", framework.ReceiverPreferencePhaseStability,
+		func(_ *api.PlanContext, _ *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverPreference {
 			if receiver.StaysOccupied {
-				return framework.ReceiverRank{1}
+				return framework.ReceiverPreference{1}
 			}
-			return framework.ReceiverRank{}
+			return framework.ReceiverPreference{}
 		})
-	ssn.AddReceiverRankFn("bestFit", framework.ReceiverRankPhasePacking,
-		func(_ *api.PlanContext, _ *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverRank {
-			return framework.ReceiverRank{-receiver.AvailableResource}
+	ssn.AddReceiverPreferenceFn("bestFit", framework.ReceiverPreferencePhasePacking,
+		func(_ *api.PlanContext, _ *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverPreference {
+			return framework.ReceiverPreference{-receiver.AvailableResource}
 		})
 }
 

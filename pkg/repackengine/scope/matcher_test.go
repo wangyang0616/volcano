@@ -121,7 +121,7 @@ func TestMatcher_PodGroupNames(t *testing.T) {
 func TestMatcher_PodGroupSelector(t *testing.T) {
 	lookup := gangScopeLookupFrom(map[schedapi.JobID]gangFixture{
 		"ns/dep-x": {"ns/dep-x", map[string]string{"app": "recommender"}},
-		"ns/dep-y": {"ns/dep-y", map[string]string{"app": "ranking"}},
+		"ns/dep-y": {"ns/dep-y", map[string]string{"app": "serving"}},
 		"ns/prot":  {"ns/prot", map[string]string{"app": "recommender", "repack.volcano.sh/protected": "true"}},
 	})
 	scope := &repackv1alpha1.RepackScope{

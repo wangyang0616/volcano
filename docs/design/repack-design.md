@@ -62,7 +62,7 @@ flowchart TB
     D["Engine Runtime\nwatch、workqueue、gate"] --> C["ActionContext\nRun + Runtime ports"]
     C --> A["Action: repack\n规划 → 模式分流 → 执行/恢复 → 终态"]
     A --> S["Planning Session\n按需打开，只读快照"]
-    S --> P["Plugins\nScope / Budget / Domain / Score / Rank"]
+    S --> P["Plugins\nScope / Budget / Domain / Score / Preference"]
     A --> L["Lazy Drain Planner\n候选、惰性模拟、增量提交"]
     A --> X["Execution Runtime\nstatus barrier / eviction / placement"]
     L --> SA["Snapshot Adapter\nScheduler Session + 完整 Filter"]
@@ -308,7 +308,7 @@ Engine 的 `reconcile` 是控制器技术入口，负责对象读取、K=1 gate 
 | `DisruptionScoreFn` | 逐维归一化加权 | 候选软排序 |
 | `VictimOrderFn` | 字典序比较器链 | 调度模拟中的 Pod 顺序 |
 | `ReceiverPoolFn` | 链式交集裁剪 | 构造 receiver universe |
-| `ReceiverRankFn` | 分阶段字典序 | 接收节点排序 |
+| `ReceiverPreferenceFn` | 分阶段字典序 | 接收节点偏好排序 |
 | `ConstraintFn` | AND | 完整计划收益和最终硬约束 |
 
 Plugin 配置顺序不表达策略优先级。Framework 复制配置并按插件名规范化后打开 Session，确保 YAML 重排不改变结果。
@@ -384,7 +384,7 @@ flowchart TD
     D --> E["多策略评分\n0～100 × integer weight"]
     E --> F["按总分从高到低"]
     F --> G{"下一个候选"}
-    G --> H["receiver rank + FeasibleRelocation"]
+    G --> H["receiver preference + FeasibleRelocation"]
     H -->|"失败"| G
     H -->|"成功"| I["原子提交候选"]
     I --> J["增量更新容量、drained、filled、moves"]
@@ -438,20 +438,20 @@ Receiver 首先满足基础边界：
 - 未被前序提交标记为 drained 或不可再接收；
 - 通过 ReceiverPool Plugin 的链式裁剪。
 
-ReceiverRank 使用固定的三阶段字典序，配置顺序不影响阶段：
+ReceiverPreference 使用固定的三阶段字典序，配置顺序不影响阶段：
 
 1. **Stability**：优先填充确定会继续占用的节点，避免破坏未来可腾空候选；
 2. **Disruption**：优先使用未来腾空会造成更高 Gang 成本的节点，把低成本节点留给后续整理；
 3. **Packing**：按 best-fit 选择迁入后余量更小的节点。
 
-Rank 对每个节点、每个 Plugin 只计算一次，之后使用缓存值稳定排序，避免比较器产生 `O(R log R)` 次昂贵聚合。
+Preference 对每个节点、每个 Plugin 只计算一次，之后使用缓存值稳定排序，避免比较器产生 `O(R log R)` 次昂贵聚合。
 
 ### 8.6 完整调度模拟
 
 `Snapshot.FeasibleRelocation` 为每个候选构造克隆节点状态和 cycle state，按 victim 顺序逐个模拟放置：
 
 1. 从克隆状态移除 victim；
-2. 按 receiver rank 遍历节点；
+2. 按 receiver preference 遍历节点；
 3. 调用 Scheduler Session 的完整模拟过滤栈；
 4. 找到可行节点后把 Pod 加到克隆节点并扣减容量；
 5. 任一 Pod 无落点则丢弃整个候选克隆。
@@ -609,7 +609,7 @@ Engine 采用单 worker 和 K=1 Execute gate：
 - 初始化阶段一次性分类空、部分占用、满卡和不可用节点；
 - 评分前排除没有 receiver 总容量的候选；
 - 缓存 Unit victim、资源量和静态节点数据；
-- receiver rank 每节点每 Plugin 单次求值；
+- receiver preference 每节点每 Plugin 单次求值；
 - Gang receiver 影响按真正进入排序的节点惰性缓存；
 - 沿评分顺序惰性执行 `FeasibleRelocation`，首个成功即停止；
 - 提交后只增量维护容量、drained、filled 和活动候选；
@@ -622,7 +622,7 @@ Engine 采用单 worker 和 K=1 Execute gate：
 
 - 总规划耗时和每步耗时；
 - 初始/活动/过滤/模拟候选数；
-- receiver 数和 rank 计算次数；
+- receiver 数和 preference 计算次数；
 - `FeasibleRelocation` 调用次数；
 - Scheduler Filter 调用量；
 - 分配内存和峰值 RSS。
@@ -635,7 +635,7 @@ Engine 采用单 worker 和 K=1 Execute gate：
 
 - V3：Run 级运维叙事，包括 gate、计划摘要、选择目标、驱逐和终态；
 - V4：候选首尾明细、被选中的中间候选、过滤原因和 retry；
-- V5：单项原始成本、`0～100` 策略分、整数权重、加权贡献和 receiver rank。
+- V5：单项原始成本、`0～100` 策略分、整数权重、加权贡献和 receiver preference。
 
 候选评分日志使用 `higher-is-better`，并输出：
 
@@ -758,7 +758,7 @@ test/e2e/repack/                            # 全量 E2E
 - HyperNode 或其他释放单元 → `DomainFn`；
 - 新预算或硬规则 → `CandidateFilterFn`/`ConstraintFn`；
 - 新的业务中断偏好 → `DisruptionScoreFn`；
-- 新 receiver 偏好 → `ReceiverRankFn`；
+- 新 receiver 偏好 → `ReceiverPreferenceFn`；
 - 只有改变一次 Run 的业务阶段时才增加 Action；
 - 只有现有 Lazy Drain 搜索无法表达时才考虑新的 Planner。
 

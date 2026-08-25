@@ -25,19 +25,19 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/api"
 )
 
-func TestOrderReceiversUsesPriorityAndEvaluatesEachRankOnce(t *testing.T) {
+func TestOrderReceiversUsesPriorityAndEvaluatesEachPreferenceOnce(t *testing.T) {
 	ssn := newSession(&fakeSnap{})
 	stabilityCalls, fitCalls := 0, 0
-	ssn.AddReceiverRankFn("bestFit", ReceiverRankPhasePacking, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
+	ssn.AddReceiverPreferenceFn("bestFit", ReceiverPreferencePhasePacking, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverPreference {
 		fitCalls++
-		return ReceiverRank{-receiver.AvailableResource}
+		return ReceiverPreference{-receiver.AvailableResource}
 	})
-	ssn.AddReceiverRankFn("stability", ReceiverRankPhaseStability, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank {
+	ssn.AddReceiverPreferenceFn("stability", ReceiverPreferencePhaseStability, func(_ *api.PlanContext, _ *PlanningCandidate, receiver *ReceiverCandidate) ReceiverPreference {
 		stabilityCalls++
 		if receiver.StaysOccupied {
-			return ReceiverRank{1}
+			return ReceiverPreference{1}
 		}
-		return ReceiverRank{}
+		return ReceiverPreference{}
 	})
 
 	receivers := []*ReceiverCandidate{
@@ -51,7 +51,7 @@ func TestOrderReceiversUsesPriorityAndEvaluatesEachRankOnce(t *testing.T) {
 		t.Fatalf("receiver order=%v, want stability before best-fit", got)
 	}
 	if stabilityCalls != len(receivers) || fitCalls != len(receivers) {
-		t.Fatalf("rank calls stability=%d fit=%d, want one call per receiver", stabilityCalls, fitCalls)
+		t.Fatalf("preference calls stability=%d fit=%d, want one call per receiver", stabilityCalls, fitCalls)
 	}
 }
 
@@ -68,6 +68,19 @@ func TestReceiverPoolChainsWithoutMutatingCallerSlice(t *testing.T) {
 	}
 	if len(pool) != 1 || pool[0].Name != "b" {
 		t.Fatalf("pool=%v, want [b]", pool)
+	}
+}
+
+func TestReceiverPoolNormalizesInitialUniverseWithoutPlugins(t *testing.T) {
+	ssn := newSession(&fakeSnap{})
+	a, b := node("a", nil), node("b", nil)
+	pool := ssn.ReceiverPool([]*schedapi.NodeInfo{nil, a, a, {Name: ""}, b})
+
+	if len(pool) != 2 {
+		t.Fatalf("pool=%v, want two unique valid nodes", pool)
+	}
+	if got := fmt.Sprint([]string{pool[0].Name, pool[1].Name}); got != "[a b]" {
+		t.Fatalf("pool=%v, want unique valid nodes [a b] in input order", got)
 	}
 }
 

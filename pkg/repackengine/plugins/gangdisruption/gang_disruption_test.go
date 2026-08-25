@@ -132,9 +132,9 @@ func TestScoreFutureReceiverImpactUsesMarginalGangCost(t *testing.T) {
 
 	// Filling this receiver prevents a future drain that would newly breach the
 	// gang. Damaged resource grows from the two moved cards to the full footprint.
-	want := framework.ReceiverRank{1, 0, 6, 2, 1}
+	want := framework.ReceiverPreference{1, 0, 6, 2, 1}
 	if got := scoreFutureReceiverImpact(ctx, candidate, receiver, futureMoves); !reflect.DeepEqual(got, want) {
-		t.Fatalf("future receiver rank=%v, want %v", got, want)
+		t.Fatalf("future receiver preference=%v, want %v", got, want)
 	}
 }
 
@@ -150,22 +150,22 @@ func TestAggregateTasksByPodGroupBelongsToGangDisruptionPlugin(t *testing.T) {
 	}
 }
 
-func TestFutureMovesCacheOnlyScansRankedReceiver(t *testing.T) {
-	ranked := &schedapi.NodeInfo{
-		Name: "ranked",
+func TestFutureMovesCacheOnlyScansPreferredReceiver(t *testing.T) {
+	preferred := &schedapi.NodeInfo{
+		Name: "preferred",
 		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
-			"ranked-task": tk("ranked-task", "ns/g", 2),
+			"preferred-task": tk("preferred-task", "ns/g", 2),
 		},
 	}
-	unranked := &schedapi.NodeInfo{
-		Name: "unranked",
+	notEvaluated := &schedapi.NodeInfo{
+		Name: "not-evaluated",
 		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
-			"unranked-task": tk("unranked-task", "ns/other", 2),
+			"not-evaluated-task": tk("not-evaluated-task", "ns/other", 2),
 		},
 	}
 	ssn := framework.OpenSession(framework.SessionConfig{
 		Resource: gpu,
-		Snapshot: &gangSnapshot{nodes: []*schedapi.NodeInfo{ranked, unranked}},
+		Snapshot: &gangSnapshot{nodes: []*schedapi.NodeInfo{preferred, notEvaluated}},
 	}, nil)
 	defer framework.CloseSession(ssn)
 	movableCalls := 0
@@ -175,16 +175,16 @@ func TestFutureMovesCacheOnlyScansRankedReceiver(t *testing.T) {
 	})
 	plugin := &gangDisruptionPlugin{}
 
-	first := plugin.futureMovesForReceiver(ssn, ranked)
-	second := plugin.futureMovesForReceiver(ssn, ranked)
+	first := plugin.futureMovesForReceiver(ssn, preferred)
+	second := plugin.futureMovesForReceiver(ssn, preferred)
 	if first["ns/g"].MovedPods != 1 || second["ns/g"].MovedPods != 1 {
-		t.Fatalf("ranked receiver cache=%v/%v, want one ns/g move", first, second)
+		t.Fatalf("preferred receiver cache=%v/%v, want one ns/g move", first, second)
 	}
 	if movableCalls != 1 {
-		t.Fatalf("movable calls=%d, want ranked receiver scanned exactly once", movableCalls)
+		t.Fatalf("movable calls=%d, want preferred receiver scanned exactly once", movableCalls)
 	}
-	if _, found := plugin.futureMovesByNode[unranked.Name]; found {
-		t.Fatal("unranked receiver must not be scanned or cached")
+	if _, found := plugin.futureMovesByNode[notEvaluated.Name]; found {
+		t.Fatal("receiver outside preference evaluation must not be scanned or cached")
 	}
 }
 

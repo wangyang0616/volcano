@@ -114,12 +114,12 @@ func PluginOptions(names ...string) []PluginOption {
 //
 //   - AddMovableFn         — may a task move? (veto: gang breach, PDB, minRunDuration, scope)
 //   - AddDomainFn          — what is a freeable unit? (node, hypernode/topology level)
-//   - AddDisruptionScoreFn — soft cost of a plan on one dimension (ranking only)
+//   - AddDisruptionScoreFn — soft cost of a plan on one dimension (ordering only)
 //   - AddConstraintFn      — hard admissibility gate on a finished plan (veto: maxDisruptionScore)
 //   - AddCandidateFilterFn — cheap pre-score candidate veto (repack budget, capacity, PDB)
 //   - AddReceiverPoolFn    — snapshot-stable receiver-universe policy
 //   - AddVictimOrderFn     — victim simulation order
-//   - AddReceiverRankFn    — lexicographic receiver preference
+//   - AddReceiverPreferenceFn — lexicographic receiver preference
 //
 // Search mechanics remain action/planner concerns; scenario semantics belong in
 // plugins and compose through these callbacks.

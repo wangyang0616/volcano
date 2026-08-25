@@ -34,41 +34,43 @@ type ReceiverCandidate struct {
 // ReceiverPoolFn applies a snapshot-stable receiver-universe policy once per pass.
 type ReceiverPoolFn func(ctx *api.PlanContext, nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo
 
-// ReceiverRankFn returns a fixed-width lexicographic rank. Larger values are preferred.
-type ReceiverRankFn func(ctx *api.PlanContext, candidate *PlanningCandidate, receiver *ReceiverCandidate) ReceiverRank
+// ReceiverPreferenceFn returns a fixed-width lexicographic preference. Larger
+// values are preferred.
+type ReceiverPreferenceFn func(ctx *api.PlanContext, candidate *PlanningCandidate, receiver *ReceiverCandidate) ReceiverPreference
 
-// ReceiverRank is one plugin's fixed-width, lexicographically compared score.
-type ReceiverRank [5]int64
+// ReceiverPreference is one plugin's fixed-width, lexicographically compared
+// preference vector.
+type ReceiverPreference [5]int64
 
-// ReceiverRankPhase defines the stable order between receiver policy groups.
-type ReceiverRankPhase int
+// ReceiverPreferencePhase defines the stable order between receiver policy groups.
+type ReceiverPreferencePhase int
 
 const (
-	// ReceiverRankPhaseStability evaluates placement stability first.
-	ReceiverRankPhaseStability ReceiverRankPhase = iota
-	// ReceiverRankPhaseDisruption evaluates workload impact after stability.
-	ReceiverRankPhaseDisruption
-	// ReceiverRankPhasePacking evaluates packing preferences last.
-	ReceiverRankPhasePacking
+	// ReceiverPreferencePhaseStability evaluates placement stability first.
+	ReceiverPreferencePhaseStability ReceiverPreferencePhase = iota
+	// ReceiverPreferencePhaseDisruption evaluates workload impact after stability.
+	ReceiverPreferencePhaseDisruption
+	// ReceiverPreferencePhasePacking evaluates packing preferences last.
+	ReceiverPreferencePhasePacking
 )
 
-type namedReceiverRank struct {
+type namedReceiverPreference struct {
 	name  string
-	phase ReceiverRankPhase
+	phase ReceiverPreferencePhase
 	order int
-	fn    ReceiverRankFn
+	fn    ReceiverPreferenceFn
 }
 
-// ReceiverRankTerm records one named plugin's rank for diagnostics.
-type ReceiverRankTerm struct {
+// ReceiverPreferenceTerm records one named plugin's preference for diagnostics.
+type ReceiverPreferenceTerm struct {
 	Name   string
-	Values ReceiverRank
+	Values ReceiverPreference
 }
 
-// RankedReceiver contains a receiver and all ranks used to order it.
-type RankedReceiver struct {
+// OrderedReceiver contains a receiver and all preferences used to order it.
+type OrderedReceiver struct {
 	Receiver *ReceiverCandidate
-	Terms    []ReceiverRankTerm
+	Terms    []ReceiverPreferenceTerm
 }
 
 func (s *Session) AddReceiverPoolFn(fn ReceiverPoolFn) {
@@ -77,25 +79,25 @@ func (s *Session) AddReceiverPoolFn(fn ReceiverPoolFn) {
 	}
 }
 
-func (s *Session) AddReceiverRankFn(name string, phase ReceiverRankPhase, fn ReceiverRankFn) {
+func (s *Session) AddReceiverPreferenceFn(name string, phase ReceiverPreferencePhase, fn ReceiverPreferenceFn) {
 	if fn == nil {
 		return
 	}
-	s.receiverRankFns = append(s.receiverRankFns, namedReceiverRank{
-		name: name, phase: phase, order: len(s.receiverRankFns), fn: fn,
+	s.receiverPreferenceFns = append(s.receiverPreferenceFns, namedReceiverPreference{
+		name: name, phase: phase, order: len(s.receiverPreferenceFns), fn: fn,
 	})
-	sort.SliceStable(s.receiverRankFns, func(i, j int) bool {
-		if s.receiverRankFns[i].phase != s.receiverRankFns[j].phase {
-			return s.receiverRankFns[i].phase < s.receiverRankFns[j].phase
+	sort.SliceStable(s.receiverPreferenceFns, func(i, j int) bool {
+		if s.receiverPreferenceFns[i].phase != s.receiverPreferenceFns[j].phase {
+			return s.receiverPreferenceFns[i].phase < s.receiverPreferenceFns[j].phase
 		}
-		return s.receiverRankFns[i].order < s.receiverRankFns[j].order
+		return s.receiverPreferenceFns[i].order < s.receiverPreferenceFns[j].order
 	})
 }
 
 // ReceiverPool chains filter-only policies without allowing a plugin to
 // reintroduce removed nodes, foreign nodes, or duplicate capacity.
 func (s *Session) ReceiverPool(nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo {
-	pool := intersectReceiverPool(nodes, nodes)
+	pool := normalizeReceiverPool(nodes)
 	ctx := s.PlanContext()
 	for _, fn := range s.receiverPoolFns {
 		selected := fn(ctx, append([]*schedapi.NodeInfo(nil), pool...))
@@ -104,6 +106,25 @@ func (s *Session) ReceiverPool(nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo 
 	return pool
 }
 
+// normalizeReceiverPool establishes the initial receiver universe. It removes
+// unusable identities and duplicate capacity while preserving the caller's
+// stable node order.
+func normalizeReceiverPool(nodes []*schedapi.NodeInfo) []*schedapi.NodeInfo {
+	retained := make([]*schedapi.NodeInfo, 0, len(nodes))
+	seen := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if node == nil || node.Name == "" || seen[node.Name] {
+			continue
+		}
+		seen[node.Name] = true
+		retained = append(retained, node)
+	}
+	return retained
+}
+
+// intersectReceiverPool retains the current pool's order and node objects,
+// using selected only as a membership set. A policy therefore cannot expand
+// the receiver universe or duplicate its capacity.
 func intersectReceiverPool(current, selected []*schedapi.NodeInfo) []*schedapi.NodeInfo {
 	selectedNames := make(map[string]bool, len(selected))
 	for _, node := range selected {
@@ -123,25 +144,28 @@ func intersectReceiverPool(current, selected []*schedapi.NodeInfo) []*schedapi.N
 	return retained
 }
 
-// OrderReceivers evaluates each rank once, then performs a stable lexicographic sort.
-func (s *Session) OrderReceivers(candidate *PlanningCandidate, receivers []*ReceiverCandidate) []RankedReceiver {
+// OrderReceivers evaluates each preference once, then performs a stable
+// lexicographic sort.
+func (s *Session) OrderReceivers(candidate *PlanningCandidate, receivers []*ReceiverCandidate) []OrderedReceiver {
 	ctx := s.PlanContext()
-	ranked := make([]RankedReceiver, 0, len(receivers))
-	allTerms := make([]ReceiverRankTerm, len(receivers)*len(s.receiverRankFns))
+	ordered := make([]OrderedReceiver, 0, len(receivers))
+	allTerms := make([]ReceiverPreferenceTerm, len(receivers)*len(s.receiverPreferenceFns))
 	for receiverIndex, receiver := range receivers {
-		terms := allTerms[receiverIndex*len(s.receiverRankFns) : (receiverIndex+1)*len(s.receiverRankFns)]
-		for rankIndex, rankFn := range s.receiverRankFns {
-			terms[rankIndex] = ReceiverRankTerm{Name: rankFn.name, Values: rankFn.fn(ctx, candidate, receiver)}
+		terms := allTerms[receiverIndex*len(s.receiverPreferenceFns) : (receiverIndex+1)*len(s.receiverPreferenceFns)]
+		for preferenceIndex, preferenceFn := range s.receiverPreferenceFns {
+			terms[preferenceIndex] = ReceiverPreferenceTerm{
+				Name: preferenceFn.name, Values: preferenceFn.fn(ctx, candidate, receiver),
+			}
 		}
-		ranked = append(ranked, RankedReceiver{Receiver: receiver, Terms: terms})
+		ordered = append(ordered, OrderedReceiver{Receiver: receiver, Terms: terms})
 	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return compareReceiverRanks(ranked[i].Terms, ranked[j].Terms) > 0
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return compareReceiverPreferences(ordered[i].Terms, ordered[j].Terms) > 0
 	})
-	return ranked
+	return ordered
 }
 
-func compareReceiverRanks(left, right []ReceiverRankTerm) int {
+func compareReceiverPreferences(left, right []ReceiverPreferenceTerm) int {
 	for termIndex := 0; termIndex < len(left) && termIndex < len(right); termIndex++ {
 		leftValues, rightValues := left[termIndex].Values, right[termIndex].Values
 		for valueIndex := range leftValues {

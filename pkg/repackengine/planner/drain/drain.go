@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package drain contains the reusable incremental drain planner used by the
-// repack action. Each step cheaply ranks the active drain units against the
+// repack action. Each step cheaply orders the active drain units against the
 // committed moves, then lazily invokes the scheduler-faithful relocation solver
 // in that order. The first feasible unit is committed. This preserves complete
 // scheduler validation for the selected plan without paying that cost for every
@@ -124,7 +124,7 @@ type drainState struct {
 }
 
 // drainGreedy is the single dynamic pass. Static unit facts are prepared once.
-// Each step ranks active units with cheap prospective moves, then runs complete
+// Each step orders active units with cheap prospective moves, then runs complete
 // scheduler simulation lazily until the first feasible candidate is found.
 // Terminates because each commit drains >= 1 node and inactive units never return.
 func drainGreedy(
@@ -148,14 +148,14 @@ func drainGreedy(
 		if ssn.Context().Err() != nil {
 			break
 		}
-		// 1. Rank all currently active candidates without constructing receiver
+		// 1. Order all currently active candidates without constructing receiver
 		// lists, cloning scheduler state, or running predicates.
 		preliminary := s.preliminaryCandidates()
 		if len(preliminary) == 0 {
 			break
 		}
 		ordered := orderScoredCandidates(s.scoreCandidates(preliminary))
-		klog.V(4).InfoS("repack drain: step ranked active units", "step", step,
+		klog.V(4).InfoS("repack drain: step ordered active units", "step", step,
 			"activeCandidates", len(ordered), "nodesFreedSoFar", len(s.freedNodes))
 
 		// 2. Lazily run the expensive scheduler simulation in disruption order.
@@ -335,7 +335,7 @@ func (s *drainState) preliminaryCandidates() []candidate {
 			continue
 		}
 		// Reuse the same whole-plan view (and its cached move aggregate) for
-		// disruption scoring and receiver ranking in this step.
+		// disruption scoring and receiver ordering in this step.
 		candidate.prospectivePlan = planningCandidate.Plan
 		preliminary = append(preliminary, candidate)
 		active = append(active, prepared)
@@ -484,20 +484,20 @@ func (s *drainState) receiversInPreferenceOrderWithPlan(
 		prospectivePlan = api.NewCandidatePlan(s.moves, prospectiveMoves(candidateVictims))
 	}
 	planningCandidate := &framework.PlanningCandidate{Plan: prospectivePlan}
-	ranked := s.ssn.OrderReceivers(planningCandidate, receivers)
-	if klog.V(5).Enabled() && len(ranked) > 0 {
-		preferred := ranked[0]
+	ordered := s.ssn.OrderReceivers(planningCandidate, receivers)
+	if klog.V(5).Enabled() && len(ordered) > 0 {
+		preferred := ordered[0]
 		klog.V(5).InfoS("repack drain: preferred receiver calculated",
 			"candidateVictims", taskNames(candidateVictims),
-			"receiverCount", len(ranked),
+			"receiverCount", len(ordered),
 			"preferredReceiver", preferred.Receiver.Node.Name,
 			"staysOccupied", preferred.Receiver.StaysOccupied,
 			"availableResource", preferred.Receiver.AvailableResource,
-			"pluginRanks", preferred.Terms)
+			"pluginPreferences", preferred.Terms)
 	}
 
-	orderedNodes := make([]*schedapi.NodeInfo, 0, len(ranked))
-	for _, receiver := range ranked {
+	orderedNodes := make([]*schedapi.NodeInfo, 0, len(ordered))
+	for _, receiver := range ordered {
 		orderedNodes = append(orderedNodes, receiver.Receiver.Node)
 	}
 	return orderedNodes
@@ -532,7 +532,7 @@ func receiverSlack(n *schedapi.NodeInfo, targetResource v1.ResourceName) int64 {
 // eligibleReceiverNodes performs the snapshot-stable receiver prefilter before
 // any candidate scoring. Only partially occupied nodes with positive scheduler-
 // visible slack may receive moved pods; empty nodes remain idle and full nodes
-// never enter plugin ranking or scheduler simulation.
+// never enter plugin ordering or scheduler simulation.
 type receiverEligibilityStats struct {
 	unavailable int
 	empty       int

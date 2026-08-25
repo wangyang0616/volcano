@@ -113,7 +113,7 @@ type DisruptionScoreTerm struct {
 	Contribution int64
 }
 
-// CandidateDisruptionScore is the complete score used to rank one candidate.
+// CandidateDisruptionScore is the complete score used to order one candidate.
 // Higher Total is preferred, matching scheduler node-score semantics.
 type CandidateDisruptionScore struct {
 	Total int64

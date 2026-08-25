@@ -71,10 +71,10 @@ type Session struct {
 	scoreTerms    []scoreTerm
 	constraintFns []PlanConstraintFn
 
-	candidateFilterFns []namedCandidateFilter
-	receiverPoolFns    []ReceiverPoolFn
-	victimOrderFns     []namedVictimOrder
-	receiverRankFns    []namedReceiverRank
+	candidateFilterFns    []namedCandidateFilter
+	receiverPoolFns       []ReceiverPoolFn
+	victimOrderFns        []namedVictimOrder
+	receiverPreferenceFns []namedReceiverPreference
 
 	// results filled by the action, read by the Engine runtime
 	plan   *api.RepackPlan
@@ -183,7 +183,7 @@ func (s *Session) Movable() api.Movable {
 }
 
 // FreeableUnits is the union of every domain plugin's units. With both node and
-// hypernode domains enabled this carries both levels; the planner ranks them in one
+// hypernode domains enabled this carries both levels; the planner orders them in one
 // active candidate set.
 func (s *Session) FreeableUnits() []api.FreeableUnit {
 	var out []api.FreeableUnit

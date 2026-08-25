@@ -324,7 +324,7 @@ func TestDrain_LazySelectionFallsBackToNextSchedulerFeasibleCandidate(t *testing
 
 	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 1, 0, []string{"workloaddisruption", "gangdisruption"}))
 	if !ok || plan == nil {
-		t.Fatal("expected the second-ranked candidate to be feasible")
+		t.Fatal("expected the second candidate in preference order to be feasible")
 	}
 	if got := fmt.Sprint(plan.FreedNodes); got != "[node-b]" {
 		t.Fatalf("freed=%s, want [node-b] after node-a fails full scheduler validation", got)
