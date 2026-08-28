@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
@@ -156,4 +157,58 @@ func TestNetworkQoSHandleDelete(t *testing.T) {
 
 	assert.Equal(t, []types.UID{"pod-1", "pod-2"}, manager.removed)
 	assert.Empty(t, manager.priorities)
+}
+
+func TestNetworkQoSHandleSyncPodPriorities(t *testing.T) {
+	ready := []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "offline", Namespace: "default", UID: "offline-uid",
+				Annotations: map[string]string{"volcano.sh/qos-level": "BE"},
+			},
+			Spec:   corev1.PodSpec{NodeName: "node-1"},
+			Status: corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort, Conditions: ready},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "host-network", Namespace: "default", UID: "host-uid"},
+			Spec:       corev1.PodSpec{NodeName: "node-1", HostNetwork: true},
+			Status:     corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort, Conditions: ready},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-node", Namespace: "default", UID: "other-uid"},
+			Spec:       corev1.PodSpec{NodeName: "node-2"},
+			Status:     corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort, Conditions: ready},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "not-ready", Namespace: "default", UID: "not-ready-uid"},
+			Spec:       corev1.PodSpec{NodeName: "node-1"},
+			Status:     corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort},
+		},
+	}
+	objects := make([]runtime.Object, 0, len(pods))
+	for i := range pods {
+		objects = append(objects, &pods[i])
+	}
+	fakeClient := fake.NewSimpleClientset(objects...)
+	informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+	informerFactory.Core().V1().Pods().Informer()
+	stop := make(chan struct{})
+	defer close(stop)
+	informerFactory.Start(stop)
+	assert.True(t, cache.WaitForNamedCacheSync(t.Name(), stop, informerFactory.Core().V1().Pods().Informer().HasSynced))
+
+	cfg := &config.Configuration{
+		InformerFactory: &config.InformerFactory{K8SInformerFactory: informerFactory},
+		GenericConfiguration: &config.VolcanoAgentConfiguration{
+			KubeClient:   fakeClient,
+			KubeNodeName: "node-1",
+			Recorder:     record.NewFakeRecorder(100),
+		},
+	}
+	manager := &fakeNetworkQoSManager{priorities: make(map[types.UID]uint32)}
+	handle := newNetworkQoSHandle(cfg, manager)
+
+	assert.NoError(t, handle.syncPodPriorities())
+	assert.Equal(t, map[types.UID]uint32{"offline-uid": ^uint32(0)}, manager.priorities)
 }

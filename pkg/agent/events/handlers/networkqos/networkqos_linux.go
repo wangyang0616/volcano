@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -134,6 +135,7 @@ func (h *NetworkQoSHandle) handleDelete(obj interface{}) {
 }
 
 func (h *NetworkQoSHandle) RefreshCfg(cfg *api.ColocationConfig) error {
+	wasActive := h.IsActive()
 	if err := h.BaseHandle.RefreshCfg(cfg); err != nil {
 		return err
 	}
@@ -146,6 +148,11 @@ func (h *NetworkQoSHandle) RefreshCfg(cfg *api.ColocationConfig) error {
 			klog.ErrorS(err, "Failed to enable network qos")
 			return err
 		}
+		if !wasActive {
+			if err := h.syncPodPriorities(); err != nil {
+				return fmt.Errorf("failed to sync pod network priorities after enabling network qos: %w", err)
+			}
+		}
 		klog.V(5).InfoS("Successfully enable/update network QoS")
 		return nil
 	}
@@ -156,5 +163,45 @@ func (h *NetworkQoSHandle) RefreshCfg(cfg *api.ColocationConfig) error {
 		return err
 	}
 	klog.V(5).InfoS("Successfully disable network QoS")
+	return nil
+}
+
+// syncPodPriorities restores the transient cgroup v2 BPF links when NetworkQoS
+// transitions from disabled to enabled. cgroup v1 priorities live in cgroup
+// files and the same reconciliation is harmless there.
+func (h *NetworkQoSHandle) syncPodPriorities() error {
+	pods, err := h.poLister.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	for _, pod := range pods {
+		if pod.Spec.NodeName != h.Config.GenericConfiguration.KubeNodeName || pod.Spec.HostNetwork || pod.DeletionTimestamp != nil {
+			continue
+		}
+		ready := false
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+
+		podEvent := framework.PodEvent{
+			UID:      pod.UID,
+			QoSClass: pod.Status.QOSClass,
+			QoSLevel: int64(extension.GetQosLevel(pod)),
+			Pod:      pod,
+		}
+		if err := h.Handle(podEvent); err != nil {
+			// A ready Pod can disappear between the informer list and cgroup
+			// lookup. Keep the config transition successful; a later Pod event
+			// will retry it.
+			klog.ErrorS(err, "Failed to sync pod network priority after enabling NetworkQoS", "pod", klog.KObj(pod))
+		}
+	}
 	return nil
 }

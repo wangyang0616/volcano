@@ -277,6 +277,11 @@ custom:
   agent_main_csc:
     runAsNonRoot: true
     runAsUser: 1000
+    # The agent loads and attaches the cgroup v2 NetworkQoS BPF program. The
+    # RuntimeDefault profile used at pod level blocks the bpf syscall on some
+    # runtimes (including containerd on openEuler), even with CAP_BPF.
+    seccompProfile:
+      type: Unconfined
     capabilities:
       add: ["DAC_OVERRIDE", "SETUID", "SETGID", "SETFCAP", "BPF", "NET_ADMIN", "SYS_RESOURCE"]
       drop: [ "ALL" ]

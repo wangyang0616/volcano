@@ -178,6 +178,8 @@ spec:
               - ALL
             runAsNonRoot: true
             runAsUser: 1000
+            seccompProfile:
+              type: Unconfined
           command:
           - /bin/sh
           - -c
