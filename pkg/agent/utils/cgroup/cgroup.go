@@ -46,6 +46,8 @@ const (
 	CgroupMemorySubsystem CgroupSubsystem = "memory"
 	CgroupCpuSubsystem    CgroupSubsystem = "cpu"
 	CgroupNetCLSSubsystem CgroupSubsystem = "net_cls"
+	// CgroupUnifiedSubsystem is used when addressing the unified cgroup v2 hierarchy.
+	CgroupUnifiedSubsystem CgroupSubsystem = ""
 
 	CgroupKubeRoot string = "kubepods"
 

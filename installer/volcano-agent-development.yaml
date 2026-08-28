@@ -172,6 +172,8 @@ spec:
               - SETGID
               - SETFCAP
               - BPF
+              - NET_ADMIN
+              - SYS_RESOURCE
               drop:
               - ALL
             runAsNonRoot: true

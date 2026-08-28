@@ -13,6 +13,7 @@
   - [Unified Manager Interface](#unified-manager-interface)
   - [File Structure Mapping](#file-structure-mapping)
   - [Event Handler Adaptation](#event-handler-adaptation)
+  - [Network QoS Adaptation](#network-qos-adaptation)
 - [Implementation Details](#implementation-details)
   - [Core Components](#core-components)
   - [Resource Management](#resource-management)
@@ -255,3 +256,20 @@ Each event handler is updated to support cgroup v2:
   - Uses `cpu.max.burst` instead of `cpu.cfs_burst_us`
   - Reads quota from `cpu.max` format
   - Handles unified cgroup paths
+
+### Network QoS Adaptation
+
+Network QoS keeps the existing user-facing API and the existing functional boundary on both cgroup versions. Users continue to enable the `NetworkQoS` feature and use the same colocation configuration, node bandwidth annotation, CNI configuration, status, and troubleshooting tools. No cgroup-version option or new QoS API is introduced.
+
+The traffic-control part is unchanged: the chained CNI still loads `bwm_tc.o` on Pod egress, and the existing online/offline bandwidth watermark and aggregate offline low/high bandwidth logic remain in effect. Only the mechanism that puts the online/offline class on an outgoing packet differs:
+
+| Cgroup version | Pod classification mechanism |
+|----------------|------------------------------|
+| v1 | Recursively write the normalized QoS level to the Pod cgroup's `net_cls.classid` files |
+| v2 | Load openEuler's `bwm_prio_kern.o`, set its `cgrp_prio` map, and attach `_bwm_out_cg` to the Pod cgroup at `cgroup_skb/egress` |
+
+The agent selects the backend from `CgroupManager.GetCgroupVersion()`. On cgroup v2, each managed Pod owns one BPF collection and cgroup link. The priority map is populated before the program is attached so packets never observe an uninitialized class. Subsequent Pod updates only update the existing map. Pod deletion, feature disablement, and agent shutdown close the link and collection. Agent restart does not require pinned state: closing the old process removes its links, and the informer initial list recreates them.
+
+The implementation never detaches or replaces BPF programs owned by another component. The packaged `bwm_prio_kern.o` is loaded directly from the agent image, while `bwm_tc.o` continues to be installed on the host for the CNI. The agent container receives the BPF, network administration, and resource-limit capabilities required to load and attach the cgroup program.
+
+This adaptation deliberately does not add ingress control, `hostNetwork` support, per-Pod bandwidth limits, extra priority levels, a new traffic-control algorithm, or support beyond the existing openEuler Network QoS platform boundary.

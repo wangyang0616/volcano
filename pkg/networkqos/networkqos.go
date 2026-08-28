@@ -25,13 +25,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/agent/apis"
 	"volcano.sh/volcano/pkg/agent/config/api"
 	"volcano.sh/volcano/pkg/agent/features"
+	"volcano.sh/volcano/pkg/agent/utils/cgroup"
 	"volcano.sh/volcano/pkg/agent/utils/exec"
 	"volcano.sh/volcano/pkg/config"
+	"volcano.sh/volcano/pkg/networkqos/priority"
 	"volcano.sh/volcano/pkg/networkqos/utils"
 )
 
@@ -40,6 +43,9 @@ type NetworkQoSManager interface {
 	HealthCheck() error
 	EnableNetworkQoS(qosConf *api.NetworkQos) error
 	DisableNetworkQoS() error
+	SetPodPriority(podUID types.UID, qosClass corev1.PodQOSClass, priority uint32) error
+	RemovePodPriority(podUID types.UID) error
+	Close() error
 }
 
 var networkQoSManager NetworkQoSManager
@@ -47,28 +53,71 @@ var networkQoSManager NetworkQoSManager
 type NetworkQoSManagerImp struct {
 	config             *config.Configuration
 	flavorQuotaMinRate int64
+	priorityManager    priority.Manager
+	supported          bool
 }
 
-func NewNetworkQoSManager(config *config.Configuration) NetworkQoSManager {
+func NewNetworkQoSManager(config *config.Configuration, cgroupMgr cgroup.CgroupManager) NetworkQoSManager {
 	networkQoSManager = &NetworkQoSManagerImp{
-		config: config,
+		config:          config,
+		priorityManager: priority.NewManager(cgroupMgr, utils.CgroupV2ProgramPath),
 	}
 	return networkQoSManager
 }
 
-func GetNetworkQoSManager(config *config.Configuration) NetworkQoSManager {
+func GetNetworkQoSManager(config *config.Configuration, cgroupMgr cgroup.CgroupManager) NetworkQoSManager {
 	if networkQoSManager == nil {
-		return NewNetworkQoSManager(config)
+		return NewNetworkQoSManager(config, cgroupMgr)
 	}
 	return networkQoSManager
 }
 
 func (m *NetworkQoSManagerImp) Init() error {
-	return InstallNetworkQoS()
+	checkErr := features.CheckNodeSupportNetworkQoS()
+	if checkErr != nil {
+		if features.IsUnsupportedError(checkErr) {
+			klog.InfoS("Skip initializing network-qos, os/network-mode not supported")
+			return nil
+		}
+		return checkErr
+	}
+
+	if err := installNetworkQoS(); err != nil {
+		return err
+	}
+	if err := m.priorityManager.Init(); err != nil {
+		return fmt.Errorf("failed to initialize pod network priority manager: %w", err)
+	}
+	m.supported = true
+	return nil
 }
 
 func (m *NetworkQoSManagerImp) HealthCheck() error {
-	return CheckNetworkQoSStatus()
+	if !m.supported {
+		return nil
+	}
+	if err := CheckNetworkQoSStatus(); err != nil {
+		return err
+	}
+	return m.priorityManager.HealthCheck()
+}
+
+func (m *NetworkQoSManagerImp) SetPodPriority(podUID types.UID, qosClass corev1.PodQOSClass, priority uint32) error {
+	if !m.supported {
+		return nil
+	}
+	return m.priorityManager.SetPodPriority(podUID, qosClass, priority)
+}
+
+func (m *NetworkQoSManagerImp) RemovePodPriority(podUID types.UID) error {
+	if !m.supported {
+		return nil
+	}
+	return m.priorityManager.RemovePodPriority(podUID)
+}
+
+func (m *NetworkQoSManagerImp) Close() error {
+	return m.priorityManager.Close()
 }
 
 func (m *NetworkQoSManagerImp) EnableNetworkQoS(qosConf *api.NetworkQos) error {
@@ -105,7 +154,7 @@ func (m *NetworkQoSManagerImp) DisableNetworkQoS() error {
 	if err != nil {
 		return fmt.Errorf("failed to reset network qos:%v, output:%s", err, output)
 	}
-	return nil
+	return m.priorityManager.Close()
 }
 
 func (m *NetworkQoSManagerImp) GetBandwidthConfigs(qosConf *api.NetworkQos) (onlineBandwidthWatermark, offlineLowBandwidth, offlineHighBandwidth string, err error) {
@@ -196,7 +245,10 @@ func InstallNetworkQoS() error {
 		}
 		return checkErr
 	}
+	return installNetworkQoS()
+}
 
+func installNetworkQoS() error {
 	klog.InfoS("Start to install network-qos")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

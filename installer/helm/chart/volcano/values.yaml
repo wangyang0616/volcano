@@ -278,7 +278,7 @@ custom:
     runAsNonRoot: true
     runAsUser: 1000
     capabilities:
-      add: ["DAC_OVERRIDE", "SETUID", "SETGID", "SETFCAP", "BPF"]
+      add: ["DAC_OVERRIDE", "SETUID", "SETGID", "SETFCAP", "BPF", "NET_ADMIN", "SYS_RESOURCE"]
       drop: [ "ALL" ]
   agent_init_csc:
     runAsUser: 0

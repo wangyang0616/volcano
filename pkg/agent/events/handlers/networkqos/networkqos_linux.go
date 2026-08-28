@@ -19,12 +19,11 @@ package networkqos
 import (
 	"fmt"
 	"os"
-	"path"
-	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	listersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
@@ -34,7 +33,6 @@ import (
 	"volcano.sh/volcano/pkg/agent/events/handlers"
 	"volcano.sh/volcano/pkg/agent/events/handlers/base"
 	"volcano.sh/volcano/pkg/agent/features"
-	"volcano.sh/volcano/pkg/agent/utils"
 	"volcano.sh/volcano/pkg/agent/utils/cgroup"
 	"volcano.sh/volcano/pkg/config"
 	"volcano.sh/volcano/pkg/metriccollect"
@@ -47,23 +45,32 @@ func init() {
 
 type NetworkQoSHandle struct {
 	*base.BaseHandle
-	cgroupMgr     cgroup.CgroupManager
 	networkqosMgr networkqos.NetworkQoSManager
 	poLister      listersv1.PodLister
 	recorder      record.EventRecorder
 }
 
 func NewNetworkQoSHandle(config *config.Configuration, mgr *metriccollect.MetricCollectorManager, cgroupMgr cgroup.CgroupManager) framework.Handle {
-	return &NetworkQoSHandle{
+	return newNetworkQoSHandle(config, networkqos.GetNetworkQoSManager(config, cgroupMgr))
+}
+
+func newNetworkQoSHandle(config *config.Configuration, networkQoSMgr networkqos.NetworkQoSManager) *NetworkQoSHandle {
+	handle := &NetworkQoSHandle{
 		BaseHandle: &base.BaseHandle{
 			Name:   string(features.NetworkQoSFeature),
 			Config: config,
 		},
-		cgroupMgr:     cgroupMgr,
-		networkqosMgr: networkqos.GetNetworkQoSManager(config),
+		networkqosMgr: networkQoSMgr,
 		poLister:      config.InformerFactory.K8SInformerFactory.Core().V1().Pods().Lister(),
 		recorder:      config.GenericConfiguration.Recorder,
 	}
+	_, err := config.InformerFactory.K8SInformerFactory.Core().V1().Pods().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: handle.handleDelete,
+	})
+	if err != nil {
+		klog.ErrorS(err, "Failed to register pod deletion handler for Network QoS")
+	}
+	return handle
 }
 
 func (h *NetworkQoSHandle) Handle(event interface{}) error {
@@ -84,28 +91,46 @@ func (h *NetworkQoSHandle) Handle(event interface{}) error {
 	_, ingressExisted := pod.Annotations["kubernetes.io/ingress-bandwidth"]
 	_, egressExisted := pod.Annotations["kubernetes.io/egress-bandwidth"]
 	if ingressExisted || egressExisted {
+		if err := h.networkqosMgr.RemovePodPriority(pod.UID); err != nil {
+			return fmt.Errorf("failed to remove network priority for pod %s: %w", pod.UID, err)
+		}
 		h.recorder.Event(pod, corev1.EventTypeWarning, "NetworkQoSSkipped",
 			fmt.Sprintf("Colocation Network QoS is not set, because it already has an Ingress-Bandwidth/Egress-Bandwidth"+
 				" network rate limit(with annotation key kubernetes.io/ingress-bandwidth or kubernetes.io/egress-bandwidth )"))
 		return nil
 	}
 
-	cgroupPath, err := h.cgroupMgr.GetPodCgroupPath(podEvent.QoSClass, cgroup.CgroupNetCLSSubsystem, podEvent.UID)
-	if err != nil {
-		return fmt.Errorf("failed to get pod cgroup file(%s), error: %v", podEvent.UID, err)
-	}
-
-	qosLevelFile := path.Join(cgroupPath, cgroup.NetCLSFileName)
 	uintQoSLevel := uint32(extension.NormalizeQosLevel(podEvent.QoSLevel))
-	qosLevel := []byte(strconv.FormatUint(uint64(uintQoSLevel), 10))
-
-	err = utils.UpdatePodCgroup(qosLevelFile, qosLevel)
+	err = h.networkqosMgr.SetPodPriority(podEvent.UID, podEvent.QoSClass, uintQoSLevel)
 	if os.IsNotExist(err) {
-		klog.InfoS("Cgroup file not existed", "cgroupFile", qosLevelFile)
+		klog.InfoS("Pod cgroup not found while setting network priority", "podUID", podEvent.UID)
 		return nil
 	}
-	klog.InfoS("Successfully set network qos level to cgroup file", "qosLevel", string(qosLevel), "cgroupFile", qosLevelFile)
+	if err != nil {
+		return fmt.Errorf("failed to set network priority for pod %s: %w", podEvent.UID, err)
+	}
+	klog.InfoS("Successfully set pod network priority", "qosLevel", uintQoSLevel, "podUID", podEvent.UID)
 	return nil
+}
+
+func (h *NetworkQoSHandle) handleDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, tombstoneOK := obj.(cache.DeletedFinalStateUnknown)
+		if !tombstoneOK {
+			klog.ErrorS(nil, "Failed to decode deleted pod for Network QoS", "object", obj)
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			klog.ErrorS(nil, "Deleted object is not a pod for Network QoS", "object", tombstone.Obj)
+			return
+		}
+	}
+
+	if err := h.networkqosMgr.RemovePodPriority(pod.UID); err != nil {
+		klog.ErrorS(err, "Failed to remove pod network priority", "podUID", pod.UID)
+	}
 }
 
 func (h *NetworkQoSHandle) RefreshCfg(cfg *api.ColocationConfig) error {

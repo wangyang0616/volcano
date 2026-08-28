@@ -80,11 +80,16 @@ func Run(ctx context.Context, opts *options.VolcanoAgentOptions) error {
 
 	var networkQoSMgr networkqos.NetworkQoSManager
 	if conf.IsFeatureSupported(string(features.NetworkQoSFeature)) {
-		networkQoSMgr = networkqos.NewNetworkQoSManager(conf)
+		networkQoSMgr = networkqos.NewNetworkQoSManager(conf, cgroupManager)
 		err = networkQoSMgr.Init()
 		if err != nil {
 			return fmt.Errorf("failed to init network qos: %v", err)
 		}
+		defer func() {
+			if err := networkQoSMgr.Close(); err != nil {
+				klog.ErrorS(err, "Failed to close network QoS manager")
+			}
+		}()
 	} else {
 		klog.InfoS("Network QoS feature is not enabled, skip initializing network QoS manager")
 	}

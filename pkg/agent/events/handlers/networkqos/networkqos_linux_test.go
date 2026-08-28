@@ -19,47 +19,52 @@ package networkqos
 import (
 	"context"
 	"fmt"
-	"os"
-	"path"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
+	coloapi "volcano.sh/volcano/pkg/agent/config/api"
 	"volcano.sh/volcano/pkg/agent/events/framework"
-	"volcano.sh/volcano/pkg/agent/utils/cgroup"
 	"volcano.sh/volcano/pkg/config"
 )
 
-func TestNeworkQoSHandle_Handle(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "MkdirTempCgroup")
-	defer func() {
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Errorf("remove dir(%s) failed: %v", dir, err)
-		}
-		assert.Equal(t, err == nil, true)
-	}()
-	assert.Equal(t, err == nil, true)
+type fakeNetworkQoSManager struct {
+	priorities map[types.UID]uint32
+	removed    []types.UID
+}
 
+func (m *fakeNetworkQoSManager) Init() error                                { return nil }
+func (m *fakeNetworkQoSManager) HealthCheck() error                         { return nil }
+func (m *fakeNetworkQoSManager) EnableNetworkQoS(*coloapi.NetworkQos) error { return nil }
+func (m *fakeNetworkQoSManager) DisableNetworkQoS() error                   { return nil }
+func (m *fakeNetworkQoSManager) Close() error                               { return nil }
+func (m *fakeNetworkQoSManager) SetPodPriority(podUID types.UID, _ corev1.PodQOSClass, priority uint32) error {
+	m.priorities[podUID] = priority
+	return nil
+}
+func (m *fakeNetworkQoSManager) RemovePodPriority(podUID types.UID) error {
+	m.removed = append(m.removed, podUID)
+	delete(m.priorities, podUID)
+	return nil
+}
+
+func TestNeworkQoSHandle_Handle(t *testing.T) {
 	testCases := []struct {
 		name             string
-		cgroupMgr        cgroup.CgroupManager
-		cgroupSubpath    string
 		recorder         record.EventRecorder
 		event            framework.PodEvent
 		expectedErr      bool
 		expectedQoSLevel string
 	}{
 		{
-			name:          "Burstable pod event && CgroupDriver=Cgroupfs",
-			cgroupMgr:     cgroup.NewCgroupManager("cgroupfs", path.Join(dir, "cgroup"), ""),
-			cgroupSubpath: "cgroup/net_cls/kubepods/burstable",
+			name: "Burstable pod event",
 			event: framework.PodEvent{
 				UID:      "00000000-1111-2222-3333-000000000001",
 				QoSLevel: -1,
@@ -76,9 +81,7 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 		},
 
 		{
-			name:          "Guaranteed pod event && CgroupDriver=Cgroupfs",
-			cgroupMgr:     cgroup.NewCgroupManager("cgroupfs", path.Join(dir, "cgroup"), ""),
-			cgroupSubpath: "cgroup/net_cls/kubepods",
+			name: "Guaranteed pod event",
 			event: framework.PodEvent{
 				UID:      "00000000-1111-2222-3333-000000000002",
 				QoSLevel: -1,
@@ -95,9 +98,7 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 		},
 
 		{
-			name:          "BestEffort pod event && CgroupDriver=Cgroupfs",
-			cgroupMgr:     cgroup.NewCgroupManager("cgroupfs", path.Join(dir, "cgroup"), ""),
-			cgroupSubpath: "cgroup/net_cls/kubepods/besteffort",
+			name: "BestEffort pod event",
 			event: framework.PodEvent{
 				UID:      "00000000-1111-2222-3333-000000000003",
 				QoSLevel: -1,
@@ -115,21 +116,12 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		fakeCgroupPath := path.Join(dir, tc.cgroupSubpath, "pod"+string(tc.event.UID))
-		err = os.MkdirAll(fakeCgroupPath, 0750)
-		assert.Equal(t, err == nil, true, tc.name)
-
-		tmpFile := path.Join(fakeCgroupPath, "net_cls.classid")
-		if err = os.WriteFile(tmpFile, []byte("0"), 0660); err != nil {
-			assert.Equal(t, nil, err, tc.name)
-		}
-
 		fakeClient := fake.NewSimpleClientset(tc.event.Pod)
 		informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
 		informerFactory.Core().V1().Pods().Informer()
 		informerFactory.Start(context.TODO().Done())
 		if !cache.WaitForNamedCacheSync("", context.TODO().Done(), informerFactory.Core().V1().Pods().Informer().HasSynced) {
-			assert.Equal(t, nil, err, tc.name)
+			t.Fatalf("%s: failed to sync pod informer", tc.name)
 		}
 
 		cfg := &config.Configuration{
@@ -142,13 +134,26 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 			},
 		}
 
-		h := NewNetworkQoSHandle(cfg, nil, tc.cgroupMgr)
+		manager := &fakeNetworkQoSManager{priorities: make(map[types.UID]uint32)}
+		h := newNetworkQoSHandle(cfg, manager)
 		handleErr := h.Handle(tc.event)
-		fmt.Println(handleErr)
 		assert.Equal(t, tc.expectedErr, handleErr != nil, tc.name)
-
-		actualLevel, readErr := os.ReadFile(tmpFile)
-		assert.Equal(t, nil, readErr, tc.name)
-		assert.Equal(t, tc.expectedQoSLevel, string(actualLevel), tc.name)
+		assert.Equal(t, tc.expectedQoSLevel, fmt.Sprint(manager.priorities[tc.event.UID]), tc.name)
 	}
+}
+
+func TestNetworkQoSHandleDelete(t *testing.T) {
+	manager := &fakeNetworkQoSManager{priorities: map[types.UID]uint32{
+		"pod-1": 1,
+		"pod-2": 1,
+	}}
+	handle := &NetworkQoSHandle{networkqosMgr: manager}
+
+	handle.handleDelete(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-1"}})
+	handle.handleDelete(cache.DeletedFinalStateUnknown{
+		Obj: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-2"}},
+	})
+
+	assert.Equal(t, []types.UID{"pod-1", "pod-2"}, manager.removed)
+	assert.Empty(t, manager.priorities)
 }

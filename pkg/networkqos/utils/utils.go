@@ -42,11 +42,12 @@ const (
 )
 
 const (
-	TCPROGPath         = "/usr/share/bwmcli/bwm_tc.o"
-	CNILogFilePath     = "/var/log/volcano/agent/network-qos.log"
-	ToolCmdLogFilePath = "/var/log/volcano/agent/network-qos-tools.log"
-	NetWorkCmdFile     = "/usr/local/bin/network-qos"
-	DefaultCNIConfFile = "/etc/cni/net.d/cni.conflist"
+	TCPROGPath          = "/usr/share/bwmcli/bwm_tc.o"
+	CgroupV2ProgramPath = "/usr/local/lib/volcano/bpf/bwm_prio_kern.o"
+	CNILogFilePath      = "/var/log/volcano/agent/network-qos.log"
+	ToolCmdLogFilePath  = "/var/log/volcano/agent/network-qos-tools.log"
+	NetWorkCmdFile      = "/usr/local/bin/network-qos"
+	DefaultCNIConfFile  = "/etc/cni/net.d/cni.conflist"
 )
 
 const (
