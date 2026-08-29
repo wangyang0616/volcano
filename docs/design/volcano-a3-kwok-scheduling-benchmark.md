@@ -11,6 +11,8 @@
 
 目标是在本文限定的负载、拓扑和可迁移范围内，验证实验方案相对基线方案的长期时间加权 NPU 调度分配率能否提升 20% 以上，同时降低大规格训练任务排队时间，并将 Repack 的迁移影响控制在预设范围内。
 
+工程同时面向后续生产轨迹复用：当生产环境积累任务投递、启动、完成、扩缩容和拓扑约束历史后，可以将其脱敏并转换为标准 Trace，在本地 KWOK 环境中按需筛选、加速回放和比较不同 Volcano 调度策略，而不需要为每次验证重新编写测试脚本。
+
 ## 2. 背景
 
 AI 集群通常同时运行多种资源形态的工作负载：
@@ -697,7 +699,413 @@ benchmark/a3-kwok/
     └── weekly-trace.example.jsonl
 ```
 
-## 12. 执行流程
+## 12. 面向生产历史的可复用回放工程
+
+### 12.1 工程定位
+
+本测试工程不应只服务于一份人工构造的 A3 测试轨迹。长期目标是形成一个可复用的生产任务轨迹回放与调度策略评估工具：
+
+```text
+生产任务历史
+        ↓
+脱敏、标准化和完整性校验
+        ↓
+按时间、租户、Queue、任务类型选择回放范围
+        ↓
+映射到本地 KWOK ClusterProfile
+        ↓
+使用同一 Trace 回放不同 StrategyProfile
+        ↓
+比较分配率、排队时间、任务吞吐和迁移成本
+```
+
+建议将用户侧工具命名为 `volcano-replay`。它负责 Trace 管理、回放和报告，不重新实现 KWOK 节点控制，也不替代 Helm 或 kubectl。
+
+### 12.2 目标使用体验
+
+#### 导入生产历史
+
+```bash
+volcano-replay import \
+  --source production-jobs.csv \
+  --from 2026-08-01 \
+  --to 2026-08-08 \
+  --output traces/prod-week-20260801
+```
+
+#### 校验轨迹
+
+```bash
+volcano-replay trace validate traces/prod-week-20260801
+```
+
+预期输出：
+
+```text
+业务周期：7 天
+任务数量：12438
+总请求 NPU 卡时：287360
+峰值需求：2584 卡
+平均需求：2031 卡
+整超节点任务：37 个
+核心字段完整率：99.2%
+拓扑字段完整率：96.8%
+```
+
+#### 本地策略回放
+
+```bash
+volcano-replay run \
+  --trace traces/prod-week-20260801 \
+  --cluster-profile profiles/a3-240.yaml \
+  --strategies baseline,binpack-repack \
+  --wall-duration 10m \
+  --repeat 10
+```
+
+#### 生成报告
+
+```bash
+volcano-replay report --run runs/prod-week-20260801
+```
+
+### 12.3 生产数据来源
+
+Kubernetes API 不会长期保存完整的任务投递历史。生产历史可以依次从以下数据源导入：
+
+1. AI 平台任务数据库；
+2. Volcano Job/PodGroup 历史数据库；
+3. Prometheus 长期存储；
+4. Kubernetes Audit 日志；
+5. Kubernetes Events 归档；
+6. 平台计费或资源使用记录。
+
+如果现有平台已经记录任务提交、开始和结束时间，应优先开发离线 Importer，不需要立即在生产集群部署新组件。
+
+如果历史字段不足，可以后续部署只读的轻量 Collector，持续记录：
+
+- VCJob 创建、更新和删除；
+- PodGroup 状态；
+- Pod 提交、绑定、Running 和终止；
+- Queue、Priority 和资源请求；
+- Gang 和拓扑约束；
+- 扩缩容、滚动升级和失败重试事件。
+
+Collector 只采集调度语义，不采集 Secret、环境变量、命令行、模型名称、数据集路径或镜像凭证。
+
+### 12.4 标准 Trace 模型
+
+Trace Schema 是整个回放工程的稳定接口，应与具体生产数据源解耦。
+
+每次任务投递至少包含：
+
+```yaml
+jobId: job-00123
+submitTime: 2026-08-01T10:05:00Z
+startTime: 2026-08-01T10:35:00Z
+completionTime: 2026-08-01T18:35:00Z
+workloadType: DistributedTraining
+queue: training
+priority: high
+tasks:
+  - role: worker
+    replicas: 48
+    npuPerPod: 8
+    cpuPerPod: 64
+    memoryPerPod: 512Gi
+resourceName: huawei.com/Ascend910
+topology: SameSupernode
+minAvailable: 48
+result: Succeeded
+retryCount: 0
+```
+
+回放时遵循以下语义：
+
+- 使用原始 `submitTime` 决定提交顺序；
+- 使用 `completionTime - startTime` 作为任务服务时间；
+- 不回放生产环境原始排队时间；
+- 新的调度策略重新决定任务何时开始；
+- 新排队时间是被测策略的结果。
+
+```text
+生产排队时间 = 历史结果，不直接回放
+任务服务时间 = 工作负载属性，应当保留
+新排队时间   = 被测调度策略产生的结果
+```
+
+弹性训练和推理还需要独立事件流：
+
+```yaml
+- businessTime: P1DT08H00M
+  workloadId: serving-001
+  action: Submit
+  replicas: 8
+- businessTime: P1DT12H00M
+  workloadId: serving-001
+  action: Scale
+  replicas: 16
+- businessTime: P1DT18H00M
+  workloadId: serving-001
+  action: Scale
+  replicas: 6
+- businessTime: P3DT10H00M
+  workloadId: serving-001
+  action: RollingUpdate
+```
+
+### 12.5 Trace 存储格式
+
+每个标准 Trace 使用独立目录：
+
+```text
+traces/prod-week-20260801/
+├── manifest.yaml
+├── jobs.parquet
+├── events.parquet
+├── cluster-snapshot.yaml
+├── resource-mapping.yaml
+├── summary.json
+└── checksums.txt
+```
+
+`manifest.yaml` 示例：
+
+```yaml
+apiVersion: replay.volcano.sh/v1alpha1
+kind: WorkloadTrace
+metadata:
+  name: prod-week-20260801
+spec:
+  startTime: 2026-08-01T00:00:00Z
+  endTime: 2026-08-08T00:00:00Z
+  source: production-history
+  anonymized: true
+  resourceMapping:
+    ascend910: huawei.com/Ascend910
+```
+
+大规模任务数据使用 Parquet 或其他列式文件保存，不把完整 Trace 存入 Kubernetes CRD。CRD 或 YAML 只保存元数据、引用和运行配置。
+
+### 12.6 数据脱敏
+
+生产历史导入时必须自动脱敏：
+
+```text
+namespace  → ns-<hash>
+user       → user-<hash>
+jobName    → job-<sequence>
+podName    → pod-<sequence>
+queueName  → queue-<hash>
+nodeName   → node-<topology-index>
+image      → 删除
+command    → 删除
+env/secret → 删除
+volumePath → 删除或只保留调度属性
+```
+
+必须保留：
+
+- CPU、内存和 NPU 请求；
+- Pod 副本数和角色；
+- Gang 语义；
+- Queue 和 Priority 的相对关系；
+- NodeSelector、Affinity 和 Taint/Toleration；
+- 机架、超节点等拓扑要求；
+- 提交时间、服务时间和 Deadline；
+- 扩缩容、重试和滚动升级事件。
+
+### 12.7 按需筛选回放
+
+Importer 应支持按以下维度选取生产历史：
+
+- 时间范围；
+- Namespace 或租户；
+- Queue；
+- Priority；
+- NPU 型号；
+- 训练或推理；
+- 单任务 NPU 规模；
+- 成功、失败或重试任务；
+- 资源池或超节点范围；
+- 是否具有拓扑约束。
+
+示例：
+
+```bash
+volcano-replay import \
+  --source production-jobs.csv \
+  --from 2026-08-01 \
+  --to 2026-08-08 \
+  --queue training \
+  --npu-model Ascend910 \
+  --min-npu 8 \
+  --output traces/training-peak-week
+```
+
+这使得同一工具能够分别回放全量流量、训练高峰、推理扩容高峰、特定租户、大规格任务积压或故障时间窗口。
+
+### 12.8 ClusterProfile
+
+生产 Trace 与本地 KWOK 环境通过 ClusterProfile 解耦：
+
+```yaml
+apiVersion: replay.volcano.sh/v1alpha1
+kind: ClusterProfile
+metadata:
+  name: a3-240
+spec:
+  nodes: 240
+  npuPerNode: 8
+  topology:
+    supernodes: 5
+    nodesPerSupernode: 48
+    racksPerSupernode: 8
+    nodesPerRack: 6
+  resources:
+    npu: huawei.com/Ascend910
+    cpuPerNode: 192
+    memoryPerNode: 1024Gi
+  kwok:
+    nodeSelector:
+      accelerator-pool: ascend-a3-kwok
+```
+
+后续可以增加不同资源池：
+
+```text
+profiles/a3-240.yaml
+profiles/a3-480.yaml
+profiles/910b-128.yaml
+profiles/mixed-910b-310p.yaml
+```
+
+如果本地集群容量与生产环境不同，应优先筛选或抽样生产任务，保持单任务资源形状不变。不能简单把每个任务的 NPU 请求等比例缩小，否则会改变 Gang 和拓扑调度语义。
+
+### 12.9 StrategyProfile
+
+调度策略也应配置化：
+
+```yaml
+apiVersion: replay.volcano.sh/v1alpha1
+kind: StrategyProfile
+metadata:
+  name: binpack-repack
+spec:
+  scheduler:
+    binpack:
+      enabled: true
+      weight: 10
+      resources:
+        huawei.com/Ascend910: 10
+  repack:
+    enabled: true
+    fragmentationHighWatermark: 0.10
+    fragmentationLowWatermark: 0.05
+    pendingDemandThreshold: 384
+    minFreedNodes: 48
+    maxMovedNPU: 192
+    maxAffectedPodGroups: 128
+    cooldown: 1h
+```
+
+基线策略：
+
+```yaml
+apiVersion: replay.volcano.sh/v1alpha1
+kind: StrategyProfile
+metadata:
+  name: baseline
+spec:
+  scheduler:
+    binpack:
+      enabled: false
+  repack:
+    enabled: false
+```
+
+当前正式验收仍只比较 `baseline` 和 `binpack-repack`。Profile 机制用于后续按需验证不同 Binpack 权重、Repack 预算、Queue 或 Priority 策略，无需修改回放器代码。
+
+### 12.10 用户入口与内部组件
+
+`volcano-replay` 是统一用户入口，但不负责实现 KWOK 节点生命周期。它调用 Helm、kubectl 和 Kubernetes API，完成以下工作：
+
+- 导入、脱敏和校验 Trace；
+- 选择 ClusterProfile 和 StrategyProfile；
+- 创建 Replay Runner；
+- 等待运行完成；
+- 收集结果并生成报告。
+
+运行时组件可以进一步收敛为：
+
+```text
+replay-runner   任务回放、逻辑时钟、生命周期和指标快照
+repack-trigger  实验方案中的碎片检测与 Repack 触发
+```
+
+`benchmark-exporter` 可以在首版独立部署，也可以后续合并进 `replay-runner`，减少长期维护的组件数量。
+
+### 12.11 可复现运行包
+
+每次运行生成完整 Bundle：
+
+```text
+runs/run-20260901-001/
+├── run.yaml
+├── trace/
+├── cluster-profile.yaml
+├── strategies/
+├── environment/
+│   ├── kubernetes-version.txt
+│   ├── volcano-version.txt
+│   ├── kwok-version.txt
+│   └── component-images.txt
+├── baseline/
+│   ├── logical-metrics.parquet
+│   ├── job-events.parquet
+│   └── logs/
+├── binpack-repack/
+│   ├── logical-metrics.parquet
+│   ├── job-events.parquet
+│   ├── repack-events.parquet
+│   └── logs/
+└── report/
+    ├── summary.json
+    ├── report.html
+    └── charts/
+```
+
+Bundle 必须记录 Trace Hash、随机种子、Profile、组件版本和镜像摘要，使历史结论可以重放和审计。
+
+### 12.12 易用性演进路线
+
+第一阶段先支持手工或合成 Trace、A3-240 ClusterProfile、两个 StrategyProfile 和命令行报告。
+
+第二阶段定义稳定 Trace Schema，实现生产 CSV/数据库 Importer、自动脱敏、字段完整性校验和按需筛选。
+
+第三阶段增加推理扩缩容、滚动升级、失败重试、PDB、多资源池、多型号 NPU 和更复杂的 Queue/拓扑策略。
+
+第四阶段提供一键 Helm 部署和可选 Web 页面，用于选择 Trace、Profile、Strategy，查看运行进度和管理历史报告。
+
+首版期望体验：
+
+```bash
+helm upgrade --install volcano-replay ./deploy/helm/volcano-replay
+
+volcano-replay import \
+  --source jobs.csv \
+  --output traces/prod-week
+
+volcano-replay run \
+  --trace traces/prod-week \
+  --cluster-profile a3-240 \
+  --strategies baseline,binpack-repack \
+  --wall-duration 10m
+
+volcano-replay report --latest
+```
+
+## 13. 执行流程
 
 ### 12.1 环境准备
 
@@ -820,7 +1228,7 @@ make report BASELINE_RUN=<run-id> TREATMENT_RUN=<run-id>
 - `grafana-dashboard.json`；
 - `run-manifest.yaml`。
 
-## 13. 20% 目标的可行性
+## 14. 20% 目标的可行性
 
 集群总容量为 1920 卡，一个完整超节点为 384 卡，占集群容量 20 个百分点。
 
@@ -843,7 +1251,7 @@ make report BASELINE_RUN=<run-id> TREATMENT_RUN=<run-id>
 - CPU、内存、Queue、Quota、拓扑或控制面是否成为真正瓶颈；
 - Repack 执行预算是否足以形成完整超节点，而不是只释放零散节点。
 
-## 14. 验收标准
+## 15. 验收标准
 
 正式验收同时满足：
 
@@ -861,7 +1269,7 @@ make report BASELINE_RUN=<run-id> TREATMENT_RUN=<run-id>
 12. 控制面未因加速回放持续饱和。
 13. 基线和实验的 Trace Hash、节点容量和非目标调度配置完全一致。
 
-## 15. 分阶段实施计划
+## 16. 分阶段实施计划
 
 ### 阶段一：基础环境
 
@@ -907,7 +1315,7 @@ make report BASELINE_RUN=<run-id> TREATMENT_RUN=<run-id>
 - 通过后将一个月业务曲线压缩为 30 分钟运行；
 - 输出长期分配率、任务吞吐、排队时间和 Repack 成本报告。
 
-## 16. 最小可运行版本
+## 17. 最小可运行版本
 
 首个 MVP 只实现：
 
@@ -943,7 +1351,7 @@ Execute 迁移 eligible Pod
 
 MVP 通过后再增加推理扩缩容、滚动升级、失败重试、PDB、超节点故障和月度轨迹。
 
-## 17. 预期结论
+## 18. 预期结论
 
 本方案希望形成以下可审计结论：
 
