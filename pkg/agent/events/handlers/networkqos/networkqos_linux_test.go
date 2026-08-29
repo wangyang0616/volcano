@@ -39,6 +39,7 @@ import (
 type fakeNetworkQoSManager struct {
 	priorities map[types.UID]uint32
 	removed    []types.UID
+	onSet      func()
 }
 
 func (m *fakeNetworkQoSManager) Init() error                                { return nil }
@@ -48,6 +49,9 @@ func (m *fakeNetworkQoSManager) DisableNetworkQoS() error                   { re
 func (m *fakeNetworkQoSManager) Close() error                               { return nil }
 func (m *fakeNetworkQoSManager) SetPodPriority(podUID types.UID, _ corev1.PodQOSClass, priority uint32) error {
 	m.priorities[podUID] = priority
+	if m.onSet != nil {
+		m.onSet()
+	}
 	return nil
 }
 func (m *fakeNetworkQoSManager) RemovePodPriority(podUID types.UID) error {
@@ -74,6 +78,7 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test1",
 						Namespace: "default",
+						UID:       "00000000-1111-2222-3333-000000000001",
 					},
 				},
 			},
@@ -91,6 +96,7 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test2",
 						Namespace: "default",
+						UID:       "00000000-1111-2222-3333-000000000002",
 					},
 				},
 			},
@@ -108,6 +114,7 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test3",
 						Namespace: "default",
+						UID:       "00000000-1111-2222-3333-000000000003",
 					},
 				},
 			},
@@ -141,6 +148,58 @@ func TestNeworkQoSHandle_Handle(t *testing.T) {
 		assert.Equal(t, tc.expectedErr, handleErr != nil, tc.name)
 		assert.Equal(t, tc.expectedQoSLevel, fmt.Sprint(manager.priorities[tc.event.UID]), tc.name)
 	}
+}
+
+func TestNetworkQoSHandleSkipsHostNetworkPod(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "host-network", Namespace: "default", UID: "host-uid"},
+		Spec:       corev1.PodSpec{HostNetwork: true},
+	}
+	manager := &fakeNetworkQoSManager{priorities: map[types.UID]uint32{"host-uid": 1}}
+	handle, _, stop := newTestNetworkQoSHandle(t, pod, manager)
+	defer stop()
+
+	err := handle.Handle(framework.PodEvent{UID: pod.UID, Pod: pod})
+	assert.NoError(t, err)
+	assert.Empty(t, manager.priorities)
+	assert.Equal(t, []types.UID{"host-uid"}, manager.removed)
+}
+
+func TestNetworkQoSHandleRemovesPriorityWhenPodDeletedDuringSet(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: "default", UID: "deleting-uid"},
+		Status:     corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort},
+	}
+	manager := &fakeNetworkQoSManager{priorities: make(map[types.UID]uint32)}
+	handle, informer, stop := newTestNetworkQoSHandle(t, pod, manager)
+	defer stop()
+	manager.onSet = func() {
+		assert.NoError(t, informer.GetStore().Delete(pod))
+	}
+
+	err := handle.Handle(framework.PodEvent{UID: pod.UID, QoSLevel: -1, QoSClass: pod.Status.QOSClass, Pod: pod})
+	assert.NoError(t, err)
+	assert.Empty(t, manager.priorities)
+	assert.Equal(t, []types.UID{"deleting-uid"}, manager.removed)
+}
+
+func newTestNetworkQoSHandle(t *testing.T, pod *corev1.Pod, manager *fakeNetworkQoSManager) (*NetworkQoSHandle, cache.SharedIndexInformer, func()) {
+	t.Helper()
+	fakeClient := fake.NewSimpleClientset(pod)
+	informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+	informer := informerFactory.Core().V1().Pods().Informer()
+	stopCh := make(chan struct{})
+	informerFactory.Start(stopCh)
+	assert.True(t, cache.WaitForNamedCacheSync(t.Name(), stopCh, informer.HasSynced))
+
+	cfg := &config.Configuration{
+		InformerFactory: &config.InformerFactory{K8SInformerFactory: informerFactory},
+		GenericConfiguration: &config.VolcanoAgentConfiguration{
+			KubeClient: fakeClient,
+			Recorder:   record.NewFakeRecorder(10),
+		},
+	}
+	return newNetworkQoSHandle(cfg, manager), informer, func() { close(stopCh) }
 }
 
 func TestNetworkQoSHandleDelete(t *testing.T) {

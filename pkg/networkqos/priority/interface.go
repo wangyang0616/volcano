@@ -27,6 +27,7 @@ import (
 // mechanism provided by the node's cgroup version.
 type Manager interface {
 	Init() error
+	Enable() error
 	SetPodPriority(podUID types.UID, qosClass corev1.PodQOSClass, priority uint32) error
 	RemovePodPriority(podUID types.UID) error
 	HealthCheck() error

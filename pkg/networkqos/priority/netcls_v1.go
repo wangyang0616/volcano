@@ -40,6 +40,10 @@ func (m *netCLSV1Manager) Init() error {
 	return nil
 }
 
+func (m *netCLSV1Manager) Enable() error {
+	return nil
+}
+
 func (m *netCLSV1Manager) SetPodPriority(podUID types.UID, qosClass corev1.PodQOSClass, priority uint32) error {
 	cgroupPath, err := m.cgroupMgr.GetPodCgroupPath(qosClass, cgroup.CgroupNetCLSSubsystem, podUID)
 	if err != nil {

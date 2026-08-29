@@ -99,6 +99,9 @@ func TestCgroupSKBV2ManagerAttachmentLifecycle(t *testing.T) {
 	if loader.initializedPath != manager.programPath {
 		t.Fatalf("initialized path = %q, want %q", loader.initializedPath, manager.programPath)
 	}
+	if err := manager.Enable(); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
 
 	if err := manager.SetPodPriority("pod-1", corev1.PodQOSBestEffort, 1); err != nil {
 		t.Fatalf("first SetPodPriority() error = %v", err)
@@ -141,5 +144,33 @@ func TestCgroupSKBV2ManagerAttachmentLifecycle(t *testing.T) {
 	}
 	if attacher.links[1].closed != 1 || loader.objectCloses != 2 || len(manager.attachments) != 0 {
 		t.Fatalf("Close() did not release all attachments: linkCloses=%d objectCloses=%d attachments=%d", attacher.links[1].closed, loader.objectCloses, len(manager.attachments))
+	}
+
+	// An event which was already dequeued before Close must not recreate the
+	// attachment or inspect a stale cgroup after the feature has been disabled.
+	provider.path = "/cgroup/removed-with-pod"
+	if err := manager.SetPodPriority("pod-3", corev1.PodQOSBestEffort, 1); err != nil {
+		t.Fatalf("SetPodPriority() after Close error = %v", err)
+	}
+	if loader.loads != 2 || len(attacher.paths) != 2 || len(manager.attachments) != 0 {
+		t.Fatalf("disabled manager created an attachment: loads=%d attaches=%d attachments=%d", loader.loads, len(attacher.paths), len(manager.attachments))
+	}
+
+	if err := manager.Enable(); err != nil {
+		t.Fatalf("second Enable() error = %v", err)
+	}
+	provider.path = cgroupPath
+	if err := manager.SetPodPriority("pod-3", corev1.PodQOSBestEffort, 1); err != nil {
+		t.Fatalf("SetPodPriority() after re-enable error = %v", err)
+	}
+	if loader.loads != 3 || len(attacher.paths) != 3 || len(manager.attachments) != 1 {
+		t.Fatalf("re-enabled manager did not create attachment: loads=%d attaches=%d attachments=%d", loader.loads, len(attacher.paths), len(manager.attachments))
+	}
+}
+
+func TestCgroupSKBV2ManagerEnableBeforeInit(t *testing.T) {
+	manager := &cgroupSKBV2Manager{}
+	if err := manager.Enable(); err == nil {
+		t.Fatal("Enable() before Init() expected error, got nil")
 	}
 }

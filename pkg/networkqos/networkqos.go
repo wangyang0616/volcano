@@ -143,10 +143,20 @@ func (m *NetworkQoSManagerImp) EnableNetworkQoS(qosConf *api.NetworkQos) error {
 	if err != nil {
 		return fmt.Errorf("failed to set network qos:%v, output:%s", err, output)
 	}
+	if err := m.priorityManager.Enable(); err != nil {
+		return fmt.Errorf("failed to enable pod network priority manager: %w", err)
+	}
 	return nil
 }
 
 func (m *NetworkQoSManagerImp) DisableNetworkQoS() error {
+	// Stop accepting new Pod attachments before resetting the host data plane.
+	// This closes the race with Pod workers which observed the feature as active
+	// immediately before the config transition.
+	if err := m.priorityManager.Close(); err != nil {
+		return fmt.Errorf("failed to disable pod network priority manager: %w", err)
+	}
+
 	cmdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := fmt.Sprintf(utils.NetWorkCmdFile+" prepare --%s=%s", utils.EnableNetworkQoS, "false")
@@ -154,7 +164,7 @@ func (m *NetworkQoSManagerImp) DisableNetworkQoS() error {
 	if err != nil {
 		return fmt.Errorf("failed to reset network qos:%v, output:%s", err, output)
 	}
-	return m.priorityManager.Close()
+	return nil
 }
 
 func (m *NetworkQoSManagerImp) GetBandwidthConfigs(qosConf *api.NetworkQos) (onlineBandwidthWatermark, offlineLowBandwidth, offlineHighBandwidth string, err error) {

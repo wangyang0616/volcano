@@ -144,6 +144,7 @@ type cgroupSKBV2Manager struct {
 	attacher    cgroupAttacher
 	attachments map[types.UID]*podAttachment
 	initialized bool
+	enabled     bool
 }
 
 func newCgroupSKBV2Manager(cgroupMgr cgroupPathProvider, programPath string) Manager {
@@ -170,20 +171,37 @@ func (m *cgroupSKBV2Manager) Init() error {
 	return nil
 }
 
+func (m *cgroupSKBV2Manager) Enable() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.initialized {
+		return errors.New("cgroup v2 network priority manager is not initialized")
+	}
+	m.enabled = true
+	return nil
+}
+
 func (m *cgroupSKBV2Manager) SetPodPriority(podUID types.UID, qosClass corev1.PodQOSClass, priority uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.initialized {
+		return errors.New("cgroup v2 network priority manager is not initialized")
+	}
+	// Close marks the manager disabled while holding the same lock. Taking the
+	// lock before cgroup discovery also makes an already-dequeued Pod event a
+	// clean no-op after disable, even if its cgroup has since disappeared.
+	if !m.enabled {
+		return nil
+	}
+
 	cgroupPath, err := m.cgroupMgr.GetPodCgroupPath(qosClass, cgroup.CgroupUnifiedSubsystem, podUID)
 	if err != nil {
 		return fmt.Errorf("failed to get pod cgroup path %s: %w", podUID, err)
 	}
 	if _, err := os.Stat(cgroupPath); err != nil {
 		return fmt.Errorf("failed to access pod cgroup path %s: %w", cgroupPath, err)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.initialized {
-		return errors.New("cgroup v2 network priority manager is not initialized")
 	}
 
 	if attachment, found := m.attachments[podUID]; found {
@@ -258,6 +276,9 @@ func (m *cgroupSKBV2Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Reject new attachments before releasing any existing link. Set and Close
+	// serialize on mu, so no attachment can survive a completed Close call.
+	m.enabled = false
 	var errs []error
 	for podUID, attachment := range m.attachments {
 		if err := closeAttachment(attachment); err != nil {

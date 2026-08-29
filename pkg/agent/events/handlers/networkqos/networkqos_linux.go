@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -88,12 +89,18 @@ func (h *NetworkQoSHandle) Handle(event interface{}) error {
 		}
 		return err
 	}
+	// hostNetwork Pods do not pass through the chained CNI data path, so a
+	// cgroup priority attachment cannot affect their traffic. Also discard a
+	// stale event when a Pod name has already been reused with a new UID.
+	if pod.UID != podEvent.UID || pod.Spec.HostNetwork || pod.DeletionTimestamp != nil {
+		return h.removePodPriority(podEvent.UID)
+	}
 
 	_, ingressExisted := pod.Annotations["kubernetes.io/ingress-bandwidth"]
 	_, egressExisted := pod.Annotations["kubernetes.io/egress-bandwidth"]
 	if ingressExisted || egressExisted {
-		if err := h.networkqosMgr.RemovePodPriority(pod.UID); err != nil {
-			return fmt.Errorf("failed to remove network priority for pod %s: %w", pod.UID, err)
+		if err := h.removePodPriority(podEvent.UID); err != nil {
+			return err
 		}
 		h.recorder.Event(pod, corev1.EventTypeWarning, "NetworkQoSSkipped",
 			fmt.Sprintf("Colocation Network QoS is not set, because it already has an Ingress-Bandwidth/Egress-Bandwidth"+
@@ -110,7 +117,41 @@ func (h *NetworkQoSHandle) Handle(event interface{}) error {
 	if err != nil {
 		return fmt.Errorf("failed to set network priority for pod %s: %w", podEvent.UID, err)
 	}
+	// Delete notifications are delivered independently from the queued Pod
+	// event. Reconcile once after attaching so a delete, name reuse, or switch
+	// to an ineligible state that won the race cannot leave an orphaned link.
+	removed, err := h.removePriorityIfPodIsStale(podEvent)
+	if err != nil {
+		return err
+	}
+	if removed {
+		return nil
+	}
 	klog.InfoS("Successfully set pod network priority", "qosLevel", uintQoSLevel, "podUID", podEvent.UID)
+	return nil
+}
+
+func (h *NetworkQoSHandle) removePriorityIfPodIsStale(podEvent framework.PodEvent) (bool, error) {
+	pod, err := h.poLister.Pods(podEvent.Pod.Namespace).Get(podEvent.Pod.Name)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return true, h.removePodPriority(podEvent.UID)
+		}
+		return false, err
+	}
+
+	_, ingressExisted := pod.Annotations["kubernetes.io/ingress-bandwidth"]
+	_, egressExisted := pod.Annotations["kubernetes.io/egress-bandwidth"]
+	if pod.UID != podEvent.UID || pod.Spec.HostNetwork || pod.DeletionTimestamp != nil || ingressExisted || egressExisted {
+		return true, h.removePodPriority(podEvent.UID)
+	}
+	return false, nil
+}
+
+func (h *NetworkQoSHandle) removePodPriority(podUID types.UID) error {
+	if err := h.networkqosMgr.RemovePodPriority(podUID); err != nil {
+		return fmt.Errorf("failed to remove network priority for pod %s: %w", podUID, err)
+	}
 	return nil
 }
 

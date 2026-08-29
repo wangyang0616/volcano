@@ -172,14 +172,10 @@ spec:
               - SETGID
               - SETFCAP
               - BPF
-              - NET_ADMIN
-              - SYS_RESOURCE
               drop:
               - ALL
             runAsNonRoot: true
             runAsUser: 1000
-            seccompProfile:
-              type: Unconfined
           command:
           - /bin/sh
           - -c

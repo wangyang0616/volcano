@@ -2,7 +2,16 @@
 {{ $agent_affinity := or .Values.custom.agent_affinity .Values.custom.default_affinity }}
 {{ $agent_tolerations := or .Values.custom.agent_tolerations .Values.custom.default_tolerations }}
 {{ $agent_sc := or .Values.custom.agent_sc .Values.custom.default_sc }}
-{{ $agent_main_csc := or .Values.custom.agent_main_csc .Values.custom.default_csc }}
+{{ $agent_features := splitList "," (default "" .Values.custom.agent_supported_features) }}
+{{ $network_qos_supported := and (not (has "-NetworkQoS" $agent_features)) (or (has "NetworkQoS" $agent_features) (has "*" $agent_features)) }}
+{{ $agent_main_csc := .Values.custom.agent_main_csc }}
+{{- if not $agent_main_csc }}
+{{- if $network_qos_supported }}
+{{- $agent_main_csc = .Values.custom.agent_network_qos_main_csc }}
+{{- else }}
+{{- $agent_main_csc = .Values.custom.agent_default_main_csc }}
+{{- end }}
+{{- end }}
 {{ $agent_init_csc := or .Values.custom.agent_init_csc .Values.custom.default_csc }}
 {{ $agent_ns := or .Values.custom.agent_ns .Values.custom.default_ns }}
 apiVersion: apps/v1

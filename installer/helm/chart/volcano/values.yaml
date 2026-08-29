@@ -274,7 +274,17 @@ custom:
   scheduler_main_csc: ~
   controller_main_csc: ~
   hypernode_controller_main_csc: ~
-  agent_main_csc:
+  # Override the agent container security context for all feature sets. When
+  # unset, Helm automatically selects the least-privileged context matching
+  # agent_supported_features.
+  agent_main_csc: ~
+  agent_default_main_csc:
+    runAsNonRoot: true
+    runAsUser: 1000
+    capabilities:
+      add: ["DAC_OVERRIDE", "SETUID", "SETGID", "SETFCAP", "BPF"]
+      drop: [ "ALL" ]
+  agent_network_qos_main_csc:
     runAsNonRoot: true
     runAsUser: 1000
     # The agent loads and attaches the cgroup v2 NetworkQoS BPF program. The

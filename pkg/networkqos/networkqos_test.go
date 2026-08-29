@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	utilpointer "k8s.io/utils/pointer"
 
@@ -35,6 +36,28 @@ import (
 	"volcano.sh/volcano/pkg/config"
 	"volcano.sh/volcano/pkg/networkqos/utils"
 )
+
+type fakePriorityManager struct {
+	enabled bool
+	closed  bool
+}
+
+func (m *fakePriorityManager) Init() error { return nil }
+func (m *fakePriorityManager) Enable() error {
+	m.enabled = true
+	m.closed = false
+	return nil
+}
+func (m *fakePriorityManager) SetPodPriority(types.UID, corev1.PodQOSClass, uint32) error {
+	return nil
+}
+func (m *fakePriorityManager) RemovePodPriority(types.UID) error { return nil }
+func (m *fakePriorityManager) HealthCheck() error                { return nil }
+func (m *fakePriorityManager) Close() error {
+	m.enabled = false
+	m.closed = true
+	return nil
+}
 
 func TestGetOnlineBandwidthWatermark(t *testing.T) {
 	testCases := []struct {
@@ -201,6 +224,7 @@ func TestEnableNetworkQoS(t *testing.T) {
 
 	for _, tc := range testCases {
 		fakeClient := fake.NewSimpleClientset(tc.node)
+		priorityManager := &fakePriorityManager{}
 		mgr := &NetworkQoSManagerImp{
 			config: &config.Configuration{
 				GenericConfiguration: &config.VolcanoAgentConfiguration{
@@ -208,11 +232,13 @@ func TestEnableNetworkQoS(t *testing.T) {
 					KubeNodeName: tc.node.Name,
 				},
 			},
+			priorityManager: priorityManager,
 		}
 		mgr.config.GenericConfiguration.KubeClient = fake.NewSimpleClientset(tc.node)
 		actualErr := mgr.EnableNetworkQoS(tc.qosConf)
 		gomock.InOrder(tc.apiCall...)
 		assert.Equal(t, tc.expectedErr, actualErr != nil, tc.name)
+		assert.True(t, priorityManager.enabled, tc.name)
 	}
 }
 
