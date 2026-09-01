@@ -176,6 +176,9 @@ func (m *NetworkQoSManagerImp) GetBandwidthConfigs(qosConf *api.NetworkQos) (onl
 		if err != nil {
 			return "", "", "0", fmt.Errorf("failed to get k8s node(%s): %v", nodeName, err)
 		}
+		if node == nil {
+			return "", "", "", fmt.Errorf("failed to get k8s node(%s): kubernetes client returned a nil node without an error", nodeName)
+		}
 		m.flavorQuotaMinRate, err = GetFlavorQuotaMinRate(node)
 		if err != nil {
 			return "", "", "", fmt.Errorf("failed to get flavor quota min rate, err: %v", err)
@@ -201,6 +204,10 @@ func (m *NetworkQoSManagerImp) GetBandwidthConfigs(qosConf *api.NetworkQos) (onl
 }
 
 func GetFlavorQuotaMinRate(node *corev1.Node) (int64, error) {
+	if node == nil {
+		return 0, fmt.Errorf("cannot get network bandwidth rate from a nil node")
+	}
+
 	minRate, ok := node.Annotations[apis.NetworkBandwidthRateAnnotationKey]
 	if !ok {
 		return 0, fmt.Errorf("node %s network bandwidth rate not exists, annotation %s", node.Name, apis.NetworkBandwidthRateAnnotationKey)

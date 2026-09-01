@@ -17,6 +17,7 @@ limitations under the License.
 package networkqos
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -27,7 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	utilpointer "k8s.io/utils/pointer"
 
 	coloConf "volcano.sh/volcano/pkg/agent/config/api"
@@ -57,6 +60,56 @@ func (m *fakePriorityManager) Close() error {
 	m.enabled = false
 	m.closed = true
 	return nil
+}
+
+type nilNodeClient struct {
+	kubernetes.Interface
+}
+
+func (c *nilNodeClient) CoreV1() typedcorev1.CoreV1Interface {
+	return &nilNodeCoreClient{CoreV1Interface: c.Interface.CoreV1()}
+}
+
+type nilNodeCoreClient struct {
+	typedcorev1.CoreV1Interface
+}
+
+func (c *nilNodeCoreClient) Nodes() typedcorev1.NodeInterface {
+	return &nilNodeGetter{NodeInterface: c.CoreV1Interface.Nodes()}
+}
+
+type nilNodeGetter struct {
+	typedcorev1.NodeInterface
+}
+
+func (n *nilNodeGetter) Get(context.Context, string, metav1.GetOptions) (*corev1.Node, error) {
+	return nil, nil
+}
+
+func TestGetFlavorQuotaMinRateRejectsNilNode(t *testing.T) {
+	rate, err := GetFlavorQuotaMinRate(nil)
+
+	assert.Zero(t, rate)
+	assert.EqualError(t, err, "cannot get network bandwidth rate from a nil node")
+}
+
+func TestGetBandwidthConfigsRejectsNilNode(t *testing.T) {
+	const nodeName = "test-node"
+	nilClient := &nilNodeClient{Interface: fake.NewSimpleClientset()}
+	mgr := &NetworkQoSManagerImp{
+		config: &config.Configuration{
+			GenericConfiguration: &config.VolcanoAgentConfiguration{
+				KubeClient:   nilClient,
+				KubeNodeName: nodeName,
+			},
+		},
+
+		priorityManager: &fakePriorityManager{},
+	}
+
+	_, _, _, err := mgr.GetBandwidthConfigs(&coloConf.NetworkQos{})
+
+	assert.EqualError(t, err, "failed to get k8s node(test-node): kubernetes client returned a nil node without an error")
 }
 
 func TestGetOnlineBandwidthWatermark(t *testing.T) {
