@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"k8s.io/component-base/logs"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
@@ -27,6 +28,11 @@ import (
 )
 
 func main() {
+	// The vc-agent binary has file capabilities, which puts the Go runtime in
+	// secure mode and forces GOTRACEBACK=none. Temporarily enable tracebacks to
+	// capture the complete stack while diagnosing agent crashes.
+	debug.SetTraceback("all")
+
 	stopCtx := signals.SetupSignalHandler()
 	command := app.NewVolcanoAgentCommand(stopCtx)
 
