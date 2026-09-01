@@ -17,14 +17,131 @@ limitations under the License.
 package priority
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"volcano.sh/volcano/pkg/agent/utils/cgroup"
 )
+
+func newBTFCollectionSpec() *ebpf.CollectionSpec {
+	function := &btf.Func{
+		Name: cgroupV2ProgramName,
+		Type: &btf.FuncProto{Return: &btf.Int{Size: 4}},
+	}
+	return &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			cgroupV2MapName: {
+				Name:       cgroupV2MapName,
+				Type:       ebpf.Array,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1,
+				Key:        &btf.Int{Name: "key", Size: 4},
+				Value:      &btf.Int{Name: "value", Size: 4},
+			},
+		},
+		Programs: map[string]*ebpf.ProgramSpec{
+			cgroupV2ProgramName: {
+				Name: cgroupV2ProgramName,
+				Type: ebpf.CGroupSKB,
+				Instructions: asm.Instructions{
+					btf.WithFuncMetadata(
+						asm.LoadMapPtr(asm.R1, 0).
+							WithSymbol(cgroupV2ProgramName).
+							WithReference(cgroupV2MapName),
+						function,
+					).WithSource(asm.Comment("source line")),
+					asm.Return(),
+				},
+				License: "GPL",
+			},
+		},
+	}
+}
+
+func TestELFObjectLoaderFallsBackWithoutBTF(t *testing.T) {
+	spec := newBTFCollectionSpec()
+	attempts := make([]*ebpf.CollectionSpec, 0, 2)
+	loader := &elfObjectLoader{
+		newCollection: func(candidate *ebpf.CollectionSpec) (*ebpf.Collection, error) {
+			attempts = append(attempts, candidate)
+			if len(attempts) == 1 {
+				return nil, fmt.Errorf("map %s: load BTF: %w", cgroupV2MapName, ebpf.ErrNotSupported)
+			}
+			return &ebpf.Collection{}, nil
+		},
+	}
+
+	compatibleSpec, collection, err := loader.loadCompatibleCollection(spec)
+	if err != nil {
+		t.Fatalf("loadCompatibleCollection() error = %v", err)
+	}
+	collection.Close()
+	if len(attempts) != 2 {
+		t.Fatalf("collection load attempts = %d, want 2", len(attempts))
+	}
+	if compatibleSpec.Maps[cgroupV2MapName].Key != nil || compatibleSpec.Maps[cgroupV2MapName].Value != nil {
+		t.Fatal("fallback collection retained map BTF")
+	}
+	instruction := &compatibleSpec.Programs[cgroupV2ProgramName].Instructions[0]
+	if btf.FuncMetadata(instruction) != nil || instruction.Source() != nil {
+		t.Fatal("fallback collection retained program BTF metadata")
+	}
+	if instruction.Symbol() != cgroupV2ProgramName || instruction.Reference() != cgroupV2MapName {
+		t.Fatalf("fallback instruction linkage = symbol %q, reference %q", instruction.Symbol(), instruction.Reference())
+	}
+
+	// Building the fallback must not mutate the original parsed object.
+	originalInstruction := &spec.Programs[cgroupV2ProgramName].Instructions[0]
+	if spec.Maps[cgroupV2MapName].Key == nil || btf.FuncMetadata(originalInstruction) == nil || originalInstruction.Source() == nil {
+		t.Fatal("fallback mutated the original collection spec")
+	}
+}
+
+func TestELFObjectLoaderDoesNotFallbackForOtherUnsupportedFeatures(t *testing.T) {
+	attempts := 0
+	loader := &elfObjectLoader{
+		newCollection: func(_ *ebpf.CollectionSpec) (*ebpf.Collection, error) {
+			attempts++
+			return nil, fmt.Errorf("create map: %w", ebpf.ErrNotSupported)
+		},
+	}
+
+	_, _, err := loader.loadCompatibleCollection(newBTFCollectionSpec())
+	if err == nil {
+		t.Fatal("loadCompatibleCollection() expected error, got nil")
+	}
+	if attempts != 1 {
+		t.Fatalf("collection load attempts = %d, want 1", attempts)
+	}
+}
+
+func TestCollectionSpecWithoutBTFRejectsCORERelocation(t *testing.T) {
+	_, err := collectionSpecWithoutBTFUsing(newBTFCollectionSpec(), func(_ *asm.Instruction) bool {
+		return true
+	})
+	if err == nil || !strings.Contains(err.Error(), "CO-RE relocation") {
+		t.Fatalf("collectionSpecWithoutBTFUsing() error = %v, want CO-RE rejection", err)
+	}
+}
+
+func TestIsBTFLoadUnsupported(t *testing.T) {
+	btfError := fmt.Errorf("program: load BTF: %w", ebpf.ErrNotSupported)
+	if !isBTFLoadUnsupported(btfError) {
+		t.Fatalf("isBTFLoadUnsupported(%v) = false, want true", btfError)
+	}
+	if isBTFLoadUnsupported(errors.New("load BTF: permission denied")) {
+		t.Fatal("permission error was treated as missing BTF support")
+	}
+}
 
 type fakePriorityMap struct {
 	values []uint32

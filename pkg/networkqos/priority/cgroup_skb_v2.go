@@ -20,13 +20,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/agent/utils/cgroup"
 )
@@ -59,8 +63,22 @@ type cgroupAttacher interface {
 	Attach(path string, program *ebpf.Program) (linkHandle, error)
 }
 
+type collectionFactory func(spec *ebpf.CollectionSpec) (*ebpf.Collection, error)
+
 type elfObjectLoader struct {
-	spec *ebpf.CollectionSpec
+	spec          *ebpf.CollectionSpec
+	newCollection collectionFactory
+}
+
+func newELFObjectLoader() *elfObjectLoader {
+	return &elfObjectLoader{newCollection: ebpf.NewCollection}
+}
+
+func (l *elfObjectLoader) collectionFactory() collectionFactory {
+	if l.newCollection != nil {
+		return l.newCollection
+	}
+	return ebpf.NewCollection
 }
 
 func (l *elfObjectLoader) Init(path string) error {
@@ -79,13 +97,113 @@ func (l *elfObjectLoader) Init(path string) error {
 		return fmt.Errorf("BPF map %q not found in %s", cgroupV2MapName, path)
 	}
 
-	probe, err := ebpf.NewCollection(spec.Copy())
+	compatibleSpec, probe, err := l.loadCompatibleCollection(spec)
 	if err != nil {
 		return fmt.Errorf("failed to load BPF priority program: %w", err)
 	}
 	probe.Close()
-	l.spec = spec
+	l.spec = compatibleSpec
 	return nil
+}
+
+// loadCompatibleCollection first tries the object with its BTF metadata. Some
+// enterprise kernels support the cgroup_skb program type but don't support
+// BPF_BTF_LOAD. The NetworkQoS program doesn't require BTF at runtime, so retry
+// without BTF metadata only when the first failure is specifically a BTF
+// capability failure.
+func (l *elfObjectLoader) loadCompatibleCollection(spec *ebpf.CollectionSpec) (*ebpf.CollectionSpec, *ebpf.Collection, error) {
+	newCollection := l.collectionFactory()
+	collection, err := newCollection(spec.Copy())
+	if err == nil {
+		return spec, collection, nil
+	}
+	if !isBTFLoadUnsupported(err) {
+		return nil, nil, err
+	}
+
+	btfLessSpec, fallbackErr := collectionSpecWithoutBTF(spec)
+	if fallbackErr != nil {
+		return nil, nil, fmt.Errorf("kernel rejected BTF and BTF-less fallback is unavailable: %v: %w", fallbackErr, err)
+	}
+	collection, fallbackErr = newCollection(btfLessSpec.Copy())
+	if fallbackErr != nil {
+		return nil, nil, fmt.Errorf("BTF-less fallback failed after kernel rejected BTF (%v): %w", err, fallbackErr)
+	}
+
+	klog.InfoS("Kernel BTF loading is unavailable, using BTF-less cgroup v2 NetworkQoS program")
+	return btfLessSpec, collection, nil
+}
+
+func isBTFLoadUnsupported(err error) bool {
+	return errors.Is(err, ebpf.ErrNotSupported) && strings.Contains(err.Error(), "load BTF")
+}
+
+type coreRelocationDetector func(instruction *asm.Instruction) bool
+
+func collectionSpecWithoutBTF(spec *ebpf.CollectionSpec) (*ebpf.CollectionSpec, error) {
+	return collectionSpecWithoutBTFUsing(spec, func(instruction *asm.Instruction) bool {
+		return btf.CORERelocationMetadata(instruction) != nil
+	})
+}
+
+// collectionSpecWithoutBTFUsing removes only metadata which makes the kernel
+// load BTF. Symbol, reference and associated-map metadata are retained since
+// they are required to link instructions. CO-RE programs and global variables
+// cannot be loaded safely without BTF and are deliberately rejected.
+func collectionSpecWithoutBTFUsing(spec *ebpf.CollectionSpec, hasCORERelocation coreRelocationDetector) (*ebpf.CollectionSpec, error) {
+	if spec == nil {
+		return nil, errors.New("BPF collection spec is nil")
+	}
+	if len(spec.Variables) != 0 {
+		return nil, errors.New("BPF collection contains global variables")
+	}
+
+	result := spec.Copy()
+	result.Types = nil
+
+	visitedMaps := make(map[*ebpf.MapSpec]struct{})
+	var removeMapBTF func(mapSpec *ebpf.MapSpec)
+	removeMapBTF = func(mapSpec *ebpf.MapSpec) {
+		if mapSpec == nil {
+			return
+		}
+		if _, found := visitedMaps[mapSpec]; found {
+			return
+		}
+		visitedMaps[mapSpec] = struct{}{}
+		mapSpec.Key = nil
+		mapSpec.Value = nil
+		removeMapBTF(mapSpec.InnerMap)
+	}
+	for _, mapSpec := range result.Maps {
+		removeMapBTF(mapSpec)
+	}
+
+	for programName, programSpec := range result.Programs {
+		for index := range programSpec.Instructions {
+			instruction := &programSpec.Instructions[index]
+			if hasCORERelocation(instruction) {
+				return nil, fmt.Errorf("BPF program %q instruction %d contains a CO-RE relocation", programName, index)
+			}
+
+			symbol := instruction.Symbol()
+			reference := instruction.Reference()
+			associatedMap := instruction.Map()
+			instruction.Metadata = asm.Metadata{}
+			if symbol != "" {
+				*instruction = instruction.WithSymbol(symbol)
+			}
+			if associatedMap != nil {
+				if err := instruction.AssociateMap(associatedMap); err != nil {
+					return nil, fmt.Errorf("restore map reference in BPF program %q instruction %d: %w", programName, index, err)
+				}
+			} else if reference != "" {
+				*instruction = instruction.WithReference(reference)
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func (l *elfObjectLoader) Load() (*loadedObjects, error) {
@@ -93,7 +211,7 @@ func (l *elfObjectLoader) Load() (*loadedObjects, error) {
 		return nil, errors.New("BPF object loader is not initialized")
 	}
 
-	collection, err := ebpf.NewCollection(l.spec.Copy())
+	collection, err := l.collectionFactory()(l.spec.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BPF priority collection: %w", err)
 	}
@@ -151,7 +269,7 @@ func newCgroupSKBV2Manager(cgroupMgr cgroupPathProvider, programPath string) Man
 	return &cgroupSKBV2Manager{
 		cgroupMgr:   cgroupMgr,
 		programPath: programPath,
-		loader:      &elfObjectLoader{},
+		loader:      newELFObjectLoader(),
 		attacher:    ebpfCgroupAttacher{},
 		attachments: make(map[types.UID]*podAttachment),
 	}
