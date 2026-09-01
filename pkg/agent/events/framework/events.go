@@ -96,7 +96,9 @@ func (eq *EventQueue) processNextWorkItem(ctx context.Context) bool {
 		if !handler.IsActive() {
 			continue
 		}
-		err := handler.Handle(key)
+		err := callHandlerWithRecovery(handler, "processing an event", func() error {
+			return handler.Handle(key)
+		})
 		if err != nil {
 			klog.ErrorS(err, "Handle process failed", "handler", handler.HandleName())
 			visitErr = true

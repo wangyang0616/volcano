@@ -184,15 +184,19 @@ func (h *NetworkQoSHandle) RefreshCfg(cfg *api.ColocationConfig) error {
 	h.Lock.Lock()
 	defer h.Lock.Unlock()
 	if h.Active {
+		klog.InfoS("Start applying enabled NetworkQoS configuration", "wasActive", wasActive)
 		err := h.networkqosMgr.EnableNetworkQoS(cfg.NetworkQosConfig)
 		if err != nil {
 			klog.ErrorS(err, "Failed to enable network qos")
 			return err
 		}
+		klog.InfoS("Successfully enabled NetworkQoS manager", "wasActive", wasActive)
 		if !wasActive {
+			klog.InfoS("Start syncing existing Pod network priorities after enabling NetworkQoS")
 			if err := h.syncPodPriorities(); err != nil {
 				return fmt.Errorf("failed to sync pod network priorities after enabling network qos: %w", err)
 			}
+			klog.InfoS("Finished syncing existing Pod network priorities after enabling NetworkQoS")
 		}
 		klog.V(5).InfoS("Successfully enable/update network QoS")
 		return nil
@@ -237,6 +241,7 @@ func (h *NetworkQoSHandle) syncPodPriorities() error {
 			QoSLevel: int64(extension.GetQosLevel(pod)),
 			Pod:      pod,
 		}
+		klog.V(2).InfoS("Syncing existing Pod network priority", "pod", klog.KObj(pod), "podUID", pod.UID, "qosClass", pod.Status.QOSClass)
 		if err := h.Handle(podEvent); err != nil {
 			// A ready Pod can disappear between the informer list and cgroup
 			// lookup. Keep the config transition successful; a later Pod event
