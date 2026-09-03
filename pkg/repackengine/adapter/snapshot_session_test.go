@@ -21,7 +21,10 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	policylisters "k8s.io/client-go/listers/policy/v1"
+	"k8s.io/client-go/tools/cache"
 
 	schedulingapi "volcano.sh/apis/pkg/apis/scheduling"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -74,6 +77,29 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 	}
 	if snap.PodGroupUsesSubGroupPolicy("ns/unknown") {
 		t.Error("unknown PodGroup must not use SubGroup policy")
+	}
+}
+
+func TestSessionSnapshot_ListPodDisruptionBudgets(t *testing.T) {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	want := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "strict"}}
+	if err := indexer.Add(want); err != nil {
+		t.Fatalf("add PDB to informer indexer: %v", err)
+	}
+	snapshot := &SessionSnapshot{pdbLister: policylisters.NewPodDisruptionBudgetLister(indexer)}
+
+	got, err := snapshot.ListPodDisruptionBudgets()
+	if err != nil {
+		t.Fatalf("ListPodDisruptionBudgets() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Namespace != want.Namespace || got[0].Name != want.Name {
+		t.Fatalf("ListPodDisruptionBudgets() = %+v, want %s/%s", got, want.Namespace, want.Name)
+	}
+
+	if _, err := (&SessionSnapshot{}).ListPodDisruptionBudgets(); err == nil {
+		t.Fatal("missing scheduler PDB informer must return an error")
 	}
 }
 

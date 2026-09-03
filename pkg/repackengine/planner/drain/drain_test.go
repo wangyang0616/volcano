@@ -24,6 +24,8 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
@@ -32,6 +34,7 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/framework"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/gangdisruption"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/pdbconstraint"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
 )
@@ -46,6 +49,8 @@ type fakeSnap struct {
 	notInScope        map[string]bool // node name → excluded from draining (receiver only)
 	infeasibleSources map[string]bool
 	feasibilityCalls  int
+	pdbs              []*policyv1.PodDisruptionBudget
+	pdbErr            error
 }
 
 func (f *fakeSnap) res() v1.ResourceName {
@@ -73,6 +78,10 @@ func (f *fakeSnap) PodGroupView(id schedapi.JobID) api.PodGroupView {
 		return f.views[schedapi.JobID(string(id)[separator+1:])]
 	}
 	return api.PodGroupView{}
+}
+
+func (f *fakeSnap) ListPodDisruptionBudgets() ([]*policyv1.PodDisruptionBudget, error) {
+	return f.pdbs, f.pdbErr
 }
 
 // FeasibleRelocation is a capacity-only stand-in for the scheduler feasibility check: every
@@ -147,6 +156,18 @@ func gpuTask(name, gang string, g int64) *schedapi.TaskInfo {
 	}
 	namespace := jobID[:strings.IndexByte(jobID, '/')]
 	return &schedapi.TaskInfo{Name: name, Namespace: namespace, Job: schedapi.JobID(jobID), InitResreq: gpuRes(g)}
+}
+
+func labeledGPUTask(name, gang string, g int64, podLabels map[string]string) *schedapi.TaskInfo {
+	task := gpuTask(name, gang, g)
+	task.UID = schedapi.TaskID(name)
+	task.Pod = &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: task.Namespace, Name: task.Name, Labels: podLabels},
+		Status: v1.PodStatus{Conditions: []v1.PodCondition{{
+			Type: v1.PodReady, Status: v1.ConditionTrue,
+		}}},
+	}
+	return task
 }
 
 // sysTask is a non-accelerator pod (e.g. a system DaemonSet): CPU-only request,
@@ -246,6 +267,88 @@ func TestDrain_FreesOneNode(t *testing.T) {
 	}
 	if plan.Benefit() != 1 {
 		t.Errorf("benefit=%v, want 1", plan.Benefit())
+	}
+}
+
+func TestDrain_PDBConstraintExcludesZeroDisruptionSourceBeforeSimulation(t *testing.T) {
+	protected := labeledGPUTask("protected", "protected-group", 2, map[string]string{"app": "protected"})
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("node-a", 8, protected),
+			capNode("node-b", 8, gpuTask("movable", "movable-group", 2)),
+			capNode("node-c", 8, gpuTask("receiver", "receiver-group", 6)),
+		},
+		pdbs: []*policyv1.PodDisruptionBudget{{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "strict", Generation: 1},
+			Spec: policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "protected"},
+			}},
+			Status: policyv1.PodDisruptionBudgetStatus{
+				ObservedGeneration: 1, ExpectedPods: 1, DesiredHealthy: 1,
+			},
+		}},
+	}
+
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"pdbconstraint"}))
+	if !ok || plan == nil {
+		t.Fatal("expected an unprotected source to remain feasible")
+	}
+	if len(plan.FreedNodes) != 1 || plan.FreedNodes[0] != "node-b" {
+		t.Fatalf("freed nodes = %v, want [node-b] with protected node-a excluded", plan.FreedNodes)
+	}
+	for _, move := range realMoves(plan) {
+		if move.Task.Name == protected.Name {
+			t.Fatalf("zero-disruption PDB Pod entered plan: %+v", move)
+		}
+	}
+}
+
+func TestDrain_PDBConstraintSkipsSimulationWhenEverySourceIsProtected(t *testing.T) {
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("node-a", 8, labeledGPUTask("protected-a", "group-a", 2, map[string]string{"protected": "true"})),
+			capNode("node-b", 8, labeledGPUTask("protected-b", "group-b", 6, map[string]string{"protected": "true"})),
+		},
+		pdbs: []*policyv1.PodDisruptionBudget{{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "strict", Generation: 1},
+			Spec: policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"protected": "true"},
+			}},
+			Status: policyv1.PodDisruptionBudgetStatus{
+				ObservedGeneration: 1, ExpectedPods: 2, DesiredHealthy: 2,
+			},
+		}},
+	}
+
+	if plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"pdbconstraint"})); ok || plan != nil {
+		t.Fatalf("plan = %+v, want no plan when every source is protected", plan)
+	}
+	if snap.feasibilityCalls != 0 {
+		t.Fatalf("scheduler simulations = %d, want 0 for statically protected sources", snap.feasibilityCalls)
+	}
+}
+
+func TestDrain_PDBConstraintDoesNotTreatTransientZeroAllowanceAsStatic(t *testing.T) {
+	victim := labeledGPUTask("victim", "victim-group", 2, map[string]string{"app": "rolling"})
+	snap := &fakeSnap{
+		nodes: []*schedapi.NodeInfo{
+			capNode("node-a", 8, victim),
+			capNode("node-b", 8, gpuTask("receiver", "receiver-group", 6)),
+		},
+		pdbs: []*policyv1.PodDisruptionBudget{{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "temporarily-full", Generation: 1},
+			Spec: policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "rolling"},
+			}},
+			Status: policyv1.PodDisruptionBudgetStatus{
+				ObservedGeneration: 1, ExpectedPods: 2, DesiredHealthy: 1, DisruptionsAllowed: 0,
+			},
+		}},
+	}
+
+	plan, ok := finalizedPlan(drainSessionWithPlugins(snap, allMovable, 1, 0, 0, []string{"pdbconstraint"}))
+	if !ok || plan == nil || len(realMoves(plan)) != 1 || realMoves(plan)[0].Task.Name != victim.Name {
+		t.Fatalf("transiently exhausted non-zero PDB should remain plannable, plan=%+v", plan)
 	}
 }
 

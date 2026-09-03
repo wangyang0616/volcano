@@ -12,15 +12,16 @@ The Repack suite mutates node capacity, node taints, and the singleton
 | Planning | nine consolidation layouts, lower-disruption migration direction, whole-PodGroup movement with `minAvailable=1`, empty-node exclusion |
 | Scheduler fidelity | taints, required node affinity, receiver ordering, immediately-idle capacity |
 | Scope and limits | node exclusion, exact PodGroup name, automatic PodGroup labels, PodGroup/card limits |
-| Execute result | success, verified no-op, all PDB rejections, partial PDB rejection and plan/result separation, exact planned/actual freed-node mismatch |
+| Execute result | success, verified no-op, static zero-disruption PDB planning filters, exact planned/actual freed-node mismatch |
 | Workloads | successful vcjob and Deployment Execute; Deployment and StatefulSet replacement admission; full Execute plus repeated workload-level PodGroup recreation with different PG/Pod names |
 | Placement protocol | synchronous gate, engine and controller-manager restart checkpoints, scale-out ambiguity, capacity expiry, binding drift |
 | Lifecycle | Execute cooldown, TTL garbage collection, status conditions/message/completion time |
 | Observability | RepackRun milestone Events and replacement Pod placement Events |
 
 Unit tests remain the primary coverage for deterministic failure injection:
-API conflicts/retries, panic recovery, active Execute serialization, stale lease
-ownership, exact/hash/homogeneous-PodGroup matching, eviction grace periods, and planner
+API conflicts/retries, dynamic PDB eviction retry/failure, panic recovery,
+active Execute serialization, stale lease ownership,
+exact/hash/homogeneous-PodGroup matching, eviction grace periods, and planner
 performance bounds.
 
 The suite intentionally does not claim coverage for real accelerator device

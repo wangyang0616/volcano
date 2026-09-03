@@ -320,6 +320,7 @@ Plugin 回调可以保持简洁，但策略语义必须由对应 Plugin 拥有�
 | Plugin | 责任 | 关闭后的影响 |
 |---|---|---|
 | `workloadscope` | 工作负载授权边界 | 不应用用户工作负载 Scope；合法 PodGroup 身份基础边界仍生效 |
+| `pdbconstraint` | 过滤状态新鲜、配置上零中断的 PDB 所保护的 Pod | 严格 PDB Pod 可能进入计划，仍由 Eviction API 和执行重试保护 |
 | `repackbudget` | `maxPerRun` 候选过滤 | 不应用对应预算 |
 | `nodeconsolidation` | 提供部分占用 Node Unit | 当前无 Domain，Action 配置校验失败 |
 | `workloaddisruption` | 工作负载数、迁移资源、Pod 数评分 | 关闭通用中断偏好 |
@@ -336,6 +337,7 @@ Repack 使用独立 ConfigMap 挂载 `repack-engine.conf`，同时读取 Schedul
 actions: "repack"
 plugins:
   - name: workloadscope
+  - name: pdbconstraint
   - name: repackbudget
   - name: nodeconsolidation
   - name: workloaddisruption
@@ -351,6 +353,8 @@ plugins:
 ```
 
 权重必须为非负整数，`0` 关闭对应评分项。未知字段、未知参数、小数和负数在启动阶段失败。命令行显式指定的 actions/plugins 优先于配置文件。
+
+`pdbconstraint` 复用 Scheduler Cache 的 PDB informer，并在 Planning Session 打开时冻结一次只读视图。它只把 `status.observedGeneration` 已追上 `metadata.generation`、`expectedPods > 0` 且 `desiredHealthy >= expectedPods` 的 PDB 视为零中断约束；不会因为动态 `disruptionsAllowed == 0` 过滤工作负载。匹配的目标资源 Pod 通过 `MovableFn` 标记为不可移动，包含它的节点在候选打分和完整调度模拟前被排除。Pod 级判断与 Eviction API 对齐：Pending、终态或已经进入删除流程的 Pod 不受 PDB 阻塞，未 Ready Pod 遵循 `unhealthyPodEvictionPolicy` 及当前健康副本数。PDB lister 不可用、status 过期或 controller 同步失败时该策略 fail-open，Execute 仍由 Eviction API 做最终校验。
 
 ## 8. Lazy Drain Planner 详细设计
 
@@ -517,7 +521,7 @@ Pending → InProgress → Accepted
 - 同名但 UID 不同表示已经是 replacement，不能再次驱逐；
 - 同一 PodGroup 的其他 eviction 触发级联删除时，未直接获得成功响应的 victim 记为 `IndirectlyRemoved`。
 
-Eviction 请求使用 Run context，Engine shutdown 能取消尚未完成的 API 调用。PDB 由 API Server 在实时状态下校验，Repack 不伪造或绕过。
+Eviction 请求使用 Run context，Engine shutdown 能取消尚未完成的 API 调用。规划阶段的 `pdbconstraint` 只排除确定性的零中断 PDB，不计算动态额度或驱逐组合；PDB 最终仍由 API Server 在实时状态下校验，Repack 不伪造或绕过。
 
 ### 9.3 Replacement Matching
 
@@ -714,6 +718,7 @@ pkg/repackengine/
   actions/repack/                          # 完整 Repack Action：规划、模式分流、执行与恢复编排
   planner/drain/                           # Lazy Drain Planner 与性能基准
   plugins/                                 # 场景策略
+    pdbconstraint/                         # 零中断 PDB 的规划期静态约束
   framework/                               # Session、Action、Plugin 及候选/受害者/接收节点扩展契约
     session.go                             # 按需创建的单轮 Planning Session 与插件生命周期
     action.go / plugin.go                  # ActionContext/ActionResult/Runtime、Plugin 接口及注册表

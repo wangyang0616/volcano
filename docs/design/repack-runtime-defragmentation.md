@@ -62,7 +62,7 @@ Repack 当前以释放完整目标资源节点为直接收益，以 Scope 和 `m
 - 不自动监听 Pending 作业并触发整理；
 - 不执行抢占、节点 `cordon` 或通过污点独占释放容量；
 - 不修改工作负载的资源请求、并行度或拓扑约束；
-- 不提前搜索绕开 PDB 的替代驱逐组合；
+- 不计算动态 PDB 额度，也不搜索绕开 PDB 的替代驱逐组合；规划期仅过滤确定性的零中断 PDB；
 - 不对上层控制器的级联重建成本进行通用建模；
 - 当前不实现 HyperNode Domain、多节点联合腾空或多跳交换；这些能力通过 Domain Plugin 和后续状态模型演进。
 
@@ -190,6 +190,7 @@ Execute 在驱逐前持久化完整 plan 和逐 Pod relocation journal，形成 
 
 - Scope 和 `maxPerRun` 是硬约束，候选评分不能突破；
 - 每个计划迁移都必须通过完整 Scheduler 可行性检查；
+- 规划阶段复用 Scheduler Cache 的 PDB informer，过滤状态新鲜且配置上零中断的 PDB 所保护的 Pod；
 - Execute 通过 Eviction API 遵守 PDB；
 - 单集群 Execute 采用 K=1 串行门控并带冷却时间；
 - 计划不预留资源，运行时竞争可能使实际结果偏离计划；
@@ -247,7 +248,7 @@ Repack 默认关闭，通过 Helm 显式开启。建议按以下顺序逐步放�
 ## Future Work
 
 - HyperNode Domain 和按训练 TP/EP、推理 Prefill/Decode role 所需卡数倍数定义的拓扑收益；
-- 规划期 PDB 感知与更多工作负载中断成本信号；
+- 动态 PDB 额度感知与更多工作负载中断成本信号；
 - 自动触发和策略化周期运行；
 - 多资源联合整理；
 - 在保持规划时延边界的前提下改进全局计划质量。

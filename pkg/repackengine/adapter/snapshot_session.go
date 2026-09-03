@@ -22,10 +22,16 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	policylisters "k8s.io/client-go/listers/policy/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 
+	"volcano.sh/volcano/pkg/features"
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 
@@ -39,17 +45,37 @@ import (
 // in-scheduler-cache implementation. It applies the resolved scope.nodes filter
 // so the planner only ever sees in-scope drain candidates.
 type SessionSnapshot struct {
-	ssn      *schedframework.Session
-	resource v1.ResourceName
-	scope    *enginescope.Matcher // nil = all nodes in scope
+	ssn       *schedframework.Session
+	resource  v1.ResourceName
+	scope     *enginescope.Matcher // nil = all nodes in scope
+	pdbLister policylisters.PodDisruptionBudgetLister
 }
 
 var _ framework.Snapshot = (*SessionSnapshot)(nil)
+var _ framework.PodDisruptionBudgetReader = (*SessionSnapshot)(nil)
 
 // NewSessionSnapshot wraps a Session for the given target resource. scope gates
 // drain targets (nil = all in scope); it does NOT filter the receiver set.
 func NewSessionSnapshot(ssn *schedframework.Session, resource v1.ResourceName, scope *enginescope.Matcher) *SessionSnapshot {
-	return &SessionSnapshot{ssn: ssn, resource: resource, scope: scope}
+	snapshot := &SessionSnapshot{ssn: ssn, resource: resource, scope: scope}
+	// SchedulerCache registers and starts this informer before opening sessions.
+	// Do not instantiate it after the shared factory has started when the feature
+	// gate is disabled; pdbconstraint will deliberately fail open instead.
+	if ssn != nil && ssn.InformerFactory() != nil &&
+		utilfeature.DefaultFeatureGate.Enabled(features.PodDisruptionBudgetsSupport) {
+		snapshot.pdbLister = ssn.InformerFactory().Policy().V1().PodDisruptionBudgets().Lister()
+	}
+	return snapshot
+}
+
+// ListPodDisruptionBudgets returns the scheduler cache's informer-backed PDB
+// view. Callers should freeze the returned facts for one planning pass rather
+// than repeatedly consulting the live lister while building a plan.
+func (s *SessionSnapshot) ListPodDisruptionBudgets() ([]*policyv1.PodDisruptionBudget, error) {
+	if s == nil || s.pdbLister == nil {
+		return nil, fmt.Errorf("scheduler PDB informer is unavailable")
+	}
+	return s.pdbLister.List(labels.Everything())
 }
 
 // Nodes returns ALL session nodes (the receiver universe). scope.nodes gates

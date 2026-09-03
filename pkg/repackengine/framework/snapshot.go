@@ -26,6 +26,8 @@ package framework
 import (
 	"context"
 
+	policyv1 "k8s.io/api/policy/v1"
+
 	schedapi "volcano.sh/volcano/pkg/scheduler/api"
 
 	"volcano.sh/volcano/pkg/repackengine/api"
@@ -54,4 +56,12 @@ type Snapshot interface {
 	// implementation must be non-destructive (no shared-state mutation) and stop
 	// promptly when ctx is cancelled.
 	FeasibleRelocation(ctx context.Context, committed []*api.Move, victims []*schedapi.TaskInfo, receivers []*schedapi.NodeInfo) ([]*api.Move, bool)
+}
+
+// PodDisruptionBudgetReader is an optional Snapshot capability used by
+// planning policies that need a point-in-time view of Kubernetes PDBs. Keeping
+// it separate from Snapshot avoids forcing policy-specific methods onto every
+// planner snapshot implementation.
+type PodDisruptionBudgetReader interface {
+	ListPodDisruptionBudgets() ([]*policyv1.PodDisruptionBudget, error)
 }

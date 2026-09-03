@@ -75,13 +75,16 @@ The configuration is parsed strictly: unknown or misspelled top-level fields,
 plugin fields, and plugin arguments stop the engine instead of silently using
 defaults.
 
-The plugin list is order-independent. `workloadscope`, `repackbudget`,
-`workloaddisruption`, `gangdisruption`, and `binpack` are optional; omitting one
-only disables its policy. The `repack` Action requires at least one plugin that
-provides the `domain` capability (`nodeconsolidation` today). Empty accelerator
-nodes and fully occupied accelerator nodes are always excluded from both sides
-of node-level relocation before scoring; this correctness boundary does not
-depend on `binpack`.
+The plugin list is order-independent. `workloadscope`, `pdbconstraint`,
+`repackbudget`, `workloaddisruption`, `gangdisruption`, and `binpack` are
+optional; omitting one only disables its policy. `pdbconstraint` excludes Pods
+protected by a fresh zero-disruption PDB during planning; temporary exhaustion
+of a non-zero PDB remains governed by the Eviction API and execution retry. The
+`repack` Action requires at least one plugin that provides the `domain`
+capability (`nodeconsolidation` today). Empty accelerator nodes and fully
+occupied accelerator nodes are always excluded from both sides of node-level
+relocation before scoring; this correctness boundary does not depend on
+`binpack`.
 
 ## Notes
 

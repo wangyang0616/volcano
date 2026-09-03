@@ -36,7 +36,7 @@
   <rect x="40" y="282" width="410" height="72" rx="6" class="card"/>
   <text x="245" y="299" text-anchor="middle" font-size="10" class="t m">framework.OpenSession(cfg, plugins)</text>
   <text x="245" y="317" text-anchor="middle" font-size="8.8" class="s">逐个 plugin.OnSessionOpen 注册回调</text>
-  <text x="245" y="332" text-anchor="middle" font-size="8.5" class="s m">workloadscope · repackbudget · nodeconsolidation</text>
+  <text x="245" y="332" text-anchor="middle" font-size="8.5" class="s m">workloadscope · pdbconstraint · repackbudget · …</text>
   <text x="245" y="347" text-anchor="middle" font-size="8.5" class="s">组合候选过滤、评分与接收排序</text>
   <rect x="468" y="282" width="430" height="72" rx="6" class="card"/>
   <text x="683" y="299" text-anchor="middle" font-size="10" class="t m">RunActions(["repack"], esn)</text>
