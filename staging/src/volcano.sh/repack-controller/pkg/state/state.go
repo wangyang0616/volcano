@@ -64,6 +64,7 @@ const (
 	ReasonScopeResolutionFailed      = "ScopeResolutionFailed"
 	ReasonExecutionPreparationFailed = "ExecutionPreparationFailed"
 	ReasonEvictionFailed             = "EvictionFailed"
+	ReasonExecutionTimedOut          = "ExecutionTimedOut"
 	ReasonPlacementTimedOut          = "PlacementTimedOut"
 	ReasonResultVerificationFailed   = "ResultVerificationFailed"
 	ReasonBenefitNotRealized         = "BenefitNotRealized"
