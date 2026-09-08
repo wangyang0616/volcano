@@ -1,0 +1,102 @@
+<svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">复杂度收敛与版本范围控制</title>
+  <desc id="desc">云原生技术信息图展示 AI 展开的候选能力如何经过目标、风险和成本门控，收敛为当前版本。</desc>
+  <defs>
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#DCE6ED" opacity=".5"/></pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#34506A" flood-opacity=".12"/></filter>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0l8 4-8 4Z" fill="#6F8798"/></marker>
+  </defs>
+  <rect width="1200" height="675" fill="#F8FAFC"/>
+  <rect width="1200" height="675" fill="url(#grid)"/>
+
+  <g font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif">
+    <text x="54" y="58" fill="#172B3A" font-size="25" font-weight="700">复杂度收敛：完整方案 ≠ 当前最合适的方案</text>
+    <text x="54" y="87" fill="#62798A" font-size="13.5">AI 负责展开候选空间，我根据目标、风险与交付成本确定当前版本边界</text>
+  </g>
+
+  <!-- Candidate space -->
+  <g transform="translate(54 125)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif" filter="url(#shadow)">
+    <rect width="350" height="446" rx="8" fill="#FFFFFF" stroke="#C9D7E1"/>
+    <rect width="350" height="40" rx="8" fill="#EEF3F6"/>
+    <rect y="32" width="350" height="8" fill="#EEF3F6"/>
+    <text x="18" y="26" fill="#40586A" font-size="12" font-weight="700" letter-spacing="1">AI EXPLORED CAPABILITY SPACE</text>
+
+    <g transform="translate(18 60)">
+      <g><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">动态预算计算</text><text x="16" y="48" fill="#71899A" font-size="9.5">Dynamic budget</text></g>
+      <g transform="translate(164)"><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">组合搜索</text><text x="16" y="48" fill="#71899A" font-size="9.5">Alternative plans</text></g>
+      <g transform="translate(0 79)"><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">Wave 控制</text><text x="16" y="48" fill="#71899A" font-size="9.5">Batch execution</text></g>
+      <g transform="translate(164 79)"><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">阻塞探测</text><text x="16" y="48" fill="#71899A" font-size="9.5">Probe mode</text></g>
+      <g transform="translate(0 158)"><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">状态明细</text><text x="16" y="48" fill="#71899A" font-size="9.5">Fine-grained status</text></g>
+      <g transform="translate(164 158)"><rect width="150" height="65" rx="6" fill="#F2F8FD" stroke="#A9CDE8"/><circle cx="20" cy="20" r="6" fill="#326CE5"/><text x="34" y="24" fill="#284B67" font-size="11.5" font-weight="700">旧参数兼容</text><text x="16" y="48" fill="#71899A" font-size="9.5">Compatibility</text></g>
+    </g>
+
+    <g transform="translate(18 312)">
+      <rect width="314" height="102" rx="6" fill="#F8FAFC" stroke="#D3DEE6" stroke-dasharray="5 4"/>
+      <text x="16" y="24" fill="#526B7D" font-size="11" font-weight="700">FEATURE BACKLOG</text>
+      <text x="16" y="49" fill="#7C91A1" font-size="10">候选能力不是被否定，而是进入明确的后续范围</text>
+      <rect x="16" y="66" width="86" height="20" rx="3" fill="#E7EDF2"/><text x="59" y="80" fill="#617889" font-size="9" text-anchor="middle">DEFERRED</text>
+      <rect x="111" y="66" width="86" height="20" rx="3" fill="#E7EDF2"/><text x="154" y="80" fill="#617889" font-size="9" text-anchor="middle">RECORDED</text>
+      <rect x="206" y="66" width="86" height="20" rx="3" fill="#E7EDF2"/><text x="249" y="80" fill="#617889" font-size="9" text-anchor="middle">TRACEABLE</text>
+    </g>
+  </g>
+
+  <!-- Scope gate -->
+  <g transform="translate(444 174)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif">
+    <text x="126" y="0" fill="#344E61" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="1">ENGINEERING SCOPE GATE</text>
+    <path d="M10 30h232l-66 159v96l-50 28-50-28v-96Z" fill="#FFFFFF" stroke="#F4511E" stroke-width="2" filter="url(#shadow)"/>
+    <path d="M28 56h196M45 99h162M62 142h128" stroke="#E6B39C"/>
+    <g font-size="11">
+      <circle cx="48" cy="77" r="8" fill="#F4511E"/><text x="48" y="81" fill="#FFF" text-anchor="middle" font-size="9" font-weight="700">1</text><text x="68" y="81" fill="#674235">是否直接服务当前目标？</text>
+      <circle cx="65" cy="120" r="8" fill="#F4511E"/><text x="65" y="124" fill="#FFF" text-anchor="middle" font-size="9" font-weight="700">2</text><text x="85" y="124" fill="#674235">收益是否大于复杂度？</text>
+      <circle cx="82" cy="163" r="8" fill="#F4511E"/><text x="82" y="167" fill="#FFF" text-anchor="middle" font-size="9" font-weight="700">3</text><text x="102" y="167" fill="#674235">能否被测试和验证？</text>
+    </g>
+    <rect x="84" y="246" width="84" height="28" rx="4" fill="#F4511E"/>
+    <text x="126" y="264" fill="#FFFFFF" font-size="10" font-weight="700" text-anchor="middle">IN SCOPE</text>
+  </g>
+
+  <path d="M404 350h38" stroke="#6F8798" stroke-width="2" marker-end="url(#arr)"/>
+  <path d="M696 350h38" stroke="#6F8798" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Current release -->
+  <g transform="translate(736 125)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif" filter="url(#shadow)">
+    <rect width="410" height="446" rx="8" fill="#FFFFFF" stroke="#A9C8DD"/>
+    <rect width="410" height="40" rx="8" fill="#EAF5FF"/>
+    <rect y="32" width="410" height="8" fill="#EAF5FF"/>
+    <text x="18" y="26" fill="#205B8D" font-size="12" font-weight="700" letter-spacing="1">CURRENT RELEASE · CONVERGED SCOPE</text>
+
+    <g transform="translate(24 64)">
+      <rect width="362" height="74" rx="6" fill="#FFF4ED" stroke="#F2B394"/>
+      <rect width="7" height="74" rx="3" fill="#F4511E"/>
+      <text x="24" y="27" fill="#6D3724" font-size="13" font-weight="700">Static constraint</text>
+      <text x="24" y="50" fill="#946452" font-size="10.5">规划期只过滤确定性的零中断约束</text>
+      <rect x="292" y="22" width="50" height="24" rx="3" fill="#F4511E"/><text x="317" y="38" fill="#FFF" font-size="9" font-weight="700" text-anchor="middle">P0</text>
+
+      <rect y="90" width="362" height="74" rx="6" fill="#F1F8FE" stroke="#A8CAE4"/>
+      <rect width="7" height="74" rx="3" fill="#326CE5" y="90"/>
+      <text x="24" y="117" fill="#244E70" font-size="13" font-weight="700">Backoff retry</text>
+      <text x="24" y="140" fill="#607F97" font-size="10.5">动态失败留在执行期，成功任务继续推进</text>
+      <rect x="292" y="112" width="50" height="24" rx="3" fill="#326CE5"/><text x="317" y="128" fill="#FFF" font-size="9" font-weight="700" text-anchor="middle">P0</text>
+
+      <rect y="180" width="362" height="74" rx="6" fill="#F2FAF7" stroke="#A5D5C3"/>
+      <rect width="7" height="74" rx="3" fill="#23A36D" y="180"/>
+      <text x="24" y="207" fill="#285D49" font-size="13" font-weight="700">Execution timeout</text>
+      <text x="24" y="230" fill="#648576" font-size="10.5">从驱逐开始到最终验证统一受 10 分钟控制</text>
+      <rect x="292" y="202" width="50" height="24" rx="3" fill="#23A36D"/><text x="317" y="218" fill="#FFF" font-size="9" font-weight="700" text-anchor="middle">P0</text>
+    </g>
+
+    <g transform="translate(24 344)">
+      <rect width="362" height="70" rx="6" fill="#0D6DCC"/>
+      <text x="18" y="27" fill="#FFFFFF" font-size="12" font-weight="700">DELIVERABLE BASELINE</text>
+      <text x="18" y="49" fill="#C7E4FC" font-size="10">边界清晰 · 状态可恢复 · 行为可验证 · 后续可扩展</text>
+      <circle cx="329" cy="35" r="18" fill="#FFFFFF" opacity=".16"/>
+      <path d="M320 35l6 6 12-14" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <g transform="translate(54 606)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif">
+    <rect width="1092" height="32" rx="4" fill="#EDF2F5"/>
+    <rect width="350" height="32" rx="4" fill="#DCEAF5"/><text x="175" y="21" fill="#46667D" font-size="10.5" font-weight="700" text-anchor="middle">EXPLORE · 展开</text>
+    <rect x="390" width="252" height="32" rx="4" fill="#FBE6DC"/><text x="516" y="21" fill="#8D4A30" font-size="10.5" font-weight="700" text-anchor="middle">DECIDE · 裁剪</text>
+    <rect x="682" width="410" height="32" rx="4" fill="#DCEEFE"/><text x="887" y="21" fill="#28618F" font-size="10.5" font-weight="700" text-anchor="middle">DELIVER · 稳定交付</text>
+  </g>
+</svg>

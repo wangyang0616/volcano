@@ -1,0 +1,136 @@
+<svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">工程证据闭环</title>
+  <desc id="desc">技术仪表板风格的信息图，以同一个场景标识关联代码分析、自动化测试和真实集群结果。</desc>
+  <defs>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse"><path d="M28 0H0V28" fill="none" stroke="#D9E4EC" opacity=".52"/></pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#34506A" flood-opacity=".12"/></filter>
+  </defs>
+  <rect width="1200" height="675" fill="#F8FAFC"/>
+  <rect width="1200" height="675" fill="url(#grid)"/>
+
+  <g font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif">
+    <text x="54" y="58" fill="#172B3A" font-size="25" font-weight="700">工程证据闭环：不接受“从代码上看应该没问题”</text>
+    <text x="54" y="87" fill="#62798A" font-size="13.5">同一个真实场景必须能够在代码、自动化测试和集群状态中相互印证</text>
+    <rect x="976" y="38" width="170" height="28" rx="4" fill="#EAF5FF" stroke="#B8D6EC"/>
+    <circle cx="995" cy="52" r="5" fill="#326CE5"/>
+    <text x="1008" y="56" fill="#336489" font-size="10" font-weight="700">SCENARIO · 8 / 4 / 4</text>
+  </g>
+
+  <!-- source evidence -->
+  <g transform="translate(54 124)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif" filter="url(#shadow)">
+    <rect width="338" height="402" rx="8" fill="#FFFFFF" stroke="#AFC5D4"/>
+    <rect width="338" height="40" rx="8" fill="#1B3448"/>
+    <rect y="32" width="338" height="8" fill="#1B3448"/>
+    <circle cx="20" cy="20" r="4" fill="#F4511E"/><circle cx="34" cy="20" r="4" fill="#FFB020"/><circle cx="48" cy="20" r="4" fill="#23B47E"/>
+    <text x="70" y="25" fill="#D4E3EE" font-size="11" font-weight="700" letter-spacing="1">CODE EVIDENCE</text>
+
+    <g transform="translate(18 60)" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="10.5">
+      <text x="0" y="14" fill="#7890A1">01</text><text x="30" y="14" fill="#235F91">candidateScore</text><text x="118" y="14" fill="#50697B">:= evaluate(node)</text>
+      <text x="0" y="38" fill="#7890A1">02</text><text x="30" y="38" fill="#50697B">if node.</text><text x="83" y="38" fill="#C24925">Allocated == Full</text><text x="198" y="38" fill="#50697B">{</text>
+      <text x="0" y="62" fill="#7890A1">03</text><text x="48" y="62" fill="#50697B">excludeDrainCandidate()</text>
+      <text x="0" y="86" fill="#7890A1">04</text><text x="30" y="86" fill="#50697B">}</text>
+      <text x="0" y="110" fill="#7890A1">05</text><text x="30" y="110" fill="#50697B">simulate.</text><text x="84" y="110" fill="#235F91">Predicate</text><text x="140" y="110" fill="#50697B">(pod, node)</text>
+    </g>
+
+    <path d="M18 190H320" stroke="#DCE5EB"/>
+    <text x="18" y="218" fill="#334D60" font-size="11" font-weight="700">REPOSITORY TRACE</text>
+    <g transform="translate(18 236)" font-size="10.5">
+      <circle cx="7" cy="7" r="5" fill="#326CE5"/><text x="22" y="11" fill="#546E81">Planner candidate ordering</text>
+      <circle cx="7" cy="37" r="5" fill="#326CE5"/><text x="22" y="41" fill="#546E81">Scheduler predicate simulation</text>
+      <circle cx="7" cy="67" r="5" fill="#326CE5"/><text x="22" y="71" fill="#546E81">Recent commit comparison</text>
+    </g>
+
+    <rect x="18" y="330" width="302" height="50" rx="5" fill="#EEF6FC"/>
+    <text x="32" y="351" fill="#2D5878" font-size="10" font-weight="700">SOURCE OF TRUTH</text>
+    <text x="32" y="368" fill="#658196" font-size="9.5">结论必须对应当前代码与实际调用路径</text>
+  </g>
+
+  <!-- test evidence -->
+  <g transform="translate(431 124)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif" filter="url(#shadow)">
+    <rect width="338" height="402" rx="8" fill="#FFFFFF" stroke="#AFC5D4"/>
+    <rect width="338" height="40" rx="8" fill="#EAF5FF"/>
+    <rect y="32" width="338" height="8" fill="#EAF5FF"/>
+    <text x="18" y="25" fill="#215B8B" font-size="11" font-weight="700" letter-spacing="1">AUTOMATED EVIDENCE</text>
+    <rect x="260" y="11" width="58" height="19" rx="3" fill="#23A36D"/>
+    <text x="289" y="24" fill="#FFF" font-size="9" font-weight="700" text-anchor="middle">PASS</text>
+
+    <g transform="translate(18 62)">
+      <rect width="302" height="58" rx="5" fill="#F8FAFC" stroke="#D8E3EA"/>
+      <circle cx="27" cy="29" r="13" fill="#E5F7EF"/><path d="M20 29l5 5 9-11" fill="none" stroke="#23A36D" stroke-width="3" stroke-linecap="round"/>
+      <text x="52" y="25" fill="#2B4659" font-size="11.5" font-weight="700">Unit tests</text><text x="52" y="43" fill="#738999" font-size="9.5">候选排序 · 状态机 · 边界条件</text>
+
+      <rect y="70" width="302" height="58" rx="5" fill="#F8FAFC" stroke="#D8E3EA"/>
+      <circle cx="27" cy="99" r="13" fill="#E5F7EF"/><path d="M20 99l5 5 9-11" fill="none" stroke="#23A36D" stroke-width="3" stroke-linecap="round"/>
+      <text x="52" y="95" fill="#2B4659" font-size="11.5" font-weight="700">Race &amp; recovery</text><text x="52" y="113" fill="#738999" font-size="9.5">并发写入 · 重启恢复 · 幂等清理</text>
+
+      <rect y="140" width="302" height="58" rx="5" fill="#F8FAFC" stroke="#D8E3EA"/>
+      <circle cx="27" cy="169" r="13" fill="#E5F7EF"/><path d="M20 169l5 5 9-11" fill="none" stroke="#23A36D" stroke-width="3" stroke-linecap="round"/>
+      <text x="52" y="165" fill="#2B4659" font-size="11.5" font-weight="700">Benchmark</text><text x="52" y="183" fill="#738999" font-size="9.5">规划开销 · 候选规模 · 模拟次数</text>
+
+      <rect y="210" width="302" height="58" rx="5" fill="#F8FAFC" stroke="#D8E3EA"/>
+      <circle cx="27" cy="239" r="13" fill="#E5F7EF"/><path d="M20 239l5 5 9-11" fill="none" stroke="#23A36D" stroke-width="3" stroke-linecap="round"/>
+      <text x="52" y="235" fill="#2B4659" font-size="11.5" font-weight="700">E2E scenarios</text><text x="52" y="253" fill="#738999" font-size="9.5">DryRun · Execute · Replacement</text>
+    </g>
+
+    <g transform="translate(18 344)">
+      <rect width="302" height="36" rx="4" fill="#E7F5EE"/>
+      <rect width="276" height="36" rx="4" fill="#23A36D"/>
+      <text x="14" y="23" fill="#FFF" font-size="9.5" font-weight="700">SCENARIO COVERAGE</text>
+      <text x="286" y="23" fill="#2D6B52" font-size="9.5" font-weight="700" text-anchor="end">VERIFIED</text>
+    </g>
+  </g>
+
+  <!-- cluster evidence -->
+  <g transform="translate(808 124)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif" filter="url(#shadow)">
+    <rect width="338" height="402" rx="8" fill="#FFFFFF" stroke="#AFC5D4"/>
+    <rect width="338" height="40" rx="8" fill="#0D6DCC"/>
+    <rect y="32" width="338" height="8" fill="#0D6DCC"/>
+    <text x="18" y="25" fill="#FFFFFF" font-size="11" font-weight="700" letter-spacing="1">CLUSTER EVIDENCE</text>
+    <circle cx="309" cy="20" r="6" fill="#64E3B0"/>
+
+    <g transform="translate(18 62)">
+      <rect width="302" height="118" rx="6" fill="#F3F8FC" stroke="#D4E2EC"/>
+      <text x="14" y="23" fill="#536D80" font-size="10" font-weight="700">NODE SNAPSHOT</text>
+      <g transform="translate(14 38)">
+        <rect width="80" height="58" rx="4" fill="#FFFFFF" stroke="#7EAED4"/>
+        <rect y="0" width="80" height="12" rx="4" fill="#326CE5"/>
+        <text x="40" y="32" fill="#264D6B" font-size="11" font-weight="700" text-anchor="middle">node-A</text><text x="40" y="49" fill="#738B9C" font-size="9.5" text-anchor="middle">8 / 8</text>
+        <rect x="96" width="80" height="58" rx="4" fill="#FFFFFF" stroke="#7EAED4"/>
+        <rect x="96" width="80" height="12" rx="4" fill="#7CB6E1"/>
+        <text x="136" y="32" fill="#264D6B" font-size="11" font-weight="700" text-anchor="middle">node-B</text><text x="136" y="49" fill="#738B9C" font-size="9.5" text-anchor="middle">4 / 8</text>
+        <rect x="192" width="80" height="58" rx="4" fill="#FFFFFF" stroke="#7EAED4"/>
+        <rect x="192" width="80" height="12" rx="4" fill="#7CB6E1"/>
+        <text x="232" y="32" fill="#264D6B" font-size="11" font-weight="700" text-anchor="middle">node-C</text><text x="232" y="49" fill="#738B9C" font-size="9.5" text-anchor="middle">4 / 8</text>
+      </g>
+    </g>
+
+    <g transform="translate(18 196)">
+      <rect width="302" height="92" rx="6" fill="#F3F8FC" stroke="#D4E2EC"/>
+      <text x="14" y="23" fill="#536D80" font-size="10" font-weight="700">OBSERVED RESULT</text>
+      <path d="M16 59h35l12-19 16 34 18-25 15 10h38" fill="none" stroke="#326CE5" stroke-width="2.5"/>
+      <circle cx="150" cy="59" r="4" fill="#326CE5"/>
+      <text x="170" y="54" fill="#275776" font-size="10.5" font-weight="700">planned node freed</text>
+      <text x="170" y="71" fill="#71899A" font-size="9.5">placement and benefit verified</text>
+    </g>
+
+    <g transform="translate(18 304)">
+      <rect width="302" height="76" rx="6" fill="#E8F6EF" stroke="#ABD8C5"/>
+      <circle cx="38" cy="38" r="22" fill="#23A36D"/>
+      <path d="M28 38l7 7 14-17" fill="none" stroke="#FFF" stroke-width="5" stroke-linecap="round"/>
+      <text x="75" y="32" fill="#275C48" font-size="12" font-weight="700">RESULT VERIFIED</text>
+      <text x="75" y="52" fill="#5C8373" font-size="10">真实状态与计划目标一致</text>
+    </g>
+  </g>
+
+  <!-- correlation rail -->
+  <g transform="translate(54 562)" font-family="Inter,'PingFang SC','Microsoft YaHei',sans-serif">
+    <rect width="1092" height="66" rx="6" fill="#172F43"/>
+    <text x="20" y="26" fill="#A7C0D2" font-size="9.5" letter-spacing="1">EVIDENCE CORRELATION ID</text>
+    <text x="20" y="47" fill="#FFFFFF" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12">repack-scenario/8-4-4</text>
+    <path d="M246 33H884" stroke="#46677F" stroke-width="2"/>
+    <circle cx="246" cy="33" r="7" fill="#326CE5"/><circle cx="565" cy="33" r="7" fill="#23A36D"/><circle cx="884" cy="33" r="7" fill="#F4511E"/>
+    <text x="246" y="54" fill="#9EB6C8" font-size="9" text-anchor="middle">CODE</text><text x="565" y="54" fill="#9EB6C8" font-size="9" text-anchor="middle">TEST</text><text x="884" y="54" fill="#9EB6C8" font-size="9" text-anchor="middle">CLUSTER</text>
+    <rect x="956" y="20" width="116" height="27" rx="4" fill="#23A36D"/>
+    <text x="1014" y="38" fill="#FFFFFF" font-size="9.5" font-weight="700" text-anchor="middle">CONSISTENT</text>
+  </g>
+</svg>
