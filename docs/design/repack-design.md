@@ -30,20 +30,7 @@ Repack 的技术目标是在在线集群中及时生成一个可执行、可解�
 
 ### 3.1 组件关系
 
-![Repack Engine 架构与扩展点](images/repack/repack-engine-architecture.svg)
-
-```mermaid
-flowchart LR
-    U["用户 / 平台"] -->|"创建 RepackRun"| API["Kubernetes API Server"]
-    API -->|"watch Run、Pod、PodGroup、Node"| E["volcano-repack-engine"]
-    API -->|"watch relocation 与 replacement"| C["Volcano Controller Manager\nRepack controller"]
-    E -->|"复用配置、缓存与 Session"| SF["Volcano Scheduler Framework"]
-    E -->|"写 plan/result/eviction journal"| API
-    E -->|"Eviction API"| API
-    C -->|"认领替身、写 nomination、观察绑定"| API
-    WC["VCJob / ModelServing / 原生控制器"] -->|"重建 Pod 或整个工作负载内的 Pod"| API
-    S["Volcano Scheduler"] -->|"调度并绑定 replacement Pod"| API
-```
+![Repack 高层模块交互架构](images/repack/repack-module-interactions.svg)
 
 组件职责：
 
@@ -57,17 +44,7 @@ Engine 和 controller 只通过 Kubernetes 对象协作，不建立私有 RPC。
 
 ### 3.2 分层架构
 
-```mermaid
-flowchart TB
-    D["Engine Runtime\nwatch、workqueue、gate"] --> C["ActionContext\nRun + Runtime ports"]
-    C --> A["Action: repack\n规划 → 模式分流 → 执行/恢复 → 终态"]
-    A --> S["Planning Session\n按需打开，只读快照"]
-    S --> P["Plugins\nScope / Budget / Domain / Score / Preference"]
-    A --> L["Lazy Drain Planner\n候选、惰性模拟、增量提交"]
-    A --> X["Execution Runtime\nstatus barrier / eviction / placement"]
-    L --> SA["Snapshot Adapter\nScheduler Session + 完整 Filter"]
-    SA --> SC["Scheduler Cache"]
-```
+![Repack Engine 架构与扩展点](images/repack/repack-engine-architecture.svg)
 
 各层职责必须保持清晰：
 

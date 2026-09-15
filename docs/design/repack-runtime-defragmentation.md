@@ -135,7 +135,7 @@ spec:
 
 Repack 由既有 Kubernetes/Volcano 组件和一个独立 Engine 协作完成：
 
-![Repack Engine 架构与扩展点](images/repack/repack-engine-architecture.svg)
+![Repack 高层模块交互架构](images/repack/repack-module-interactions.svg)
 
 - API Server 保存 `RepackRun`、PodGroup、Pod 和 Node 状态，并通过 CRD/CEL 校验不可变性和字段边界；
 - `volcano-repack-engine` 监听 Run，复用 scheduler cache 和 scheduler 配置完成规划，Execute 时调用 Eviction API；

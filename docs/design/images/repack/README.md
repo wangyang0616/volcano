@@ -6,6 +6,7 @@
 
 | 文件 | 用途 |
 |---|---|
+| `repack-module-interactions.svg` | Repack、Kubernetes 与 Scheduler 各模块的高层交互关系 |
 | `repack-engine-architecture.svg` | Engine、Action、Plugin、Planner 与 Scheduler Framework 架构 |
 | `repack-end-to-end.svg` | DryRun/Execute 端到端组件交互 |
 | `core-invocation.svg` | Action 到 Lazy Drain Planner 的调用链 |

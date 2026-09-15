@@ -1,0 +1,116 @@
+<svg viewBox="0 0 1320 790" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" role="img">
+  <title>Repack 高层模块交互架构</title>
+  <desc>高层展示用户、Kubernetes API、Repack Engine、Repack Controller、Admission Webhooks、工作负载控制器、Scheduler Cache 和 Volcano Scheduler 之间的交互。Kubernetes API 中的 RepackRun、PodGroup 和 Pod 是组件之间的持久化协作中枢，Engine 与 Controller 不直接调用彼此。</desc>
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M24 0H0V24" fill="none" stroke="#e2e8f0" stroke-width="1" opacity=".42"/></pattern>
+    <marker id="blueArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker>
+    <marker id="greenArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#16a34a"/></marker>
+    <marker id="orangeArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#f97316"/></marker>
+    <marker id="blueBiArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto-start-reverse"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker>
+    <marker id="greenBiArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto-start-reverse"><path d="M0,0 L8,3 L0,6 Z" fill="#16a34a"/></marker>
+    <marker id="orangeBiArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto-start-reverse"><path d="M0,0 L8,3 L0,6 Z" fill="#f97316"/></marker>
+    <style>
+      .title{fill:#0f172a;font-size:21px;font-weight:750}.subtitle{fill:#64748b;font-size:11px}.head{fill:#0f172a;font-size:14px;font-weight:700}.subhead{fill:#1e293b;font-size:12px;font-weight:700}.body{fill:#475569;font-size:10.5px}.small{fill:#64748b;font-size:9.5px}.micro{fill:#64748b;font-size:8.5px}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace}.panel{fill:#fff;stroke:#cbd5e1;stroke-width:1.4}.apiPanel{fill:#f8fafc;stroke:#94a3b8;stroke-width:1.6}.bluePanel{fill:#eff6ff;stroke:#3b82f6;stroke-width:1.6}.greenPanel{fill:#f0fdf4;stroke:#22c55e;stroke-width:1.6}.orangePanel{fill:#fff7ed;stroke:#fb923c;stroke-width:1.6}.card{fill:#fff;stroke:#cbd5e1;stroke-width:1.2}.apiCard{fill:#fff;stroke:#94a3b8;stroke-width:1.2}.blueText{fill:#1d4ed8}.greenText{fill:#15803d}.orangeText{fill:#c2410c}.line{fill:none;stroke:#2563eb;stroke-width:1.7;marker-end:url(#blueArrow)}.greenLine{fill:none;stroke:#16a34a;stroke-width:1.7;marker-end:url(#greenArrow)}.orangeLine{fill:none;stroke:#f97316;stroke-width:1.7;marker-end:url(#orangeArrow)}.blueBidi{fill:none;stroke:#2563eb;stroke-width:1.7;marker-start:url(#blueBiArrow);marker-end:url(#blueBiArrow)}.greenBidi{fill:none;stroke:#16a34a;stroke-width:1.7;marker-start:url(#greenBiArrow);marker-end:url(#greenBiArrow)}.orangeBidi{fill:none;stroke:#f97316;stroke-width:1.7;marker-start:url(#orangeBiArrow);marker-end:url(#orangeBiArrow)}.dash{stroke-dasharray:6 5}.lane{fill:#fff;stroke:#e2e8f0;stroke-width:1.2}.number{fill:#2563eb}.numberText{fill:#fff;font-size:9px;font-weight:700}
+    </style>
+  </defs>
+  <rect width="1320" height="790" fill="#fff"/><rect width="1320" height="790" fill="url(#grid)"/>
+  <text x="660" y="34" text-anchor="middle" class="title">Repack 高层模块交互架构</text>
+  <text x="660" y="56" text-anchor="middle" class="subtitle">组件通过 Kubernetes 对象协作；Engine 决策与执行，Controller 协调替换，Scheduler 完成最终绑定</text>
+
+  <!-- Entry -->
+  <rect x="44" y="96" width="170" height="86" rx="12" class="card"/>
+  <text x="129" y="120" text-anchor="middle" class="head">用户 / 运维平台</text>
+  <text x="129" y="146" text-anchor="middle" class="body">创建与查询 RepackRun</text>
+  <text x="129" y="165" text-anchor="middle" class="small code">DryRun / Execute</text>
+
+  <!-- API hub -->
+  <rect x="268" y="82" width="1008" height="122" rx="14" class="apiPanel"/>
+  <text x="772" y="106" text-anchor="middle" class="head">Kubernetes API · 模块协作中枢</text>
+  <rect x="292" y="124" width="220" height="58" rx="9" class="apiCard"/>
+  <text x="402" y="145" text-anchor="middle" class="subhead code">RepackRun</text><text x="402" y="166" text-anchor="middle" class="small">请求 · plan · journal · placement · result</text>
+  <rect x="534" y="124" width="202" height="58" rx="9" class="apiCard"/>
+  <text x="635" y="145" text-anchor="middle" class="subhead code">PodGroup</text><text x="635" y="166" text-anchor="middle" class="small">workload metadata · placement lease</text>
+  <rect x="758" y="124" width="220" height="58" rx="9" class="apiCard"/>
+  <text x="868" y="145" text-anchor="middle" class="subhead code">Pod</text><text x="868" y="166" text-anchor="middle" class="small">gate · nomination · binding · Eviction</text>
+  <rect x="1000" y="124" width="252" height="58" rx="9" class="apiCard"/>
+  <text x="1126" y="145" text-anchor="middle" class="subhead">Admission / Events</text><text x="1126" y="166" text-anchor="middle" class="small">准入请求、对象变更通知与可观测事件</text>
+  <path d="M214 139H266" class="line"/><text x="240" y="126" text-anchor="middle" class="small blueText">创建 / 查询</text>
+
+  <!-- Repack control plane -->
+  <rect x="44" y="276" width="266" height="154" rx="14" class="greenPanel"/>
+  <text x="177" y="303" text-anchor="middle" class="head greenText">Repack Engine</text>
+  <text x="177" y="332" text-anchor="middle" class="body">规划、DryRun、Execute 与结果验证</text>
+  <text x="177" y="354" text-anchor="middle" class="body">准备 placement lease，调用 Eviction API</text>
+  <rect x="66" y="379" width="222" height="32" rx="8" fill="#dcfce7"/>
+  <text x="177" y="395" text-anchor="middle" class="small greenText">写 RepackRun 状态 · PodGroup lease</text>
+
+  <rect x="354" y="276" width="266" height="154" rx="14" class="bluePanel"/>
+  <text x="487" y="303" text-anchor="middle" class="head blueText">Repack Controller</text>
+  <text x="487" y="332" text-anchor="middle" class="body">替换 Pod 识别、认领与恢复</text>
+  <text x="487" y="354" text-anchor="middle" class="body">写软提名、移除 gate、观察实际落点</text>
+  <rect x="376" y="379" width="222" height="32" rx="8" fill="#dbeafe"/>
+  <text x="487" y="395" text-anchor="middle" class="small blueText">读写 RepackRun placement · Pod 状态</text>
+
+  <rect x="664" y="276" width="266" height="154" rx="14" class="orangePanel"/>
+  <text x="797" y="303" text-anchor="middle" class="head orangeText">Admission Webhooks</text>
+  <text x="797" y="332" text-anchor="middle" class="body">识别活动 placement lease</text>
+  <text x="797" y="354" text-anchor="middle" class="body">为重建 Pod 注入 gate 与 owner</text>
+  <rect x="686" y="379" width="222" height="32" rx="8" fill="#ffedd5"/>
+  <text x="797" y="395" text-anchor="middle" class="small orangeText">PodGroup lease 继承 · Pod admission</text>
+
+  <rect x="974" y="276" width="302" height="154" rx="14" class="orangePanel"/>
+  <text x="1125" y="303" text-anchor="middle" class="head orangeText">Workload Controllers</text>
+  <text x="1125" y="332" text-anchor="middle" class="body">观察 Pod 删除并恢复期望副本</text>
+  <text x="1125" y="354" text-anchor="middle" class="body">创建 replacement Pod / 新一代 PodGroup</text>
+  <rect x="996" y="379" width="258" height="32" rx="8" fill="#ffedd5"/>
+  <text x="1125" y="395" text-anchor="middle" class="small orangeText">VCJob · Deployment · StatefulSet · ModelServing</text>
+
+  <!-- API interactions -->
+  <path d="M177 276V224C177 212 318 214 402 184" class="greenBidi"/><text x="225" y="235" class="small greenText">watch / status</text>
+  <path d="M278 276C360 228 546 226 660 204" class="orangeLine dash"/><text x="455" y="219" text-anchor="middle" class="small orangeText">lease / Eviction</text>
+  <path d="M487 276V224C487 212 448 207 426 184" class="blueBidi"/><text x="497" y="231" class="small blueText">watch / patch</text>
+  <path d="M797 276V224C797 212 1002 210 1090 184" class="orangeBidi dash"/><text x="846" y="231" class="small orangeText">admission</text>
+  <path d="M1125 276V206" class="orangeBidi"/><text x="1140" y="235" class="small orangeText">observe / create</text>
+
+  <!-- Scheduling foundation -->
+  <rect x="44" y="510" width="350" height="150" rx="14" class="bluePanel"/>
+  <text x="219" y="537" text-anchor="middle" class="head blueText">Scheduler Cache &amp; Framework</text>
+  <text x="219" y="567" text-anchor="middle" class="body">独立只读 Cache 持续同步集群状态</text>
+  <text x="219" y="590" text-anchor="middle" class="body">按需打开 Scheduler Session，复用完整过滤能力</text>
+  <rect x="66" y="616" width="306" height="26" rx="7" fill="#dbeafe"/>
+  <text x="219" y="629" text-anchor="middle" class="small blueText">为规划、实时选点与结果验证提供事实</text>
+
+  <rect x="484" y="510" width="266" height="150" rx="14" class="greenPanel"/>
+  <text x="617" y="537" text-anchor="middle" class="head greenText">Repack Plugins</text>
+  <text x="617" y="567" text-anchor="middle" class="body">通过 Planning Session 注册策略回调</text>
+  <text x="617" y="590" text-anchor="middle" class="body">扩展过滤、评分、Domain 与 Receiver 偏好</text>
+  <rect x="506" y="616" width="222" height="26" rx="7" fill="#dcfce7"/>
+  <text x="617" y="629" text-anchor="middle" class="small greenText">不侵入 Action 与 Lazy Planner</text>
+
+  <rect x="840" y="510" width="266" height="150" rx="14" class="bluePanel"/>
+  <text x="973" y="537" text-anchor="middle" class="head blueText">Volcano Scheduler</text>
+  <text x="973" y="567" text-anchor="middle" class="body">观察 gate 已释放的 Pending Pod</text>
+  <text x="973" y="590" text-anchor="middle" class="body">基于实时集群状态完成最终绑定</text>
+  <rect x="862" y="616" width="222" height="26" rx="7" fill="#dbeafe"/>
+  <text x="973" y="629" text-anchor="middle" class="small blueText">提名是偏好，不是资源预留</text>
+
+  <rect x="1152" y="510" width="124" height="150" rx="14" class="card"/>
+  <text x="1214" y="537" text-anchor="middle" class="head">Cluster</text>
+  <rect x="1174" y="560" width="32" height="62" rx="5" fill="#dcfce7" stroke="#22c55e"/>
+  <rect x="1220" y="560" width="32" height="62" rx="5" fill="#fff" stroke="#94a3b8"/>
+  <text x="1214" y="642" text-anchor="middle" class="small">目标节点状态</text>
+
+  <!-- Lower interactions -->
+  <path d="M219 510V456C219 444 190 442 181 432" class="greenLine"/><text x="230" y="470" class="small greenText">snapshot / simulate</text>
+  <path d="M484 570H396C375 570 361 468 285 430" class="greenLine dash"/><text x="414" y="554" class="small greenText">策略回调</text>
+  <path d="M973 510V464C973 448 950 448 950 432V226C950 214 902 206 868 184" class="blueBidi"/><text x="985" y="467" class="small blueText">watch / bind</text>
+  <path d="M1106 585H1150" class="line"/><text x="1128" y="571" text-anchor="middle" class="small blueText">bind</text>
+
+  <!-- Coordination statement -->
+  <rect x="44" y="692" width="1232" height="68" rx="11" class="lane"/>
+  <text x="660" y="713" text-anchor="middle" class="subhead">核心解耦关系</text>
+  <text x="660" y="738" text-anchor="middle" class="body">
+    <tspan class="greenText" font-weight="700">Engine</tspan><tspan> 与 </tspan><tspan class="blueText" font-weight="700">Controller</tspan><tspan> 不进行进程内或 RPC 直连，而是通过 </tspan><tspan class="code" font-weight="700">RepackRun.status</tspan><tspan>、</tspan><tspan class="code" font-weight="700">PodGroup lease</tspan><tspan> 和 </tspan><tspan class="code" font-weight="700">Pod gate</tspan><tspan> 进行可恢复协作</tspan>
+  </text>
+  <text x="660" y="779" text-anchor="middle" class="micro"><tspan class="blueText">蓝色：观察与状态协调</tspan><tspan>　</tspan><tspan class="greenText">绿色：规划能力与只读数据</tspan><tspan>　</tspan><tspan class="orangeText">橙色：准入、驱逐和工作负载变更</tspan></text>
+</svg>
