@@ -433,7 +433,7 @@ func (alloc *Action) allocateForJob(job *api.JobInfo, jobWorksheet *JobWorksheet
 
 	alloc.recorder.SnapshotSubJobStatus(job, jobWorksheet)
 
-	hyperNodeGradients := ssn.HyperNodeGradientForJobFn(job, hyperNodeToAllocate, api.PurposeAllocate)
+	hyperNodeGradients, _ := ssn.HyperNodeGradientForJobFn(job, hyperNodeToAllocate, api.PurposeAllocate)
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)   // backup the statement after the job is allocated to a hyperNode
 		jobWorksheetsBackup := make(map[string]*JobWorksheet) // backup the job worksheet after the job is allocated to a hyperNode
@@ -537,7 +537,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 		}
 	}
 
-	hyperNodeGradients := ssn.HyperNodeGradientForSubJobFn(subJob, hyperNodeForJob, api.PurposeAllocate)
+	hyperNodeGradients, _ := ssn.HyperNodeGradientForSubJobFn(subJob, hyperNodeForJob, api.PurposeAllocate)
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)         // backup the statement after the subJob is allocated to a hyperNode
 		subJobWorksheetsBackup := make(map[string]*SubJobWorksheet) // backup the subJob worksheet after the subJob is allocated to a hyperNode
