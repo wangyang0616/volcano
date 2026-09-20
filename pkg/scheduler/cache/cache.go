@@ -1547,6 +1547,7 @@ func (sc *SchedulerCache) Snapshot() *schedulingapi.ClusterInfo {
 	snapshot.HyperNodeTierNameMap = sc.HyperNodesInfo.HyperNodeTierNameMap()
 	snapshot.RealNodesSet = sc.HyperNodesInfo.RealNodesSet()
 	snapshot.HyperNodesReadyToSchedule = sc.HyperNodesInfo.Ready()
+	snapshot.HyperNodeGeneration = sc.HyperNodesInfo.Generation()
 	sc.HyperNodesInfo.Unlock()
 
 	for _, value := range sc.Queues {
@@ -1760,6 +1761,7 @@ func (sc *SchedulerCache) updateJobInfo(job *schedulingapi.JobInfo) {
 
 	if jobInCache, ok := sc.Jobs[job.UID]; ok {
 		jobInCache.AllocatedHyperNode = job.AllocatedHyperNode
+		jobInCache.AllocatedHyperNodeGeneration = job.AllocatedHyperNodeGeneration
 		for subJobID, subJobInCache := range jobInCache.SubJobs {
 			if subJob, found := job.SubJobs[subJobID]; found {
 				subJobInCache.AllocatedHyperNode = subJob.AllocatedHyperNode
