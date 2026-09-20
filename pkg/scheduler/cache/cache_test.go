@@ -902,8 +902,9 @@ func TestUpdateJobInfo_PropagatesNominatedHyperNode(t *testing.T) {
 
 	// Session-side copy carries the gangpreempt/gangreclaim decision.
 	sessionView := &api.JobInfo{
-		UID:                jobID,
-		AllocatedHyperNode: "hn-allocated",
+		UID:                          jobID,
+		AllocatedHyperNode:           "hn-allocated",
+		AllocatedHyperNodeGeneration: 7,
 		SubJobs: map[api.SubJobID]*api.SubJobInfo{
 			subID: {
 				UID:                subID,
@@ -917,6 +918,7 @@ func TestUpdateJobInfo_PropagatesNominatedHyperNode(t *testing.T) {
 	sc.updateJobInfo(sessionView)
 
 	assert.Equal(t, "hn-allocated", cached.AllocatedHyperNode)
+	assert.Equal(t, uint64(7), cached.AllocatedHyperNodeGeneration)
 	assert.Equal(t, "hn-allocated", cached.SubJobs[subID].AllocatedHyperNode)
 	assert.Equal(t, "hn-nominated", cached.SubJobs[subID].NominatedHyperNode,
 		"cache must persist NominatedHyperNode so the next cycle honors the gang-eviction pin")
