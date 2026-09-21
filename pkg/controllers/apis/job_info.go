@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 )
@@ -28,6 +29,9 @@ import (
 type JobInfo struct {
 	Namespace string
 	Name      string
+	// UID identifies one concrete VCJob lifecycle. Namespace and name can be
+	// reused, while UID is immutable for the lifetime of a Kubernetes object.
+	UID types.UID
 
 	Job  *batch.Job
 	Pods map[string]map[string]*v1.Pod
@@ -46,6 +50,7 @@ func (ji *JobInfo) Clone() *JobInfo {
 	job := &JobInfo{
 		Namespace: ji.Namespace,
 		Name:      ji.Name,
+		UID:       ji.UID,
 		Job:       ji.Job,
 
 		Pods:       make(map[string]map[string]*v1.Pod, len(ji.Pods)),
@@ -82,6 +87,7 @@ func (ji *JobInfo) Clone() *JobInfo {
 func (ji *JobInfo) SetJob(job *batch.Job) {
 	ji.Name = job.Name
 	ji.Namespace = job.Namespace
+	ji.UID = job.UID
 	ji.Job = job
 	ji.Partitions = make(map[string]*PartitionInfo)
 	for _, taskSpec := range job.Spec.Tasks {

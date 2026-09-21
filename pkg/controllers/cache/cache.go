@@ -24,6 +24,8 @@ import (
 
 	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -31,6 +33,7 @@ import (
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 
 	"volcano.sh/volcano/pkg/controllers/apis"
+	controllermetrics "volcano.sh/volcano/pkg/controllers/metrics"
 )
 
 type jobCache struct {
@@ -71,6 +74,29 @@ func jobKeyOfPod(pod *v1.Pod) (string, error) {
 	}
 
 	return keyFn(pod.Namespace, jobName), nil
+}
+
+func jobUIDOfPod(pod *v1.Pod) types.UID {
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil {
+		return ""
+	}
+	return owner.UID
+}
+
+func validatePodJobUID(job *apis.JobInfo, pod *v1.Pod) error {
+	// Empty UIDs are kept compatible with unit tests and legacy objects. Real
+	// API-server objects always have a UID.
+	if job.UID == "" {
+		return nil
+	}
+	podJobUID := jobUIDOfPod(pod)
+	if podJobUID != job.UID {
+		controllermetrics.IncJobControllerLifecycleMismatch("pod-cache")
+		return fmt.Errorf("pod <%s/%s> belongs to job uid <%s>, current cached job uid is <%s>",
+			pod.Namespace, pod.Name, podJobUID, job.UID)
+	}
+	return nil
 }
 
 // New gets the job Cache.
@@ -126,6 +152,21 @@ func (jc *jobCache) Add(job *v1alpha1.Job) error {
 	defer jc.Unlock()
 	key := JobKey(job)
 	if jobInfo, found := jc.jobs[key]; found {
+		if jobInfo.UID != job.UID {
+			if jobInfo.Job != nil {
+				// Add events alone do not establish ordering between two
+				// lifecycles. Refuse to replace a live entry, otherwise a late
+				// event from the old UID could roll the cache back. The informer
+				// handler/recovery path first deletes the lifecycle it observed
+				// before adding the replacement.
+				controllermetrics.IncJobControllerLifecycleMismatch("job-add")
+				return fmt.Errorf("job <%v> uid mismatch: cached <%s>, added <%s>", key, jobInfo.UID, job.UID)
+			}
+			// A name can be reused after deletion. Never attach the new VCJob to
+			// the old lifecycle's JobInfo; stale cleanup items still reference it.
+			jc.jobs[key] = newJobInfo(job)
+			return nil
+		}
 		if jobInfo.Job == nil {
 			jobInfo.SetJob(job)
 
@@ -134,16 +175,22 @@ func (jc *jobCache) Add(job *v1alpha1.Job) error {
 		return fmt.Errorf("duplicated jobInfo <%v>", key)
 	}
 
-	jc.jobs[key] = &apis.JobInfo{
-		Name:      job.Name,
-		Namespace: job.Namespace,
-
-		Job:  job,
-		Pods: make(map[string]map[string]*v1.Pod),
-	}
-	jc.jobs[key].SetJob(job)
+	jc.jobs[key] = newJobInfo(job)
 
 	return nil
+}
+
+func newJobInfo(job *v1alpha1.Job) *apis.JobInfo {
+	jobInfo := &apis.JobInfo{
+		Name:       job.Name,
+		Namespace:  job.Namespace,
+		UID:        job.UID,
+		Job:        job,
+		Pods:       make(map[string]map[string]*v1.Pod),
+		Partitions: make(map[string]*apis.PartitionInfo),
+	}
+	jobInfo.SetJob(job)
+	return jobInfo
 }
 
 func (jc *jobCache) Update(obj *v1alpha1.Job) error {
@@ -154,6 +201,10 @@ func (jc *jobCache) Update(obj *v1alpha1.Job) error {
 	job, found := jc.jobs[key]
 	if !found {
 		return fmt.Errorf("failed to find job <%v>", key)
+	}
+	if job.UID != obj.UID {
+		controllermetrics.IncJobControllerLifecycleMismatch("job-update")
+		return fmt.Errorf("job <%v> uid mismatch: cached <%s>, updated <%s>", key, job.UID, obj.UID)
 	}
 
 	if job.Job != nil {
@@ -183,6 +234,11 @@ func (jc *jobCache) Delete(obj *v1alpha1.Job) error {
 	if !found {
 		return fmt.Errorf("failed to find job <%v>", key)
 	}
+	if jobInfo.UID != obj.UID {
+		controllermetrics.IncJobControllerLifecycleMismatch("job-delete")
+		klog.V(3).Infof("Ignore stale delete event for Job <%s>, event uid <%s>, current uid <%s>", key, obj.UID, jobInfo.UID)
+		return nil
+	}
 	jobInfo.Job = nil
 	jc.deleteJob(jobInfo)
 
@@ -201,9 +257,15 @@ func (jc *jobCache) AddPod(pod *v1.Pod) error {
 	job, found := jc.jobs[key]
 	if !found {
 		job = &apis.JobInfo{
-			Pods: make(map[string]map[string]*v1.Pod),
+			Namespace: pod.Namespace,
+			Name:      pod.Annotations[v1alpha1.JobNameKey],
+			UID:       jobUIDOfPod(pod),
+			Pods:      make(map[string]map[string]*v1.Pod),
 		}
 		jc.jobs[key] = job
+	}
+	if err := validatePodJobUID(job, pod); err != nil {
+		return err
 	}
 
 	return job.AddPod(pod)
@@ -221,9 +283,15 @@ func (jc *jobCache) UpdatePod(pod *v1.Pod) error {
 	job, found := jc.jobs[key]
 	if !found {
 		job = &apis.JobInfo{
-			Pods: make(map[string]map[string]*v1.Pod),
+			Namespace: pod.Namespace,
+			Name:      pod.Annotations[v1alpha1.JobNameKey],
+			UID:       jobUIDOfPod(pod),
+			Pods:      make(map[string]map[string]*v1.Pod),
 		}
 		jc.jobs[key] = job
+	}
+	if err := validatePodJobUID(job, pod); err != nil {
+		return err
 	}
 
 	return job.UpdatePod(pod)
@@ -239,6 +307,9 @@ func (jc *jobCache) DeletePod(pod *v1.Pod) error {
 	}
 
 	if job, found := jc.jobs[key]; found {
+		if err := validatePodJobUID(job, pod); err != nil {
+			return err
+		}
 		if err := job.DeletePod(pod); err != nil {
 			return err
 		}
@@ -261,6 +332,9 @@ func (jc *jobCache) HasPod(pod *v1.Pod) bool {
 
 	job, found := jc.jobs[key]
 	if !found {
+		return false
+	}
+	if validatePodJobUID(job, pod) != nil {
 		return false
 	}
 
@@ -371,9 +445,19 @@ func (jc *jobCache) processCleanupJob() bool {
 	jc.Mutex.Lock()
 	defer jc.Mutex.Unlock()
 
+	key := keyFn(job.Namespace, job.Name)
+	current, found := jc.jobs[key]
+	if !found || current != job || current.UID != job.UID {
+		// The name has been reused and this queue item belongs to an old
+		// lifecycle. It must never delete the current map entry.
+		jc.deletedJobs.Forget(job)
+		controllermetrics.IncJobControllerStaleCleanup()
+		klog.V(3).Infof("Ignore stale cleanup for Job <%s> uid <%s>", key, job.UID)
+		return true
+	}
+
 	if jobTerminated(job) {
 		jc.deletedJobs.Forget(job)
-		key := keyFn(job.Namespace, job.Name)
 		delete(jc.jobs, key)
 		klog.V(3).Infof("Job <%s> was deleted.", key)
 	} else {

@@ -35,6 +35,28 @@ var (
 			Buckets:   prometheus.ExponentialBucketsRange(50, 60000, 30),
 		},
 	)
+	jobControllerCacheMissCount = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Subsystem: util.VolcanoSubSystemName,
+			Name:      "controller_job_cache_miss_total",
+			Help:      "Total number of VCJob controller worker cache misses.",
+		},
+	)
+	jobControllerLifecycleMismatchCount = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: util.VolcanoSubSystemName,
+			Name:      "controller_job_lifecycle_mismatch_total",
+			Help:      "Total number of stale VCJob lifecycle operations rejected by UID validation.",
+		},
+		[]string{"operation"},
+	)
+	jobControllerStaleCleanupCount = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Subsystem: util.VolcanoSubSystemName,
+			Name:      "controller_job_stale_cleanup_total",
+			Help:      "Total number of stale VCJob cache cleanup items ignored after name reuse.",
+		},
+	)
 )
 
 // DurationInMilliseconds converts a time.Duration to float64 milliseconds.
@@ -45,4 +67,21 @@ func DurationInMilliseconds(duration time.Duration) float64 {
 // ObserveJobToPodCreationLatency observes the latency from job creation to a single pod created.
 func ObserveJobToPodCreationLatency(duration time.Duration) {
 	jobToPodCreationLatency.Observe(DurationInMilliseconds(duration))
+}
+
+// IncJobControllerCacheMiss records a job controller worker cache miss.
+func IncJobControllerCacheMiss() {
+	jobControllerCacheMissCount.Inc()
+}
+
+// IncJobControllerLifecycleMismatch records a rejected operation from an old
+// VCJob lifecycle. Operation must be a bounded controller-defined value.
+func IncJobControllerLifecycleMismatch(operation string) {
+	jobControllerLifecycleMismatchCount.WithLabelValues(operation).Inc()
+}
+
+// IncJobControllerStaleCleanup records a cleanup item that referred to an old
+// VCJob lifecycle after the namespace/name had been reused.
+func IncJobControllerStaleCleanup() {
+	jobControllerStaleCleanupCount.Inc()
 }

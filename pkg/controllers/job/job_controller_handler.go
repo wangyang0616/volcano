@@ -59,6 +59,7 @@ func (cc *jobcontroller) addJob(obj interface{}) {
 	req := apis.Request{
 		Namespace: job.Namespace,
 		JobName:   job.Name,
+		JobUid:    job.UID,
 
 		Event: bus.OutOfSyncEvent,
 	}
@@ -86,20 +87,38 @@ func (cc *jobcontroller) updateJob(oldObj, newObj interface{}) {
 		return
 	}
 
-	// No need to update if ResourceVersion is not changed
-	if newJob.ResourceVersion == oldJob.ResourceVersion {
+	lifecycleChanged := oldJob.UID != newJob.UID
+	// Equal resource versions can only suppress an update within one object
+	// lifecycle. UID remains authoritative for delete-and-recreate.
+	if !lifecycleChanged && newJob.ResourceVersion == oldJob.ResourceVersion {
 		klog.V(6).Infof("No need to update because job is not modified.")
 		return
 	}
 
-	if err := cc.cache.Update(newJob); err != nil {
+	if lifecycleChanged {
+		// A relist can surface delete-and-recreate under one key as Update.
+		// Retire the observed old lifecycle before Add; cache.Add refuses a
+		// blind different-UID overwrite so a late old Add cannot roll back the
+		// current lifecycle.
+		if err := cc.cache.Delete(oldJob); err != nil {
+			klog.Errorf("UpdateJob - Failed to retire old job <%s/%s> uid <%s>: %v",
+				oldJob.Namespace, oldJob.Name, oldJob.UID, err)
+		}
+		if err := cc.cache.Add(newJob); err != nil {
+			key := jobcache.JobKey(newJob)
+			if current, getErr := cc.cache.Get(key); getErr != nil || current.UID != newJob.UID {
+				klog.Errorf("UpdateJob - Failed to replace job <%s/%s> with uid <%s>: %v",
+					newJob.Namespace, newJob.Name, newJob.UID, err)
+			}
+		}
+	} else if err := cc.cache.Update(newJob); err != nil {
 		klog.Errorf("UpdateJob - Failed to update job <%s/%s>: %v in cache",
 			newJob.Namespace, newJob.Name, err)
 	}
 
 	// NOTE: Since we only reconcile job based on Spec, we will ignore other attributes
 	// For Job status, it's used internally and always been updated via our controller.
-	if equality.Semantic.DeepEqual(newJob.Spec, oldJob.Spec) && newJob.Status.State.Phase == oldJob.Status.State.Phase {
+	if !lifecycleChanged && equality.Semantic.DeepEqual(newJob.Spec, oldJob.Spec) && newJob.Status.State.Phase == oldJob.Status.State.Phase {
 		klog.V(6).Infof("Job update event is ignored since no update in 'Spec'.")
 		return
 	}
@@ -107,6 +126,7 @@ func (cc *jobcontroller) updateJob(oldObj, newObj interface{}) {
 	req := apis.Request{
 		Namespace: newJob.Namespace,
 		JobName:   newJob.Name,
+		JobUid:    newJob.UID,
 		Event:     bus.OutOfSyncEvent,
 	}
 	key := jobhelpers.GetJobKeyByReq(&req)
@@ -438,8 +458,14 @@ func (cc *jobcontroller) processNextCommand() bool {
 	req := apis.Request{
 		Namespace: cmd.Namespace,
 		JobName:   cmd.TargetObject.Name,
+		JobUid:    cmd.TargetObject.UID,
 		Event:     bus.CommandIssuedEvent,
 		Action:    bus.Action(cmd.Action),
+	}
+	if req.JobUid == "" && cc.jobLister != nil {
+		if job, err := cc.jobLister.Jobs(req.Namespace).Get(req.JobName); err == nil {
+			req.JobUid = job.UID
+		}
 	}
 
 	key := jobhelpers.GetJobKeyByReq(&req)
@@ -463,10 +489,12 @@ func (cc *jobcontroller) updatePodGroup(oldObj, newObj interface{}) {
 	}
 
 	jobNameKey := newPG.Name
+	var jobUID types.UID
 	ors := newPG.OwnerReferences
 	for _, or := range ors {
 		if or.Kind == "Job" {
 			jobNameKey = or.Name
+			jobUID = or.UID
 		}
 	}
 
@@ -480,6 +508,7 @@ func (cc *jobcontroller) updatePodGroup(oldObj, newObj interface{}) {
 		req := apis.Request{
 			Namespace: newPG.Namespace,
 			JobName:   jobNameKey,
+			JobUid:    jobUID,
 		}
 		switch newPG.Status.Phase {
 		case scheduling.PodGroupUnknown:

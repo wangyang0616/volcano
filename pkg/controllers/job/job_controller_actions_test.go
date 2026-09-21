@@ -28,7 +28,11 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	kubeclient "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 
@@ -1022,6 +1026,119 @@ func TestDeleteJobPod(t *testing.T) {
 				t.Error("Expected Pod to be deleted but not deleted")
 			}
 		})
+	}
+}
+
+func TestDeleteJobPodUsesUIDPrecondition(t *testing.T) {
+	controller := newFakeController()
+	pod := buildPod("test", "job-worker-0", v1.PodRunning, nil)
+	pod.UID = "pod-uid"
+	if _, err := controller.kubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	client := controller.kubeClient.(*kubeclient.Clientset)
+	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAction := action.(k8stesting.DeleteAction)
+		options := deleteAction.GetDeleteOptions()
+		if options.Preconditions == nil || options.Preconditions.UID == nil {
+			t.Errorf("delete request has no UID precondition")
+		} else if got := *options.Preconditions.UID; got != pod.UID {
+			t.Errorf("delete UID precondition = %q, want %q", got, pod.UID)
+		}
+		return false, nil, nil
+	})
+
+	if err := controller.deleteJobPod("job", pod); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+}
+
+func TestDeleteJobPodDoesNotDeleteSameNameReplacement(t *testing.T) {
+	controller := newFakeController()
+	current := buildPod("test", "job-worker-0", v1.PodRunning, nil)
+	current.UID = "new-pod-uid"
+	if _, err := controller.kubeClient.CoreV1().Pods(current.Namespace).Create(context.Background(), current, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create replacement pod: %v", err)
+	}
+
+	stale := current.DeepCopy()
+	stale.UID = "old-pod-uid"
+	client := controller.kubeClient.(*kubeclient.Clientset)
+	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAction := action.(k8stesting.DeleteAction)
+		options := deleteAction.GetDeleteOptions()
+		if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != stale.UID {
+			t.Errorf("delete request did not target stale UID %q: %#v", stale.UID, options.Preconditions)
+		}
+		return true, nil, apierrors.NewConflict(
+			schema.GroupResource{Resource: "pods"}, stale.Name, errors.New("UID precondition failed"))
+	})
+
+	if err := controller.deleteJobPod("job", stale); err != nil {
+		t.Fatalf("UID mismatch should be an idempotent success: %v", err)
+	}
+	got, err := controller.kubeClient.CoreV1().Pods(current.Namespace).Get(context.Background(), current.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("replacement pod was deleted: %v", err)
+	}
+	if got.UID != current.UID {
+		t.Fatalf("got replacement UID %q, want %q", got.UID, current.UID)
+	}
+}
+
+func TestDeleteJobPodPreservesSameUIDErrors(t *testing.T) {
+	controller := newFakeController()
+	pod := buildPod("test", "job-worker-0", v1.PodRunning, nil)
+	pod.UID = "pod-uid"
+	if _, err := controller.kubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	client := controller.kubeClient.(*kubeclient.Clientset)
+	client.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("temporary delete failure"))
+	})
+
+	if err := controller.deleteJobPod("job", pod); err == nil {
+		t.Fatal("same-UID API failure should remain retryable")
+	}
+}
+
+func TestMarkJobPodOutOfSyncDoesNotPatchSameNameReplacement(t *testing.T) {
+	controller := newFakeController()
+	current := buildPod("test", "job-worker-0", v1.PodRunning, nil)
+	current.UID = "new-pod-uid"
+	if _, err := controller.kubeClient.CoreV1().Pods(current.Namespace).Create(context.Background(), current, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create replacement pod: %v", err)
+	}
+
+	stale := current.DeepCopy()
+	stale.UID = "old-pod-uid"
+	client := controller.kubeClient.(*kubeclient.Clientset)
+	client.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		patchAction := action.(k8stesting.PatchAction)
+		expected := `[{"op":"test","path":"/metadata/uid","value":"old-pod-uid"},{"op":"add","path":"/metadata/annotations/volcano.sh~1controller-out-of-sync","value":"true"}]`
+		if got := string(patchAction.GetPatch()); got != expected {
+			t.Errorf("patch = %s, want %s", got, expected)
+		}
+		return true, nil, apierrors.NewConflict(
+			schema.GroupResource{Resource: "pods"}, stale.Name, errors.New("JSON patch UID test failed"))
+	})
+
+	isStale, err := controller.markJobPodOutOfSync(stale)
+	if err != nil {
+		t.Fatalf("UID mismatch should be an idempotent success: %v", err)
+	}
+	if !isStale {
+		t.Fatal("expected old Pod lifecycle to be classified as stale")
+	}
+	got, err := controller.kubeClient.CoreV1().Pods(current.Namespace).Get(context.Background(), current.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get replacement pod: %v", err)
+	}
+	if _, found := got.Annotations["volcano.sh/controller-out-of-sync"]; found {
+		t.Fatal("replacement pod was marked out-of-sync")
 	}
 }
 

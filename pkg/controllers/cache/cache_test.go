@@ -22,10 +22,150 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 )
+
+func controlledPod(namespace, name, jobName string, jobUID, podUID types.UID) *v1.Pod {
+	controller := true
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+			UID:       podUID,
+			Annotations: map[string]string{
+				v1alpha1.JobNameKey:  jobName,
+				v1alpha1.TaskSpecKey: "worker",
+				v1alpha1.JobVersion:  "0",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch.volcano.sh/v1alpha1",
+				Kind:       "Job",
+				Name:       jobName,
+				UID:        jobUID,
+				Controller: &controller,
+			}},
+		},
+	}
+}
+
+func TestJobCacheNameReuseDoesNotDeleteNewLifecycle(t *testing.T) {
+	jc := New().(*jobCache)
+	oldJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "old-uid"}}
+	newJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "new-uid"}}
+
+	if err := jc.Add(oldJob); err != nil {
+		t.Fatalf("add old job: %v", err)
+	}
+	if err := jc.Delete(oldJob); err != nil {
+		t.Fatalf("delete old job: %v", err)
+	}
+	if err := jc.Add(newJob); err != nil {
+		t.Fatalf("add recreated job: %v", err)
+	}
+
+	// Process the cleanup item that still points at the old JobInfo. Before the
+	// fix, its namespace/name-only delete removed the recreated JobInfo.
+	if !jc.processCleanupJob() {
+		t.Fatal("cleanup worker unexpectedly stopped")
+	}
+
+	got, err := jc.Get(JobKey(newJob))
+	if err != nil {
+		t.Fatalf("recreated job was deleted by stale cleanup: %v", err)
+	}
+	if got.UID != newJob.UID {
+		t.Fatalf("got job uid %q, want %q", got.UID, newJob.UID)
+	}
+}
+
+func TestJobCacheRepeatedNameReuse(t *testing.T) {
+	jc := New().(*jobCache)
+	current := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "uid-0"}}
+	if err := jc.Add(current); err != nil {
+		t.Fatalf("add initial job: %v", err)
+	}
+
+	for i := 1; i <= 100; i++ {
+		if err := jc.Delete(current); err != nil {
+			t.Fatalf("iteration %d delete job: %v", i, err)
+		}
+		next := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{
+			Namespace: current.Namespace,
+			Name:      current.Name,
+			UID:       types.UID(fmt.Sprintf("uid-%d", i)),
+		}}
+		if err := jc.Add(next); err != nil {
+			t.Fatalf("iteration %d add recreated job: %v", i, err)
+		}
+		if !jc.processCleanupJob() {
+			t.Fatalf("iteration %d cleanup worker unexpectedly stopped", i)
+		}
+		got, err := jc.Get(JobKey(next))
+		if err != nil {
+			t.Fatalf("iteration %d recreated job was lost: %v", i, err)
+		}
+		if got.UID != next.UID {
+			t.Fatalf("iteration %d got uid %q, want %q", i, got.UID, next.UID)
+		}
+		current = next
+	}
+}
+
+func TestJobCacheRejectsOldLifecycleEvents(t *testing.T) {
+	jc := New().(*jobCache)
+	oldJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "old-uid"}}
+	newJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "new-uid"}}
+	newPod := controlledPod("test", "same-name-worker-0", newJob.Name, newJob.UID, "new-pod-uid")
+	oldPod := controlledPod("test", "same-name-worker-0", oldJob.Name, oldJob.UID, "old-pod-uid")
+
+	if err := jc.Add(newJob); err != nil {
+		t.Fatalf("add new job: %v", err)
+	}
+	if err := jc.AddPod(newPod); err != nil {
+		t.Fatalf("add new pod: %v", err)
+	}
+	if err := jc.Delete(oldJob); err != nil {
+		t.Fatalf("stale job delete should be ignored: %v", err)
+	}
+	if err := jc.DeletePod(oldPod); err == nil {
+		t.Fatal("expected old pod delete to be rejected by job UID validation")
+	}
+
+	got, err := jc.Get(JobKey(newJob))
+	if err != nil {
+		t.Fatalf("get new job: %v", err)
+	}
+	if got.Job == nil || got.Job.UID != newJob.UID {
+		t.Fatalf("stale job delete changed current lifecycle: %#v", got.Job)
+	}
+	if got.Pods["worker"][newPod.Name].UID != newPod.UID {
+		t.Fatalf("stale pod delete removed or replaced the new pod")
+	}
+}
+
+func TestJobCacheStaleAddDoesNotRollbackCurrentLifecycle(t *testing.T) {
+	jc := New().(*jobCache)
+	current := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "new-uid"}}
+	stale := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "old-uid"}}
+
+	if err := jc.Add(current); err != nil {
+		t.Fatalf("add current job: %v", err)
+	}
+	if err := jc.Add(stale); err == nil {
+		t.Fatal("expected a different-UID Add to be rejected while the current lifecycle is live")
+	}
+
+	got, err := jc.Get(JobKey(current))
+	if err != nil {
+		t.Fatalf("get current job: %v", err)
+	}
+	if got.UID != current.UID {
+		t.Fatalf("stale Add rolled cache back to uid %q; want %q", got.UID, current.UID)
+	}
+}
 
 func TestJobCache_Add(t *testing.T) {
 	namespace := "test"

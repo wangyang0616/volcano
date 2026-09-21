@@ -178,14 +178,18 @@ func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.Ph
 	}
 
 	for podName, pod := range podsToKill {
-		_, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType,
-			jobhelpers.OutOfSyncJSONPatch(), metav1.PatchOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
+		stale, err := cc.markJobPodOutOfSync(pod)
+		if err != nil {
 			// record the error, and then collect the pod info like retained pod
 			errs = append(errs, err)
 			// If we fail to patch the pod, we should not delete it,
 			// as it would cause the restart loop. The action will be retried.
 			delete(podsToKill, podName)
+		} else if stale {
+			// The intended Pod instance is already gone. Do not let the later
+			// name-based loop touch a replacement Pod with the same name.
+			delete(podsToKill, podName)
+			terminating++
 		} else {
 			klog.V(3).InfoS("Marked Pod as out-of-sync", "Pod", klog.KObj(pod), "UID", pod.UID)
 		}
@@ -918,8 +922,18 @@ func (cc *jobcontroller) shouldUpdateExistingPodGroup(pg *scheduling.PodGroup, j
 }
 
 func (cc *jobcontroller) deleteJobPod(jobName string, pod *v1.Pod) error {
-	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
+	deleteOptions := metav1.DeleteOptions{}
+	if pod.UID != "" {
+		uid := pod.UID
+		deleteOptions.Preconditions = &metav1.Preconditions{UID: &uid}
+	}
+
+	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, deleteOptions)
+	stale, err := cc.resolvePodMutationError("pod-delete", pod, err)
+	if stale {
+		return nil
+	}
+	if err != nil {
 		klog.Errorf("Failed to delete pod %s/%s for Job %s, err %#v",
 			pod.Namespace, pod.Name, jobName, err)
 
@@ -927,6 +941,52 @@ func (cc *jobcontroller) deleteJobPod(jobName string, pod *v1.Pod) error {
 	}
 
 	return nil
+}
+
+// markJobPodOutOfSync atomically verifies the Pod UID before annotating it.
+// The boolean result is true when the intended Pod lifecycle no longer exists.
+func (cc *jobcontroller) markJobPodOutOfSync(pod *v1.Pod) (bool, error) {
+	_, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Patch(
+		context.TODO(), pod.Name, types.JSONPatchType,
+		jobhelpers.OutOfSyncJSONPatch(pod.UID), metav1.PatchOptions{})
+	return cc.resolvePodMutationError("pod-patch", pod, err)
+}
+
+// resolvePodMutationError distinguishes a stale lifecycle target from a real
+// API failure. A stale target is an idempotent success: the controller's
+// intended Pod is already gone, and a same-name replacement must not be
+// modified. Errors against the same UID remain visible to the existing retry
+// path.
+func (cc *jobcontroller) resolvePodMutationError(operation string, pod *v1.Pod, mutationErr error) (bool, error) {
+	if mutationErr == nil {
+		return false, nil
+	}
+	if apierrors.IsNotFound(mutationErr) {
+		return true, nil
+	}
+	if pod.UID == "" {
+		// Preserve legacy behavior for tests or objects that did not originate
+		// from the API server. Real persisted Pods always carry a UID.
+		return false, mutationErr
+	}
+
+	current, getErr := cc.kubeClient.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(getErr) {
+		return true, nil
+	}
+	if getErr != nil {
+		klog.V(3).InfoS("Failed to verify Pod lifecycle after mutation error",
+			"Operation", operation, "Pod", klog.KObj(pod), "UID", pod.UID, "Error", getErr)
+		return false, mutationErr
+	}
+	if current.UID != pod.UID {
+		metrics.IncJobControllerLifecycleMismatch(operation)
+		klog.V(3).InfoS("Treat Pod mutation as complete because the target lifecycle was replaced",
+			"Operation", operation, "Pod", klog.KObj(pod), "ExpectedUID", pod.UID, "CurrentUID", current.UID)
+		return true, nil
+	}
+
+	return false, mutationErr
 }
 
 func (cc *jobcontroller) calcPGMinResources(job *batch.Job) *v1.ResourceList {

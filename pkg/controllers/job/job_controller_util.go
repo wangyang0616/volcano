@@ -182,6 +182,7 @@ func createJobPod(job *batch.Job, template *v1.PodTemplateSpec, ix int, jobForwa
 func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 	delayAct = &delayAction{
 		jobKey:    jobcache.JobKeyByReq(req),
+		jobUID:    job.UID,
 		event:     req.Event,
 		taskName:  req.TaskName,
 		podName:   req.PodName,

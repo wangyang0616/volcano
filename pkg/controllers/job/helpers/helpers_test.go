@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
@@ -664,17 +665,23 @@ func TestIsOutOfSyncPod(t *testing.T) {
 func TestOutOfSyncJSONPatch(t *testing.T) {
 	testCases := []struct {
 		name     string
+		uid      types.UID
 		expected string
 	}{
 		{
-			name:     "should generate valid JSON patch for out-of-sync annotation",
+			name:     "should preserve the legacy patch when uid is empty",
 			expected: `[{"op":"add","path":"/metadata/annotations/volcano.sh~1controller-out-of-sync","value":"true"}]`,
+		},
+		{
+			name:     "should test uid before adding the annotation",
+			uid:      "pod-uid",
+			expected: `[{"op":"test","path":"/metadata/uid","value":"pod-uid"},{"op":"add","path":"/metadata/annotations/volcano.sh~1controller-out-of-sync","value":"true"}]`,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := OutOfSyncJSONPatch()
+			result := OutOfSyncJSONPatch(tc.uid)
 			resultStr := string(result)
 
 			if resultStr != tc.expected {

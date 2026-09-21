@@ -67,6 +67,11 @@ func (cc *jobcontroller) syncTask(oldTask *v1.Pod) error {
 	newPod, err := cc.kubeClient.CoreV1().Pods(oldTask.Namespace).Get(context.TODO(), oldTask.Name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// A same-name Pod from an old Job lifecycle must not remove a Pod
+			// belonging to the current lifecycle from the controller cache.
+			if !cc.cache.HasPod(oldTask) {
+				return nil
+			}
 			if err := cc.cache.DeletePod(oldTask); err != nil {
 				klog.Errorf("failed to delete cache pod <%v/%v>, err %v.", oldTask.Namespace, oldTask.Name, err)
 				return err
@@ -76,6 +81,11 @@ func (cc *jobcontroller) syncTask(oldTask *v1.Pod) error {
 			return nil
 		}
 		return fmt.Errorf("failed to get Pod <%v/%v>: err %v", oldTask.Namespace, oldTask.Name, err)
+	}
+	if oldTask.UID != "" && newPod.UID != oldTask.UID {
+		klog.V(3).Infof("Ignore stale resync for Pod <%s/%s> uid <%s>; current uid is <%s>",
+			oldTask.Namespace, oldTask.Name, oldTask.UID, newPod.UID)
+		return nil
 	}
 
 	return cc.cache.UpdatePod(newPod)

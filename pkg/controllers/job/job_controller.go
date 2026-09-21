@@ -24,6 +24,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -55,6 +56,7 @@ import (
 	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	"volcano.sh/volcano/pkg/controllers/framework"
 	"volcano.sh/volcano/pkg/controllers/job/state"
+	controllermetrics "volcano.sh/volcano/pkg/controllers/metrics"
 	"volcano.sh/volcano/pkg/features"
 )
 
@@ -65,6 +67,8 @@ func init() {
 type delayAction struct {
 	// The namespacing name of the job
 	jobKey string
+	// jobUID identifies the VCJob lifecycle that created this action.
+	jobUID types.UID
 
 	// The name of the task
 	taskName string
@@ -88,6 +92,20 @@ type delayAction struct {
 
 	// The cancel function of the action
 	cancel context.CancelFunc
+}
+
+func (d *delayAction) lifecycleKey() string {
+	if d.jobUID == "" {
+		return d.jobKey
+	}
+	return fmt.Sprintf("%s/%s", d.jobKey, d.jobUID)
+}
+
+func (d *delayAction) targetKey() string {
+	if d.podUID == "" {
+		return d.podName
+	}
+	return fmt.Sprintf("%s/%s", d.podName, d.podUID)
 }
 
 // jobcontroller the Job jobcontroller type.
@@ -147,8 +165,9 @@ type jobcontroller struct {
 	maxRequeueNum int
 
 	delayActionMapLock sync.RWMutex
-	// delayActionMap stores delayed actions for jobs, where outer map key is job key (namespace/name),
-	// inner map key is pod name, and value is the delayed action to be performed
+	// delayActionMap stores delayed actions for jobs, where outer map key is the
+	// job lifecycle key (namespace/name/uid),
+	// inner map key is the pod lifecycle key (name/uid), and value is the delayed action to be performed
 	delayActionMap map[string]map[string]*delayAction
 }
 
@@ -359,8 +378,16 @@ func (cc *jobcontroller) processNextReq(count uint32) bool {
 
 	jobInfo, err := cc.cache.Get(key)
 	if err != nil {
-		// TODO(k82cn): ignore not-ready error.
-		klog.Errorf("Failed to get job by <%v> from cache: %v", req, err)
+		controllermetrics.IncJobControllerCacheMiss()
+		klog.Errorf("Failed to get job by <%v> from cache: %v; recovering from informer", req, err)
+		cc.recoverCurrentJob(queue, req)
+		return true
+	}
+
+	if req.JobUid != "" && req.JobUid != jobInfo.UID {
+		controllermetrics.IncJobControllerLifecycleMismatch("worker-request")
+		klog.V(2).Infof("Ignore stale request for Job <%s> uid <%s>; current cached uid is <%s>", key, req.JobUid, jobInfo.UID)
+		cc.recoverCurrentJob(queue, req)
 		return true
 	}
 
@@ -379,6 +406,10 @@ func (cc *jobcontroller) processNextReq(count uint32) bool {
 		cc.recordJobEvent(jobInfo.Job.Namespace, jobInfo.Job.Name, batchv1alpha1.ExecuteAction, fmt.Sprintf(
 			"Execute action %s after %s", delayAct.action, delayAct.delay.String()))
 		cc.AddDelayActionForJob(req, delayAct)
+		// Registering the delayed action completes this queue attempt. In
+		// particular, clear any rate-limit history left by an earlier retry;
+		// the delayed action will enter the queue as a fresh request.
+		queue.Forget(req)
 		return true
 	}
 
@@ -408,6 +439,65 @@ func (cc *jobcontroller) processNextReq(count uint32) bool {
 	return true
 }
 
+// recoverCurrentJob repairs the controller cache from the informer and makes
+// sure a current-lifecycle reconciliation remains queued. A cache miss must not
+// permanently consume the only event capable of reconciling a recreated Job.
+func (cc *jobcontroller) recoverCurrentJob(queue workqueue.TypedRateLimitingInterface[any], req apis.Request) {
+	if cc.jobLister == nil {
+		queue.AddRateLimited(req)
+		return
+	}
+
+	job, err := cc.jobLister.Jobs(req.Namespace).Get(req.JobName)
+	if apierrors.IsNotFound(err) {
+		queue.Forget(req)
+		return
+	}
+	if err != nil {
+		klog.Errorf("Failed to recover Job <%s/%s> from informer: %v", req.Namespace, req.JobName, err)
+		queue.AddRateLimited(req)
+		return
+	}
+
+	key := jobcache.JobKeyByName(job.Namespace, job.Name)
+	jobInfo, getErr := cc.cache.Get(key)
+	if getErr != nil || jobInfo.UID != job.UID {
+		if getErr == nil && jobInfo.UID != job.UID {
+			// Add deliberately refuses to overwrite a live, different UID: a
+			// standalone Add could be stale. Here the informer lister is the
+			// source of truth, so retire the lifecycle we actually observed
+			// before installing the current one.
+			if err := cc.cache.Delete(jobInfo.Job); err != nil {
+				klog.Errorf("Failed to retire stale Job <%s> uid <%s> during recovery: %v", key, jobInfo.UID, err)
+				queue.AddRateLimited(req)
+				return
+			}
+		}
+		if err := cc.cache.Add(job); err != nil {
+			// Another informer event may have repaired the same lifecycle first.
+			if current, currentErr := cc.cache.Get(key); currentErr != nil || current.UID != job.UID {
+				klog.Errorf("Failed to recover Job <%s> uid <%s> in cache: %v", key, job.UID, err)
+				queue.AddRateLimited(req)
+				return
+			}
+		}
+	}
+
+	recoveredReq := req
+	if req.JobUid != "" && req.JobUid != job.UID {
+		recoveredReq = apis.Request{
+			Namespace: job.Namespace,
+			JobName:   job.Name,
+			JobUid:    job.UID,
+			Event:     busv1alpha1.OutOfSyncEvent,
+		}
+	} else {
+		recoveredReq.JobUid = job.UID
+	}
+	queue.Forget(req)
+	queue.Add(recoveredReq)
+}
+
 // CleanPodDelayActionsIfNeed is used to clean delayed actions for Pod events when the pod phase changed:
 // if the event is not PodPending event:
 //   - cancel corresponding Pod Pending delayed action
@@ -419,12 +509,19 @@ func (cc *jobcontroller) CleanPodDelayActionsIfNeed(req apis.Request) {
 	}
 
 	if req.Event != busv1alpha1.PodPendingEvent {
-		key := jobcache.JobKeyByReq(&req)
+		requestAction := &delayAction{
+			jobKey:  jobcache.JobKeyByReq(&req),
+			jobUID:  req.JobUid,
+			podName: req.PodName,
+			podUID:  req.PodUID,
+		}
+		key := requestAction.lifecycleKey()
 		cc.delayActionMapLock.Lock()
 		defer cc.delayActionMapLock.Unlock()
 
 		if taskMap, exists := cc.delayActionMap[key]; exists {
-			if delayAct, exists := taskMap[req.PodName]; exists {
+			targetKey := requestAction.targetKey()
+			if delayAct, exists := taskMap[targetKey]; exists {
 				shouldCancel := false
 
 				if delayAct.event == busv1alpha1.PodPendingEvent {
@@ -444,7 +541,10 @@ func (cc *jobcontroller) CleanPodDelayActionsIfNeed(req apis.Request) {
 				if shouldCancel {
 					klog.V(3).Infof("Cancel delayed action <%v> for pod <%s> because of event <%s> of Job <%s>", delayAct.action, req.PodName, req.Event, delayAct.jobKey)
 					delayAct.cancel()
-					delete(taskMap, req.PodName)
+					delete(taskMap, targetKey)
+					if len(taskMap) == 0 {
+						delete(cc.delayActionMap, key)
+					}
 				}
 			}
 		}
@@ -462,15 +562,19 @@ func (cc *jobcontroller) AddDelayActionForJob(req apis.Request, delayAct *delayA
 	cc.delayActionMapLock.Lock()
 	defer cc.delayActionMapLock.Unlock()
 
-	m, ok := cc.delayActionMap[delayAct.jobKey]
+	lifecycleKey := delayAct.lifecycleKey()
+	m, ok := cc.delayActionMap[lifecycleKey]
 	if !ok {
 		m = make(map[string]*delayAction)
-		cc.delayActionMap[delayAct.jobKey] = m
+		cc.delayActionMap[lifecycleKey] = m
 	}
-	if oldDelayAct, exists := m[req.PodName]; exists && oldDelayAct.action == delayAct.action {
+	targetKey := delayAct.targetKey()
+	if oldDelayAct, exists := m[targetKey]; exists && oldDelayAct.action == delayAct.action {
 		return
+	} else if exists && oldDelayAct.cancel != nil {
+		oldDelayAct.cancel()
 	}
-	m[req.PodName] = delayAct
+	m[targetKey] = delayAct
 
 	ctx, cancel := context.WithTimeout(context.Background(), delayAct.delay)
 	delayAct.cancel = cancel
@@ -482,30 +586,32 @@ func (cc *jobcontroller) AddDelayActionForJob(req apis.Request, delayAct *delayA
 			return
 		}
 
-		klog.V(4).Infof("Job<%s/%s>'s delayed action %s is expired, execute it", req.Namespace, req.JobName, delayAct.action)
+		klog.V(4).Infof("Job<%s/%s> uid <%s>'s delayed action %s is expired, enqueue it", req.Namespace, req.JobName, delayAct.jobUID, delayAct.action)
 
-		jobInfo, err := cc.cache.Get(delayAct.jobKey)
-		if err != nil {
-			klog.Errorf("Failed to get job by <%v> from cache: %v", req, err)
-			return
-		}
-
-		st := state.NewState(jobInfo)
-		if st == nil {
-			klog.Errorf("Invalid state <%s> of Job <%v/%v>",
-				jobInfo.Job.Status.State, jobInfo.Job.Namespace, jobInfo.Job.Name)
-			return
-		}
+		cc.removeDelayAction(delayAct)
 		queue := cc.getWorkerQueue(delayAct.jobKey)
-
-		if err := st.Execute(GetStateAction(delayAct)); err != nil {
-			cc.handleJobError(queue, req, st, err, delayAct.action)
-		}
-
-		queue.Forget(req)
-
-		cc.cleanupDelayActions(delayAct)
+		delayedReq := req
+		delayedReq.JobUid = delayAct.jobUID
+		delayedReq.Action = delayAct.action
+		queue.Add(delayedReq)
 	}()
+}
+
+func (cc *jobcontroller) removeDelayAction(delayAct *delayAction) {
+	cc.delayActionMapLock.Lock()
+	defer cc.delayActionMapLock.Unlock()
+
+	key := delayAct.lifecycleKey()
+	m, exists := cc.delayActionMap[key]
+	if !exists {
+		return
+	}
+	if current, found := m[delayAct.targetKey()]; found && current == delayAct {
+		delete(m, delayAct.targetKey())
+	}
+	if len(m) == 0 {
+		delete(cc.delayActionMap, key)
+	}
 }
 
 func (cc *jobcontroller) handleJobError(queue workqueue.TypedRateLimitingInterface[any], req apis.Request, st state.State, err error, action busv1alpha1.Action) {
@@ -545,7 +651,7 @@ func (cc *jobcontroller) cleanupDelayActions(currentDelayAction *delayAction) {
 
 	actionType := GetActionType(currentDelayAction.action)
 
-	if m, exists := cc.delayActionMap[currentDelayAction.jobKey]; exists {
+	if m, exists := cc.delayActionMap[currentDelayAction.lifecycleKey()]; exists {
 		for _, delayAct := range m {
 			if GetActionType(delayAct.action) == actionType {
 				// For Task level actions, only cancel delayed actions for the same task
@@ -565,8 +671,11 @@ func (cc *jobcontroller) cleanupDelayActions(currentDelayAction *delayAction) {
 					klog.V(3).Infof("Cancel delayed action <%v> for pod <%s> because of event <%s> and action <%s> of Job <%s>", delayAct.action, delayAct.podName, currentDelayAction.event, currentDelayAction.action, delayAct.jobKey)
 					delayAct.cancel()
 				}
-				delete(m, delayAct.podName)
+				delete(m, delayAct.targetKey())
 			}
+		}
+		if len(m) == 0 {
+			delete(cc.delayActionMap, currentDelayAction.lifecycleKey())
 		}
 	}
 }
