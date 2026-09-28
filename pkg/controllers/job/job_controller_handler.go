@@ -36,7 +36,6 @@ import (
 	"volcano.sh/volcano/pkg/controllers/apis"
 	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
-	"volcano.sh/volcano/pkg/controllers/job/state"
 )
 
 func (cc *jobcontroller) addCommand(obj interface{}) {
@@ -97,16 +96,12 @@ func (cc *jobcontroller) updateJob(oldObj, newObj interface{}) {
 
 	if lifecycleChanged {
 		// A relist can surface delete-and-recreate under one key as Update.
-		// Retire the observed old lifecycle before Add; cache.Add refuses a
-		// blind different-UID overwrite so a late old Add cannot roll back the
-		// current lifecycle.
-		if err := cc.cache.Delete(oldJob); err != nil {
-			klog.Errorf("UpdateJob - Failed to retire old job <%s/%s> uid <%s>: %v",
-				oldJob.Namespace, oldJob.Name, oldJob.UID, err)
-		}
-		if err := cc.cache.Add(newJob); err != nil {
+		// Replace the lifecycle and its informer-visible Pods atomically so Pod
+		// events cannot observe an intermediate deleted cache entry.
+		cc.cache.RetireUID(oldJob.UID)
+		if _, err := cc.cache.RebuildLifecycle(newJob.Namespace, newJob.Name, newJob.UID, nil); err != nil {
 			key := jobcache.JobKey(newJob)
-			if current, getErr := cc.cache.Get(key); getErr != nil || current.UID != newJob.UID {
+			if current, getErr := cc.cache.GetLifecycle(key); getErr != nil || current.UID != newJob.UID {
 				klog.Errorf("UpdateJob - Failed to replace job <%s/%s> with uid <%s>: %v",
 					newJob.Namespace, newJob.Name, newJob.UID, err)
 			}
@@ -155,8 +150,6 @@ func (cc *jobcontroller) deleteJob(obj interface{}) {
 			job.Namespace, job.Name, err)
 	}
 
-	// Delete job metrics
-	state.DeleteJobMetrics(fmt.Sprintf("%s/%s", job.Namespace, job.Name), job.Spec.Queue)
 }
 
 func (cc *jobcontroller) addPod(obj interface{}) {
@@ -203,23 +196,27 @@ func (cc *jobcontroller) addPod(obj interface{}) {
 	}
 
 	event := bus.PodPendingEvent
-	if jobhelpers.IsOutOfSyncPod(pod) {
+	terminal := pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded
+	if jobhelpers.IsOutOfSyncPod(pod) || terminal {
+		// Initial-list terminal Pods have no new failure transition. Do not
+		// invent a Pending timeout while waiting for their first observation.
 		event = bus.OutOfSyncEvent
 	}
 
 	req := apis.Request{
-		Namespace:   pod.Namespace,
-		JobName:     jobName,
-		JobUid:      jobUid,
-		PodName:     pod.Name,
-		PodUID:      pod.UID,
-		TaskName:    taskName,
-		PartitionID: apis.GetPartitionID(pod),
-		Event:       event,
-		JobVersion:  int32(dVersion),
+		Namespace:           pod.Namespace,
+		JobName:             jobName,
+		JobUid:              jobUid,
+		PodName:             pod.Name,
+		PodUID:              pod.UID,
+		TaskName:            taskName,
+		PartitionID:         apis.GetPartitionID(pod),
+		Event:               event,
+		JobVersion:          int32(dVersion),
+		TerminalObservation: terminal,
 	}
 
-	if err := cc.cache.AddPod(pod); err != nil {
+	if _, err := cc.cache.ObservePod(pod, false); err != nil {
 		klog.Errorf("Failed to add Pod <%s/%s>: %v to cache",
 			pod.Namespace, pod.Name, err)
 	}
@@ -281,7 +278,7 @@ func (cc *jobcontroller) updatePod(oldObj, newObj interface{}) {
 		return
 	}
 
-	if err := cc.cache.UpdatePod(newPod); err != nil {
+	if _, err := cc.cache.ObservePod(newPod, false); err != nil {
 		klog.Errorf("Failed to update Pod <%s/%s>: %v in cache",
 			newPod.Namespace, newPod.Name, err)
 	}
@@ -301,18 +298,18 @@ func (cc *jobcontroller) updatePod(oldObj, newObj interface{}) {
 		}
 	case v1.PodSucceeded:
 		if oldPod.Status.Phase != v1.PodSucceeded &&
-			cc.cache.TaskCompleted(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName) {
+			cc.cache.TaskCompleted(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName, jobUid) {
 			event = bus.TaskCompletedEvent
 		}
 	case v1.PodRunning:
-		if cc.cache.TaskFailed(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName) {
+		if cc.cache.TaskFailed(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName, jobUid) {
 			event = bus.TaskFailedEvent
 		}
 		if oldPod.Status.Phase != v1.PodRunning {
 			event = bus.PodRunningEvent
 		}
 	case v1.PodPending:
-		if cc.cache.TaskFailed(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName) {
+		if cc.cache.TaskFailed(jobcache.JobKeyByName(newPod.Namespace, jobName), taskName, jobUid) {
 			event = bus.TaskFailedEvent
 		}
 		if oldPod.Status.Phase != v1.PodPending {
@@ -323,18 +320,24 @@ func (cc *jobcontroller) updatePod(oldObj, newObj interface{}) {
 	if jobhelpers.IsOutOfSyncPod(newPod) {
 		event = bus.OutOfSyncEvent
 	}
+	checkCompleted := !jobhelpers.IsOutOfSyncPod(newPod) && oldPod.Status.Phase != v1.PodSucceeded && newPod.Status.Phase == v1.PodSucceeded
+	checkFailed := !jobhelpers.IsOutOfSyncPod(newPod) && oldPod.Status.Phase == newPod.Status.Phase && (newPod.Status.Phase == v1.PodRunning || newPod.Status.Phase == v1.PodPending)
 
 	req := apis.Request{
-		Namespace:   newPod.Namespace,
-		JobName:     jobName,
-		JobUid:      jobUid,
-		TaskName:    taskName,
-		PodName:     newPod.Name,
-		PodUID:      newPod.UID,
-		PartitionID: apis.GetPartitionID(newPod),
-		Event:       event,
-		ExitCode:    exitCode,
-		JobVersion:  int32(dVersion),
+		Namespace:          newPod.Namespace,
+		JobName:            jobName,
+		JobUid:             jobUid,
+		TaskName:           taskName,
+		PodName:            newPod.Name,
+		PodUID:             newPod.UID,
+		PartitionID:        apis.GetPartitionID(newPod),
+		Event:              event,
+		ExitCode:           exitCode,
+		CheckTaskCompleted: checkCompleted,
+		CheckTaskFailed:    checkFailed,
+		TerminalObservation: (newPod.Status.Phase == v1.PodFailed || newPod.Status.Phase == v1.PodSucceeded) &&
+			(oldPod.UID != newPod.UID || oldPod.Status.Phase != newPod.Status.Phase),
+		JobVersion: int32(dVersion),
 	}
 
 	key := jobhelpers.GetJobKeyByReq(&req)
@@ -395,7 +398,7 @@ func (cc *jobcontroller) deletePod(obj interface{}) {
 	}
 
 	event := bus.PodEvictedEvent
-	if jobhelpers.IsOutOfSyncPod(pod) || !cc.cache.HasPod(pod) {
+	if jobhelpers.IsOutOfSyncPod(pod) {
 		event = bus.OutOfSyncEvent
 	}
 
@@ -411,7 +414,7 @@ func (cc *jobcontroller) deletePod(obj interface{}) {
 		JobVersion:  int32(dVersion),
 	}
 
-	if err := cc.cache.DeletePod(pod); err != nil {
+	if _, err := cc.cache.ObservePod(pod, true); err != nil {
 		klog.Errorf("Failed to delete Pod <%s/%s>: %v in cache",
 			pod.Namespace, pod.Name, err)
 	}

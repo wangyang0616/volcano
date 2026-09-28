@@ -17,8 +17,6 @@ limitations under the License.
 package state
 
 import (
-	"fmt"
-
 	v1 "k8s.io/api/core/v1"
 
 	vcbatch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
@@ -60,6 +58,9 @@ func (ps *runningState) Execute(action Action) error {
 			return true
 		})
 	default:
+		// The informer projection may be ahead of its callback listener. A
+		// terminal count must not preempt an unhandled failure/completion policy.
+		terminalObservationsHandled := terminalPodsHandled(ps.job)
 		return SyncJob(ps.job, func(status *vcbatch.JobStatus) bool {
 			jobReplicas := TotalTasks(ps.job.Job)
 			if jobReplicas == 0 {
@@ -68,14 +69,14 @@ func (ps *runningState) Execute(action Action) error {
 			}
 
 			minSuccess := ps.job.Job.Spec.MinSuccess
-			if minSuccess != nil && status.Succeeded >= *minSuccess {
+			if terminalObservationsHandled && minSuccess != nil && status.Succeeded >= *minSuccess {
 				status.State.Phase = vcbatch.Completed
-				UpdateJobCompleted(fmt.Sprintf("%s/%s", ps.job.Job.Namespace, ps.job.Job.Name), ps.job.Job.Spec.Queue)
+				UpdateJobCompleted(ps.job.Job)
 				return true
 			}
 
 			totalTaskMinAvailable := TotalTaskMinAvailable(ps.job.Job)
-			if status.Succeeded+status.Failed == jobReplicas {
+			if terminalObservationsHandled && status.Succeeded+status.Failed == jobReplicas {
 				if ps.job.Job.Spec.MinAvailable >= totalTaskMinAvailable {
 					for _, task := range ps.job.Job.Spec.Tasks {
 						if task.MinAvailable == nil {
@@ -85,7 +86,7 @@ func (ps *runningState) Execute(action Action) error {
 						if taskStatus, ok := status.TaskStatusCount[task.Name]; ok {
 							if taskStatus.Phase[v1.PodSucceeded] < *task.MinAvailable {
 								status.State.Phase = vcbatch.Failed
-								UpdateJobFailed(fmt.Sprintf("%s/%s", ps.job.Job.Namespace, ps.job.Job.Name), ps.job.Job.Spec.Queue)
+								UpdateJobFailed(ps.job.Job)
 								return true
 							}
 						}
@@ -94,13 +95,13 @@ func (ps *runningState) Execute(action Action) error {
 
 				if minSuccess != nil && status.Succeeded < *minSuccess {
 					status.State.Phase = vcbatch.Failed
-					UpdateJobFailed(fmt.Sprintf("%s/%s", ps.job.Job.Namespace, ps.job.Job.Name), ps.job.Job.Spec.Queue)
+					UpdateJobFailed(ps.job.Job)
 				} else if status.Succeeded >= ps.job.Job.Spec.MinAvailable {
 					status.State.Phase = vcbatch.Completed
-					UpdateJobCompleted(fmt.Sprintf("%s/%s", ps.job.Job.Namespace, ps.job.Job.Name), ps.job.Job.Spec.Queue)
+					UpdateJobCompleted(ps.job.Job)
 				} else {
 					status.State.Phase = vcbatch.Failed
-					UpdateJobFailed(fmt.Sprintf("%s/%s", ps.job.Job.Namespace, ps.job.Job.Name), ps.job.Job.Spec.Queue)
+					UpdateJobFailed(ps.job.Job)
 				}
 				return true
 			}

@@ -103,7 +103,7 @@ func (sp *sshPlugin) OnJobAdd(job *batch.Job) error {
 	}
 
 	if err := helpers.CreateOrUpdateSecret(job, sp.client.KubeClients, data, sp.secretName(job)); err != nil {
-		return fmt.Errorf("create secret for job <%s/%s> with ssh plugin failed for %v",
+		return fmt.Errorf("create secret for job <%s/%s> with ssh plugin failed for %w",
 			job.Namespace, job.Name, err)
 	}
 

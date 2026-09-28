@@ -41,6 +41,10 @@ type jobCache struct {
 
 	jobs        map[string]*apis.JobInfo
 	deletedJobs workqueue.TypedRateLimitingInterface[*apis.JobInfo]
+	reader      SnapshotReader
+	initialized map[string]bool
+	retired     map[types.UID]struct{}
+	recovery    map[string]recoveryWait
 }
 
 func keyFn(ns, name string) string {
@@ -77,7 +81,7 @@ func jobKeyOfPod(pod *v1.Pod) (string, error) {
 }
 
 func jobUIDOfPod(pod *v1.Pod) types.UID {
-	owner := metav1.GetControllerOf(pod)
+	owner := metav1.GetControllerOfNoCopy(pod)
 	if owner == nil {
 		return ""
 	}
@@ -100,17 +104,24 @@ func validatePodJobUID(job *apis.JobInfo, pod *v1.Pod) error {
 }
 
 // New gets the job Cache.
-func New() Cache {
+func New(readers ...SnapshotReader) Cache {
 	queue := workqueue.NewTypedMaxOfRateLimiter(
 		workqueue.NewTypedItemExponentialFailureRateLimiter[*apis.JobInfo](5*time.Millisecond, 180*time.Second),
 		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
 		&workqueue.TypedBucketRateLimiter[*apis.JobInfo]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 	)
 
-	return &jobCache{
+	jc := &jobCache{
 		jobs:        map[string]*apis.JobInfo{},
 		deletedJobs: workqueue.NewTypedRateLimitingQueue(queue),
+		initialized: make(map[string]bool),
+		retired:     make(map[types.UID]struct{}),
+		recovery:    make(map[string]recoveryWait),
 	}
+	if len(readers) != 0 {
+		jc.reader = readers[0]
+	}
+	return jc
 }
 
 func (jc *jobCache) Get(key string) (*apis.JobInfo, error) {
@@ -142,33 +153,49 @@ func (jc *jobCache) GetStatus(key string) (*v1alpha1.JobStatus, error) {
 		return nil, fmt.Errorf("job <%s> is not ready", key)
 	}
 
-	status := job.Job.Status
-
-	return &status, nil
+	return job.Job.Status.DeepCopy(), nil
 }
 
 func (jc *jobCache) Add(job *v1alpha1.Job) error {
 	jc.Lock()
 	defer jc.Unlock()
 	key := JobKey(job)
+	if _, retired := jc.retired[job.UID]; retired {
+		return ErrLifecycleChanged
+	}
+	if jc.reader != nil {
+		if job.UID == "" {
+			return fmt.Errorf("job <%s> has no UID", key)
+		}
+		observed, err := jc.reader.GetJob(job.Namespace, job.Name)
+		if err != nil {
+			return err
+		}
+		if observed.UID != job.UID {
+			return ErrLifecycleChanged
+		}
+	}
 	if jobInfo, found := jc.jobs[key]; found {
+		if jobInfo.UID == job.UID && jobInfo.Deleted {
+			return ErrLifecycleChanged
+		}
 		if jobInfo.UID != job.UID {
 			if jobInfo.Job != nil {
 				// Add events alone do not establish ordering between two
 				// lifecycles. Refuse to replace a live entry, otherwise a late
 				// event from the old UID could roll the cache back. The informer
-				// handler/recovery path first deletes the lifecycle it observed
-				// before adding the replacement.
+				// handler/recovery path replaces the observed lifecycle atomically.
 				controllermetrics.IncJobControllerLifecycleMismatch("job-add")
 				return fmt.Errorf("job <%v> uid mismatch: cached <%s>, added <%s>", key, jobInfo.UID, job.UID)
 			}
 			// A name can be reused after deletion. Never attach the new VCJob to
 			// the old lifecycle's JobInfo; stale cleanup items still reference it.
 			jc.jobs[key] = newJobInfo(job)
+			jc.initialized[key] = jc.reader == nil
 			return nil
 		}
 		if jobInfo.Job == nil {
-			jobInfo.SetJob(job)
+			jobInfo.SetJob(job.DeepCopy())
 
 			return nil
 		}
@@ -176,11 +203,15 @@ func (jc *jobCache) Add(job *v1alpha1.Job) error {
 	}
 
 	jc.jobs[key] = newJobInfo(job)
+	jc.initialized[key] = jc.reader == nil
 
 	return nil
 }
 
 func newJobInfo(job *v1alpha1.Job) *apis.JobInfo {
+	// Callers may keep mutating API responses (for example during plugin
+	// initialization). The cache must own its Job object, not just its maps.
+	job = job.DeepCopy()
 	jobInfo := &apis.JobInfo{
 		Name:       job.Name,
 		Namespace:  job.Namespace,
@@ -198,6 +229,9 @@ func (jc *jobCache) Update(obj *v1alpha1.Job) error {
 	defer jc.Unlock()
 
 	key := JobKey(obj)
+	if _, retired := jc.retired[obj.UID]; retired {
+		return ErrLifecycleChanged
+	}
 	job, found := jc.jobs[key]
 	if !found {
 		return fmt.Errorf("failed to find job <%v>", key)
@@ -205,6 +239,9 @@ func (jc *jobCache) Update(obj *v1alpha1.Job) error {
 	if job.UID != obj.UID {
 		controllermetrics.IncJobControllerLifecycleMismatch("job-update")
 		return fmt.Errorf("job <%v> uid mismatch: cached <%s>, updated <%s>", key, job.UID, obj.UID)
+	}
+	if job.Deleted {
+		return ErrLifecycleChanged
 	}
 
 	if job.Job != nil {
@@ -221,15 +258,22 @@ func (jc *jobCache) Update(obj *v1alpha1.Job) error {
 			return fmt.Errorf("job <%v> has too old resource version: %d (%d)", key, newResourceVersion, oldResourceVersion)
 		}
 	}
-	job.SetJob(obj)
+	job.SetJob(obj.DeepCopy())
 	return nil
 }
 
 func (jc *jobCache) Delete(obj *v1alpha1.Job) error {
 	jc.Lock()
-	defer jc.Unlock()
+	var cleanup *apis.JobInfo
+	defer func() {
+		jc.Unlock()
+		if cleanup != nil {
+			jc.deleteJob(cleanup)
+		}
+	}()
 
 	key := JobKey(obj)
+	jc.retireUID(obj.UID)
 	jobInfo, found := jc.jobs[key]
 	if !found {
 		return fmt.Errorf("failed to find job <%v>", key)
@@ -240,12 +284,20 @@ func (jc *jobCache) Delete(obj *v1alpha1.Job) error {
 		return nil
 	}
 	jobInfo.Job = nil
-	jc.deleteJob(jobInfo)
+	jobInfo.Deleted = true
+	jc.initialized[key] = false
+	controllermetrics.DeleteJobMetrics(key, obj.Spec.Queue)
+	delete(jc.recovery, key)
+	cleanup = jobInfo
 
 	return nil
 }
 
 func (jc *jobCache) AddPod(pod *v1.Pod) error {
+	if jc.reader != nil {
+		_, err := jc.ObservePod(pod, false)
+		return err
+	}
 	jc.Lock()
 	defer jc.Unlock()
 
@@ -272,6 +324,10 @@ func (jc *jobCache) AddPod(pod *v1.Pod) error {
 }
 
 func (jc *jobCache) UpdatePod(pod *v1.Pod) error {
+	if jc.reader != nil {
+		_, err := jc.ObservePod(pod, false)
+		return err
+	}
 	jc.Lock()
 	defer jc.Unlock()
 
@@ -299,7 +355,13 @@ func (jc *jobCache) UpdatePod(pod *v1.Pod) error {
 
 func (jc *jobCache) DeletePod(pod *v1.Pod) error {
 	jc.Lock()
-	defer jc.Unlock()
+	var cleanup *apis.JobInfo
+	defer func() {
+		jc.Unlock()
+		if cleanup != nil {
+			jc.deleteJob(cleanup)
+		}
+	}()
 
 	key, err := jobKeyOfPod(pod)
 	if err != nil {
@@ -314,7 +376,7 @@ func (jc *jobCache) DeletePod(pod *v1.Pod) error {
 			return err
 		}
 		if jobTerminated(job) {
-			jc.deleteJob(job)
+			cleanup = job
 		}
 	}
 
@@ -345,7 +407,7 @@ func (jc *jobCache) Run(stopCh <-chan struct{}) {
 	wait.Until(jc.worker, 0, stopCh)
 }
 
-func (jc *jobCache) TaskCompleted(jobKey, taskName string) bool {
+func (jc *jobCache) TaskCompleted(jobKey, taskName string, uid ...types.UID) bool {
 	jc.Lock()
 	defer jc.Unlock()
 
@@ -353,6 +415,9 @@ func (jc *jobCache) TaskCompleted(jobKey, taskName string) bool {
 
 	jobInfo, found := jc.jobs[jobKey]
 	if !found {
+		return false
+	}
+	if len(uid) != 0 && jobInfo.UID != uid[0] {
 		return false
 	}
 
@@ -380,7 +445,7 @@ func (jc *jobCache) TaskCompleted(jobKey, taskName string) bool {
 	return completed >= taskReplicas
 }
 
-func (jc *jobCache) TaskFailed(jobKey, taskName string) bool {
+func (jc *jobCache) TaskFailed(jobKey, taskName string, uid ...types.UID) bool {
 	jc.Lock()
 	defer jc.Unlock()
 
@@ -388,6 +453,9 @@ func (jc *jobCache) TaskFailed(jobKey, taskName string) bool {
 
 	jobInfo, found := jc.jobs[jobKey]
 	if !found {
+		return false
+	}
+	if len(uid) != 0 && jobInfo.UID != uid[0] {
 		return false
 	}
 
@@ -443,11 +511,11 @@ func (jc *jobCache) processCleanupJob() bool {
 	defer jc.deletedJobs.Done(job)
 
 	jc.Mutex.Lock()
-	defer jc.Mutex.Unlock()
 
 	key := keyFn(job.Namespace, job.Name)
 	current, found := jc.jobs[key]
 	if !found || current != job || current.UID != job.UID {
+		jc.Mutex.Unlock()
 		// The name has been reused and this queue item belongs to an old
 		// lifecycle. It must never delete the current map entry.
 		jc.deletedJobs.Forget(job)
@@ -457,10 +525,14 @@ func (jc *jobCache) processCleanupJob() bool {
 	}
 
 	if jobTerminated(job) {
-		jc.deletedJobs.Forget(job)
 		delete(jc.jobs, key)
+		delete(jc.initialized, key)
+		delete(jc.recovery, key)
+		jc.Mutex.Unlock()
+		jc.deletedJobs.Forget(job)
 		klog.V(3).Infof("Job <%s> was deleted.", key)
 	} else {
+		jc.Mutex.Unlock()
 		// Retry
 		jc.retryDeleteJob(job)
 	}

@@ -39,6 +39,13 @@ type Request struct {
 	ExitCode    int32
 	Action      v1alpha1.Action
 	JobVersion  int32
+	// Re-evaluate task conditions after lifecycle recovery if a Pod callback
+	// arrived before the Job cache was ready. These are not Pod policy events.
+	CheckTaskCompleted bool
+	CheckTaskFailed    bool
+	// TerminalObservation distinguishes a terminal transition (or initial
+	// terminal Add) from later metadata updates of the same terminal Pod.
+	TerminalObservation bool
 }
 
 // String function returns the request in string format.

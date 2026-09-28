@@ -318,6 +318,9 @@ func TestJobInfo_DeletePod(t *testing.T) {
 			Labels: map[string]string{batch.TaskPartitionID: "p1"},
 		},
 	}
+	// Both projections reference the same observed Pod, including its labels.
+	ji.Pods["task-1"]["pod-1"] = podToDelete
+	ji.Partitions["task-1"].Partition["p1"]["pod-1"] = podToDelete
 	if err := ji.DeletePod(podToDelete); err != nil {
 		t.Errorf("DeletePod failed: %v", err)
 	}

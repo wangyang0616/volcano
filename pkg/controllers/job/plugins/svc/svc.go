@@ -157,30 +157,28 @@ func (sp *servicePlugin) OnJobAdd(job *batch.Job) error {
 }
 
 func (sp *servicePlugin) OnJobDelete(job *batch.Job) error {
-	if job.Status.ControlledResources["plugin-"+sp.Name()] != sp.Name() {
-		return nil
-	}
-
+	// A failed initialization may already have created the ConfigMap or
+	// Service without completing the plugin. Cleanup is ownership/UID guarded
+	// and must not depend on the full-initialization marker being persisted.
 	if err := helpers.DeleteConfigmap(job, sp.Clientset.KubeClients, sp.cmName(job)); err != nil {
 		return err
 	}
 
-	if err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Delete(context.TODO(), job.Name, metav1.DeleteOptions{}); err != nil {
+	if err := helpers.DeleteJobResource(job, sp.Clientset.KubeClients.CoreV1().Services(job.Namespace), job.Name); err != nil {
 		if !apierrors.IsNotFound(err) {
 			klog.Errorf("Failed to delete Service of Job %v/%v: %v", job.Namespace, job.Name, err)
 			return err
 		}
 	}
-	delete(job.Status.ControlledResources, "plugin-"+sp.Name())
-
 	if !sp.disableNetworkPolicy {
-		if err := sp.Clientset.KubeClients.NetworkingV1().NetworkPolicies(job.Namespace).Delete(context.TODO(), job.Name, metav1.DeleteOptions{}); err != nil {
+		if err := helpers.DeleteJobResource(job, sp.Clientset.KubeClients.NetworkingV1().NetworkPolicies(job.Namespace), job.Name); err != nil {
 			if !apierrors.IsNotFound(err) {
 				klog.Errorf("Failed to delete Network policy of Job %v/%v: %v", job.Namespace, job.Name, err)
 				return err
 			}
 		}
 	}
+	delete(job.Status.ControlledResources, "plugin-"+sp.Name())
 	return nil
 }
 
@@ -218,7 +216,7 @@ func (sp *servicePlugin) mountConfigmap(pod *v1.Pod, job *batch.Job) {
 
 func (sp *servicePlugin) createServiceIfNotExist(job *batch.Job) error {
 	// If Service does not exist, create one for Job.
-	if _, err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{}); err != nil {
+	if existing, err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			klog.V(3).Infof("Failed to get Service for Job <%s/%s>: %v",
 				job.Namespace, job.Name, err)
@@ -247,7 +245,8 @@ func (sp *servicePlugin) createServiceIfNotExist(job *batch.Job) error {
 			klog.V(3).Infof("Failed to create Service for Job <%s/%s>: %v", job.Namespace, job.Name, e)
 			return e
 		}
-		job.Status.ControlledResources["plugin-"+sp.Name()] = sp.Name()
+	} else if !helpers.IsControlledByJob(existing, job) {
+		return &helpers.JobResourceConflictError{Name: job.Name}
 	}
 
 	return nil
@@ -256,7 +255,7 @@ func (sp *servicePlugin) createServiceIfNotExist(job *batch.Job) error {
 // Limit pods can be accessible only by pods belong to the job.
 func (sp *servicePlugin) createNetworkPolicyIfNotExist(job *batch.Job) error {
 	// If network policy does not exist, create one for Job.
-	if _, err := sp.Clientset.KubeClients.NetworkingV1().NetworkPolicies(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{}); err != nil {
+	if existing, err := sp.Clientset.KubeClients.NetworkingV1().NetworkPolicies(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			klog.V(3).Infof("Failed to get NetworkPolicy for Job <%s/%s>: %v",
 				job.Namespace, job.Name, err)
@@ -296,7 +295,8 @@ func (sp *servicePlugin) createNetworkPolicyIfNotExist(job *batch.Job) error {
 			klog.V(3).Infof("Failed to create Service for Job <%s/%s>: %v", job.Namespace, job.Name, e)
 			return e
 		}
-		job.Status.ControlledResources["plugin-"+sp.Name()] = sp.Name()
+	} else if !helpers.IsControlledByJob(existing, job) {
+		return &helpers.JobResourceConflictError{Name: job.Name}
 	}
 
 	return nil

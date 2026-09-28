@@ -29,6 +29,7 @@ import (
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	volcanoclient "volcano.sh/apis/pkg/client/clientset/versioned/fake"
 	informerfactory "volcano.sh/apis/pkg/client/informers/externalversions"
+	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	"volcano.sh/volcano/pkg/controllers/framework"
 )
 
@@ -49,6 +50,9 @@ func newFakeController() *jobcontroller {
 	}
 
 	controller.Initialize(opt)
+	// These action/plugin fixtures mutate the cache directly without running
+	// informers. Lifecycle tests explicitly install the production store reader.
+	controller.cache = jobcache.New()
 
 	return controller
 }

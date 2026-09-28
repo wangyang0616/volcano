@@ -213,7 +213,7 @@ func (rp *rayPlugin) OnJobDelete(job *batch.Job) error {
 
 	// When OnJobDelete is called, the head node Service is deleted
 	headServiceName := job.Name + "-head-svc"
-	if err := rp.clientset.KubeClients.CoreV1().Services(job.Namespace).Delete(context.TODO(), headServiceName, metav1.DeleteOptions{}); err != nil {
+	if err := helpers.DeleteJobResource(job, rp.clientset.KubeClients.CoreV1().Services(job.Namespace), headServiceName); err != nil {
 		if !apierrors.IsNotFound(err) {
 			klog.Errorf("Failed to delete Service of Job %v/%v: %v", job.Namespace, headServiceName, err)
 			return err
@@ -230,7 +230,7 @@ func (rp *rayPlugin) OnJobUpdate(job *batch.Job) error {
 func (rp *rayPlugin) createServiceIfNotExist(job *batch.Job) error {
 	// If Service does not exist, create one for Job.
 	headServiceName := job.Name + "-head-svc"
-	if _, err := rp.clientset.KubeClients.CoreV1().Services(job.Namespace).Get(context.TODO(), headServiceName, metav1.GetOptions{}); err != nil {
+	if existing, err := rp.clientset.KubeClients.CoreV1().Services(job.Namespace).Get(context.TODO(), headServiceName, metav1.GetOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			klog.V(3).Infof("Failed to get Service for Job <%s/%s>: %v",
 				job.Namespace, job.Name, err)
@@ -278,6 +278,8 @@ func (rp *rayPlugin) createServiceIfNotExist(job *batch.Job) error {
 			klog.V(3).Infof("Failed to create Service for Job <%s/%s>: %v", job.Namespace, headServiceName, e)
 			return e
 		}
+	} else if !helpers.IsControlledByJob(existing, job) {
+		return &helpers.JobResourceConflictError{Name: headServiceName}
 	}
 
 	return nil

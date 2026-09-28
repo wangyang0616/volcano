@@ -23,8 +23,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	toolscache "k8s.io/client-go/tools/cache"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	batchlisters "volcano.sh/apis/pkg/client/listers/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 )
 
@@ -165,6 +167,95 @@ func TestJobCacheStaleAddDoesNotRollbackCurrentLifecycle(t *testing.T) {
 	if got.UID != current.UID {
 		t.Fatalf("stale Add rolled cache back to uid %q; want %q", got.UID, current.UID)
 	}
+}
+
+func TestJobCacheRebuildLifecycleRestoresCurrentPods(t *testing.T) {
+	jc := New().(*jobCache)
+	oldJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "old-uid"}}
+	newJob := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "new-uid"}}
+	newPod := controlledPod("test", "same-name-worker-0", newJob.Name, newJob.UID, "new-pod-uid")
+	oldPod := controlledPod("test", "same-name-worker-1", oldJob.Name, oldJob.UID, "old-pod-uid")
+
+	if err := jc.Add(oldJob); err != nil {
+		t.Fatalf("add old job: %v", err)
+	}
+	attachInformerStores(t, jc, newJob, oldPod, newPod)
+	if _, err := jc.RebuildLifecycle(newJob.Namespace, newJob.Name, newJob.UID, nil); err != nil {
+		t.Fatalf("replace lifecycle: %v", err)
+	}
+
+	got, err := jc.Get(JobKey(newJob))
+	if err != nil {
+		t.Fatalf("get replacement: %v", err)
+	}
+	if got.UID != newJob.UID {
+		t.Fatalf("got uid %q, want %q", got.UID, newJob.UID)
+	}
+	if pod := got.Pods["worker"][newPod.Name]; pod == nil || pod.UID != newPod.UID {
+		t.Fatalf("current Pod was not restored: %#v", pod)
+	}
+}
+
+func TestJobCacheRebuildLifecycleRejectsStaleSnapshot(t *testing.T) {
+	jc := New().(*jobCache)
+	current := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "current-uid"}}
+	stale := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "stale-uid"}}
+
+	if err := jc.Add(current); err != nil {
+		t.Fatalf("add current job: %v", err)
+	}
+	attachInformerStores(t, jc, current)
+	if _, err := jc.RebuildLifecycle(stale.Namespace, stale.Name, stale.UID, nil); err == nil {
+		t.Fatal("expected stale replacement to be rejected")
+	}
+	got, err := jc.Get(JobKey(current))
+	if err != nil {
+		t.Fatalf("get current job: %v", err)
+	}
+	if got.UID != current.UID {
+		t.Fatalf("stale replacement changed uid to %q", got.UID)
+	}
+}
+
+func TestJobCacheRebuildLifecycleObservesCurrentPod(t *testing.T) {
+	jc := New().(*jobCache)
+	job := &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "same-name", UID: "current-uid"}}
+	pod := controlledPod("test", "same-name-worker-0", job.Name, job.UID, "pod-uid")
+
+	// A Pod can be observed before the Job handler initializes its lifecycle.
+	if err := jc.AddPod(pod); err != nil {
+		t.Fatalf("add current pod placeholder: %v", err)
+	}
+	attachInformerStores(t, jc, job, pod)
+	if _, err := jc.RebuildLifecycle(job.Namespace, job.Name, job.UID, nil); err != nil {
+		t.Fatalf("replace lifecycle: %v", err)
+	}
+
+	got, err := jc.Get(JobKey(job))
+	if err != nil {
+		t.Fatalf("get replacement: %v", err)
+	}
+	if restored := got.Pods["worker"][pod.Name]; restored == nil || restored.UID != pod.UID {
+		t.Fatalf("concurrent current Pod was lost: %#v", restored)
+	}
+}
+
+func attachInformerStores(t testing.TB, jc *jobCache, job *v1alpha1.Job, pods ...*v1.Pod) (toolscache.Indexer, toolscache.Indexer) {
+	t.Helper()
+	jobs := toolscache.NewIndexer(toolscache.MetaNamespaceKeyFunc, toolscache.Indexers{toolscache.NamespaceIndex: toolscache.MetaNamespaceIndexFunc})
+	podStore := toolscache.NewIndexer(toolscache.MetaNamespaceKeyFunc, toolscache.Indexers{JobOwnerIndex: JobOwnerIndexFunc})
+	if err := jobs.Add(job); err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range pods {
+		if err := podStore.Add(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jc.reader = NewInformerReader(batchlisters.NewJobLister(jobs), podStore)
+	jc.initialized = make(map[string]bool)
+	t.Cleanup(jc.deletedJobs.ShutDown)
+	return jobs, podStore
 }
 
 func TestJobCache_Add(t *testing.T) {

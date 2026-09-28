@@ -26,6 +26,24 @@ import (
 )
 
 var (
+	jobRecoveryWaits = promauto.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: util.VolcanoSubSystemName, Name: "controller_job_recovery_wait_total",
+		Help: "Lifecycle recovery waits by reason, independent of execution retries.",
+	}, []string{"reason"})
+	podUIDPreconditionRejections = promauto.NewCounter(prometheus.CounterOpts{
+		Subsystem: util.VolcanoSubSystemName, Name: "controller_pod_stale_operation_total",
+		Help: "Pod operations completed idempotently after confirming a UID replacement.",
+	})
+	lifecycleRebuildDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Subsystem: util.VolcanoSubSystemName, Name: "controller_job_rebuild_duration_seconds",
+		Help:    "Time spent waiting for and holding the lifecycle rebuild cache lock.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 18),
+	}, []string{"mode", "result", "stage"})
+	lifecycleRebuildPods = promauto.NewHistogram(prometheus.HistogramOpts{
+		Subsystem: util.VolcanoSubSystemName, Name: "controller_job_rebuild_pods",
+		Help:    "Number of Pods in successful lifecycle rebuilds.",
+		Buckets: []float64{0, 8, 100, 1000, 5000, 10000},
+	})
 	// jobToPodCreationLatency is the per-pod latency from VCJob creation to pod created.
 	jobToPodCreationLatency = promauto.NewHistogram(
 		prometheus.HistogramOpts{
@@ -58,6 +76,18 @@ var (
 		},
 	)
 )
+
+func ObserveLifecycleRebuild(mode, result string, pods int, waiting, held time.Duration) {
+	lifecycleRebuildDuration.WithLabelValues(mode, result, "wait").Observe(waiting.Seconds())
+	lifecycleRebuildDuration.WithLabelValues(mode, result, "hold").Observe(held.Seconds())
+	lifecycleRebuildDuration.WithLabelValues(mode, result, "total").Observe((waiting + held).Seconds())
+	if result == "rebuilt" {
+		lifecycleRebuildPods.Observe(float64(pods))
+	}
+}
+
+func IncJobRecoveryWait(reason string) { jobRecoveryWaits.WithLabelValues(reason).Inc() }
+func IncStalePodOperation()            { podUIDPreconditionRejections.Inc() }
 
 // DurationInMilliseconds converts a time.Duration to float64 milliseconds.
 func DurationInMilliseconds(duration time.Duration) float64 {

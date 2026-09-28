@@ -35,6 +35,7 @@ import (
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	informerfactory "volcano.sh/apis/pkg/client/informers/externalversions"
+	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	"volcano.sh/volcano/pkg/controllers/framework"
 )
 
@@ -67,6 +68,7 @@ func newController() *jobcontroller {
 	}
 
 	controller.Initialize(opt)
+	controller.cache = jobcache.New()
 
 	return controller
 }

@@ -32,11 +32,17 @@ type JobInfo struct {
 	// UID identifies one concrete VCJob lifecycle. Namespace and name can be
 	// reused, while UID is immutable for the lifetime of a Kubernetes object.
 	UID types.UID
+	// Deleted is terminal for this cache entry, even if the bounded retired-UID
+	// lookup has evicted this lifecycle. A Pod-only placeholder is not deleted.
+	Deleted bool
 
 	Job  *batch.Job
 	Pods map[string]map[string]*v1.Pod
 	// Partitions taskName:PartitionInfo
 	Partitions map[string]*PartitionInfo
+	// HandledTerminalPods records terminal observations whose policy request
+	// has completed. It is ephemeral and scoped to the Pods in this lifecycle.
+	HandledTerminalPods map[types.UID]struct{}
 }
 
 type PartitionInfo struct {
@@ -45,13 +51,15 @@ type PartitionInfo struct {
 	NetworkTopology *batch.NetworkTopologySpec
 }
 
-// Clone function clones the k8s pod values to the JobInfo struct.
+// Clone copies mutable Job state and projection maps. Pod references are
+// informer-owned and read-only; callers must DeepCopy before modifying a Pod.
 func (ji *JobInfo) Clone() *JobInfo {
 	job := &JobInfo{
 		Namespace: ji.Namespace,
 		Name:      ji.Name,
 		UID:       ji.UID,
-		Job:       ji.Job,
+		Deleted:   ji.Deleted,
+		Job:       ji.Job.DeepCopy(),
 
 		Pods:       make(map[string]map[string]*v1.Pod, len(ji.Pods)),
 		Partitions: make(map[string]*PartitionInfo, len(ji.Partitions)),
@@ -61,6 +69,12 @@ func (ji *JobInfo) Clone() *JobInfo {
 		job.Pods[key] = make(map[string]*v1.Pod, len(pods))
 		for pn, pod := range pods {
 			job.Pods[key][pn] = pod
+		}
+	}
+	if len(ji.HandledTerminalPods) != 0 {
+		job.HandledTerminalPods = make(map[types.UID]struct{}, len(ji.HandledTerminalPods))
+		for uid := range ji.HandledTerminalPods {
+			job.HandledTerminalPods[uid] = struct{}{}
 		}
 	}
 
@@ -179,6 +193,9 @@ func (ji *JobInfo) UpdatePod(pod *v1.Pod) error {
 		return fmt.Errorf("can not find pod <%s/%s> in cache",
 			pod.Namespace, pod.Name)
 	}
+	if ji.Pods[taskName][pod.Name].UID != pod.UID {
+		return fmt.Errorf("pod <%s/%s> UID changed", pod.Namespace, pod.Name)
+	}
 	ji.Pods[taskName][pod.Name] = pod
 
 	if ji.Partitions != nil {
@@ -211,7 +228,15 @@ func (ji *JobInfo) DeletePod(pod *v1.Pod) error {
 	}
 
 	if pods, found := ji.Pods[taskName]; found {
+		if current, exists := pods[pod.Name]; exists {
+			if current.UID != pod.UID {
+				return nil
+			}
+			// A delayed callback may carry old partition labels of the same Pod.
+			pod = current
+		}
 		delete(pods, pod.Name)
+		delete(ji.HandledTerminalPods, pod.UID)
 		if len(pods) == 0 {
 			delete(ji.Pods, taskName)
 		}
@@ -235,6 +260,33 @@ func (ji *JobInfo) DeletePod(pod *v1.Pod) error {
 	return nil
 }
 
+// MarkTerminalPodHandled acknowledges only the observed instance, never a
+// replacement with the same name. Callers own the JobInfo or hold its cache lock.
+func (ji *JobInfo) MarkTerminalPodHandled(taskName, podName string, uid types.UID) {
+	if uid == "" {
+		return
+	}
+	pod := ji.Pods[taskName][podName]
+	if pod == nil || pod.UID != uid {
+		// Task metadata can move an existing Pod between projection buckets
+		// while its original policy request is queued. Identity is the UID,
+		// not the task annotation captured by that request.
+		for _, pods := range ji.Pods {
+			if current := pods[podName]; current != nil && current.UID == uid {
+				pod = current
+				break
+			}
+		}
+	}
+	if pod == nil || pod.UID != uid || (pod.Status.Phase != v1.PodFailed && pod.Status.Phase != v1.PodSucceeded) {
+		return
+	}
+	if ji.HandledTerminalPods == nil {
+		ji.HandledTerminalPods = make(map[types.UID]struct{})
+	}
+	ji.HandledTerminalPods[uid] = struct{}{}
+}
+
 // HasPod checks whether the given k8s pod exists in the JobInfo struct.
 func (ji *JobInfo) HasPod(pod *v1.Pod) bool {
 	taskName, found := pod.Annotations[batch.TaskSpecKey]
@@ -250,8 +302,8 @@ func (ji *JobInfo) HasPod(pod *v1.Pod) bool {
 	if !found {
 		return false
 	}
-	_, found = pods[pod.Name]
-	return found
+	current, found := pods[pod.Name]
+	return found && current.UID == pod.UID
 }
 
 func GetPartitionID(pod *v1.Pod) string {

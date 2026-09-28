@@ -25,6 +25,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
@@ -1314,6 +1315,18 @@ func TestRunningState_Execute(t *testing.T) {
 
 	for i, testcase := range testcases {
 		t.Run(testcase.Name, func(t *testing.T) {
+			// These state-only fixtures represent already-consumed Pod events.
+			// Callback/worker ordering is covered by observation regression tests.
+			for _, pods := range testcase.JobInfo.Pods {
+				for _, pod := range pods {
+					if pod.Status.Phase == v1.PodFailed || pod.Status.Phase == v1.PodSucceeded {
+						if testcase.JobInfo.HandledTerminalPods == nil {
+							testcase.JobInfo.HandledTerminalPods = make(map[types.UID]struct{})
+						}
+						testcase.JobInfo.HandledTerminalPods[pod.UID] = struct{}{}
+					}
+				}
+			}
 			testState := state.NewState(testcase.JobInfo)
 
 			fakecontroller := newFakeController()

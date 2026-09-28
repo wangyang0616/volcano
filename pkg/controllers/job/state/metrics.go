@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Volcano Authors.
+Copyright 2026 The Volcano Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,40 +16,11 @@ limitations under the License.
 
 package state
 
-import (
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+import batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 
-	"volcano.sh/volcano/pkg/controllers/util"
-)
+// RecordJobPhase is installed alongside SyncJob/KillJob. The controller cache
+// checks UID and updates counters under the same lock as lifecycle replacement.
+var RecordJobPhase = func(job *batch.Job, phase batch.JobPhase) {}
 
-var (
-	jobCompletedPhaseCount = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Subsystem: util.VolcanoSubSystemName,
-			Name:      "job_completed_phase_count",
-			Help:      "Number of job completed phase",
-		}, []string{"job_name", "queue_name"},
-	)
-
-	jobFailedPhaseCount = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Subsystem: util.VolcanoSubSystemName,
-			Name:      "job_failed_phase_count",
-			Help:      "Number of job failed phase",
-		}, []string{"job_name", "queue_name"},
-	)
-)
-
-func UpdateJobCompleted(jobName, queueName string) {
-	jobCompletedPhaseCount.WithLabelValues(jobName, queueName).Inc()
-}
-
-func UpdateJobFailed(jobName, queueName string) {
-	jobFailedPhaseCount.WithLabelValues(jobName, queueName).Inc()
-}
-
-func DeleteJobMetrics(jobName, queueName string) {
-	jobCompletedPhaseCount.DeleteLabelValues(jobName, queueName)
-	jobFailedPhaseCount.DeleteLabelValues(jobName, queueName)
-}
+func UpdateJobCompleted(job *batch.Job) { RecordJobPhase(job, batch.Completed) }
+func UpdateJobFailed(job *batch.Job)    { RecordJobPhase(job, batch.Failed) }

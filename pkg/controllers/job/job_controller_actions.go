@@ -19,6 +19,7 @@ package job
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"volcano.sh/apis/pkg/apis/helpers"
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
+	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
 	"volcano.sh/volcano/pkg/controllers/job/state"
 	"volcano.sh/volcano/pkg/controllers/metrics"
@@ -52,9 +54,13 @@ func (cc *jobcontroller) getPodGroupByJob(job *batch.Job) (*scheduling.PodGroup,
 		return pg, nil
 	}
 	if apierrors.IsNotFound(err) {
+		originalErr := err
 		pg, err := cc.pgLister.PodGroups(job.Namespace).Get(job.Name)
 		if err != nil {
 			return nil, err
+		}
+		if !helpers.IsControlledByJob(pg, job) {
+			return nil, originalErr
 		}
 		return pg, nil
 	}
@@ -66,6 +72,15 @@ func (cc *jobcontroller) generateRelatedPodGroupName(job *batch.Job) string {
 }
 
 func (cc *jobcontroller) killTarget(jobInfo *apis.JobInfo, target state.Target, updateStatus state.UpdateStatusFn) error {
+	if target.Type == state.TargetTypePod {
+		pod := jobInfo.Pods[target.TaskName][target.PodName]
+		if pod == nil || (target.PodUID != "" && target.PodUID != pod.UID) {
+			// The old instance is gone, but a PodEvicted -> RestartPod request
+			// can still be the only wakeup capable of recreating the replica.
+			cc.getWorkerQueue(jobcache.JobKey(jobInfo.Job)).Add(jobSyncRequest(jobInfo.Job))
+			return nil
+		}
+	}
 	switch target.Type {
 	case state.TargetTypeTask:
 		klog.V(3).Infof("Killing task <%s> of Job <%s/%s>, current version %d", target.TaskName, jobInfo.Namespace, jobInfo.Name, jobInfo.Job.Status.Version)
@@ -89,7 +104,7 @@ func (cc *jobcontroller) killJob(jobInfo *apis.JobInfo, podRetainPhase state.Pha
 }
 
 func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.PhaseMap, target *state.Target, updateStatus state.UpdateStatusFn) error {
-	job := jobInfo.Job
+	job := jobInfo.Job.DeepCopy()
 	if job.DeletionTimestamp != nil {
 		klog.Infof("Job <%s/%s> is terminating, skip management process.",
 			job.Namespace, job.Name)
@@ -112,7 +127,7 @@ func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.Ph
 			}
 		case state.TargetTypePod:
 			if targetPods, found := jobInfo.Pods[target.TaskName]; found {
-				if pod, found := targetPods[target.PodName]; found {
+				if pod, found := targetPods[target.PodName]; found && (target.PodUID == "" || target.PodUID == pod.UID) {
 					podsToKill[target.PodName] = pod
 				}
 			}
@@ -178,18 +193,13 @@ func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.Ph
 	}
 
 	for podName, pod := range podsToKill {
-		stale, err := cc.markJobPodOutOfSync(pod)
+		err := cc.markPodOutOfSync(pod)
 		if err != nil {
 			// record the error, and then collect the pod info like retained pod
 			errs = append(errs, err)
 			// If we fail to patch the pod, we should not delete it,
 			// as it would cause the restart loop. The action will be retried.
 			delete(podsToKill, podName)
-		} else if stale {
-			// The intended Pod instance is already gone. Do not let the later
-			// name-based loop touch a replacement Pod with the same name.
-			delete(podsToKill, podName)
-			terminating++
 		} else {
 			klog.V(3).InfoS("Marked Pod as out-of-sync", "Pod", klog.KObj(pod), "UID", pod.UID)
 		}
@@ -277,7 +287,7 @@ func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.Ph
 			return err
 		}
 		if pg != nil {
-			if err := cc.vcClient.SchedulingV1beta1().PodGroups(job.Namespace).Delete(context.TODO(), pg.Name, metav1.DeleteOptions{}); err != nil {
+			if err := helpers.DeleteJobResource(job, cc.vcClient.SchedulingV1beta1().PodGroups(job.Namespace), pg.Name); err != nil {
 				if !apierrors.IsNotFound(err) {
 					klog.Errorf("Failed to delete PodGroup of Job %s/%s: %v", job.Namespace, job.Name, err)
 					return err
@@ -299,24 +309,45 @@ func (cc *jobcontroller) initiateJob(job *batch.Job) (*batch.Job, error) {
 			fmt.Sprintf("Failed to initialize job status, err: %v", err))
 		return nil, err
 	}
+	previousResources := maps.Clone(jobInstance.Status.ControlledResources)
+	jobInstance, initErr := cc.initializeJobResources(jobInstance)
+	// Resource initialization can succeed while the PodGroup stays Pending,
+	// or only some plugins can succeed. Persist those completed steps even when
+	// no phase/count changes, before another request attempts their cleanup.
+	if !maps.Equal(previousResources, jobInstance.Status.ControlledResources) {
+		updated, err := cc.vcClient.BatchV1alpha1().Jobs(job.Namespace).UpdateStatus(context.TODO(), jobInstance, metav1.UpdateOptions{})
+		if err != nil {
+			return nil, err // a real write failure takes precedence over name waits
+		}
+		if err := cc.cache.Update(updated); err != nil {
+			return nil, err
+		}
+		jobInstance = updated
+	}
+	if initErr != nil {
+		return nil, initErr
+	}
+	return jobInstance, nil
+}
 
-	if err := cc.pluginOnJobAdd(jobInstance); err != nil {
+func (cc *jobcontroller) initializeJobResources(job *batch.Job) (*batch.Job, error) {
+	if err := cc.pluginOnJobAdd(job); err != nil {
 		cc.recorder.Event(job, v1.EventTypeWarning, string(batch.PluginError),
 			fmt.Sprintf("Execute plugin when job add failed, err: %v", err))
-		return nil, err
+		return job, err
 	}
 
-	newJob, err := cc.createJobIOIfNotExist(jobInstance)
+	newJob, err := cc.createJobIOIfNotExist(job)
 	if err != nil {
 		cc.recorder.Event(job, v1.EventTypeWarning, string(batch.PVCError),
 			fmt.Sprintf("Failed to create PVC, err: %v", err))
-		return nil, err
+		return newJob, err
 	}
 
 	if err := cc.createOrUpdatePodGroup(newJob); err != nil {
 		cc.recorder.Event(job, v1.EventTypeWarning, string(batch.PodGroupError),
 			fmt.Sprintf("Failed to create PodGroup, err: %v", err))
-		return nil, err
+		return newJob, err
 	}
 
 	return newJob, nil
@@ -453,6 +484,7 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 	var podToDelete []*v1.Pod
 	var creationErrs []error
 	var deletionErrs []error
+	var refreshPods []string
 	appendMutex := sync.Mutex{}
 
 	appendError := func(container *[]error, err error) {
@@ -530,9 +562,13 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 					newPod, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 					if err != nil {
 						if apierrors.IsAlreadyExists(err) {
-							// Pod already exists - this can happen during controller restart or race conditions.
-							// Skip counting here; the pod will be properly counted when the informer cache syncs.
-							klog.V(4).Infof("Pod %s for Job %s already exists, skipping", pod.Name, job.Name)
+							_, restoreErr := cc.observeExistingJobPod(job, pod.Name)
+							appendMutex.Lock()
+							refreshPods = append(refreshPods, pod.Name)
+							appendMutex.Unlock()
+							if restoreErr != nil {
+								appendError(&creationErrs, restoreErr)
+							}
 						} else {
 							// Failed to create Pod. The error will be collected and the sync will be retried.
 							// This is to ensure all pods for the same Job are created
@@ -553,6 +589,13 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 	}
 
 	waitCreationGroup.Wait()
+	if len(refreshPods) != 0 {
+		// At most one rebuild per sync, even when all 5000 creations conflict.
+		// The rebuild rechecks hints under the lock and skips satisfied hints.
+		if _, err := cc.cache.RebuildLifecycle(job.Namespace, job.Name, job.UID, refreshPods); err != nil {
+			klog.V(3).Infof("Waiting to recover Pods of Job %s/%s: %v", job.Namespace, job.Name, err)
+		}
+	}
 
 	if len(creationErrs) != 0 {
 		cc.recorder.Event(job, v1.EventTypeWarning, FailedCreatePodReason,
@@ -588,6 +631,12 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 			fmt.Sprintf("Error deleting pods: %+v", deletionErrs))
 		return fmt.Errorf("failed to delete %d pods of %d", len(deletionErrs), len(podToDelete))
 	}
+	if len(refreshPods) != 0 {
+		// Do not publish incomplete status or acknowledge the request as a
+		// success. The worker retains the original action and failure history.
+		return errJobObservationPending
+	}
+	cc.cache.ResetRecovery(jobcache.JobKey(job), job.UID)
 
 	newStatus := batch.JobStatus{
 		State: job.Status.State,
@@ -678,6 +727,9 @@ func (cc *jobcontroller) isDependsOnPodsReady(task string, job *batch.Job) bool 
 			continue
 		}
 
+		if !helpers.IsControlledByJob(pod, job) {
+			continue
+		}
 		if pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodSucceeded {
 			klog.V(5).Infof("Sequential state, pod %v/%v of depends on tasks is not running", pod.Namespace, pod.Name)
 			continue
@@ -922,18 +974,8 @@ func (cc *jobcontroller) shouldUpdateExistingPodGroup(pg *scheduling.PodGroup, j
 }
 
 func (cc *jobcontroller) deleteJobPod(jobName string, pod *v1.Pod) error {
-	deleteOptions := metav1.DeleteOptions{}
-	if pod.UID != "" {
-		uid := pod.UID
-		deleteOptions.Preconditions = &metav1.Preconditions{UID: &uid}
-	}
-
-	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, deleteOptions)
-	stale, err := cc.resolvePodMutationError("pod-delete", pod, err)
-	if stale {
-		return nil
-	}
-	if err != nil {
+	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &pod.UID}})
+	if err != nil && !cc.podInstanceGone(pod, err) {
 		klog.Errorf("Failed to delete pod %s/%s for Job %s, err %#v",
 			pod.Namespace, pod.Name, jobName, err)
 
@@ -943,50 +985,61 @@ func (cc *jobcontroller) deleteJobPod(jobName string, pod *v1.Pod) error {
 	return nil
 }
 
-// markJobPodOutOfSync atomically verifies the Pod UID before annotating it.
-// The boolean result is true when the intended Pod lifecycle no longer exists.
-func (cc *jobcontroller) markJobPodOutOfSync(pod *v1.Pod) (bool, error) {
-	_, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Patch(
-		context.TODO(), pod.Name, types.JSONPatchType,
-		jobhelpers.OutOfSyncJSONPatch(pod.UID), metav1.PatchOptions{})
-	return cc.resolvePodMutationError("pod-patch", pod, err)
+// observeExistingJobPod diagnoses a name conflict. API GET results must never
+// be written back to the informer-derived Pod cache.
+func (cc *jobcontroller) observeExistingJobPod(job *batch.Job, podName string) (*v1.Pod, error) {
+	pod, err := cc.podLister.Pods(job.Namespace).Get(podName)
+	if apierrors.IsNotFound(err) {
+		pod, err = cc.kubeClient.CoreV1().Pods(job.Namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	}
+	if apierrors.IsNotFound(err) {
+		metrics.IncJobRecoveryWait("pod-disappeared")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get existing Pod %s/%s for Job %s: %w", job.Namespace, podName, job.Name, err)
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.UID != job.UID {
+		if pod.DeletionTimestamp != nil {
+			metrics.IncJobRecoveryWait("old-owner-terminating")
+		} else {
+			metrics.IncJobRecoveryWait("name-conflict")
+		}
+		var ownerUID types.UID
+		if owner != nil {
+			ownerUID = owner.UID
+		}
+		klog.V(3).InfoS("Existing Pod belongs to another Job lifecycle",
+			"Pod", klog.KObj(pod), "PodOwnerUID", ownerUID, "JobUID", job.UID)
+		return nil, nil
+	}
+
+	return pod, nil
 }
 
-// resolvePodMutationError distinguishes a stale lifecycle target from a real
-// API failure. A stale target is an idempotent success: the controller's
-// intended Pod is already gone, and a same-name replacement must not be
-// modified. Errors against the same UID remain visible to the existing retry
-// path.
-func (cc *jobcontroller) resolvePodMutationError(operation string, pod *v1.Pod, mutationErr error) (bool, error) {
-	if mutationErr == nil {
-		return false, nil
+func (cc *jobcontroller) markPodOutOfSync(pod *v1.Pod) error {
+	_, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType,
+		jobhelpers.OutOfSyncJSONPatch(pod.UID), metav1.PatchOptions{})
+	if err != nil && cc.podInstanceGone(pod, err) {
+		return nil
 	}
-	if apierrors.IsNotFound(mutationErr) {
-		return true, nil
-	}
-	if pod.UID == "" {
-		// Preserve legacy behavior for tests or objects that did not originate
-		// from the API server. Real persisted Pods always carry a UID.
-		return false, mutationErr
-	}
+	return err
+}
 
+func (cc *jobcontroller) podInstanceGone(pod *v1.Pod, err error) bool {
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	if !apierrors.IsConflict(err) && !apierrors.IsInvalid(err) {
+		return false
+	}
 	current, getErr := cc.kubeClient.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
-	if apierrors.IsNotFound(getErr) {
-		return true, nil
+	if getErr == nil && current.UID != pod.UID {
+		metrics.IncStalePodOperation()
+		return true
 	}
-	if getErr != nil {
-		klog.V(3).InfoS("Failed to verify Pod lifecycle after mutation error",
-			"Operation", operation, "Pod", klog.KObj(pod), "UID", pod.UID, "Error", getErr)
-		return false, mutationErr
-	}
-	if current.UID != pod.UID {
-		metrics.IncJobControllerLifecycleMismatch(operation)
-		klog.V(3).InfoS("Treat Pod mutation as complete because the target lifecycle was replaced",
-			"Operation", operation, "Pod", klog.KObj(pod), "ExpectedUID", pod.UID, "CurrentUID", current.UID)
-		return true, nil
-	}
-
-	return false, mutationErr
+	return apierrors.IsNotFound(getErr)
 }
 
 func (cc *jobcontroller) calcPGMinResources(job *batch.Job) *v1.ResourceList {

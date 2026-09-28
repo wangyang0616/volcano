@@ -108,10 +108,14 @@ func CreateOrUpdateConfigMap(job *vcbatch.Job, kubeClients kubernetes.Interface,
 	}
 
 	// no changes
+	if !IsControlledByJob(cmOld, job) {
+		return &JobResourceConflictError{Name: cmName}
+	}
 	if reflect.DeepEqual(cmOld.Data, data) {
 		return nil
 	}
 
+	cmOld = cmOld.DeepCopy()
 	cmOld.Data = data
 	if _, err := kubeClients.CoreV1().ConfigMaps(job.Namespace).Update(context.TODO(), cmOld, metav1.UpdateOptions{}); err != nil {
 		klog.V(3).Infof("Failed to update ConfigMap for Job <%s/%s>: %v",
@@ -153,11 +157,15 @@ func CreateOrUpdateSecret(job *vcbatch.Job, kubeClients kubernetes.Interface, da
 	}
 
 	// no changes
+	if !IsControlledByJob(secretOld, job) {
+		return &JobResourceConflictError{Name: secretName}
+	}
 	SSHConfig := "config"
 	if reflect.DeepEqual(secretOld.Data[SSHConfig], data[SSHConfig]) {
 		return nil
 	}
 
+	secretOld = secretOld.DeepCopy()
 	secretOld.Data = data
 	if _, err := kubeClients.CoreV1().Secrets(job.Namespace).Update(context.TODO(), secretOld, metav1.UpdateOptions{}); err != nil {
 		klog.V(3).Infof("Failed to update Secret for Job <%s/%s>: %v",
@@ -170,22 +178,56 @@ func CreateOrUpdateSecret(job *vcbatch.Job, kubeClients kubernetes.Interface, da
 
 // DeleteConfigmap deletes the config map resource.
 func DeleteConfigmap(job *vcbatch.Job, kubeClients kubernetes.Interface, cmName string) error {
-	if err := kubeClients.CoreV1().ConfigMaps(job.Namespace).Delete(context.TODO(), cmName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		klog.Errorf("Failed to delete Configmap of Job %v/%v: %v",
-			job.Namespace, job.Name, err)
-		return err
-	}
-
-	return nil
+	return DeleteJobResource(job, kubeClients.CoreV1().ConfigMaps(job.Namespace), cmName)
 }
 
 // DeleteSecret delete secret.
 func DeleteSecret(job *vcbatch.Job, kubeClients kubernetes.Interface, secretName string) error {
-	err := kubeClients.CoreV1().Secrets(job.Namespace).Delete(context.TODO(), secretName, metav1.DeleteOptions{})
-	if err != nil && apierrors.IsNotFound(err) {
+	return DeleteJobResource(job, kubeClients.CoreV1().Secrets(job.Namespace), secretName)
+}
+
+// JobResourceConflictError denotes a name that is not available to this Job.
+// Waiting for GC or the resource's owner must not exhaust Job execution retries.
+type JobResourceConflictError struct{ Name string }
+
+func (e *JobResourceConflictError) Error() string {
+	return fmt.Sprintf("resource %q belongs to another owner; waiting for name release", e.Name)
+}
+
+func IsControlledByJob(obj metav1.Object, job *vcbatch.Job) bool {
+	owner := metav1.GetControllerOf(obj)
+	return owner != nil && owner.UID == job.UID && owner.Name == job.Name && owner.Kind == JobKind.Kind && owner.APIVersion == JobKind.GroupVersion().String()
+}
+
+type jobResourceClient[T metav1.Object] interface {
+	Get(context.Context, string, metav1.GetOptions) (T, error)
+	Delete(context.Context, string, metav1.DeleteOptions) error
+}
+
+// DeleteJobResource only deletes the observed resource of this lifecycle.
+// It is for controller-owned resources, never user-shared PVCs or ConfigMaps.
+func DeleteJobResource[T metav1.Object](job *vcbatch.Job, client jobResourceClient[T], name string) error {
+	obj, err := client.Get(context.TODO(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
 		return nil
 	}
-
+	if err != nil {
+		return err
+	}
+	if !IsControlledByJob(obj, job) {
+		return nil
+	}
+	uid := obj.GetUID()
+	err = client.Delete(context.TODO(), name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if apierrors.IsConflict(err) {
+		current, getErr := client.Get(context.TODO(), name, metav1.GetOptions{})
+		if apierrors.IsNotFound(getErr) || (getErr == nil && current.GetUID() != uid) {
+			return nil
+		}
+	}
 	return err
 }
 

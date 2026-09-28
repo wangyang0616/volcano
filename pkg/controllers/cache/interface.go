@@ -17,7 +17,10 @@ limitations under the License.
 package cache
 
 import (
+	"time"
+
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/controllers/apis"
@@ -28,6 +31,17 @@ type Cache interface {
 	Run(stopCh <-chan struct{})
 
 	Get(key string) (*apis.JobInfo, error)
+	GetForUID(key string, uid types.UID) (*apis.JobInfo, error)
+	GetLifecycle(key string) (Lifecycle, error)
+	RebuildLifecycle(namespace, name string, expectedUID types.UID, refresh []string) (Lifecycle, error)
+	ObservePod(pod *v1.Pod, deleted bool) (Observation, error)
+	AcknowledgeTerminalPod(req apis.Request)
+	RetireUID(uid types.UID)
+	IsRetired(uid types.UID) bool
+	RecoveryDelay(key string, uid types.UID) time.Duration
+	AllowIdentityCheck(key string, uid types.UID) bool
+	ResetRecovery(key string, uid types.UID)
+	RecordJobPhase(job *v1alpha1.Job, phase v1alpha1.JobPhase)
 	GetStatus(key string) (*v1alpha1.JobStatus, error)
 	Add(obj *v1alpha1.Job) error
 	Update(obj *v1alpha1.Job) error
@@ -38,6 +52,6 @@ type Cache interface {
 	DeletePod(pod *v1.Pod) error
 	HasPod(pod *v1.Pod) bool
 
-	TaskCompleted(jobKey, taskName string) bool
-	TaskFailed(jobKey, taskName string) bool
+	TaskCompleted(jobKey, taskName string, uid ...types.UID) bool
+	TaskFailed(jobKey, taskName string, uid ...types.UID) bool
 }

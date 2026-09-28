@@ -17,8 +17,37 @@ limitations under the License.
 package state
 
 import (
+	"strconv"
+
+	v1 "k8s.io/api/core/v1"
+
 	vcbatch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	"volcano.sh/volcano/pkg/controllers/apis"
+	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
 )
+
+func terminalPodsHandled(info *apis.JobInfo) bool {
+	for _, pods := range info.Pods {
+		for _, pod := range pods {
+			if pod.Status.Phase != v1.PodFailed && pod.Status.Phase != v1.PodSucceeded {
+				continue
+			}
+			// Only persisted Pods carry an observation identity. Deliberately
+			// discarded Pods cannot block the current version's completion.
+			if pod.UID == "" || pod.DeletionTimestamp != nil || jobhelpers.IsOutOfSyncPod(pod) {
+				continue
+			}
+			version, err := strconv.ParseInt(pod.Annotations[vcbatch.JobVersion], 10, 32)
+			if err == nil && int32(version) < info.Job.Status.Version {
+				continue
+			}
+			if _, handled := info.HandledTerminalPods[pod.UID]; !handled {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // TotalTasks returns number of tasks in a given volcano job.
 func TotalTasks(job *vcbatch.Job) int32 {

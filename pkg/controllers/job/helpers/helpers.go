@@ -17,7 +17,6 @@ limitations under the License.
 package helpers
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -186,33 +185,10 @@ func IsOutOfSyncPod(pod *v1.Pod) bool {
 	return exists
 }
 
-// OutOfSyncJSONPatch generates a JSON patch to mark the pod as out-of-sync.
-// When uid is set, the leading test operation makes the mutation conditional
-// on the concrete Pod lifecycle instead of only its namespace and name.
+// OutOfSyncJSONPatch generates a JSON patch to mark the pod as out-of-sync with the given reason.
 func OutOfSyncJSONPatch(uid types.UID) []byte {
-	type operation struct {
-		Op    string `json:"op"`
-		Path  string `json:"path"`
-		Value string `json:"value"`
-	}
-
-	operations := make([]operation, 0, 2)
-	if uid != "" {
-		operations = append(operations, operation{
-			Op:    "test",
-			Path:  "/metadata/uid",
-			Value: string(uid),
-		})
-	}
-	operations = append(operations, operation{
-		Op:    "add",
-		Path:  "/metadata/annotations/" + escapeJSONPointer(OutOfSyncKey),
-		Value: "true",
-	})
-
-	// operation contains only strings, so marshaling cannot fail.
-	patch, _ := json.Marshal(operations)
-	return patch
+	return []byte(fmt.Sprintf(`[{"op":"test","path":"/metadata/uid","value":%q},{"op":"add","path":"/metadata/annotations/%s","value":"true"}]`,
+		uid, escapeJSONPointer(OutOfSyncKey)))
 }
 
 // escapeJSONPointer escapes a string for use in a JSON Pointer.
