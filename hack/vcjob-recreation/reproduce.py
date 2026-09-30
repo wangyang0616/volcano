@@ -383,7 +383,26 @@ def protocol(args):
             "poll_seconds", "request_timeout", "recreate_jitter_ms", "seed")}
 
 
+
+def prepare_run(args):
+    if args.context is None:
+        try:
+            result = subprocess.run(["kubectl", "config", "current-context"], text=True,
+                                    capture_output=True, timeout=args.request_timeout)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise TestError("cannot read kubectl current context: " + str(error)) from error
+        if result.returncode:
+            raise TestError(result.stderr.strip() or "kubectl has no current context; use --context")
+        args.context = result.stdout.strip()
+    if not args.context.strip():
+        raise TestError("kubectl context must not be empty; use --context")
+    if args.output is None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        args.output = str(pathlib.Path("_artifacts/vcjob-recreation") / (stamp + "-" + uuid.uuid4().hex[:8]))
+
+
 def run(args):
+    prepare_run(args)
     output = pathlib.Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     kube = Kubectl(args.context, args.request_timeout)
@@ -396,6 +415,8 @@ def run(args):
                 "started_at": utcnow(), "namespace": experiment.namespace, "parameters": protocol(args)}
     save(output / "metadata.json", metadata)
     rng = random.Random(args.seed)
+    print("Context: %s; namespace: %s; iterations: %d; output: %s" %
+          (args.context, experiment.namespace, args.iterations, output), flush=True)
     try:
         metadata["kubernetes"] = json.loads(kube.call(["version", "-o", "json"]))
         metadata["cluster_uid"] = kube.get("namespace", "kube-system")["metadata"]["uid"]
@@ -413,7 +434,6 @@ def run(args):
         experiment.namespace_uid = namespace["metadata"]["uid"]
         metadata["namespace_uid"] = experiment.namespace_uid
         save(output / "metadata.json", metadata)
-        print("Context: %s; namespace: %s; output: %s" % (args.context, experiment.namespace, output), flush=True)
         for index in range(1, args.iterations + 1):
             started = time.monotonic()
             row = {"iteration": index, "started_at": utcnow(), "outcome": "inconclusive", "reason": "interrupted",
@@ -561,10 +581,10 @@ def cleanup(args):
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     subs = root.add_subparsers(dest="command", required=True)
-    run_parser = subs.add_parser("run", help="exercise the currently installed controller; never deploys/restarts it")
-    run_parser.add_argument("--context", required=True, help="explicit kubectl context")
-    run_parser.add_argument("--label", required=True, help="e.g. before-8708aca48 or after-290c0c98e")
-    run_parser.add_argument("--output", required=True, help="new output directory; existing directories are rejected")
+    run_parser = subs.add_parser("run", help="test the currently installed controller (default command)")
+    run_parser.add_argument("--context", help="kubectl context; defaults to current-context")
+    run_parser.add_argument("--label", default="current", help="report label, e.g. before or after; default: current")
+    run_parser.add_argument("--output", help="new output directory; default: _artifacts/vcjob-recreation/<time>-<id>")
     run_parser.add_argument("--iterations", type=int, default=100)
     run_parser.add_argument("--replicas", type=int, default=8)
     run_parser.add_argument("--image", default="busybox:1.36.1", help="must provide sh and sleep; pre-pull on all nodes")
@@ -593,9 +613,9 @@ def parser():
 
 def main():
     cli = parser()
-    args = cli.parse_args()
+    args = cli.parse_args(sys.argv[1:] or ["run"])
     if args.command == "run":
-        if not args.context.strip():
+        if args.context is not None and not args.context.strip():
             cli.error("context must not be empty")
         for key in ("iterations", "replicas", "grace_seconds", "startup_timeout", "recovery_timeout", "poll_seconds", "request_timeout"):
             if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:

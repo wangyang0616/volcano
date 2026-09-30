@@ -289,6 +289,52 @@ class ExperimentTests(unittest.TestCase):
 
 
 
+class LaunchTests(unittest.TestCase):
+    def test_no_arguments_starts_default_100_round_run(self):
+        with mock.patch.object(r.sys, "argv", ["reproduce.py"]), mock.patch.object(r, "run", return_value=0) as run, mock.patch.object(r.signal, "signal"):
+            self.assertEqual(r.main(), 0)
+        args = run.call_args.args[0]
+        self.assertEqual(args.iterations, 100)
+        self.assertEqual(args.replicas, 8)
+        self.assertEqual(args.label, "current")
+        self.assertIsNone(args.context)
+        self.assertIsNone(args.output)
+
+    def test_current_context_resolved_once_and_output_generated(self):
+        args = r.parser().parse_args(["run"])
+        with mock.patch.object(r.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="local-cluster\n", stderr="")) as command:
+            r.prepare_run(args)
+            output = args.output
+            r.prepare_run(args)
+        self.assertEqual(args.context, "local-cluster")
+        self.assertEqual(args.output, output)
+        self.assertEqual(pathlib.Path(output).parent, pathlib.Path("_artifacts/vcjob-recreation"))
+        command.assert_called_once_with(["kubectl", "config", "current-context"], text=True, capture_output=True, timeout=10)
+
+    def test_explicit_options_skip_current_context_lookup(self):
+        args = r.parser().parse_args(["run", "--context", "selected", "--label", "before", "--output", "/tmp/chosen", "--iterations", "3"])
+        with mock.patch.object(r.subprocess, "run") as command:
+            r.prepare_run(args)
+        command.assert_not_called()
+        self.assertEqual((args.context, args.label, args.output, args.iterations), ("selected", "before", "/tmp/chosen", 3))
+
+    def test_no_current_context_stops_before_cluster_access(self):
+        args = r.parser().parse_args(["run"])
+        with mock.patch.object(r.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="current-context is not set")), mock.patch.object(r, "Kubectl") as kube:
+            with self.assertRaisesRegex(r.TestError, "current-context is not set"):
+                r.run(args)
+        kube.assert_not_called()
+        self.assertIsNone(args.output)
+
+    def test_help_does_not_read_kubeconfig_or_start_tests(self):
+        with mock.patch.object(r.sys, "argv", ["reproduce.py", "--help"]), mock.patch.object(r.subprocess, "run") as command, mock.patch.object(r, "run") as run, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                r.main()
+        self.assertEqual(result.exception.code, 0)
+        command.assert_not_called()
+        run.assert_not_called()
+
+
 class ReportingTests(unittest.TestCase):
     def test_counts_use_only_live_pods_of_current_job(self):
         current = pod("a", "p1", "new")
