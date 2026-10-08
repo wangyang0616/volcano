@@ -32,7 +32,7 @@ from urllib.parse import quote
 JOB = "jobs.batch.volcano.sh"
 LABEL = "recreation-test.volcano.sh/run"
 FINALIZER = "recreation-test.volcano.sh/hold"
-PROTOCOL = 2
+PROTOCOL = 3
 
 
 class TestError(Exception):
@@ -301,11 +301,11 @@ class Experiment:
         start = time.monotonic()
         row["stage"] = stage
         try:
-            wait_for(lambda: self.recovered(name, uid, old_pod_uid), self.args.recovery_timeout,
+            wait_for(lambda: self.recovered(name, uid, old_pod_uid), min(60, self.args.recovery_timeout / 2),
                      self.args.poll_seconds, stage)
         except DeadlineExceeded:
             self.unchanged_controller()
-            # A fresh Job must still create Pods under the same queue and admission rules.
+            # Check cluster health early, then keep observing this Job through the full deadline.
             control_name = "%s-control-%04d" % (name, row.get("iteration", 0))
             row["control_name"] = control_name
             control = self.kube.create(self.job(control_name))
@@ -313,13 +313,20 @@ class Experiment:
             row["control_uid"] = control_uid
             wait_for(lambda: len(live_pods(self.pods(), control_uid)) == self.args.replicas,
                      self.args.startup_timeout, self.args.poll_seconds, "fresh control Job cannot create Pods")
+            row["control_ready_after_seconds"] = round(time.monotonic() - start, 3)
             self.unchanged_controller()
-            if self.recovered(name, uid, old_pod_uid):
-                raise TestError("recovered after observation deadline; increase recovery-timeout for both runs")
-            job = self.verify_job(name, uid)
-            row["job_status"] = job.get("status", {})
-            row["observed_replicas"] = len(live_pods(self.pods(), uid))
-            raise Reproduced(stage + ": missing replacement Pods after deadline, while fresh control Job creates Pods")
+            try:
+                wait_for(lambda: self.recovered(name, uid, old_pod_uid),
+                         max(0, start + self.args.recovery_timeout - time.monotonic()),
+                         self.args.poll_seconds, stage + " final observation")
+            except DeadlineExceeded:
+                self.unchanged_controller()
+                job = self.verify_job(name, uid)
+                row["job_status"] = job.get("status", {})
+                row["observed_replicas"] = len(live_pods(self.pods(), uid))
+                row[stage + "_seconds"] = round(time.monotonic() - start, 3)
+                raise Reproduced(stage + ": missing replacement Pods after deadline, while fresh control Job creates Pods")
+            raise TestError("recovered after the early observation window; inspect delayed recovery")
         row[stage + "_seconds"] = round(time.monotonic() - start, 3)
 
     def trial(self, index, row, prior_uid=None):
@@ -639,7 +646,8 @@ def parser():
     run_parser.add_argument("--grace-seconds", type=int, default=5)
     run_parser.add_argument("--hold-seconds", type=float, default=20)
     run_parser.add_argument("--stability-seconds", type=float, default=15)
-    run_parser.add_argument("--recovery-timeout", type=float, default=60)
+    run_parser.add_argument("--recovery-timeout", type=float, default=300,
+                            help="final observation period for missing replicas in seconds (default: 300)")
     run_parser.add_argument("--startup-timeout", type=float, default=120)
     run_parser.add_argument("--poll-seconds", type=float, default=0.5)
     run_parser.add_argument("--request-timeout", type=int, default=10)

@@ -256,9 +256,33 @@ class ExperimentTests(unittest.TestCase):
 
     def test_late_recovery_is_inconclusive(self):
         experiment, _ = self.experiment(failure="initial_recovery", late=True)
-        with self.assertRaisesRegex(r.TestError, "after observation deadline") as caught:
+        with self.assertRaisesRegex(r.TestError, "after the early observation window") as caught:
             experiment.trial(1, {"recreate_delay_seconds": 0})
         self.assertNotIsInstance(caught.exception, r.Reproduced)
+
+    def test_persistent_missing_replicas_waits_full_five_minutes(self):
+        self.args.recovery_timeout = 300
+        experiment, _ = self.experiment(failure="initial_recovery")
+        row = {"recreate_delay_seconds": 0}
+        with self.assertRaises(r.Reproduced):
+            experiment.trial(1, row)
+        self.assertGreaterEqual(row["initial_recovery_seconds"], 300)
+        self.assertLess(row["control_ready_after_seconds"], 300)
+
+    def test_recovery_after_early_warning_is_not_reproduced(self):
+        self.args.recovery_timeout = 300
+        experiment, cluster = self.experiment(failure="initial_recovery")
+        original = experiment.recovered
+        def recovered(*args):
+            if self.clock.now >= 120:
+                cluster.failure = None
+            return original(*args)
+        experiment.recovered = recovered
+        row = {"recreate_delay_seconds": 0}
+        with self.assertRaisesRegex(r.TestError, "recovered after the early observation window"):
+            experiment.trial(1, row)
+        self.assertGreaterEqual(self.clock.now, 120)
+        self.assertLess(self.clock.now, 300)
 
     def test_controller_restart_invalidates_trial(self):
         experiment, _ = self.experiment()
