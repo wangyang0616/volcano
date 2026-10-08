@@ -44,6 +44,7 @@ class FakeCluster:
         self.jobs, self.pods, self.generations = {}, {}, {}
         self.sequence = 0
         self.failure, self.control_works, self.late = failure, control_works, late
+        self.stuck_uids = set()
         self.patches = []
         self.probe_deleted = False
         self.natural = False
@@ -73,16 +74,19 @@ class FakeCluster:
         generation = self.generations.get(name, 0) + 1
         self.generations[name] = generation
         count = job["spec"]["tasks"][0]["replicas"]
-        if generation == 2 and self.failure == "initial_recovery":
+        if generation % 2 == 0 and self.failure == "initial_recovery" and "-control-" not in name:
             count = 0
-        if name.endswith("-control") and not self.control_works:
+        if self.failure == "drained_race" and generation > 1 and "-control-" not in name and not self.pods:
+            count = 0
+            self.stuck_uids.add(job["metadata"]["uid"])
+        if "-control-" in name and not self.control_works:
             count = 0
         self.fill(job, count)
         if self.natural and generation == 2:
             self.natural_gc_remaining = 1
-        if name.endswith("-control") and self.late:
+        if "-control-" in name and self.late:
             self.failure = None
-            target = self.jobs[name[:-8]]
+            target = self.jobs[name.split("-control-")[0]]
             self.fill(target, target["spec"]["tasks"][0]["replicas"])
         return copy.deepcopy(job)
 
@@ -102,7 +106,8 @@ class FakeCluster:
                 self.natural_gc_remaining -= 1
             # Once the held old Pod is released, a working controller fills names.
             for key, job in self.jobs.items():
-                if not key.endswith("-control") and self.failure != "initial_recovery" and not (self.failure == "post_cleanup_recovery" and self.probe_deleted):
+                if ("-control-" not in key and job["metadata"]["uid"] not in self.stuck_uids
+                        and self.failure != "initial_recovery" and not (self.failure == "post_cleanup_recovery" and self.probe_deleted)):
                     self.fill(job, job["spec"]["tasks"][0]["replicas"])
             return {"items": copy.deepcopy(list(self.pods.values()))}
         if resource == "pod":
@@ -184,6 +189,39 @@ class ExperimentTests(unittest.TestCase):
         experiment.cleanup_trial(row["job_name"])
         self.assertFalse(cluster.pods)
         self.assertFalse(cluster.jobs)
+
+    def test_reuses_job_name_and_successor_across_both_windows(self):
+        experiment, cluster = self.experiment()
+        first = {"recreate_delay_seconds": 0}
+        first_uid = experiment.trial(1, first)
+        second = {"recreate_delay_seconds": 0}
+        second_uid = experiment.trial(2, second, first_uid)
+        self.assertEqual(first["job_name"], second["job_name"])
+        self.assertEqual((first["window"], second["window"]), ("overlap", "drained"))
+        self.assertEqual(second["old_uid"], first["new_uid"])
+        self.assertEqual(second["old_uid"], first_uid)
+        self.assertNotEqual(second_uid, first_uid)
+        self.assertFalse(second["overlap_confirmed"])
+        self.assertLessEqual(second["old_pods_gone_at"], r.utcnow())
+        self.assertEqual(len(cluster.patches), 2)
+        experiment.cleanup_trial(second["job_name"])
+        self.assertFalse(cluster.jobs)
+        self.assertFalse(cluster.pods)
+
+    def test_drained_window_can_detect_failure_missed_by_overlap(self):
+        experiment, cluster = self.experiment(failure="drained_race")
+        first = {"recreate_delay_seconds": 0}
+        first_uid = experiment.trial(1, first)
+        self.assertEqual(first["window"], "overlap")
+        second = {"recreate_delay_seconds": 0, "iteration": 2}
+        with self.assertRaisesRegex(r.Reproduced, "initial_recovery"):
+            experiment.trial(2, second, first_uid)
+        self.assertEqual(second["window"], "drained")
+        self.assertEqual(second["old_uid"], first_uid)
+        self.assertEqual(second["observed_replicas"], 0)
+        experiment.cleanup_trial(second["job_name"], second["control_name"])
+        self.assertFalse(cluster.jobs)
+        self.assertFalse(cluster.pods)
 
     def test_natural_mode_confirms_overlap_without_finalizer(self):
         experiment, cluster = self.experiment()
@@ -267,6 +305,11 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(summary["reproduced"], expected_count)
                 self.assertEqual(summary["inconclusive"], 0)
                 self.assertEqual(len((pathlib.Path(self.args.output) / "results.jsonl").read_text().splitlines()), 100)
+                rows = [json.loads(line) for line in (pathlib.Path(self.args.output) / "results.jsonl").read_text().splitlines()]
+                self.assertEqual([rows[0]["window"], rows[1]["window"]], ["overlap", "drained"])
+                self.assertGreaterEqual(rows[1]["recreate_delay_seconds"], self.args.drained_settle_seconds)
+                if failure is None:
+                    self.assertEqual(rows[1]["old_uid"], rows[0]["new_uid"])
                 self.assertIsNone(cluster.namespace)
                 self.assertFalse(cluster.pods)
 
@@ -274,7 +317,7 @@ class ExperimentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cluster = FakeCluster()
             self.args.output = str(pathlib.Path(directory) / "interrupted")
-            def interrupt(experiment, index, row):
+            def interrupt(experiment, index, row, prior_uid):
                 job = cluster.create(experiment.job("interrupted"))
                 p = r.live_pods(experiment.pods(), job["metadata"]["uid"])[0]
                 experiment.set_hold(p, True)
@@ -354,6 +397,15 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(result["not_attempted"], 15)
         self.assertEqual(result["observed_reproduction_rate"], 0.125)
 
+    def test_window_counts_report_reproduction_separately(self):
+        rows = [{"window": "overlap", "outcome": "passed"},
+                {"window": "drained", "outcome": "reproduced"},
+                {"window": "drained", "outcome": "inconclusive"}]
+        result = r.summarize(rows, 4)
+        self.assertEqual(result["by_window"]["overlap"]["observed_reproduction_rate"], 0)
+        self.assertEqual(result["by_window"]["drained"]["observed_reproduction_rate"], 1)
+        self.assertEqual(result["by_window"]["drained"]["inconclusive"], 1)
+
     def test_zero_failures_bound_and_empty_sample(self):
         result = r.summarize([{"outcome": "passed"}] * 100, 100)
         self.assertAlmostEqual(result["zero_failure_upper_95"], 0.0295130496)
@@ -363,7 +415,7 @@ class ReportingTests(unittest.TestCase):
         for label, failures in (("before", before_failures), ("after", after_failures)):
             folder = root / label
             folder.mkdir()
-            r.save(folder / "metadata.json", {"protocol_version": 1, "script_sha256": "fixture", "finished_at": "offline", "label": label, "parameters": {"iterations": 100},
+            r.save(folder / "metadata.json", {"protocol_version": r.PROTOCOL, "script_sha256": "fixture", "finished_at": "offline", "label": label, "parameters": {"iterations": 100},
                 "controller": {"replicas": 1, "containers": [{"image": label, "args": []}],
                                "pods": [{"containers": [{"imageID": label}]}]}})
             summary = r.summarize([{"outcome": "passed"}] * (100 - failures) + [{"outcome": "reproduced"}] * failures, 100)

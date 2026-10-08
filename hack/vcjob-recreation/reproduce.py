@@ -32,7 +32,7 @@ from urllib.parse import quote
 JOB = "jobs.batch.volcano.sh"
 LABEL = "recreation-test.volcano.sh/run"
 FINALIZER = "recreation-test.volcano.sh/hold"
-PROTOCOL = 1
+PROTOCOL = 2
 
 
 class TestError(Exception):
@@ -72,6 +72,10 @@ def running(pods, replicas):
     return len(pods) == replicas and all(p.get("status", {}).get("phase") == "Running" for p in pods)
 
 
+def window_for(index):
+    return "overlap" if index % 2 else "drained"
+
+
 def summarize(rows, requested):
     counts = {status: sum(row["outcome"] == status for row in rows)
               for status in ("passed", "reproduced", "inconclusive")}
@@ -88,6 +92,16 @@ def summarize(rows, requested):
                       wilson_95_interval=[max(0, center - width), min(1, center + width)])
         if not counts["reproduced"]:
             result["zero_failure_upper_95"] = 1 - math.pow(0.05, 1 / valid)
+    result["by_window"] = {}
+    for window in ("overlap", "drained"):
+        group = [row for row in rows if row.get("window") == window]
+        passed = sum(row["outcome"] == "passed" for row in group)
+        reproduced = sum(row["outcome"] == "reproduced" for row in group)
+        result["by_window"][window] = {
+            "attempted": len(group), "passed": passed, "reproduced": reproduced,
+            "inconclusive": len(group) - passed - reproduced,
+            "observed_reproduction_rate": reproduced / (passed + reproduced) if passed + reproduced else None,
+        }
     return result
 
 
@@ -292,7 +306,9 @@ class Experiment:
         except DeadlineExceeded:
             self.unchanged_controller()
             # A fresh Job must still create Pods under the same queue and admission rules.
-            control = self.kube.create(self.job(name + "-control"))
+            control_name = "%s-control-%04d" % (name, row.get("iteration", 0))
+            row["control_name"] = control_name
+            control = self.kube.create(self.job(control_name))
             control_uid = control["metadata"]["uid"]
             row["control_uid"] = control_uid
             wait_for(lambda: len(live_pods(self.pods(), control_uid)) == self.args.replicas,
@@ -306,12 +322,13 @@ class Experiment:
             raise Reproduced(stage + ": missing replacement Pods after deadline, while fresh control Job creates Pods")
         row[stage + "_seconds"] = round(time.monotonic() - start, 3)
 
-    def trial(self, index, row):
+    def trial(self, index, row, prior_uid=None):
         a = self.args
-        name = "recreate-%04d" % index
-        row.update(job_name=name, namespace=self.namespace, stage="setup")
+        name = "recreate"
+        window = window_for(index)
+        row.update(job_name=name, namespace=self.namespace, window=window, stage="setup")
         self.unchanged_controller()
-        old = self.kube.create(self.job(name))
+        old = self.verify_job(name, prior_uid) if prior_uid else self.kube.create(self.job(name))
         old_uid = old["metadata"]["uid"]
         row["old_uid"] = old_uid
         wait_for(lambda: running(live_pods(self.pods(), old_uid), a.replicas), a.startup_timeout, a.poll_seconds, "old Pods Running")
@@ -319,33 +336,44 @@ class Experiment:
         row["old_pods"] = [{"name": p["metadata"]["name"], "uid": p["metadata"]["uid"]} for p in old_pods]
         row["workload_image_ids"] = sorted({c.get("imageID", "") for p in old_pods for c in p.get("status", {}).get("containerStatuses", [])})
         victim = sorted(old_pods, key=lambda p: p["metadata"]["name"])[0]
-        if a.mode == "finalizer":
+        if window == "overlap" and a.mode == "finalizer":
             self.set_hold(victim, True)
-        row["stage"] = "overlap"
+        row["stage"] = window
         self.kube.delete(JOB, name, self.namespace, uid=old_uid)
+        deleted_at = time.monotonic()
         wait_for(lambda: self.kube.get(JOB, name, self.namespace) is None, a.startup_timeout, a.poll_seconds, "old Job deleted")
-        wait_for(lambda: any(owner_uid(p) == old_uid and p["metadata"].get("deletionTimestamp") for p in self.pods()),
-                 a.startup_timeout, a.poll_seconds, "old Pods Terminating")
+        if window == "overlap":
+            wait_for(lambda: any(owner_uid(p) == old_uid and p["metadata"].get("deletionTimestamp") for p in self.pods()),
+                     a.startup_timeout, a.poll_seconds, "old Pods Terminating")
+        else:
+            wait_for(lambda: not any(owner_uid(p) == old_uid for p in self.pods()),
+                     a.startup_timeout, a.poll_seconds, "all old Pods actually deleted")
+            row["old_pods_gone_at"] = utcnow()
+            old_pods_gone = time.monotonic()
         delay = row["recreate_delay_seconds"]
         time.sleep(delay)
-        if not any(owner_uid(p) == old_uid for p in self.pods()):
+        if window == "overlap" and not any(owner_uid(p) == old_uid for p in self.pods()):
             raise TestError("no old Pods remain: required overlap was not exercised")
         new = self.kube.create(self.job(name))
+        row["delete_to_create_seconds"] = round(time.monotonic() - deleted_at, 3)
+        if window == "drained":
+            row["old_pods_gone_to_create_seconds"] = round(time.monotonic() - old_pods_gone, 3)
         uid = new["metadata"]["uid"]
         row["new_uid"] = uid
         if uid == old_uid:
             raise TestError("recreated Job has the same UID")
-        if not any(owner_uid(p) == old_uid for p in self.pods()):
+        if window == "overlap" and not any(owner_uid(p) == old_uid for p in self.pods()):
             raise TestError("old Pods disappeared before overlap could be confirmed")
-        row["overlap_confirmed"] = True
-        if a.mode == "finalizer":
+        row["overlap_confirmed"] = window == "overlap"
+        if window == "overlap" and a.mode == "finalizer":
             time.sleep(a.hold_seconds)
             held = self.kube.get("pod", victim["metadata"]["name"], self.namespace)
             if not held or held["metadata"]["uid"] != victim["metadata"]["uid"] or FINALIZER not in held["metadata"].get("finalizers", []):
                 raise TestError("held Pod changed before release")
             self.release_all()
-        wait_for(lambda: not any(owner_uid(p) == old_uid for p in self.pods()), a.startup_timeout, a.poll_seconds, "all old Pods actually deleted")
-        row["old_pods_gone_at"] = utcnow()
+        if window == "overlap":
+            wait_for(lambda: not any(owner_uid(p) == old_uid for p in self.pods()), a.startup_timeout, a.poll_seconds, "all old Pods actually deleted")
+            row["old_pods_gone_at"] = utcnow()
         self.await_recovery(name, uid, row, "initial_recovery")
         deadline = time.monotonic() + a.stability_seconds
         while time.monotonic() < deadline:
@@ -357,12 +385,17 @@ class Experiment:
         row["probe_pod_uid"] = victim["metadata"]["uid"]
         self.kube.delete("pod", victim["metadata"]["name"], self.namespace, uid=row["probe_pod_uid"])
         self.await_recovery(name, uid, row, "post_cleanup_recovery", row["probe_pod_uid"])
+        wait_for(lambda: running(live_pods(self.pods(), uid), a.replicas),
+                 a.startup_timeout, a.poll_seconds, "new Pods Running before next lifecycle")
         self.unchanged_controller()
         row["observed_replicas"] = len(live_pods(self.pods(), uid))
+        return uid
 
-    def cleanup_trial(self, name):
+    def cleanup_trial(self, name, control_name=None):
         self.release_all()
-        for job_name in (name, name + "-control"):
+        for job_name in (name, control_name):
+            if not job_name:
+                continue
             self.kube.delete(JOB, job_name, self.namespace)
         wait_for(lambda: not self.pods(), self.args.startup_timeout, self.args.poll_seconds, "trial Pods cleaned up")
         wait_for(lambda: not self.kube.get(JOB, namespace=self.namespace)["items"], self.args.startup_timeout, self.args.poll_seconds, "trial Jobs cleaned up")
@@ -380,7 +413,7 @@ class Experiment:
 def protocol(args):
     return {key: getattr(args, key) for key in ("iterations", "replicas", "image", "scheduler", "queue", "mode",
             "grace_seconds", "hold_seconds", "stability_seconds", "recovery_timeout", "startup_timeout",
-            "poll_seconds", "request_timeout", "recreate_jitter_ms", "seed")}
+            "poll_seconds", "request_timeout", "recreate_jitter_ms", "drained_settle_seconds", "seed")}
 
 
 
@@ -434,16 +467,20 @@ def run(args):
         experiment.namespace_uid = namespace["metadata"]["uid"]
         metadata["namespace_uid"] = experiment.namespace_uid
         save(output / "metadata.json", metadata)
+        prior_uid = None
         for index in range(1, args.iterations + 1):
             started = time.monotonic()
             row = {"iteration": index, "started_at": utcnow(), "outcome": "inconclusive", "reason": "interrupted",
-                   "recreate_delay_seconds": round(rng.uniform(0, args.recreate_jitter_ms) / 1000, 6)}
+                   "recreate_delay_seconds": round(rng.uniform(0, args.recreate_jitter_ms) / 1000
+                                                   + (args.drained_settle_seconds if window_for(index) == "drained" else 0), 6)}
             try:
-                experiment.trial(index, row)
+                prior_uid = experiment.trial(index, row, prior_uid)
                 row.update(outcome="passed", reason="both replica recovery checks passed")
             except Reproduced as error:
+                prior_uid = None
                 row.update(outcome="reproduced", reason=str(error))
             except TestError as error:
+                prior_uid = None
                 row.update(outcome="inconclusive", reason=str(error))
             finally:
                 row["duration_seconds"] = round(time.monotonic() - started, 3)
@@ -457,7 +494,8 @@ def run(args):
                     journal.write(json.dumps(row, ensure_ascii=False) + "\n")
                 print("[%d/%d] %s: %s" % (index, args.iterations, row["outcome"], row["reason"]), flush=True)
                 save(output / "summary.json", summarize(rows, args.iterations))
-            experiment.cleanup_trial(row["job_name"])
+            if prior_uid is None or index == args.iterations:
+                experiment.cleanup_trial(row["job_name"], row.get("control_name"))
             # Never continue into a new controller revision/restart and mix samples.
             experiment.unchanged_controller()
     except (TestError, KeyboardInterrupt) as error:
@@ -483,7 +521,7 @@ def run(args):
         summary = summarize(rows, args.iterations)
         summary["errors"] = errors
         save(output / "summary.json", summary)
-        fields = ["iteration", "outcome", "stage", "reason", "old_uid", "new_uid", "observed_replicas", "duration_seconds"]
+        fields = ["iteration", "window", "outcome", "stage", "reason", "old_uid", "new_uid", "observed_replicas", "delete_to_create_seconds", "old_pods_gone_to_create_seconds", "duration_seconds"]
         with (output / "results.csv").open("w", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fields, extrasaction="ignore")
             writer.writeheader()
@@ -519,6 +557,11 @@ def compare(args):
         rate_text = "N/A" if rate is None else "%.2f%% (%d/%d)" % (100 * rate, summary["reproduced"], summary["valid"])
         print("| %s | %d/%d | %d | %d | %d | %s |" % (meta["label"], summary["attempted"], summary["requested"],
               summary["passed"], summary["reproduced"], summary["inconclusive"], rate_text))
+        for window in ("overlap", "drained"):
+            group = summary.get("by_window", {}).get(window, {})
+            if group.get("attempted"):
+                print("  %s %s: %d reproduced / %d valid" %
+                      (meta["label"], window, group["reproduced"], group["passed"] + group["reproduced"]))
     comparable = True
     if before[0].get("controller_target") != after[0].get("controller_target"):
         print("INCOMPARABLE: experiments targeted different controller Deployments.")
@@ -601,6 +644,8 @@ def parser():
     run_parser.add_argument("--poll-seconds", type=float, default=0.5)
     run_parser.add_argument("--request-timeout", type=int, default=10)
     run_parser.add_argument("--recreate-jitter-ms", type=float, default=200)
+    run_parser.add_argument("--drained-settle-seconds", type=float, default=0.5,
+                            help="wait after old Pods disappear in drained rounds (default: 0.5)")
     run_parser.add_argument("--seed", type=int, default=20260930)
     comparison = subs.add_parser("compare", help="compare two saved runs without accessing Kubernetes")
     comparison.add_argument("--before", required=True)
@@ -620,7 +665,7 @@ def main():
         for key in ("iterations", "replicas", "grace_seconds", "startup_timeout", "recovery_timeout", "poll_seconds", "request_timeout"):
             if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
                 cli.error(key.replace("_", "-") + " must be positive")
-        for key in ("hold_seconds", "stability_seconds", "recreate_jitter_ms"):
+        for key in ("hold_seconds", "stability_seconds", "recreate_jitter_ms", "drained_settle_seconds"):
             if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
                 cli.error(key.replace("_", "-") + " must be nonnegative")
         def stop(_signum, _frame):
