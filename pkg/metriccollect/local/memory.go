@@ -30,6 +30,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/agent/utils/cgroup"
+	"volcano.sh/volcano/pkg/agent/utils/file"
 )
 
 var memoryStatMetrics = map[string]bool{
@@ -56,22 +57,19 @@ func NewMemoryResourceCollector(cgroupManager cgroup.CgroupManager) (SubCollecto
 func (c *MemoryResourceCollector) Run() {}
 
 func (c *MemoryResourceCollector) CollectLocalMetrics(metricInfo *LocalMetricInfo, start time.Time, window metav1.Duration) ([]*prompb.TimeSeries, error) {
-	var (
-		count int64
-		err   error
-	)
-	cgroupPath, err := c.cgroupManager.GetRootCgroupPath(cgroup.CgroupMemorySubsystem)
-	if err != nil {
-		return nil, err
-	}
-
-	count, err = getMemoryUsage(cgroupPath, c.cgroupManager.GetCgroupVersion())
-	if err != nil {
-		return nil, err
-	}
-
+	var count int64
+	var err error
 	if metricInfo.IncludeSystemUsed {
 		count, err = nodeMemoryUsage()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cgroupPath, pathErr := c.cgroupManager.GetRootCgroupPath(cgroup.CgroupMemorySubsystem)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		count, err = getMemoryUsage(cgroupPath, c.cgroupManager.GetCgroupVersion())
 		if err != nil {
 			return nil, err
 		}
@@ -88,44 +86,48 @@ func (c *MemoryResourceCollector) CollectLocalMetrics(metricInfo *LocalMetricInf
 }
 
 func getMemoryUsage(cgroupRoot string, cgroupVersion string) (int64, error) {
-	usage := int64(0)
-
-	var memoryUsageFile string
-	if cgroupVersion == cgroup.CgroupV2 {
-		memoryUsageFile = cgroup.MemoryUsageFileV2
-	} else {
-		memoryUsageFile = cgroup.MemoryUsageFile
+	switch cgroupVersion {
+	case cgroup.CgroupV2:
+		// memory.stat contains overlapping totals and breakdowns (e.g.
+		// file includes shmem, kernel includes slab and pagetables).
+		// memory.current accounts for the cgroup and its descendants once.
+		filePath := filepath.Join(cgroupRoot, cgroup.MemoryUsageFileV2)
+		value, err := file.ReadIntFromFile(filePath)
+		if err != nil {
+			return 0, fmt.Errorf("read %s: %w", filePath, err)
+		}
+		return value, nil
+	case cgroup.CgroupV1:
+		// Preserve the v1 RSS + cache + swap accounting.
+	default:
+		return 0, fmt.Errorf("unsupported cgroup version %q for memory usage at %s", cgroupVersion, cgroupRoot)
 	}
-	cgroupMemory := filepath.Join(cgroupRoot, memoryUsageFile)
-	date, err := os.ReadFile(cgroupMemory)
+	cgroupMemory := filepath.Join(cgroupRoot, cgroup.MemoryUsageFile)
+	data, err := os.ReadFile(cgroupMemory)
 	if err != nil {
 		return 0, err
 	}
-	lines := strings.Split(string(date), "\n")
+	usage := int64(0)
+	var hasRSS, hasCache bool
+	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
-		slices := strings.Split(line, " ")
-		if len(slices) != 2 {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !memoryStatMetrics[fields[0]] {
 			continue
 		}
-
-		if cgroupVersion == cgroup.CgroupV2 {
-			if isMemoryStatMetricV2(slices[0]) {
-				value, err := strconv.Atoi(slices[1])
-				if err != nil {
-					continue
-				}
-				usage += int64(value)
-			}
-		} else {
-			if memoryStatMetrics[slices[0]] {
-				value, err := strconv.Atoi(slices[1])
-				if err != nil {
-					continue
-				}
-
-				usage = usage + int64(value)
-			}
+		if len(fields) != 2 {
+			return 0, fmt.Errorf("invalid memory stat %q in %s", line, cgroupMemory)
 		}
+		value, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse %s in %s: %w", fields[0], cgroupMemory, err)
+		}
+		usage += value
+		hasRSS = hasRSS || fields[0] == "total_rss"
+		hasCache = hasCache || fields[0] == "total_cache"
+	}
+	if !hasRSS || !hasCache {
+		return 0, fmt.Errorf("total_rss or total_cache missing from %s", cgroupMemory)
 	}
 	return usage, nil
 }
@@ -141,64 +143,41 @@ func nodeMemoryUsage() (int64, error) {
 	}
 
 	total, available := int64(0), int64(0)
+	var foundTotal, foundAvailable bool
 	for _, line := range strings.Split(string(content), "\n") {
 		fields := strings.SplitN(line, ":", 2)
 		if len(fields) < 2 {
 			continue
 		}
 		if fields[0] == "MemTotal" {
-			total, err = strconv.ParseInt(strings.Fields(fields[1])[0], 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("failed to get mem total, err: %v", err)
+			values := strings.Fields(fields[1])
+			if len(values) == 0 {
+				return 0, fmt.Errorf("MemTotal is empty in %s", memInfoFile)
 			}
+			total, err = strconv.ParseInt(values[0], 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("failed to parse MemTotal in %s: %w", memInfoFile, err)
+			}
+			foundTotal = true
 		}
 		if fields[0] == "MemAvailable" {
-			available, err = strconv.ParseInt(strings.Fields(fields[1])[0], 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("failed to get mem available, err: %v", err)
+			values := strings.Fields(fields[1])
+			if len(values) == 0 {
+				return 0, fmt.Errorf("MemAvailable is empty in %s", memInfoFile)
 			}
-			break
+			available, err = strconv.ParseInt(values[0], 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("failed to parse MemAvailable in %s: %w", memInfoFile, err)
+			}
+			foundAvailable = true
 		}
+	}
+	if !foundTotal || !foundAvailable || total <= 0 || available < 0 || available > total {
+		return 0, fmt.Errorf("invalid MemTotal or MemAvailable in %s", memInfoFile)
 	}
 
 	// mem info unit KB.
 	systemUsed := (total - available) * 1024
 	klog.V(4).InfoS("System used memory", "value", systemUsed)
 	return systemUsed, nil
-}
-
-// isMemoryStatMetricV2 checks if the metric is a valid memory stat metric for cgroup v2
-func isMemoryStatMetricV2(metric string) bool {
-	// In cgroup v2, memory.stat contains different field names
-	// Based on actual cgroup v2 memory.stat file content:
-	// For memory usage calculation, we focus on the main memory consumption metrics:
-	// - anon: anonymous memory (similar to total_rss in v1)
-	// - file: file-backed memory (similar to total_cache in v1)
-	// - kernel: kernel memory usage
-	// - shmem: shared memory
-	// - slab: slab memory usage
-	// - pagetables: page table memory
-	// - kernel_stack: kernel stack memory
-	// - percpu: per-CPU memory
-	// - sock: socket memory
-	// - vmalloc: vmalloc memory
-	v2MemoryStatMetrics := map[string]bool{
-		"anon":         true, // Anonymous memory (RSS equivalent)
-		"file":         true, // File-backed memory (cache equivalent)
-		"kernel":       true, // Kernel memory
-		"shmem":        true, // Shared memory
-		"slab":         true, // Slab memory
-		"pagetables":   true, // Page tables
-		"kernel_stack": true, // Kernel stack
-		"percpu":       true, // Per-CPU memory
-		"sock":         true, // Socket memory
-		"vmalloc":      true, // Vmalloc memory
-		// Note: We exclude some metrics that are subsets or derivatives:
-		// - slab_reclaimable, slab_unreclaimable (covered by slab)
-		// - active_anon, inactive_anon (covered by anon)
-		// - active_file, inactive_file (covered by file)
-		// - file_mapped, file_dirty, file_writeback (covered by file)
-		// - anon_thp, file_thp, shmem_thp (covered by anon, file, shmem)
-	}
-	return v2MemoryStatMetrics[metric]
 }

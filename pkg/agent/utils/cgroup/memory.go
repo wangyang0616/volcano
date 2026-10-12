@@ -40,7 +40,7 @@ const (
 	MemoryQoSLevelFile string = "memory.qos_level"
 	MemoryLimitFile    string = "memory.limit_in_bytes"
 
-	MemoryUsageFileV2 string = "memory.stat"
+	MemoryUsageFileV2 string = "memory.current"
 	MemoryMaxFileV2   string = "memory.max"
 	MemoryHighFileV2  string = "memory.high"
 	MemoryLowFileV2   string = "memory.low"

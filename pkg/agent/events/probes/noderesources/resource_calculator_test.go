@@ -236,6 +236,17 @@ func Test_historicalUsageCalculator_preProcess(t *testing.T) {
 	}
 }
 
+func TestHistoricalUsageCalculatorWithdrawsLatestZero(t *testing.T) {
+	q := queue.NewSqQueue()
+	q.Enqueue(apis.Resource{v1.ResourceCPU: 1000, v1.ResourceMemory: 2000})
+	q.Enqueue(apis.Resource{v1.ResourceCPU: 0, v1.ResourceMemory: 1000})
+	r := &historicalUsageCalculator{queue: q}
+	got := r.computeOverSubRes()
+	if got[v1.ResourceCPU] != 0 || got[v1.ResourceMemory] != 1333 {
+		t.Fatalf("weighted resources = %v; want CPU=0, memory=1333", got)
+	}
+}
+
 func Test_historicalUsageCalculator_RefreshCfg(t *testing.T) {
 	tests := []struct {
 		name                 string

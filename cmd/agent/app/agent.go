@@ -66,13 +66,29 @@ func Run(ctx context.Context, opts *options.VolcanoAgentOptions) error {
 		return fmt.Errorf("failed to create volcano-agent configuration: %v", err)
 	}
 
-	// TODO: get cgroup driver dynamically
 	sfsFsPath := strings.TrimSpace(os.Getenv(utils.SysFsPathEnv))
 	if sfsFsPath == "" {
 		sfsFsPath = utils.DefaultSysFsPath
 	}
-	cgroupDriver := cgroup.GetCgroupDriver()
-	cgroupManager := cgroup.NewCgroupManager(cgroupDriver, path.Join(sfsFsPath, "cgroup"), conf.GenericConfiguration.KubeCgroupRoot)
+	cgroupRoot := path.Join(sfsFsPath, "cgroup")
+	if err := cgroup.ValidateCgroupRoot(cgroupRoot); err != nil {
+		return fmt.Errorf("invalid host cgroup mount: %w", err)
+	}
+	cgroupManager := cgroup.NewCgroupManager("", cgroupRoot, conf.GenericConfiguration.KubeCgroupRoot)
+	cpuMetricRoot, err := cgroupManager.GetRootCgroupPath(cgroup.CgroupCpuAcctSubsystem)
+	if err != nil {
+		return fmt.Errorf("resolve CPU cgroup metric path: %w", err)
+	}
+	memoryMetricRoot, err := cgroupManager.GetRootCgroupPath(cgroup.CgroupMemorySubsystem)
+	if err != nil {
+		return fmt.Errorf("resolve memory cgroup metric path: %w", err)
+	}
+	cpuMetricFile, memoryMetricFile := cgroup.CPUUsageFile, cgroup.MemoryUsageFile
+	if cgroupManager.GetCgroupVersion() == cgroup.CgroupV2 {
+		cpuMetricFile, memoryMetricFile = cgroup.CPUUsageFileV2, cgroup.MemoryUsageFileV2
+	}
+	klog.InfoS("Configured cgroup metric sources", "cpuCgroupFile", path.Join(cpuMetricRoot, cpuMetricFile),
+		"memoryCgroupFile", path.Join(memoryMetricRoot, memoryMetricFile), "includeSystemUsage", conf.GenericConfiguration.IncludeSystemUsage)
 	metricCollectorManager, err := metriccollect.NewMetricCollectorManager(conf, cgroupManager)
 	if err != nil {
 		return fmt.Errorf("failed to create metric collector manager: %v", err)

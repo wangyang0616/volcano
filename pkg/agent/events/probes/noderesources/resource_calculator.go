@@ -99,7 +99,7 @@ func (r *historicalUsageCalculator) RefreshCfg(cfg *api.ColocationConfig) error 
 func (r *historicalUsageCalculator) preProcess() {
 	node, err := r.getNodeFunc()
 	if err != nil {
-		klog.ErrorS(nil, "OverSubscription: failed to get node")
+		klog.ErrorS(err, "OverSubscription: failed to get node")
 		return
 	}
 	nodeCopy := node.DeepCopy()
@@ -139,7 +139,12 @@ func (r *historicalUsageCalculator) computeOverSubRes() apis.Resource {
 		initWeight = initWeight * 2
 	}
 	for _, res := range apis.OverSubscriptionResourceTypes {
-		overSubRes[res] = overSubRes[res] / totalWeight
+		// Do not average a withdrawn resource with stale positive samples.
+		if historicalUsages[len(historicalUsages)-1][res] == 0 {
+			overSubRes[res] = 0
+		} else {
+			overSubRes[res] = overSubRes[res] / totalWeight
+		}
 	}
 	return overSubRes
 }

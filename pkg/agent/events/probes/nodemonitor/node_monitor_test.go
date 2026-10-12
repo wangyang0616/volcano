@@ -53,6 +53,14 @@ func makeNode() (*v1.Node, error) {
 	}, nil
 }
 
+type partialUsageGetter struct {
+	value      resourceusage.Resource
+	percentage resourceusage.Resource
+}
+
+func (g partialUsageGetter) UsagesByValue(bool, bool) resourceusage.Resource    { return g.value }
+func (g partialUsageGetter) UsagesByPercentage(*v1.Node) resourceusage.Resource { return g.percentage }
+
 func Test_monitor_detect(t *testing.T) {
 	tests := []struct {
 		name                    string
@@ -102,6 +110,30 @@ func Test_monitor_detect(t *testing.T) {
 				return node
 			},
 			expectedLen: 0,
+		},
+		{
+			name:                    "keep taint when memory usage is unavailable",
+			highUsageCountByResName: map[v1.ResourceName]int{},
+			getNodeFunc:             makeNode,
+			getPodsFunc:             func() ([]*v1.Pod, error) { return nil, nil },
+			policy: func(cfg *config.Configuration, pods utilpod.ActivePods, evictor eviction.Eviction) policy.Interface {
+				return extend.NewExtendResource(cfg, nil, evictor, nil, "")
+			},
+			usageGetter:  partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceCPU: 20}},
+			expectedNode: func() *v1.Node { node, _ := makeNode(); return node },
+			expectedLen:  0,
+		},
+		{
+			name:                    "do not evict based on stale CPU pressure when usage is unavailable",
+			highUsageCountByResName: map[v1.ResourceName]int{v1.ResourceCPU: 6},
+			getNodeFunc:             makeNode,
+			getPodsFunc:             func() ([]*v1.Pod, error) { return nil, nil },
+			policy: func(cfg *config.Configuration, pods utilpod.ActivePods, evictor eviction.Eviction) policy.Interface {
+				return extend.NewExtendResource(cfg, nil, evictor, nil, "")
+			},
+			usageGetter:  partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceMemory: 20}},
+			expectedNode: func() *v1.Node { node, _ := makeNode(); return node },
+			expectedLen:  0,
 		},
 	}
 	for _, tt := range tests {
@@ -250,6 +282,22 @@ func Test_monitor_detectCPUQuota(t *testing.T) {
 				assert.True(t, time.Since(event.TimeStamp) < time.Second, "event timestamp should be recent")
 			}
 		})
+	}
+}
+
+func TestMonitorSkipsQuotaWhenCPUUsageUnavailable(t *testing.T) {
+	node, _ := makeNodeWithAllocatable("1000m")
+	factory := &framework.EventQueueFactory{Queues: map[string]*framework.EventQueue{}}
+	m := &monitor{
+		eventQueueFactory:      factory,
+		getNodeFunc:            func() (*v1.Node, error) { return node, nil },
+		usageGetter:            partialUsageGetter{value: resourceusage.Resource{v1.ResourceMemory: 100}},
+		cpuThrottlingThreshold: 80,
+		lastCPUQuotaMilli:      -1,
+	}
+	m.detectCPUQuota()
+	if got := factory.EventQueue(string(framework.NodeCPUThrottleEventName)).GetQueue().Len(); got != 0 {
+		t.Fatalf("CPU quota events = %d; want 0", got)
 	}
 }
 

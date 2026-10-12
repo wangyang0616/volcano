@@ -110,7 +110,8 @@ func (e *extendResource) RecoverSchedule() error {
 func (e *extendResource) CalOverSubscriptionResources() {
 	node, err := e.getNodeFunc()
 	if err != nil {
-		klog.ErrorS(nil, "overSubscription: failed to get node")
+		klog.ErrorS(err, "Failed to get node; withdrawing oversubscribed resources")
+		e.withdrawResources()
 		return
 	}
 	nodeCopy := node.DeepCopy()
@@ -121,7 +122,8 @@ func (e *extendResource) CalOverSubscriptionResources() {
 
 	pods, err := e.getPodsFunc()
 	if err != nil {
-		klog.ErrorS(err, "Failed to get pods")
+		klog.ErrorS(err, "Failed to get pods; withdrawing oversubscribed resources")
+		e.withdrawResources()
 		return
 	}
 
@@ -130,6 +132,14 @@ func (e *extendResource) CalOverSubscriptionResources() {
 	overSubscriptionRes := make(apis.Resource)
 
 	for _, resType := range apis.OverSubscriptionResourceTypes {
+		usage, ok := currentUsage[resType]
+		if !ok {
+			// A missing sample must never turn into zero usage and advertise
+			// spare capacity. Withdraw this resource until collection recovers.
+			overSubscriptionRes[resType] = 0
+			klog.InfoS("Withdrawing oversubscribed resource because usage is unavailable", "resource", resType)
+			continue
+		}
 		total := int64(0)
 		switch resType {
 		case corev1.ResourceCPU:
@@ -140,13 +150,17 @@ func (e *extendResource) CalOverSubscriptionResources() {
 			klog.InfoS("overSubscription: reporter does not support resource", "resourceType", resType)
 		}
 
-		if total >= currentUsage[resType] {
-			overSubscriptionRes[resType] = (total - currentUsage[resType]) * int64(e.ratio) / 100
+		if total >= usage {
+			overSubscriptionRes[resType] = (total - usage) * int64(e.ratio) / 100
 		} else {
 			overSubscriptionRes[resType] = 0
 		}
 
-		klog.V(4).InfoS("overSubscription:", "resourceType", resType, "total", total, "usage", currentUsage[resType], "delta", overSubscriptionRes[resType])
+		klog.V(4).InfoS("Calculated oversubscribed resource", "resource", resType, "total", total, "usage", usage, "available", overSubscriptionRes[resType])
 	}
 	e.queue.Enqueue(overSubscriptionRes)
+}
+
+func (e *extendResource) withdrawResources() {
+	e.queue.Enqueue(apis.Resource{corev1.ResourceCPU: 0, corev1.ResourceMemory: 0})
 }
