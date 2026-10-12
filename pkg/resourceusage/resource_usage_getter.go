@@ -17,6 +17,7 @@ limitations under the License.
 package resourceusage
 
 import (
+	"math"
 	"time"
 
 	"github.com/prometheus/prometheus/prompb"
@@ -69,52 +70,76 @@ func (g *getter) UsagesByPercentage(node *v1.Node) Resource {
 	cpuTotal := cpuAllocatable.MilliValue()
 	memoryTotal := memoryAllocatable.Value()
 
-	if cpuTotal == 0 || memoryTotal == 0 {
-		klog.ErrorS(nil, "Failed to get total resource of cpu or memory")
-		return res
+	if cpuUsed, ok := usage[v1.ResourceCPU]; ok {
+		if cpuTotal > 0 {
+			res[v1.ResourceCPU] = cpuUsed * 100 / cpuTotal
+		} else {
+			klog.ErrorS(nil, "Cannot calculate CPU usage percentage without allocatable CPU", "node", klog.KObj(node))
+		}
 	}
-
-	res[v1.ResourceCPU] = usage[v1.ResourceCPU] * 100 / cpuTotal
-	res[v1.ResourceMemory] = usage[v1.ResourceMemory] * 100 / memoryTotal
+	if memoryUsed, ok := usage[v1.ResourceMemory]; ok {
+		if memoryTotal > 0 {
+			res[v1.ResourceMemory] = memoryUsed * 100 / memoryTotal
+		} else {
+			klog.ErrorS(nil, "Cannot calculate memory usage percentage without allocatable memory", "node", klog.KObj(node))
+		}
+	}
 
 	return res
 }
 
-func (g *getter) convertMetric(metric []*prompb.TimeSeries) int64 {
+func (g *getter) convertMetric(metric []*prompb.TimeSeries) (int64, bool) {
 	ret := int64(0)
-	if len(metric) == 0 {
-		return ret
-	}
+	hasSample := false
+	const maxInt64 = int64(^uint64(0) >> 1)
 	for _, ts := range metric {
+		if ts == nil {
+			continue
+		}
 		for _, value := range ts.Samples {
-			ret += int64(value.Value)
+			if math.IsNaN(value.Value) || math.IsInf(value.Value, 0) || value.Value < 0 || value.Value >= float64(maxInt64) {
+				return 0, false
+			}
+			converted := int64(value.Value)
+			if ret > maxInt64-converted {
+				return 0, false
+			}
+			hasSample = true
+			ret += converted
 		}
 	}
-	return ret
+	return ret, hasSample
 }
 
 func (g *getter) commonUsage(includeGuaranteedPods, includeBestEffortPods bool) Resource {
 	res := make(Resource)
 	c, err := g.collector.GetPluginByName(g.collectorName)
 	if err != nil {
-		klog.ErrorS(err, "Failed to collector plugin", "name", local.CollectorName)
+		klog.ErrorS(err, "Failed to get resource collector", "name", g.collectorName)
 		return res
 	}
 
 	includeSystemUsed := g.collector.Config.GenericConfiguration.IncludeSystemUsage
-	metricInfos := map[v1.ResourceName]*local.LocalMetricInfo{
-		v1.ResourceCPU:    {ResourceType: "cpu", IncludeGuaranteedPods: includeGuaranteedPods, IncludeBestEffortPods: includeBestEffortPods, IncludeSystemUsed: includeSystemUsed},
-		v1.ResourceMemory: {ResourceType: "memory", IncludeSystemUsed: includeSystemUsed},
+	metricInfos := []struct {
+		resource v1.ResourceName
+		info     *local.LocalMetricInfo
+	}{
+		{v1.ResourceCPU, &local.LocalMetricInfo{ResourceType: "cpu", IncludeGuaranteedPods: includeGuaranteedPods, IncludeBestEffortPods: includeBestEffortPods, IncludeSystemUsed: includeSystemUsed}},
+		{v1.ResourceMemory, &local.LocalMetricInfo{ResourceType: "memory", IncludeSystemUsed: includeSystemUsed}},
 	}
 
-	for resType, metricInfo := range metricInfos {
-		metric, err := c.CollectMetrics(metricInfo, time.Time{}, metav1.Duration{})
+	for _, entry := range metricInfos {
+		metric, err := c.CollectMetrics(entry.info, time.Time{}, metav1.Duration{})
 		if err != nil {
-			klog.ErrorS(err, "Failed to collector cpu metric", "resType", resType)
+			klog.ErrorS(err, "Failed to collect resource usage", "resource", entry.resource, "collector", g.collectorName)
 			continue
 		}
-		sumUsage := g.convertMetric(metric)
-		res[resType] = sumUsage
+		sumUsage, hasSample := g.convertMetric(metric)
+		if !hasSample {
+			klog.ErrorS(nil, "Resource collector returned missing or invalid samples", "resource", entry.resource, "collector", g.collectorName)
+			continue
+		}
+		res[entry.resource] = sumUsage
 	}
 
 	return res

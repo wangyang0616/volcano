@@ -18,6 +18,7 @@ package nodemonitor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -52,6 +53,14 @@ func makeNode() (*v1.Node, error) {
 		}}},
 	}, nil
 }
+
+type partialUsageGetter struct {
+	value      resourceusage.Resource
+	percentage resourceusage.Resource
+}
+
+func (g partialUsageGetter) UsagesByValue(bool, bool) resourceusage.Resource    { return g.value }
+func (g partialUsageGetter) UsagesByPercentage(*v1.Node) resourceusage.Resource { return g.percentage }
 
 func Test_monitor_detect(t *testing.T) {
 	tests := []struct {
@@ -103,6 +112,41 @@ func Test_monitor_detect(t *testing.T) {
 			},
 			expectedLen: 0,
 		},
+		{
+			name:                    "do not evict after CPU usage recovers below high watermark",
+			highUsageCountByResName: map[v1.ResourceName]int{v1.ResourceCPU: 6},
+			getNodeFunc:             makeNode,
+			getPodsFunc:             func() ([]*v1.Pod, error) { return nil, nil },
+			policy: func(cfg *config.Configuration, pods utilpod.ActivePods, evictor eviction.Eviction) policy.Interface {
+				return extend.NewExtendResource(cfg, nil, evictor, nil, "")
+			},
+			usageGetter: resourceusage.NewFakeResourceGetter(0, 0, 20, 20),
+			expectedLen: 0,
+		},
+		{
+			name:                    "keep taint when memory usage is unavailable",
+			highUsageCountByResName: map[v1.ResourceName]int{},
+			getNodeFunc:             makeNode,
+			getPodsFunc:             func() ([]*v1.Pod, error) { return nil, nil },
+			policy: func(cfg *config.Configuration, pods utilpod.ActivePods, evictor eviction.Eviction) policy.Interface {
+				return extend.NewExtendResource(cfg, nil, evictor, nil, "")
+			},
+			usageGetter:  partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceCPU: 20}},
+			expectedNode: func() *v1.Node { node, _ := makeNode(); return node },
+			expectedLen:  0,
+		},
+		{
+			name:                    "do not evict based on stale CPU pressure when usage is unavailable",
+			highUsageCountByResName: map[v1.ResourceName]int{v1.ResourceCPU: 6},
+			getNodeFunc:             makeNode,
+			getPodsFunc:             func() ([]*v1.Pod, error) { return nil, nil },
+			policy: func(cfg *config.Configuration, pods utilpod.ActivePods, evictor eviction.Eviction) policy.Interface {
+				return extend.NewExtendResource(cfg, nil, evictor, nil, "")
+			},
+			usageGetter:  partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceMemory: 20}},
+			expectedNode: func() *v1.Node { node, _ := makeNode(); return node },
+			expectedLen:  0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,6 +168,7 @@ func Test_monitor_detect(t *testing.T) {
 				Interface:               tt.policy(cfg, nil, nil),
 				highUsageCountByResName: tt.highUsageCountByResName,
 				lowWatermark:            map[v1.ResourceName]int{v1.ResourceCPU: 30, v1.ResourceMemory: 30},
+				highWatermark:           map[v1.ResourceName]int{v1.ResourceCPU: 50, v1.ResourceMemory: 50},
 				getNodeFunc:             tt.getNodeFunc,
 				getPodsFunc:             tt.getPodsFunc,
 				usageGetter:             tt.usageGetter,
@@ -250,6 +295,65 @@ func Test_monitor_detectCPUQuota(t *testing.T) {
 				assert.True(t, time.Since(event.TimeStamp) < time.Second, "event timestamp should be recent")
 			}
 		})
+	}
+}
+
+func TestMonitorWithdrawsQuotaWhenCPUUsageUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		previousQuota int64
+		wantEvents    int
+	}{
+		{"first sample missing", -1, 1},
+		{"positive quota becomes unsafe", 500, 1},
+		{"already at minimum", 0, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			node, _ := makeNodeWithAllocatable("1000m")
+			factory := &framework.EventQueueFactory{Queues: map[string]*framework.EventQueue{}}
+			m := &monitor{
+				eventQueueFactory:      factory,
+				getNodeFunc:            func() (*v1.Node, error) { return node, nil },
+				usageGetter:            partialUsageGetter{value: resourceusage.Resource{v1.ResourceMemory: 100}},
+				cpuThrottlingThreshold: 80,
+				lastCPUQuotaMilli:      tt.previousQuota,
+			}
+			m.detectCPUQuota()
+			q := factory.EventQueue(string(framework.NodeCPUThrottleEventName)).GetQueue()
+			if got := q.Len(); got != tt.wantEvents {
+				t.Fatalf("CPU quota events = %d; want %d", got, tt.wantEvents)
+			}
+			if tt.wantEvents != 0 {
+				item, _ := q.Get()
+				if got := item.(framework.NodeCPUThrottleEvent).CPUQuotaMilli; got != 0 {
+					t.Fatalf("CPU quota = %d; want 0", got)
+				}
+			}
+		})
+	}
+}
+
+func TestMonitorPreservesPressureOnMissingSample(t *testing.T) {
+	node, _ := makeNode()
+	m := &monitor{
+		getNodeFunc:             func() (*v1.Node, error) { return node, nil },
+		usageGetter:             partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceMemory: 20}},
+		highUsageCountByResName: map[v1.ResourceName]int{v1.ResourceCPU: highUsageCountLimit - 1},
+		highWatermark:           map[v1.ResourceName]int{v1.ResourceCPU: 80, v1.ResourceMemory: 80},
+	}
+	m.utilizationMonitoring()
+	if got := m.highUsageCountByResName[v1.ResourceCPU]; got != highUsageCountLimit-1 {
+		t.Fatalf("CPU pressure count after missing sample = %d", got)
+	}
+	m.usageGetter = partialUsageGetter{percentage: resourceusage.Resource{v1.ResourceCPU: 90, v1.ResourceMemory: 20}}
+	m.utilizationMonitoring()
+	if got := m.highUsageCountByResName[v1.ResourceCPU]; got != highUsageCountLimit {
+		t.Fatalf("CPU pressure count after recovery = %d", got)
+	}
+	m.getNodeFunc = func() (*v1.Node, error) { return nil, errors.New("node temporarily unavailable") }
+	m.utilizationMonitoring()
+	if got := m.highUsageCountByResName[v1.ResourceCPU]; got != highUsageCountLimit {
+		t.Fatalf("CPU pressure count after node lookup failure = %d", got)
 	}
 }
 

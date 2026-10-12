@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/moby/sys/userns"
 	cgroupsystemd "github.com/opencontainers/cgroups/systemd"
@@ -33,19 +32,15 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// Global variables for cgroup v2 detection
-var (
-	isUnified     bool
-	isUnifiedOnce sync.Once
-	CgroupVersion string
-)
+var CgroupVersion string
 
 type CgroupSubsystem string
 
 const (
-	CgroupMemorySubsystem CgroupSubsystem = "memory"
-	CgroupCpuSubsystem    CgroupSubsystem = "cpu"
-	CgroupNetCLSSubsystem CgroupSubsystem = "net_cls"
+	CgroupMemorySubsystem  CgroupSubsystem = "memory"
+	CgroupCpuSubsystem     CgroupSubsystem = "cpu"
+	CgroupCpuAcctSubsystem CgroupSubsystem = "cpuacct"
+	CgroupNetCLSSubsystem  CgroupSubsystem = "net_cls"
 	// CgroupUnifiedSubsystem is used when addressing the unified cgroup v2 hierarchy.
 	CgroupUnifiedSubsystem CgroupSubsystem = ""
 
@@ -116,24 +111,33 @@ type CgroupManagerImpl struct {
 
 // GetCgroupDriver gets the cgroup driver from multiple sources in order of priority
 func GetCgroupDriver() string {
+	return getCgroupDriver(DefaultCgroupV1MountPoint)
+}
+
+func getCgroupDriver(cgroupRoot string) string {
 	// 1. Try to get from environment variable
 	if driver := os.Getenv("CGROUP_DRIVER"); driver != "" {
 		if driver == CgroupDriverSystemd || driver == CgroupDriverCgroupfs {
+			klog.InfoS("Selected cgroup driver", "driver", driver, "source", "CGROUP_DRIVER")
 			return driver
 		}
+		klog.Warningf("Ignoring invalid CGROUP_DRIVER value %q", driver)
 	}
 
 	// 2. Try to read from kubelet config file
 	if driver := readKubeletCgroupDriver(); driver != "" {
+		klog.InfoS("Selected cgroup driver", "driver", driver, "source", "kubelet")
 		return driver
 	}
 
 	// 3. Try to detect from system
-	if driver, err := DetectCgroupDriver(); err == nil {
+	if driver, err := detectCgroupDriver(cgroupRoot); err == nil {
+		klog.InfoS("Selected cgroup driver", "driver", driver, "source", "cgroup hierarchy", "root", cgroupRoot)
 		return driver
 	}
 
 	// 4. Default fallback
+	klog.Warningf("Could not detect cgroup driver at %s; using cgroupfs", cgroupRoot)
 	return CgroupDriverCgroupfs
 }
 
@@ -340,35 +344,50 @@ func parseCgroupDriverFromCmdline(args []string) string {
 
 // DetectCgroupDriver detects the cgroup driver (cgroupfs or systemd) on the system
 func DetectCgroupDriver() (string, error) {
+	return detectCgroupDriver(DefaultCgroupV1MountPoint)
+}
+
+func detectCgroupDriver(cgroupRoot string) (string, error) {
+	// The kubelet's hierarchy is more specific than the host's init system.
+	for _, controller := range []string{"", "cpu", "cpuacct", "cpu,cpuacct", "cpuacct,cpu", "memory"} {
+		root := filepath.Join(cgroupRoot, controller)
+		if info, err := os.Stat(filepath.Join(root, CgroupKubeRoot+SystemdSuffix)); err == nil && info.IsDir() {
+			return CgroupDriverSystemd, nil
+		}
+		if info, err := os.Stat(filepath.Join(root, CgroupKubeRoot)); err == nil && info.IsDir() {
+			return CgroupDriverCgroupfs, nil
+		}
+	}
+
 	// Check if systemd is managing cgroups by looking for systemd cgroup hierarchy
 	// In systemd-managed systems, there's typically a systemd slice at the root
-	if _, err := os.Stat("/sys/fs/cgroup/system.slice"); err == nil {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "system.slice")); err == nil {
 		return CgroupDriverSystemd, nil
 	}
 
 	// Check if we can find systemd cgroup paths
-	if _, err := os.Stat("/sys/fs/cgroup/systemd"); err == nil {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "systemd")); err == nil {
 		return CgroupDriverSystemd, nil
 	}
 
 	// Check for cgroupfs by looking for traditional cgroup hierarchy
 	// In cgroupfs systems, we typically see individual controller directories
-	if _, err := os.Stat("/sys/fs/cgroup/cpu"); err == nil {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "cpu")); err == nil {
 		return CgroupDriverCgroupfs, nil
 	}
 
 	// Additional check for cgroup v2 with cgroupfs driver
-	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err == nil {
 		// Check if systemd is not managing this hierarchy
-		if _, err := os.Stat("/sys/fs/cgroup/system.slice"); err != nil {
+		if _, err := os.Stat(filepath.Join(cgroupRoot, "system.slice")); err != nil {
 			return CgroupDriverCgroupfs, nil
 		}
 	}
 
 	// Check for hybrid mode where systemd might be managing some controllers
-	if _, err := os.Stat("/sys/fs/cgroup/unified"); err == nil {
+	if _, err := os.Stat(filepath.Join(cgroupRoot, "unified")); err == nil {
 		// In hybrid mode, check if systemd is managing the unified hierarchy
-		if _, err := os.Stat("/sys/fs/cgroup/unified/system.slice"); err == nil {
+		if _, err := os.Stat(filepath.Join(cgroupRoot, "unified", "system.slice")); err == nil {
 			return CgroupDriverSystemd, nil
 		}
 		return CgroupDriverCgroupfs, nil
@@ -377,26 +396,56 @@ func DetectCgroupDriver() (string, error) {
 	return "", fmt.Errorf("unable to detect cgroup driver")
 }
 
-// IsCgroupsV2 checks once if the CGroup V2 is in use.
-// This is a more robust implementation based on mature projects like runc.
+// IsCgroupsV2 checks the supplied mount point. Do not cache this globally:
+// managers can refer to different mounts, and failed probes must be retryable.
 func IsCgroupsV2(unifiedMountpoint string) bool {
-	isUnifiedOnce.Do(func() {
-		var st unix.Statfs_t
-		err := unix.Statfs(unifiedMountpoint, &st)
-		if err != nil {
-			if os.IsNotExist(err) && userns.RunningInUserNS() {
-				// ignore the "not found" error if running in userns
-				klog.ErrorS(err, "cgroup mount missing, assuming cgroup v1", "path", unifiedMountpoint)
-				isUnified = false
-				return
-			}
-			klog.ErrorS(err, "Failed to statfs cgroup root, assuming cgroup v1", "mountpoint", unifiedMountpoint)
-			isUnified = false
-			return
+	var st unix.Statfs_t
+	if err := unix.Statfs(unifiedMountpoint, &st); err != nil {
+		if os.IsNotExist(err) && userns.RunningInUserNS() {
+			klog.ErrorS(err, "cgroup mount missing, assuming cgroup v1", "path", unifiedMountpoint)
+			return false
 		}
-		isUnified = st.Type == unix.CGROUP2_SUPER_MAGIC
-	})
-	return isUnified
+		klog.ErrorS(err, "Failed to statfs cgroup root, assuming cgroup v1", "mountpoint", unifiedMountpoint)
+		return false
+	}
+	return st.Type == unix.CGROUP2_SUPER_MAGIC
+}
+
+// ValidateCgroupRoot rejects a missing or unrelated host mount before the Agent
+// starts collecting metrics. A v1 root may be tmpfs with controller mounts below it.
+func ValidateCgroupRoot(root string) error {
+	var st unix.Statfs_t
+	if err := unix.Statfs(root, &st); err != nil {
+		return fmt.Errorf("inspect cgroup root %s: %w", root, err)
+	}
+	if st.Type == unix.CGROUP2_SUPER_MAGIC {
+		for _, fileName := range []string{CPUUsageFileV2, MemoryUsageFileV2} {
+			filePath := filepath.Join(root, fileName)
+			info, err := os.Stat(filePath)
+			if err != nil {
+				return fmt.Errorf("cgroup v2 metric file %s is unavailable: %w", filePath, err)
+			}
+			if info.IsDir() {
+				return fmt.Errorf("cgroup v2 metric file %s is a directory", filePath)
+			}
+		}
+		return nil
+	}
+	controllerMounted := func(fileName string, names ...string) bool {
+		for _, name := range names {
+			controllerRoot := filepath.Join(root, name)
+			if err := unix.Statfs(controllerRoot, &st); err == nil && st.Type == unix.CGROUP_SUPER_MAGIC {
+				if info, err := os.Stat(filepath.Join(controllerRoot, fileName)); err == nil && !info.IsDir() {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if controllerMounted(CPUUsageFile, "cpuacct", "cpu,cpuacct", "cpuacct,cpu", "cpu") && controllerMounted(MemoryUsageFile, "memory") {
+		return nil
+	}
+	return fmt.Errorf("%s is neither a cgroup v2 mount nor a cgroup v1 root with CPU accounting and memory controller files", root)
 }
 
 // DetectCgroupVersion detects the cgroup version on the system
@@ -431,8 +480,10 @@ func NewCgroupManager(cgroupDriver, cgroupRoot, kubeCgroupRoot string) CgroupMan
 
 	// Auto-detect cgroupDriver if not provided
 	if cgroupDriver == "" {
-		cgroupDriver = GetCgroupDriver()
+		cgroupDriver = getCgroupDriver(cgroupRoot)
 	}
+	klog.InfoS("Initialized cgroup manager", "version", cgroupVersion, "driver", cgroupDriver,
+		"root", cgroupRoot, "kubeCgroupRoot", kubeCgroupRoot)
 
 	return &CgroupManagerImpl{
 		cgroupDriver:   cgroupDriver,
@@ -545,6 +596,32 @@ func (c *CgroupManagerImpl) buildCgroupPath(cgroupSubsystem CgroupSubsystem, cgr
 	switch c.cgroupVersion {
 	case CgroupV1:
 		// v1: each controller has its own hierarchy
+		if cgroupSubsystem == CgroupCpuAcctSubsystem || cgroupSubsystem == CgroupCpuSubsystem {
+			// The cpu and cpuacct controllers may share one mount. Check for
+			// the controller's file: a directory alone can be a stale alias.
+			controllers := []string{"cpu", "cpu,cpuacct", "cpuacct,cpu", "cpuacct"}
+			files := []string{CPUQuotaTotalFile, CPUShareFileName}
+			if cgroupSubsystem == CgroupCpuAcctSubsystem {
+				controllers = []string{"cpuacct", "cpu,cpuacct", "cpuacct,cpu", "cpu"}
+				files = []string{CPUUsageFile}
+			}
+			for _, controller := range controllers {
+				root := filepath.Join(c.cgroupRoot, controller)
+				for _, fileName := range files {
+					if info, err := os.Stat(filepath.Join(root, fileName)); err == nil && !info.IsDir() {
+						return filepath.Join(root, cgroupPath)
+					}
+				}
+			}
+			// Preserve path construction for callers before controller files
+			// become visible (and for synthetic cgroup trees in tests).
+			for _, controller := range controllers {
+				root := filepath.Join(c.cgroupRoot, controller)
+				if info, err := os.Stat(root); err == nil && info.IsDir() {
+					return filepath.Join(root, cgroupPath)
+				}
+			}
+		}
 		return filepath.Join(c.cgroupRoot, string(cgroupSubsystem), cgroupPath)
 	case CgroupV2:
 		// v2: unified hierarchy, no subsystem in path

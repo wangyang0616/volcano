@@ -129,7 +129,6 @@ func (m *monitor) utilizationMonitoring() {
 	node, err := m.getNodeFunc()
 	if err != nil {
 		klog.ErrorS(err, "Eviction: failed to get node")
-		m.highUsageCountByResName = map[v1.ResourceName]int{}
 		return
 	}
 	nodeCopy := node.DeepCopy()
@@ -137,6 +136,12 @@ func (m *monitor) utilizationMonitoring() {
 	// check if resource usage is high
 	usage := m.usageGetter.UsagesByPercentage(nodeCopy)
 	for _, res := range apis.OverSubscriptionResourceTypes {
+		if _, ok := usage[res]; !ok {
+			// A transient collection failure provides no evidence that pressure
+			// subsided. detectEviction skips unavailable resources separately.
+			klog.V(2).InfoS("Preserving pressure history because usage is unavailable", "resource", res)
+			continue
+		}
 		if m.isHighResourceUsageOnce(nodeCopy, apis.Resource(usage), res) {
 			m.highUsageCountByResName[res]++
 		} else {
@@ -154,7 +159,13 @@ func (m *monitor) detectEviction() {
 	nodeCopy := node.DeepCopy()
 
 	allResourcesAreLowUsage := true
+	usage := m.usageGetter.UsagesByPercentage(nodeCopy)
 	for _, res := range apis.OverSubscriptionResourceTypes {
+		if _, ok := usage[res]; !ok {
+			allResourcesAreLowUsage = false
+			klog.V(2).InfoS("Skipping pressure and recovery checks because usage is unavailable", "resource", res)
+			continue
+		}
 		// Getting pod to be evicted should be executed in every resource for loop,
 		// it's important because for every resource we should get the latest pods state.
 		_, resList, err := utilnode.GetLatestPodsAndResList(nodeCopy, m.getPodsFunc, res)
@@ -162,7 +173,10 @@ func (m *monitor) detectEviction() {
 			klog.ErrorS(err, "Failed to get pods and resource list")
 			return
 		}
-		if m.ShouldEvict(nodeCopy, res, resList, m.nodeHasPressure(res)) {
+		// The pressure count may be from before a transient missing sample.
+		// Require the current sample to remain high before evicting.
+		currentHigh := m.isHighResourceUsageOnce(nodeCopy, apis.Resource(usage), res)
+		if m.ShouldEvict(nodeCopy, res, resList, m.nodeHasPressure(res) && currentHigh) {
 			event := framework.NodeMonitorEvent{
 				TimeStamp: time.Now(),
 				Resource:  res,
@@ -172,7 +186,6 @@ func (m *monitor) detectEviction() {
 			eventQueue.Add(event)
 		}
 
-		usage := m.usageGetter.UsagesByPercentage(nodeCopy)
 		if !m.isLowResourceUsageOnce(nodeCopy, apis.Resource(usage), res) {
 			allResourcesAreLowUsage = false
 		}
@@ -244,7 +257,16 @@ func (m *monitor) detectCPUQuota() {
 	totalMilli := totalCPU.MilliValue()
 
 	usage := m.usageGetter.UsagesByValue(true, false)
-	usedMilli := usage[v1.ResourceCPU]
+	usedMilli, ok := usage[v1.ResourceCPU]
+	if !ok {
+		// An old positive quota can become unsafe while usage is unknown.
+		// Zero is translated to the kernel's minimum quota by the handler.
+		if m.lastCPUQuotaMilli != 0 {
+			klog.InfoS("CPU usage unavailable; setting BestEffort CPU quota to minimum", "previousQuotaMilli", m.lastCPUQuotaMilli)
+			m.sendNodeCPUThrottleEvent(0)
+		}
+		return
+	}
 
 	// availableBEMilli represents the CPU quota available to the Best Effort pod defined by Volcano.
 	// The calculation is the allocatable Quota of current node minus the real-time CPU usage.

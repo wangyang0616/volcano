@@ -17,9 +17,11 @@ limitations under the License.
 package resourceusage
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -127,5 +129,24 @@ func makeNode() *v1.Node {
 			v1.ResourceCPU:    *resource.NewMilliQuantity(5000, resource.DecimalSI),
 			v1.ResourceMemory: *resource.NewQuantity(5000, resource.DecimalSI),
 		}},
+	}
+}
+
+func TestConvertMetricDistinguishesMissingFromZero(t *testing.T) {
+	g := &getter{}
+	if value, ok := g.convertMetric(nil); ok || value != 0 {
+		t.Fatalf("missing samples = %d, %v; want 0, false", value, ok)
+	}
+	if value, ok := g.convertMetric([]*prompb.TimeSeries{{Samples: []prompb.Sample{{Value: 0}}}}); !ok || value != 0 {
+		t.Fatalf("zero-valued sample = %d, %v; want 0, true", value, ok)
+	}
+}
+
+func TestConvertMetricRejectsInvalidUsage(t *testing.T) {
+	g := &getter{}
+	for _, value := range []float64{-1, math.NaN(), math.Inf(1), math.Exp2(63)} {
+		if got, ok := g.convertMetric([]*prompb.TimeSeries{{Samples: []prompb.Sample{{Value: value}}}}); ok || got != 0 {
+			t.Fatalf("invalid sample %v = %d, %v; want 0, false", value, got, ok)
+		}
 	}
 }

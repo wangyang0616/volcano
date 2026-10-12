@@ -24,7 +24,7 @@
 
 ## Summary
 
-This document describes the design and implementation of cgroup v2 adaptation for the Volcano Agent. The work enables Volcano Agent to seamlessly work with both cgroup v1 and v2 systems while maintaining backward compatibility. The adaptation includes automatic version detection, unified management interfaces, and event handler updates to support cgroup v2-specific file formats and hierarchies.
+This document describes cgroup v2 adaptation for the Volcano Agent. Core CPU and memory metric collection and the handlers listed below use version-aware paths and file formats. Some optional QoS handlers still require vendor-specific cgroup files. Network QoS uses `net_cls` on v1 and a cgroup BPF program on v2; see Network QoS Adaptation for its platform requirements.
 
 ## Motivation
 
@@ -42,7 +42,7 @@ Container runtime environments are evolving towards cgroup v2, which provides a 
 - **Automatic Detection**: Seamlessly detect cgroup version and driver configuration
 - **Unified Interface**: Provide a consistent API for both cgroup v1 and v2
 - **Backward Compatibility**: Maintain full compatibility with existing cgroup v1 deployments
-- **Event Handler Support**: Update all relevant event handlers for cgroup v2 file formats
+- **Event Handler Support**: Use cgroup v2 file formats where standard kernel interfaces are available
 - **Robust Testing**: Comprehensive unit test coverage for both versions
 
 ## Non-Goals
@@ -118,6 +118,7 @@ func IsCgroupsV2(unifiedMountpoint string) bool {
 - Uses `statfs` system call to check filesystem type
 - `CGROUP2_SUPER_MAGIC` (0x63677270) identifies cgroup v2 filesystems
 - Based on proven methods from container runtime projects like runc
+- Probes the supplied mount point for each manager instead of caching one result for all paths. Each manager retains its detected version for its lifetime.
 
 #### 2. Test Environment Override
 
@@ -138,6 +139,8 @@ func DetectCgroupVersion(cgroupRoot string) (string, error) {
 ### Cgroup Driver Detection
 
 The system detects the cgroup driver (systemd vs cgroupfs) through multiple methods with fallback priority:
+
+When creating the Agent's manager, filesystem detection uses the same host mount as version detection (`SYS_FS_PATH/cgroup`). It checks the kubelet's `kubepods.slice` or `kubepods` hierarchy before falling back to host init-system hints. Explicit driver settings and kubelet configuration take precedence.
 
 #### Priority Order:
 1. **Environment Variable**: `CGROUP_DRIVER`
@@ -211,6 +214,7 @@ func (c *CgroupManagerImpl) buildCgroupPath(cgroupSubsystem CgroupSubsystem, cgr
 
 **Cgroup v1 Example**: Separate subsystem paths
 - CPU: `/sys/fs/cgroup/cpu/kubepods/burstable/pod<uid>`
+- CPU accounting: `/sys/fs/cgroup/cpuacct/kubepods/burstable/pod<uid>`. Metric collection also resolves combined `cpu,cpuacct` / `cpuacct,cpu` mounts and the existing `cpu` layout.
 - Memory: `/sys/fs/cgroup/memory/kubepods/burstable/pod<uid>`
 
 **Cgroup v2 Example**: Unified hierarchy
@@ -225,14 +229,24 @@ The system maps between v1 and v2 control files:
 | CPU Shares/Weight | `cpu.shares` | `cpu.weight` | shares(1024) → weight(100) |
 | CPU Quota | `cpu.cfs_quota_us` | `cpu.max` | "200000" → "200000 100000" |
 | CPU Burst | `cpu.cfs_burst_us` | `cpu.max.burst` | Same format |
+| CPU Usage | `cpuacct.usage` | `cpu.stat: usage_usec` | nanoseconds → microseconds; normalized to nanoseconds before calculating millicores |
+| Memory Usage | `memory.stat: total_rss + total_cache + total_swap` | `memory.current` | bytes; v2 reports resident usage including kernel memory, with swap accounted separately by the kernel |
 | Memory Limit | `memory.limit_in_bytes` | `memory.max` | bytes → "max" for unlimited |
 | Memory High | N/A | `memory.high` | New in v2 |
 | Memory Low | N/A | `memory.low` | New in v2 |
 | Memory Min | N/A | `memory.min` | New in v2 |
 
+Local memory collection uses `memory.current` on v2 because `memory.stat` contains overlapping totals and breakdowns: `file` includes `shmem`, and `kernel` includes `slab`, `pagetables`, and other components. Adding these fields together overcounts memory. The v1 calculation retains its existing RSS, cache, and swap semantics.
+
+CPU QoS filtering accounts for the hierarchy in both versions: the `kubepods` counter includes all pods, including Burstable and BestEffort. To include Guaranteed and Burstable while excluding BestEffort, subtract BestEffort from the root counter. Do not add the Burstable counter to the root counter.
+
+The Agent validates the host cgroup mount before starting collection and fails startup if the mount is missing, if a v2 hierarchy lacks `cpu.stat` or `memory.current`, or if a v1 hierarchy lacks CPU accounting and memory controllers. It logs the selected version, driver, host mount, and kubelet cgroup root when initializing its manager, plus the source used to select the driver. `VOLCANO_TEST_CGROUP_VERSION` is a test override, not a production configuration mechanism.
+
+CPU metrics read `cpuacct.usage` on v1 and `cpu.stat`'s `usage_usec` on v2. Both cumulative counters are read as unsigned values. The root, QoS, and optional `/proc/stat` counters are sampled over one interval before QoS and system usage are combined; the v2 counter is converted only after taking the delta to avoid overflow. Memory metrics read v1 hierarchical `memory.stat` values or v2 `memory.current`; when system usage is enabled, `/proc/meminfo` provides node memory usage. A failed or empty sample remains unavailable rather than becoming zero. The Agent logs the resource and underlying file error, withdraws the affected oversubscribed resource before publishing the next capacity event, and avoids using missing values to recover scheduling or evict on stale pressure. A missing CPU sample applies the minimum BestEffort CPU quota until collection recovers. Failed node or Pod-list retrieval also withdraws both oversubscribed resources.
+
 ### Event Handler Adaptation
 
-Each event handler is updated to support cgroup v2:
+Handler support depends on both the cgroup version and the available kernel interfaces:
 
 #### Resources Handler
 - **Purpose**: Manages CPU and memory resource limits for containers
@@ -249,6 +263,11 @@ Each event handler is updated to support cgroup v2:
 #### Memory QoS Handler
 - **Purpose**: Sets memory quality-of-service levels  
 - **V2 Changes**: Currently uses legacy `memory.qos_level` file (vendor-specific)
+- The separate `MemoryQoSV2` handler uses standard v2 `memory.high`, `memory.low`, and `memory.min` interfaces.
+
+#### Network QoS Handler
+- On v1, the handler writes `net_cls.classid` for each managed Pod.
+- On v2, it attaches the cgroup BPF priority program to each managed Pod; see Network QoS Adaptation below.
 
 #### CPU Burst Handler
 - **Purpose**: Manages CPU burst capabilities

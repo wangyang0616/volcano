@@ -182,12 +182,12 @@ func GetCPUManagerPolicy() string {
 
 	b, err := os.ReadFile(path.Join(kubeletDir, cpuManagerState))
 	if err != nil {
-		klog.ErrorS(err, "Failed to read cpu manager state file")
+		klog.ErrorS(err, "Failed to read CPU manager state; including Guaranteed pod CPU in usage", "path", path.Join(kubeletDir, cpuManagerState))
 		return ""
 	}
 	s := &state.CPUManagerCheckpoint{}
 	if err = json.Unmarshal(b, s); err != nil {
-		klog.ErrorS(err, "Failed to unmarshal cpu manager state")
+		klog.ErrorS(err, "Failed to parse CPU manager state; including Guaranteed pod CPU in usage", "path", path.Join(kubeletDir, cpuManagerState))
 		return ""
 	}
 	return s.PolicyName

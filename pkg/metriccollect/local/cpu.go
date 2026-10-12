@@ -31,7 +31,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/agent/utils/cgroup"
-	"volcano.sh/volcano/pkg/agent/utils/file"
 )
 
 const (
@@ -55,49 +54,59 @@ func NewCPUResourceCollector(cgroupManager cgroup.CgroupManager) (SubCollector, 
 func (c *CPUResourceCollector) Run() {}
 
 func (c *CPUResourceCollector) CollectLocalMetrics(metricInfo *LocalMetricInfo, start time.Time, window metav1.Duration) ([]*prompb.TimeSeries, error) {
-	cgroupPath, err := c.cgroupManager.GetRootCgroupPath(cgroup.CgroupCpuSubsystem)
+	rootPath, err := c.cgroupManager.GetRootCgroupPath(cgroup.CgroupCpuAcctSubsystem)
 	if err != nil {
 		return nil, err
 	}
 
 	cgroupVersion := c.cgroupManager.GetCgroupVersion()
-	podAllUsage, err := getMilliCPUUsage(cgroupPath, cgroupVersion)
+	paths := []string{rootPath}
+	var burstablePath, bestEffortPath string
+	if !metricInfo.IncludeGuaranteedPods {
+		burstablePath, err = c.cgroupManager.GetQoSCgroupPath(corev1.PodQOSBurstable, cgroup.CgroupCpuAcctSubsystem)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, burstablePath)
+	}
+	if metricInfo.IncludeGuaranteedPods != metricInfo.IncludeBestEffortPods {
+		bestEffortPath, err = c.cgroupManager.GetQoSCgroupPath(corev1.PodQOSBestEffort, cgroup.CgroupCpuAcctSubsystem)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, bestEffortPath)
+	}
+
+	usage, nodeUsage, err := sampleCPUUsages(paths, cgroupVersion, metricInfo.IncludeSystemUsed)
 	if err != nil {
 		return nil, err
 	}
+	podAllUsage := usage[rootPath]
 
 	finalUsage := int64(0)
-	if metricInfo.IncludeGuaranteedPods && metricInfo.IncludeBestEffortPods {
+	if metricInfo.IncludeGuaranteedPods {
 		finalUsage = podAllUsage
+		if !metricInfo.IncludeBestEffortPods {
+			// Root counters include all QoS children, so subtract BestEffort.
+			finalUsage -= usage[bestEffortPath]
+		}
 	} else {
-		qosClasses := []corev1.PodQOSClass{corev1.PodQOSBurstable}
-		if metricInfo.IncludeGuaranteedPods {
-			qosClasses = append(qosClasses, corev1.PodQOSGuaranteed)
-		}
+		finalUsage = usage[burstablePath]
 		if metricInfo.IncludeBestEffortPods {
-			qosClasses = append(qosClasses, corev1.PodQOSBestEffort)
-		}
-		for _, qos := range qosClasses {
-			cgroupPath, err = c.cgroupManager.GetQoSCgroupPath(qos, cgroup.CgroupCpuSubsystem)
-			if err != nil {
-				return nil, err
-			}
-
-			count, err := getMilliCPUUsage(cgroupPath, cgroupVersion)
-			if err != nil {
-				return nil, err
-			}
-			finalUsage += count
+			finalUsage += usage[bestEffortPath]
 		}
 	}
 
 	if metricInfo.IncludeSystemUsed {
-		nodeUsage, err := nodeCPUUsage()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get node usage, err: %v", err)
+		if nodeUsage < podAllUsage {
+			klog.V(2).InfoS("Node CPU usage is below pod CPU usage; ignoring negative system usage", "nodeMilliCPU", nodeUsage, "podMilliCPU", podAllUsage)
+		} else {
+			finalUsage += nodeUsage - podAllUsage
 		}
-		systemUsage := nodeUsage - podAllUsage
-		finalUsage += systemUsage
+	}
+	if finalUsage < 0 {
+		klog.V(2).InfoS("Calculated CPU usage is negative; using zero", "milliCPU", finalUsage)
+		finalUsage = 0
 	}
 	sample := prompb.TimeSeries{
 		Samples: []prompb.Sample{
@@ -110,52 +119,104 @@ func (c *CPUResourceCollector) CollectLocalMetrics(metricInfo *LocalMetricInfo, 
 	return []*prompb.TimeSeries{&sample}, nil
 }
 
-func getMilliCPUUsage(cgroupRoot string, cgroupVersion string) (int64, error) {
-	startTime := time.Now().UnixNano()
+// sampleCPUUsages samples every requested cgroup and the optional node counter
+// over one interval so QoS subtraction compares the same second of activity.
+func sampleCPUUsages(paths []string, cgroupVersion string, includeNode bool) (map[string]int64, int64, error) {
+	startTime := time.Now()
+	startCounters := make(map[string]uint64, len(paths))
+	for _, path := range paths {
+		value, err := readCPUUsage(path, cgroupVersion)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read initial CPU usage: %w", err)
+		}
+		startCounters[path] = value
+	}
+	var startNode uint64
+	if includeNode {
+		var err error
+		startNode, err = nodeCPUState()
+		if err != nil {
+			return nil, 0, fmt.Errorf("read initial node CPU usage: %w", err)
+		}
+	}
 
-	var cpuUsageFile string
+	time.Sleep(time.Second)
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	if duration <= 0 {
+		return nil, 0, fmt.Errorf("CPU sampling interval is not positive")
+	}
+	usage := make(map[string]int64, len(paths))
+	unitNanoseconds := int64(1)
 	if cgroupVersion == cgroup.CgroupV2 {
-		cpuUsageFile = cgroup.CPUUsageFileV2
-	} else {
-		cpuUsageFile = cgroup.CPUUsageFile
+		unitNanoseconds = 1000 // cpu.stat usage_usec is in microseconds.
+	}
+	for _, path := range paths {
+		value, err := readCPUUsage(path, cgroupVersion)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read final CPU usage: %w", err)
+		}
+		if value < startCounters[path] {
+			return nil, 0, fmt.Errorf("CPU counter decreased at %s", path)
+		}
+		delta := value - startCounters[path]
+		const maxInt64 = int64(^uint64(0) >> 1)
+		if delta > uint64(maxInt64/(unitNanoseconds*1000)) {
+			return nil, 0, fmt.Errorf("CPU counter delta too large at %s", path)
+		}
+		// Scale the delta, not the cumulative counter. Multiplying the v2
+		// counter by 1000 can overflow on long-lived, many-core nodes.
+		usage[path] = int64(delta) * unitNanoseconds * 1000 / duration.Nanoseconds()
 	}
 
-	cgroupsCPU := filepath.Join(cgroupRoot, cpuUsageFile)
-
-	var startUsage int64
-	var err error
-	if cgroupVersion == cgroup.CgroupV1 {
-		startUsage, err = file.ReadIntFromFile(cgroupsCPU)
-	} else {
-		startUsage, err = readCPUUsageV2(cgroupsCPU)
+	var nodeUsage int64
+	if includeNode {
+		endNode, err := nodeCPUState()
+		if err != nil {
+			return nil, 0, fmt.Errorf("read final node CPU usage: %w", err)
+		}
+		if endNode < startNode {
+			return nil, 0, fmt.Errorf("node CPU counter decreased")
+		}
+		nodeUsage = int64((float64(endNode-startNode) / (float64(duration) / jiffies)) * 1000)
+		klog.V(4).InfoS("Node CPU usage", "milliCPU", nodeUsage)
 	}
-
-	if err != nil {
-		return 0, err
-	}
-	time.Sleep(1 * time.Second)
-	endTime := time.Now().UnixNano()
-
-	var endUsage int64
-	if cgroupVersion == cgroup.CgroupV1 {
-		endUsage, err = file.ReadIntFromFile(cgroupsCPU)
-	} else {
-		endUsage, err = readCPUUsageV2(cgroupsCPU)
-	}
-	if err != nil {
-		return 0, err
-	}
-	if endTime-startTime == 0 {
-		return 0, fmt.Errorf("statistic time is zero")
-	}
-	return (endUsage - startUsage) * 1000 / (endTime - startTime), nil
+	return usage, nodeUsage, nil
 }
 
-func nodeCPUState() (uint64, error) {
+// readCPUUsage returns v1 nanoseconds or v2 microseconds. sampleCPUUsages
+// converts the counter delta to nanoseconds before calculating millicores.
+func readCPUUsage(cgroupRoot, cgroupVersion string) (uint64, error) {
+	switch cgroupVersion {
+	case cgroup.CgroupV1:
+		filePath := filepath.Join(cgroupRoot, cgroup.CPUUsageFile)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return 0, fmt.Errorf("read %s: %w", filePath, err)
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse %s: %w", filePath, err)
+		}
+		return value, nil
+	case cgroup.CgroupV2:
+		return readCPUUsageV2(filepath.Join(cgroupRoot, cgroup.CPUUsageFileV2))
+	default:
+		return 0, fmt.Errorf("unsupported cgroup version %q for CPU usage at %s", cgroupVersion, cgroupRoot)
+	}
+}
+
+// CPUNodeSource returns the proc file used for host-wide CPU accounting.
+func CPUNodeSource() string {
 	procStatFile := os.Getenv(procStatPathEnv)
 	if procStatFile == "" {
 		procStatFile = defaultProcPath
 	}
+	return procStatFile
+}
+
+func nodeCPUState() (uint64, error) {
+	procStatFile := CPUNodeSource()
 	contents, err := os.ReadFile(procStatFile)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read proc state file: %v", err)
@@ -166,46 +227,24 @@ func nodeCPUState() (uint64, error) {
 			continue
 		}
 		total := uint64(0)
-		// sum cpu time = $user+$nice+$system+$idle+$iowait+$irq+$softirq
+		// Guest time is already included in user/nice. Exclude idle and
+		// iowait because neither represents busy CPU time.
 		for i := 1; i < len(fields); i++ {
 			val, err := strconv.ParseUint(fields[i], 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("failed to parse state filed: %v, err: %v", fields[i], err)
+				return 0, fmt.Errorf("failed to parse CPU field %q in %s: %w", fields[i], procStatFile, err)
 			}
-			// exclude $idle $iowait time.
-			if i == 4 || i == 5 {
+			if i == 4 || i == 5 || i == 9 || i == 10 {
 				continue
 			}
 			total += val
 		}
 		return total, nil
 	}
-	return 0, fmt.Errorf("invalid proc stat file: %s", procStatFile)
+	return 0, fmt.Errorf("CPU aggregate line missing from %s", procStatFile)
 }
 
-func nodeCPUUsage() (int64, error) {
-	startTime := time.Now().UnixNano()
-	total0, err := nodeCPUState()
-	if err != nil {
-		return 0, err
-	}
-	time.Sleep(time.Second)
-	endTime := time.Now().UnixNano()
-	total1, err := nodeCPUState()
-	if err != nil {
-		return 0, err
-	}
-
-	totalTicks := float64(total1 - total0)
-	if totalTicks <= 0 {
-		return 0, fmt.Errorf("negative total tick: %v", totalTicks)
-	}
-	cpuUsage := int64((totalTicks / (float64(endTime-startTime) / jiffies)) * 1000)
-	klog.V(4).InfoS("Node cpu usage", "value", cpuUsage)
-	return cpuUsage, nil
-}
-
-func readCPUUsageV2(filePath string) (int64, error) {
+func readCPUUsageV2(filePath string) (uint64, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return 0, err
@@ -224,13 +263,13 @@ func readCPUUsageV2(filePath string) (int64, error) {
 		}
 
 		if fields[0] == "usage_usec" {
-			value, err := strconv.ParseInt(fields[1], 10, 64)
+			value, err := strconv.ParseUint(fields[1], 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("failed to parse usage_usec value: %v", err)
+				return 0, fmt.Errorf("failed to parse usage_usec in %s: %w", filePath, err)
 			}
-			return value * 1000, nil
+			return value, nil
 		}
 	}
 
-	return 0, fmt.Errorf("usage_usec field not found in cpu.stat file")
+	return 0, fmt.Errorf("usage_usec missing from %s", filePath)
 }
