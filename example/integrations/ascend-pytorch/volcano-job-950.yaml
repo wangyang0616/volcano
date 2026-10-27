@@ -1,0 +1,82 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: a5-resnet50-8npu
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  queue: default
+  maxRetry: 1
+  policies:
+    - event: PodEvicted
+      action: RestartJob
+    - event: PodFailed
+      action: RestartJob
+  tasks:
+    - name: trainer
+      replicas: 1
+      policies:
+        - event: TaskCompleted
+          action: CompleteJob
+      template:
+        metadata:
+          labels:
+            app: a5-resnet50-8npu
+            framework: pytorch
+        spec:
+          restartPolicy: Never
+          # A single Pod requesting eight NPUs is always placed on one node.
+          # To force a particular A5 node, uncomment and replace the value:
+          # nodeSelector:
+          #   kubernetes.io/hostname: a5-node-name
+          containers:
+            - name: trainer
+              image: quay.io/ascend/triton:3.2.2-cann9.1.0-torch_npu2.7.1.post8-950-openeuler24.03-py3.11
+              # The image has already been imported into the node runtime.
+              imagePullPolicy: Never
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  command -v npu-smi >/dev/null && npu-smi info || true
+                  torchrun \
+                    --standalone \
+                    --nnodes=1 \
+                    --nproc-per-node=8 \
+                    /opt/ascend-train/train_resnet50_synthetic.py \
+                    --duration 1800 \
+                    --batch-size 64 \
+                    --precision bf16
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: OMP_NUM_THREADS
+                  value: "1"
+                - name: ASCEND_GLOBAL_LOG_LEVEL
+                  value: "3"
+                - name: HCCL_CONNECT_TIMEOUT
+                  value: "600"
+                - name: ASCEND_VISIBLE_DEVICES
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['huawei.com/npu']
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: 32Gi
+                  huawei.com/npu: "8"
+                limits:
+                  huawei.com/npu: "8"
+              volumeMounts:
+                - name: train-script
+                  mountPath: /opt/ascend-train
+                  readOnly: true
+                - name: output
+                  mountPath: /output
+          volumes:
+            - name: train-script
+              configMap:
+                name: a5-resnet50-script
+                defaultMode: 0555
+            - name: output
+              emptyDir: {}

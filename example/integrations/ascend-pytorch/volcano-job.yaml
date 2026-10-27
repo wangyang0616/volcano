@@ -1,0 +1,81 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: a3-resnet50-8npu
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  queue: default
+  maxRetry: 1
+  policies:
+    - event: PodEvicted
+      action: RestartJob
+    - event: PodFailed
+      action: RestartJob
+  tasks:
+    - name: trainer
+      replicas: 1
+      policies:
+        - event: TaskCompleted
+          action: CompleteJob
+      template:
+        metadata:
+          labels:
+            app: a3-resnet50-8npu
+        spec:
+          restartPolicy: Never
+          # Uncomment and replace the value when you need to pin the test node.
+          # nodeSelector:
+          #   kubernetes.io/hostname: a3-node-name
+          containers:
+            - name: trainer
+              image: quay.io/ascend/triton:3.2.2-cann9.1.0-torch_npu2.7.1.post8-a3-openeuler24.03-py3.11
+              # The existing Kubernetes node pulls this image from the registry.
+              # Change to Never only when the image was imported into the node runtime.
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  command -v npu-smi >/dev/null && npu-smi info || true
+                  torchrun \
+                    --standalone \
+                    --nnodes=1 \
+                    --nproc-per-node=8 \
+                    /opt/ascend-train/train_resnet50_synthetic.py \
+                    --duration 1800 \
+                    --batch-size 64 \
+                    --precision bf16
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: OMP_NUM_THREADS
+                  value: "1"
+                - name: ASCEND_GLOBAL_LOG_LEVEL
+                  value: "3"
+                - name: HCCL_CONNECT_TIMEOUT
+                  value: "600"
+                - name: ASCEND_VISIBLE_DEVICES
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['huawei.com/Ascend910']
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: 32Gi
+                  huawei.com/Ascend910: "8"
+                limits:
+                  huawei.com/Ascend910: "8"
+              volumeMounts:
+                - name: train-script
+                  mountPath: /opt/ascend-train
+                  readOnly: true
+                - name: output
+                  mountPath: /output
+          volumes:
+            - name: train-script
+              configMap:
+                name: a3-resnet50-script
+                defaultMode: 0555
+            - name: output
+              emptyDir: {}
