@@ -950,10 +950,12 @@ func (ji *JobInfo) TaskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeN
 		return "", "", ""
 	}
 
-	// Get detailed scheduling reason based on LastTransaction
+	// A discarded Pipeline is only a trial, not the task's current placement.
 	ctx := taskInfo.GetTransactionContext()
-	if taskInfo.LastTransaction != nil {
-		ctx = *taskInfo.LastTransaction
+	if last := taskInfo.LastTransaction; last != nil {
+		if ctx.Status != Pending || ctx.NodeName != "" || last.Status != Pipelined {
+			ctx = *last
+		}
 	}
 
 	switch status := ctx.Status; status {

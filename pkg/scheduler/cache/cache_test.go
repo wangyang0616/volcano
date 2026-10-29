@@ -1087,6 +1087,49 @@ func TestTaskUnschedulable_DoesNotSyncWhenNominatedNodeNameEmpty(t *testing.T) {
 		"previously written NominatedNodeName must remain intact")
 }
 
+func TestRecordJobStatusEventRolledBackPipelineDoesNotRepublishPodStatus(t *testing.T) {
+	pod := buildPod("ns1", "task-1", "", v1.PodPending, api.BuildResourceList("1", "1G"),
+		[]metav1.OwnerReference{buildOwnerReference("job1")}, nil)
+	task := api.NewTaskInfo(pod)
+	job := api.NewJobInfo(task.Job, task)
+	job.JobFitErrors = "0/7 hyperNodes available (minResource)"
+	client := kubefake.NewClientset(pod)
+	sc := &SchedulerCache{
+		StatusUpdater: &defaultStatusUpdater{kubeclient: client},
+		Recorder:      record.NewFakeRecorder(16),
+	}
+	updates := 0
+	client.PrependReactor("update", "pods", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		assert.Equal(t, "status", action.GetSubresource())
+		updates++
+		return false, nil, nil
+	})
+	publish := func() {
+		sc.RecordJobStatusEvent(job, false)
+		updated, err := client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		// Model the Pod informer update before the next scheduling session.
+		task.Pod = updated
+	}
+
+	for _, candidate := range []string{"node-a", "node-b", "", "node-a", ""} {
+		task.ClearLastTxContext()
+		if candidate != "" {
+			task.LastTransaction = &api.TransactionContext{Status: api.Pipelined, NodeName: candidate, EvictionOccurred: true}
+		}
+		publish()
+		assert.Equal(t, 1, updates, "candidate=%q", candidate)
+		assert.Equal(t, "HyperNode: 0/7 hyperNodes available (minResource)", task.Pod.Status.Conditions[0].Message)
+		assert.Empty(t, task.Pod.Status.NominatedNodeName)
+	}
+
+	job.JobFitErrors = "0/7 hyperNodes available (networkTopology)"
+	publish()
+	assert.Equal(t, 2, updates, "a changed scheduling failure must update the Pod")
+}
+
 // addDRAResource accumulates a user-controlled device count. A pod with two
 // same-deviceClass requests each near math.MaxInt64 (both individually valid:
 // the apiserver only rejects count <= 0) must not wrap the aggregate Count to a
