@@ -41,11 +41,11 @@
     | Task2     | **Schedulable**    | **Pod ns1/task-2 can possibly be assigned to node2, once minAvailable is satisfied**                                                                                                            |
     | Task3     | **Schedulable**    | **Pod ns1/task-3 can possibly be assigned to node3, once minAvailable is satisfied**                                                                                                            |
     | Task4     | Unschedulable      | all nodes are unavailable: 1 plugin InterPodAffinity predicates failed node(s) didn't match pod affinity/anti-affinity, node(s) didn't match pod affinity rules, 2 node(s) resource fit failed. |
-    | Task5 ~ 6 | Unschedulable      | pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                                                                  |
+    | Task5 ~ 6 | Unschedulable      | **3/6** tasks in gang unschedulable: pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                             |
 
     - Note: Task5 ~ 6 are `Unschedulable` maybe because that this two locate after task4 by `TaskOrderFn`;
 
-- In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally, we can find the histogram of reason why there are some tasks whose status is pending. The `3/6 tasks in gang unschedulable` prefix belongs to the PodGroup event; individual Pod conditions retain the Pending histogram without that prefix.
+- In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally,  we can find the histogram of reason why there are some tasks whose status is pending.
 
 ### Rolled-back Pipeline attempts
 
