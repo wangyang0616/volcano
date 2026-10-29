@@ -1150,7 +1150,7 @@ func TestRecordJobStatusEventPipelineAttempts(t *testing.T) {
 			delete(job.NodesFitErrors, task.UID)
 			publish()
 			assert.Equal(t, 4, updates, "cleared diagnostics must not leave stale errors on the Pod")
-			assert.Equal(t, "pod group is not ready, 1 Pending, 4 minAvailable", task.Pod.Status.Conditions[0].Message)
+			assert.Equal(t, "pod group is not ready, 1 Pending, 4 minAvailable; Pending: 1 Unschedulable", task.Pod.Status.Conditions[0].Message)
 
 			job.UpdateTaskStatus(task, api.Pipelined)
 			task.NodeName = "node3"

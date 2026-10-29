@@ -41,11 +41,11 @@
     | Task2     | **Schedulable**    | **Pod ns1/task-2 can possibly be assigned to node2, once minAvailable is satisfied**                                                                                                            |
     | Task3     | **Schedulable**    | **Pod ns1/task-3 can possibly be assigned to node3, once minAvailable is satisfied**                                                                                                            |
     | Task4     | Unschedulable      | all nodes are unavailable: 1 plugin InterPodAffinity predicates failed node(s) didn't match pod affinity/anti-affinity, node(s) didn't match pod affinity rules, 2 node(s) resource fit failed. |
-    | Task5 ~ 6 | Unschedulable      | pod group is not ready, 6 Pending, 6 minAvailable                                                                                                                                             |
+    | Task5 ~ 6 | Unschedulable      | pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                                                                  |
 
     - Note: Task5 ~ 6 are `Unschedulable` maybe because that this two locate after task4 by `TaskOrderFn`;
 
-- In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally,  we can find the histogram of reason why there are some tasks whose status is pending.
+- In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally, we can find the histogram of reason why there are some tasks whose status is pending. The `3/6 tasks in gang unschedulable` prefix belongs to the PodGroup event; individual Pod conditions retain the Pending histogram without that prefix.
 
 ### Rolled-back Pipeline attempts
 
@@ -58,11 +58,11 @@ alternating between a Pipeline attempt and no attempt, from changing the Pod
 condition when the failure diagnostics are otherwise unchanged.
 
 Pending conditions include the Job's HyperNode diagnosis and the task's own
-node-fit errors. Without either, they fall back to the current Job state, without
-trial-result counts or another task's errors. For Pod conditions, a Pipeline
-without a nomination counts as Pending in this fallback summary; Job diagnostics
-still report its live Pipeline status. The `Schedulable` reason for
-Allocated attempts retains its behavior.
+node-fit errors. Without either, they fall back to the current Job state and
+the aggregate Pending reason counts, without another task's node-fit errors.
+For Pod conditions, a Pipeline without a nomination counts as Pending in this
+fallback summary; Job diagnostics still report its live Pipeline status. The
+`Schedulable` reason for Allocated attempts retains its behavior.
 
 A live Pipeline is only a trial placement until it actually evicts a victim.
 The Pod condition includes a candidate node only when that eviction has produced

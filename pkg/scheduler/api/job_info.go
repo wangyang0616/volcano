@@ -892,10 +892,10 @@ func formatReasonsHistogram(reasons map[string]int) string {
 	return strings.Join(reasonStrings, ", ")
 }
 
-// taskStatusSummary describes the current job state without individual trial outcomes.
-// A Pod condition treats an uncommitted Pipeline as Pending, while job diagnostics
+// schedulingSummary describes task status and reason counts without node details.
+// A Pod condition counts an uncommitted Pipeline as Pending, while job diagnostics
 // retain the actual scheduling status.
-func (ji *JobInfo) taskStatusSummary(pipelineAsPending bool) string {
+func (ji *JobInfo) schedulingSummary(pipelineAsPending bool) string {
 	// Stat histogram for all tasks of the job
 	reasons := make(map[string]int)
 	for status, taskMap := range ji.TaskStatusIndex {
@@ -910,23 +910,30 @@ func (ji *JobInfo) taskStatusSummary(pipelineAsPending bool) string {
 	if ji.IsReady() {
 		podGroupStatus = scheduling.PodGroupReady
 	}
-	return fmt.Sprintf("%v, %v", podGroupStatus, formatReasonsHistogram(reasons))
+	reasonMsg := fmt.Sprintf("%v, %v", podGroupStatus, formatReasonsHistogram(reasons))
+
+	// Count the reason of every task represented as Pending in this summary.
+	reasons = make(map[string]int)
+	statuses := []TaskStatus{Pending}
+	if pipelineAsPending {
+		statuses = append(statuses, Pipelined)
+	}
+	for _, status := range statuses {
+		for uid := range ji.TaskStatusIndex[status] {
+			reason, _, _ := ji.TaskSchedulingReason(uid)
+			reasons[reason]++
+		}
+	}
+	if len(reasons) > 0 {
+		reasonMsg += "; " + fmt.Sprintf("%s: %s", Pending.String(), formatReasonsHistogram(reasons))
+	}
+	return reasonMsg
 }
 
 // FitError returns detailed information on why a job's task failed to fit on
 // each available node
 func (ji *JobInfo) FitError() string {
-	reasonMsg := ji.taskStatusSummary(false)
-
-	// Stat histogram for pending tasks only
-	reasons := make(map[string]int)
-	for uid := range ji.TaskStatusIndex[Pending] {
-		reason, _, _ := ji.TaskSchedulingReason(uid)
-		reasons[reason]++
-	}
-	if len(reasons) > 0 {
-		reasonMsg += "; " + fmt.Sprintf("%s: %s", Pending.String(), formatReasonsHistogram(reasons))
-	}
+	reasonMsg := ji.schedulingSummary(false)
 
 	if dimensions := ji.schedulingDimensions(""); dimensions != "" {
 		reasonMsg += ". " + dimensions
@@ -996,7 +1003,7 @@ func (ji *JobInfo) TaskSchedulingCondition(tid TaskID) (reason, msg, nominatedNo
 		if live.Status == Pipelined {
 			msg = ji.schedulingDimensions(tid)
 			if msg == "" {
-				msg = ji.taskStatusSummary(true)
+				msg = ji.schedulingSummary(true)
 			}
 			return PodReasonUnschedulable, msg, ""
 		}
@@ -1052,9 +1059,8 @@ func (ji *JobInfo) taskSchedulingReason(tid TaskID, purpose schedulingReasonPurp
 	}
 
 	if purpose == schedulingReasonForCondition && msg == "" {
-		// FitError also includes trial statistics and another task's fit errors.
-		// Use only the current job state when this task has no specific diagnosis.
-		msg = ji.taskStatusSummary(true)
+		// Preserve aggregate counts without showing another task's node errors.
+		msg = ji.schedulingSummary(true)
 	}
 	return reason, msg, nominatedNodeName
 }

@@ -588,12 +588,12 @@ func TestTaskSchedulingCondition(t *testing.T) {
 		},
 		{
 			name: "pending falls back to current job state", live: TransactionContext{Status: Pending},
-			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable",
+			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable; Pending: 1 Unschedulable",
 		},
 		{
 			name: "rolled-back pipeline uses the same fallback", live: TransactionContext{Status: Pending},
 			last:       &TransactionContext{Status: Pipelined, NodeName: "node2"},
-			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable",
+			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable; Pending: 1 Unschedulable",
 		},
 		{
 			name: "live pipeline without eviction hides its trial node", live: TransactionContext{Status: Pipelined, NodeName: "node1"},
@@ -680,23 +680,54 @@ func TestTaskSchedulingConditionFallback(t *testing.T) {
 	job.NodesFitErrors[other.UID] = fitError
 
 	_, message, _ := job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable", message)
+	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 1 Schedulable, 1 Unschedulable", message)
+	assert.NotContains(t, message, "another task's error")
 	assert.Contains(t, job.FitError(), "Pending: 1 Schedulable, 1 Unschedulable")
 	assert.Contains(t, job.FitError(), "another task's error")
 
 	other.ClearLastTxContext()
 	_, message, _ = job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable", message)
+	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable", message)
 	assert.Contains(t, job.FitError(), "Pending: 2 Unschedulable")
 
 	job.MinAvailable = 0
 	_, message, _ = job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is ready, 0 minAvailable, 2 Pending", message)
+	assert.Equal(t, "pod group is ready, 0 minAvailable, 2 Pending; Pending: 2 Unschedulable", message)
 
 	reason, message, nomination := job.TaskSchedulingCondition("missing-task")
 	assert.Empty(t, reason)
 	assert.Empty(t, message)
 	assert.Empty(t, nomination)
+}
+
+func TestTaskSchedulingConditionPreservesGangReasonCounts(t *testing.T) {
+	tasks := make([]*TaskInfo, 0, 6)
+	for _, name := range []string{"task-1", "task-2", "task-3", "task-4", "task-5", "task-6"} {
+		tasks = append(tasks, NewTaskInfo(buildPod("ns1", name, "", v1.PodPending, BuildResourceList("1", "1G"), nil, nil)))
+	}
+	job := NewJobInfo("job1", tasks...)
+	job.MinAvailable = 6
+	for _, task := range tasks[:3] {
+		task.LastTransaction = &TransactionContext{Status: Allocated, NodeName: "allocated-node"}
+	}
+
+	check := func() {
+		reason, message, nomination := job.TaskSchedulingCondition(tasks[4].UID)
+		assert.Equal(t, PodReasonUnschedulable, reason)
+		assert.Equal(t, "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable", message)
+		assert.Empty(t, nomination)
+		assert.NotContains(t, message, "trial-node")
+	}
+
+	check()
+	for _, node := range []string{"trial-node-a", "trial-node-b"} {
+		tasks[4].LastTransaction = &TransactionContext{Status: Pipelined, NodeName: node}
+		check()
+	}
+	tasks[4].ClearLastTxContext()
+	job.UpdateTaskStatus(tasks[4], Pipelined)
+	tasks[4].NodeName = "trial-node-a"
+	check()
 }
 
 func TestTaskSchedulingConditionUnnominatedPipelineFallback(t *testing.T) {
