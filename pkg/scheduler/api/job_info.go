@@ -930,16 +930,20 @@ func (ji *JobInfo) schedulingSummary(pipelineAsPending bool) string {
 	return reasonMsg
 }
 
-// FitError returns detailed information on why a job's task failed to fit on
-// each available node
-func (ji *JobInfo) FitError() string {
-	reasonMsg := ji.schedulingSummary(false)
+func (ji *JobInfo) fitError(pipelineAsPending bool) string {
+	reasonMsg := ji.schedulingSummary(pipelineAsPending)
 
 	if dimensions := ji.schedulingDimensions(""); dimensions != "" {
 		reasonMsg += ". " + dimensions
 	}
 
 	return reasonMsg
+}
+
+// FitError returns detailed information on why a job's task failed to fit on
+// each available node.
+func (ji *JobInfo) FitError() string {
+	return ji.fitError(false)
 }
 
 func (ji *JobInfo) schedulingDimensions(taskID TaskID) string {
@@ -1003,7 +1007,7 @@ func (ji *JobInfo) TaskSchedulingCondition(tid TaskID) (reason, msg, nominatedNo
 		if live.Status == Pipelined {
 			msg = ji.schedulingDimensions(tid)
 			if msg == "" {
-				msg = ji.schedulingSummary(true)
+				msg = ji.fitError(true)
 			}
 			return PodReasonUnschedulable, msg, ""
 		}
@@ -1059,8 +1063,9 @@ func (ji *JobInfo) taskSchedulingReason(tid TaskID, purpose schedulingReasonPurp
 	}
 
 	if purpose == schedulingReasonForCondition && msg == "" {
-		// Preserve aggregate counts without showing another task's node errors.
-		msg = ji.schedulingSummary(true)
+		// Preserve aggregate counts and a representative node failure without
+		// exposing an uncommitted Pipeline candidate.
+		msg = ji.fitError(true)
 	}
 	return reason, msg, nominatedNodeName
 }

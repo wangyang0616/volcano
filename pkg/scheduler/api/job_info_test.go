@@ -680,19 +680,18 @@ func TestTaskSchedulingConditionFallback(t *testing.T) {
 	job.NodesFitErrors[other.UID] = fitError
 
 	_, message, _ := job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 1 Schedulable, 1 Unschedulable", message)
-	assert.NotContains(t, message, "another task's error")
+	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 1 Schedulable, 1 Unschedulable. Node: task-2: another task's error", message)
 	assert.Contains(t, job.FitError(), "Pending: 1 Schedulable, 1 Unschedulable")
 	assert.Contains(t, job.FitError(), "another task's error")
 
 	other.ClearLastTxContext()
 	_, message, _ = job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable", message)
+	assert.Equal(t, "pod group is not ready, 2 Pending, 2 minAvailable; Pending: 2 Unschedulable. Node: task-2: another task's error", message)
 	assert.Contains(t, job.FitError(), "Pending: 2 Unschedulable")
 
 	job.MinAvailable = 0
 	_, message, _ = job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, "pod group is ready, 0 minAvailable, 2 Pending; Pending: 2 Unschedulable", message)
+	assert.Equal(t, "pod group is ready, 0 minAvailable, 2 Pending; Pending: 2 Unschedulable. Node: task-2: another task's error", message)
 
 	reason, message, nomination := job.TaskSchedulingCondition("missing-task")
 	assert.Empty(t, reason)
@@ -727,6 +726,36 @@ func TestTaskSchedulingConditionPreservesGangReasonCounts(t *testing.T) {
 	tasks[4].ClearLastTxContext()
 	job.UpdateTaskStatus(tasks[4], Pipelined)
 	tasks[4].NodeName = "trial-node-a"
+	check()
+}
+
+func TestTaskSchedulingConditionKeepsGangNodeFailure(t *testing.T) {
+	tasks := make([]*TaskInfo, 0, 8)
+	for _, name := range []string{"task-1", "task-2", "task-3", "task-4", "task-5", "task-6", "task-7", "task-8"} {
+		tasks = append(tasks, NewTaskInfo(buildPod("ns1", name, "", v1.PodPending, BuildResourceList("1", "1G"), nil, nil)))
+	}
+	job := NewJobInfo("job1", tasks...)
+	job.MinAvailable = 6
+	fitError := NewFitErrors()
+	fitError.SetError("0/6 nodes are unavailable: 6 Insufficient cpu")
+	job.NodesFitErrors[tasks[0].UID] = fitError
+
+	check := func() {
+		reason, message, nomination := job.TaskSchedulingCondition(tasks[7].UID)
+		assert.Equal(t, PodReasonUnschedulable, reason)
+		assert.Equal(t, "pod group is not ready, 6 minAvailable, 8 Pending; Pending: 8 Unschedulable. Node: task-1: 0/6 nodes are unavailable: 6 Insufficient cpu", message)
+		assert.Empty(t, nomination)
+		assert.NotContains(t, message, "trial-node")
+	}
+
+	check()
+	for _, node := range []string{"trial-node-a", "trial-node-b"} {
+		tasks[7].LastTransaction = &TransactionContext{Status: Pipelined, NodeName: node}
+		check()
+	}
+	tasks[7].ClearLastTxContext()
+	job.UpdateTaskStatus(tasks[7], Pipelined)
+	tasks[7].NodeName = "trial-node-a"
 	check()
 }
 

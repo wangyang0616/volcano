@@ -58,8 +58,10 @@ alternating between a Pipeline attempt and no attempt, from changing the Pod
 condition when the failure diagnostics are otherwise unchanged.
 
 Pending conditions include the Job's HyperNode diagnosis and the task's own
-node-fit errors. Without either, they fall back to the current Job state and
-the aggregate Pending reason counts, without another task's node-fit errors.
+node-fit errors. Without either, they fall back to the current Job state, the
+aggregate Pending reason counts, and one named task's node-fit error when
+available. This preserves the existing gang failure detail for tasks skipped
+after another task fails, without attributing that error to the skipped task.
 For Pod conditions, a Pipeline without a nomination counts as Pending in this
 fallback summary; Job diagnostics still report its live Pipeline status. The
 `Schedulable` reason for Allocated attempts retains its behavior.

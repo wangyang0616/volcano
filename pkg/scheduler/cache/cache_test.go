@@ -1175,6 +1175,36 @@ func TestRecordJobStatusEventPipelineAttempts(t *testing.T) {
 	}
 }
 
+func TestRecordJobStatusEventKeepsGangNodeFailure(t *testing.T) {
+	owner := []metav1.OwnerReference{buildOwnerReference("job1")}
+	tasks := make([]*api.TaskInfo, 0, 8)
+	objects := make([]runtime.Object, 0, 8)
+	for i := 1; i <= 8; i++ {
+		pod := buildPod("ns1", fmt.Sprintf("task-%d", i), "", v1.PodPending, api.BuildResourceList("1", "1G"), owner, nil)
+		tasks = append(tasks, api.NewTaskInfo(pod))
+		objects = append(objects, pod)
+	}
+	job := api.NewJobInfo(tasks[0].Job, tasks...)
+	job.MinAvailable = 6
+	fitError := api.NewFitErrors()
+	fitError.SetError("0/6 nodes are unavailable: 6 Insufficient cpu")
+	job.NodesFitErrors[tasks[0].UID] = fitError
+
+	client := kubefake.NewClientset(objects...)
+	sc := &SchedulerCache{
+		Jobs:          map[api.JobID]*api.JobInfo{job.UID: job},
+		StatusUpdater: &defaultStatusUpdater{kubeclient: client},
+		Recorder:      record.NewFakeRecorder(32),
+	}
+	sc.RecordJobStatusEvent(job, false)
+
+	pod, err := client.CoreV1().Pods("ns1").Get(context.Background(), "task-8", metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, "pod group is not ready, 6 minAvailable, 8 Pending; Pending: 8 Unschedulable. Node: task-1: 0/6 nodes are unavailable: 6 Insufficient cpu", pod.Status.Conditions[0].Message)
+		assert.Empty(t, pod.Status.NominatedNodeName)
+	}
+}
+
 // addDRAResource accumulates a user-controlled device count. A pod with two
 // same-deviceClass requests each near math.MaxInt64 (both individually valid:
 // the apiserver only rejects count <= 0) must not wrap the aggregate Count to a
