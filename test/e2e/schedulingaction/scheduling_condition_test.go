@@ -65,12 +65,21 @@ var _ = Describe("Pending Pod scheduling conditions", Serial, Label("scheduling-
 
 		By("Confirming repeated Pipeline and rollback before observing Pod status")
 		f.waitForAttempts(metav1.Now(), f.nodes[1], true, nil)
-		observedTask := "candidate-a"
-		if restrictSecondTask {
-			observedTask = "candidate-b"
+		observations := []*pipelineStatusObservation{
+			f.observeStatus("candidate-a"),
+			f.observeStatus("candidate-b"),
 		}
-		observation := f.observeStatus(observedTask)
-		DeferCleanup(observation.stop)
+		for _, observation := range observations {
+			DeferCleanup(observation.stop)
+		}
+		checkObservations := func() error {
+			for _, observation := range observations {
+				if err := observation.err(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 
 		// Only a scoring label changes. Pod specs, requests, available resources,
 		// and the HyperNode minResource failure stay unchanged. This exercises both
@@ -80,11 +89,13 @@ var _ = Describe("Pending Pod scheduling conditions", Serial, Label("scheduling-
 			since := metav1.Now()
 			f.preferNode(preferred)
 			secondPipelined := !restrictSecondTask || preferred == f.nodes[1]
-			f.waitForAttempts(since, preferred, secondPipelined, observation.err)
-			Consistently(observation.err, 5*time.Second, 200*time.Millisecond).Should(Succeed())
+			f.waitForAttempts(since, preferred, secondPipelined, checkObservations)
+			Consistently(checkObservations, 5*time.Second, 200*time.Millisecond).Should(Succeed())
 		}
-		observation.stop()
-		Expect(observation.err()).To(Succeed())
+		for _, observation := range observations {
+			observation.stop()
+		}
+		Expect(checkObservations()).To(Succeed())
 
 		By("Confirming trial victims were never evicted")
 		for _, original := range f.reservations {
@@ -575,6 +586,7 @@ func (f *pipelineConditionFixture) observeStatus(taskName string) *pipelineStatu
 				found = true
 				Expect(condition.Status).To(Equal(corev1.ConditionFalse))
 				Expect(condition.Reason).To(Equal(corev1.PodReasonUnschedulable))
+				Expect(condition.Message).To(ContainSubstring("last observed candidate node"))
 				Expect(condition.Message).To(ContainSubstring("HyperNode: 0/"))
 				Expect(condition.Message).To(ContainSubstring("minResource"))
 			}

@@ -981,13 +981,45 @@ func (ji *JobInfo) schedulingDimensions(taskID TaskID) string {
 // TaskSchedulingReason get detailed reason and message of the given task
 // It returns detailed reason and message for tasks based on last scheduling transaction.
 func (ji *JobInfo) TaskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeName string) {
-	return ji.taskSchedulingReason(tid, schedulingReasonForAttempt)
+	return ji.taskSchedulingReason(tid)
+}
+
+// SchedulingCandidate describes a possible placement observed in one session.
+// It is a diagnostic result, not a committed assignment or nomination.
+type SchedulingCandidate struct {
+	Status   TaskStatus
+	NodeName string
+}
+
+// TaskSchedulingCandidate returns the latest trial placement for this task.
+func (ji *JobInfo) TaskSchedulingCandidate(tid TaskID) SchedulingCandidate {
+	task := ji.Tasks[tid]
+	if task == nil {
+		return SchedulingCandidate{}
+	}
+	ctx := task.GetTransactionContext()
+	if last := task.LastTransaction; last != nil {
+		// A live Pipeline and a different last transaction do not describe
+		// the same placement; leave the candidate unknown in that case.
+		if ctx.Status == Pipelined && last.Status != Pipelined {
+			return SchedulingCandidate{}
+		}
+		ctx = *last
+	}
+	if (ctx.Status == Allocated || ctx.Status == Pipelined) && ctx.NodeName != "" {
+		return SchedulingCandidate{Status: ctx.Status, NodeName: ctx.NodeName}
+	}
+	return SchedulingCandidate{}
 }
 
 // TaskSchedulingCondition returns the reason, message and nomination to publish on a Pod.
-// A Pipeline candidate is reported only when it produces the same nomination
-// as TaskSchedulingReason, or a previous nomination remains on the Pod.
 func (ji *JobInfo) TaskSchedulingCondition(tid TaskID) (reason, msg, nominatedNodeName string) {
+	return ji.TaskSchedulingConditionWithCandidate(tid, ji.TaskSchedulingCandidate(tid))
+}
+
+// TaskSchedulingConditionWithCandidate formats a published candidate without
+// using it to alter the live scheduling transaction or node nomination.
+func (ji *JobInfo) TaskSchedulingConditionWithCandidate(tid TaskID, candidate SchedulingCandidate) (reason, msg, nominatedNodeName string) {
 	task, exists := ji.Tasks[tid]
 	if !exists {
 		return "", "", ""
@@ -1004,16 +1036,33 @@ func (ji *JobInfo) TaskSchedulingCondition(tid TaskID) (reason, msg, nominatedNo
 		if task.Pod != nil && task.Pod.Status.NominatedNodeName != "" {
 			return PodReasonUnschedulable, ji.pipelinedTaskMessage(task, task.Pod.Status.NominatedNodeName), ""
 		}
-		if live.Status == Pipelined {
-			msg = ji.schedulingDimensions(tid)
-			if msg == "" {
-				msg = ji.fitError(true)
-			}
-			return PodReasonUnschedulable, msg, ""
+	}
+	switch candidate.Status {
+	case Allocated:
+		if candidate.NodeName != "" {
+			return PodReasonSchedulable, ji.candidateTaskMessage(task, candidate), ""
+		}
+	case Pipelined:
+		if candidate.NodeName != "" {
+			return PodReasonUnschedulable, ji.candidateTaskMessage(task, candidate), ""
 		}
 	}
-	reason, msg, _ = ji.taskSchedulingReason(tid, schedulingReasonForCondition)
-	return reason, msg, ""
+	msg = ji.schedulingDimensions(tid)
+	if msg == "" {
+		msg = ji.fitError(true)
+	}
+	return PodReasonUnschedulable, msg, ""
+}
+
+func (ji *JobInfo) candidateTaskMessage(task *TaskInfo, candidate SchedulingCandidate) string {
+	requirement := "minAvailable"
+	if candidate.Status == Pipelined {
+		requirement = "resource release and minAvailable"
+	}
+	return AppendSchedulingDimensions(
+		fmt.Sprintf("Pod %s/%s last observed candidate node %s; scheduling requires %s", task.Namespace, task.Name, candidate.NodeName, requirement),
+		ji.JobFitErrors, "",
+	)
 }
 
 func (ji *JobInfo) pipelinedTaskMessage(task *TaskInfo, nodeName string) string {
@@ -1023,20 +1072,17 @@ func (ji *JobInfo) pipelinedTaskMessage(task *TaskInfo, nodeName string) string 
 	)
 }
 
-func (ji *JobInfo) taskSchedulingReason(tid TaskID, purpose schedulingReasonPurpose) (reason, msg, nominatedNodeName string) {
+func (ji *JobInfo) taskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeName string) {
 	taskInfo, exists := ji.Tasks[tid]
 	if !exists {
 		return "", "", ""
 	}
 
-	// Preserve trial outcomes for diagnostics. A rolled-back Pipeline is still
-	// Pending for condition reporting, regardless of its temporary candidate node.
+	// Preserve trial outcomes for diagnostics. A rolled-back Pipeline is
+	// still Pending in the live transaction.
 	ctx := taskInfo.GetTransactionContext()
 	if last := taskInfo.LastTransaction; last != nil {
-		rolledBackPipeline := ctx.Status == Pending && ctx.NodeName == "" && last.Status == Pipelined
-		if purpose == schedulingReasonForAttempt || !rolledBackPipeline {
-			ctx = *last
-		}
+		ctx = *last
 	}
 
 	switch status := ctx.Status; status {
@@ -1062,11 +1108,6 @@ func (ji *JobInfo) taskSchedulingReason(tid TaskID, purpose schedulingReasonPurp
 		msg = FormatSchedulingDimensions(ji.JobFitErrors, "")
 	}
 
-	if purpose == schedulingReasonForCondition && msg == "" {
-		// Preserve aggregate counts and a representative node failure without
-		// exposing an uncommitted Pipeline candidate.
-		msg = ji.fitError(true)
-	}
 	return reason, msg, nominatedNodeName
 }
 

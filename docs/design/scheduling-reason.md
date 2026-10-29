@@ -37,9 +37,9 @@
   + | Tasks     | Reason             | Message                                                                                                                                                                                         |
     |-----------|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
     | PodGroup  | NotEnoughResources | **3/6** tasks in gang unschedulable: pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                             |
-    | Task1     | **Schedulable**    | **Pod ns1/task-1 can possibly be assigned to node1, once minAvailable is satisfied**                                                                                                            |
-    | Task2     | **Schedulable**    | **Pod ns1/task-2 can possibly be assigned to node2, once minAvailable is satisfied**                                                                                                            |
-    | Task3     | **Schedulable**    | **Pod ns1/task-3 can possibly be assigned to node3, once minAvailable is satisfied**                                                                                                            |
+    | Task1     | **Schedulable**    | **Pod ns1/task-1 last observed candidate node node1; scheduling requires minAvailable**                                                                                                        |
+    | Task2     | **Schedulable**    | **Pod ns1/task-2 last observed candidate node node2; scheduling requires minAvailable**                                                                                                        |
+    | Task3     | **Schedulable**    | **Pod ns1/task-3 last observed candidate node node3; scheduling requires minAvailable**                                                                                                        |
     | Task4     | Unschedulable      | all nodes are unavailable: 1 plugin InterPodAffinity predicates failed node(s) didn't match pod affinity/anti-affinity, node(s) didn't match pod affinity rules, 2 node(s) resource fit failed. |
     | Task5 ~ 6 | Unschedulable      | **3/6** tasks in gang unschedulable: pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                             |
 
@@ -47,51 +47,50 @@
 
 - In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally,  we can find the histogram of reason why there are some tasks whose status is pending.
 
-### Rolled-back Pipeline attempts
+### Pod candidate snapshots
 
-`LastTransaction` preserves a task's context before a statement is discarded.
-`TaskSchedulingReason` continues to expose that attempt for diagnostics and gang
-statistics, including its candidate node. `TaskSchedulingCondition` shares the
-same formatting logic but reports a rolled-back Pipeline as Pending when the
-live context is Pending with no node. This prevents candidate-node changes, or
-alternating between a Pipeline attempt and no attempt, from changing the Pod
-condition when the failure diagnostics are otherwise unchanged.
+`LastTransaction` preserves a task's trial placement before a statement is
+discarded. Job diagnostics and gang counts continue to use that attempt.
+For Pod conditions, the cache records the candidate nodes of all tasks in a
+VCJob from one scheduling session. An uncommitted Allocated or Pipeline attempt
+is presented as a **last observed candidate**, never as a binding or a
+nomination. A Pipeline candidate has reason `Unschedulable`; an Allocated
+candidate retains reason `Schedulable`.
+
+Candidate-node changes alone are published at most once every five minutes.
+When a session does not evaluate a previously published candidate, the cache
+keeps the prior complete snapshot rather than combining nodes from two
+sessions. A newly discovered candidate, a definite node-fit failure, a task
+membership change, or a real nomination publishes the current Job-wide view
+immediately. Thus another task in the VCJob may lose a stale candidate if it
+was not evaluated in that session. Only Pods whose resulting condition differs
+are written; unrelated VCJobs are not refreshed. There is no atomic multi-Pod
+status update, so readers may briefly see old and new messages during writes.
 
 Pending conditions include the Job's HyperNode diagnosis and the task's own
 node-fit errors. Without either, they fall back to the current Job state, the
 aggregate Pending reason counts, and one named task's node-fit error when
-available. This preserves the existing gang failure detail for tasks skipped
-after another task fails, without attributing that error to the skipped task.
-For Pod conditions, a Pipeline without a nomination counts as Pending in this
-fallback summary; Job diagnostics still report its live Pipeline status. The
-`Schedulable` reason for Allocated attempts retains its behavior.
+available. This preserves gang failure detail for tasks skipped after another
+task fails, without attributing that error to the skipped task.
 
-A live Pipeline is only a trial placement until it actually evicts a victim.
-The Pod condition includes a candidate node only when that eviction has produced
-a nomination. In later sessions, the victim may still be terminating and no new
-eviction may occur. The condition continues to show the nomination stored in
-`Pod.Status.NominatedNodeName`, even if the current session has no Pipeline or
-tries a different node without evicting. A new eviction may replace the
-nomination. When the existing scheduling fallback invalidates a nomination,
-the condition follows the nomination value visible on the task's Pod. This
-change leaves nomination creation, invalidation, and scheduling decisions as
-they were.
-
-Changes to HyperNode or task fit errors still update the Pod condition; this
-separation does not cache old errors or suppress newly observed failures.
+A real eviction may set `Pod.Status.NominatedNodeName`. Its existing message
+and nomination behavior take precedence over candidate presentation, including
+later sessions while a victim is terminating. Scheduler decisions and
+nomination creation or invalidation are unchanged.
 
 The `scheduling-condition` E2E cases run as part of the existing scheduling
 actions suite. They use two workers, preemptible reservations, and a blocked
 gang member to force Pipeline rollback. Changing only a soft node-affinity
 label selects each candidate deterministically; Pod specs and resources stay
 unchanged during observation. The cases separately watch candidate-node changes
-and Pipeline presence/absence, and require at least three completed trial and
-rollback sessions per selection using existing scheduler V(3) logs. A Pod watch
-starts at the baseline List resourceVersion and rejects any status change or
-watch error. Finally, releasing reservations and unblocking the gang must let
-the same Pods run. A third case performs a real eviction with a long terminating
-victim, then checks that the Pod status remains unchanged for several complete
-sessions and that the nominated Pod ultimately binds.
+and Pipeline presence/absence for both candidate Pods, and require at least three
+completed trial and rollback sessions per selection using existing scheduler
+V(3) logs. A Pod watch starts at the baseline List resourceVersion and rejects
+any status change or watch error. Finally, releasing reservations and
+unblocking the gang must let the same Pods run. A third case performs a real
+eviction with a long terminating victim, then checks that the Pod status remains
+unchanged for several complete sessions and that the nominated Pod ultimately
+binds.
 
 On an existing test cluster with one scheduler (verbosity >= 3) and two ready
 workers with at least 800m CPU free each, run only these cases with:

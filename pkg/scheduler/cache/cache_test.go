@@ -42,6 +42,7 @@ import (
 	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	testingclock "k8s.io/utils/clock/testing"
 	vcv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcclient "volcano.sh/apis/pkg/client/clientset/versioned"
 	vcclientfake "volcano.sh/apis/pkg/client/clientset/versioned/fake"
@@ -1173,6 +1174,159 @@ func TestRecordJobStatusEventPipelineAttempts(t *testing.T) {
 
 		})
 	}
+}
+
+func TestRecordJobStatusEventCandidateSnapshot(t *testing.T) {
+	owner := []metav1.OwnerReference{buildOwnerReference("job1")}
+	makeTask := func(name string, references []metav1.OwnerReference) *api.TaskInfo {
+		pod := buildPod("ns1", name, "", v1.PodPending, api.BuildResourceList("1", "1G"), references, nil)
+		pod.Annotations = map[string]string{vcv1beta1.KubeGroupNameAnnotationKey: string(references[0].UID)}
+		return api.NewTaskInfo(pod)
+	}
+	a := makeTask("candidate-a", owner)
+	b := makeTask("candidate-b", owner)
+	failed := makeTask("failed", owner)
+	other := makeTask("other-job", []metav1.OwnerReference{buildOwnerReference("job2")})
+	job := api.NewJobInfo(a.Job, a, b, failed)
+	job.MinAvailable = 4
+	otherJob := api.NewJobInfo(other.Job, other)
+	otherJob.MinAvailable = 1
+	client := kubefake.NewClientset(a.Pod, b.Pod, failed.Pod, other.Pod)
+	clock := testingclock.NewFakeClock(time.Now())
+	sc := &SchedulerCache{
+		Jobs:           map[api.JobID]*api.JobInfo{job.UID: job, otherJob.UID: otherJob},
+		candidateClock: clock,
+		StatusUpdater:  &defaultStatusUpdater{kubeclient: client},
+		Recorder:       record.NewFakeRecorder(32),
+	}
+	var mu sync.Mutex
+	updates := make(map[string]int)
+	client.PrependReactor("update", "pods", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		mu.Lock()
+		updates[action.(kubetesting.UpdateAction).GetObject().(*v1.Pod).Name]++
+		mu.Unlock()
+		return false, nil, nil
+	})
+	publish := func(info *api.JobInfo) {
+		sc.RecordJobStatusEvent(info, false)
+		for _, task := range info.Tasks {
+			updated, err := client.CoreV1().Pods(task.Namespace).Get(context.Background(), task.Name, metav1.GetOptions{})
+			if !assert.NoError(t, err) {
+				t.FailNow()
+			}
+			// Model the informer update consumed by the next session.
+			task.Pod = updated
+		}
+	}
+	count := func(task *api.TaskInfo) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return updates[task.Name]
+	}
+	message := func(task *api.TaskInfo) string {
+		return task.Pod.Status.Conditions[0].Message
+	}
+	setCandidate := func(task *api.TaskInfo, node string) {
+		task.ClearLastTxContext()
+		if node != "" {
+			task.LastTransaction = &api.TransactionContext{Status: api.Pipelined, NodeName: node}
+		}
+	}
+
+	setCandidate(a, "node-a1")
+	setCandidate(b, "node-b1")
+	setCandidate(other, "node-c1")
+	publish(job)
+	publish(otherJob)
+	assert.Contains(t, message(a), "candidate node node-a1")
+	assert.Contains(t, message(b), "candidate node node-b1")
+	assert.Equal(t, 1, count(a))
+	assert.Equal(t, 1, count(b))
+
+	setCandidate(a, "node-a2")
+	setCandidate(b, "node-b2")
+	setCandidate(other, "node-c2")
+	publish(job)
+	assert.Equal(t, 1, count(a), "candidate IP changes alone are rate-limited")
+	assert.Equal(t, 1, count(b))
+	failedError := api.NewFitErrors()
+	failedError.SetError("insufficient memory")
+	job.NodesFitErrors[failed.UID] = failedError
+	publish(job)
+	assert.Equal(t, 2, count(failed), "a changed failure updates only its Pod")
+	assert.Equal(t, 1, count(a))
+	assert.Equal(t, 1, count(b))
+
+	setCandidate(b, "") // This task was not evaluated in this session.
+	clock.Step(candidateRefreshInterval)
+	publish(job)
+	assert.Equal(t, 1, count(a), "an incomplete session must not mix candidate nodes from two sessions")
+	assert.Equal(t, 1, count(b))
+	assert.Equal(t, 1, count(other), "another Job is not refreshed by this Job")
+
+	setCandidate(b, "node-b2")
+	publish(job)
+	assert.Contains(t, message(a), "candidate node node-a2")
+	assert.Contains(t, message(b), "candidate node node-b2")
+	assert.Equal(t, 2, count(a))
+	assert.Equal(t, 2, count(b))
+	assert.Equal(t, 2, count(failed), "unchanged Pod messages must not be rewritten")
+	assert.Equal(t, 1, count(other))
+	clock.Step(candidateRefreshInterval)
+	publish(job)
+	assert.Equal(t, 2, count(a), "an unchanged snapshot is not written merely to refresh its age")
+	assert.Equal(t, 2, count(b))
+
+	setCandidate(a, "node-a3")
+	setCandidate(b, "")
+	fitError := api.NewFitErrors()
+	fitError.SetError("insufficient cpu")
+	job.NodesFitErrors[b.UID] = fitError
+	publish(job)
+	assert.Contains(t, message(a), "candidate node node-a3")
+	assert.Contains(t, message(b), "Node: insufficient cpu")
+	assert.Equal(t, 3, count(a), "a definite failure refreshes all changed candidates from one session")
+	assert.Equal(t, 3, count(b))
+
+	setCandidate(a, "node-a4")
+	setCandidate(b, "node-b4")
+	delete(job.NodesFitErrors, b.UID)
+	publish(job)
+	assert.Contains(t, message(a), "candidate node node-a4")
+	assert.Contains(t, message(b), "candidate node node-b4")
+	assert.Equal(t, 4, count(a))
+	assert.Equal(t, 4, count(b))
+	assert.Empty(t, a.Pod.Status.NominatedNodeName)
+	assert.Empty(t, b.Pod.Status.NominatedNodeName)
+
+	// A definite failure must clear its old candidate even if another task
+	// was not tried. Publish the entire current session rather than mixing it
+	// with the previous session's candidate nodes.
+	setCandidate(a, "")
+	setCandidate(b, "")
+	job.NodesFitErrors[a.UID] = fitError
+	publish(job)
+	assert.Contains(t, message(a), "Node: insufficient cpu")
+	assert.NotContains(t, message(b), "candidate node")
+	assert.Equal(t, 5, count(a))
+	assert.Equal(t, 5, count(b))
+
+	// B was untried, not failed. Its return is a candidate-only change,
+	// so it remains rate-limited even after the forced snapshot above.
+	setCandidate(b, "node-b5")
+	publish(job)
+	assert.Equal(t, 5, count(b))
+	clock.Step(candidateRefreshInterval)
+	publish(job)
+	assert.Contains(t, message(b), "candidate node node-b5")
+	assert.Equal(t, 6, count(b))
+
+	setCandidate(a, "node-a5")
+	delete(job.NodesFitErrors, a.UID)
+	publish(job)
+	assert.Contains(t, message(a), "candidate node node-a5")
+	assert.Equal(t, 6, count(a), "recovery from a definite failure publishes immediately")
+	assert.Equal(t, 6, count(b))
 }
 
 func TestRecordJobStatusEventKeepsGangNodeFailure(t *testing.T) {

@@ -19,6 +19,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"sort"
 	"strconv"
@@ -56,6 +57,7 @@ import (
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
+	"k8s.io/utils/clock"
 	"stathat.com/c/consistent"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
@@ -84,8 +86,20 @@ const (
 	// default interval for sync data from metrics server, the value is 30s
 	defaultMetricsInternal = 30 * time.Second
 
-	handlerSyncPollPeriod = 100 * time.Millisecond
+	handlerSyncPollPeriod    = 100 * time.Millisecond
+	candidateRefreshInterval = 5 * time.Minute
 )
+
+// candidateSnapshot holds one Job's trial placements from a single session.
+// Missing entries mean that session had no candidate for the task.
+type candidateSnapshot struct {
+	observedAt time.Time
+	pgUID      string
+	tasks      map[schedulingapi.TaskID]struct{}
+	candidates map[schedulingapi.TaskID]schedulingapi.SchedulingCandidate
+	everSeen   map[schedulingapi.TaskID]struct{}
+	failures   map[schedulingapi.TaskID]struct{}
+}
 
 // defaultIgnoredProvisioners contains provisioners that will be ignored during pod pvc request computation and preemption.
 var defaultIgnoredProvisioners = []string{"rancher.io/local-path", "hostpath.csi.k8s.io"}
@@ -153,6 +167,8 @@ type SchedulerCache struct {
 	Recorder record.EventRecorder
 
 	Jobs                 map[schedulingapi.JobID]*schedulingapi.JobInfo
+	candidateSnapshots   map[schedulingapi.JobID]candidateSnapshot
+	candidateClock       clock.Clock
 	Nodes                map[string]*schedulingapi.NodeInfo
 	Queues               map[schedulingapi.QueueID]*schedulingapi.QueueInfo
 	NodeShards           map[string]*schedulingapi.NodeShardInfo
@@ -604,6 +620,8 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 
 	sc := &SchedulerCache{
 		Jobs:                make(map[schedulingapi.JobID]*schedulingapi.JobInfo),
+		candidateSnapshots:  make(map[schedulingapi.JobID]candidateSnapshot),
+		candidateClock:      clock.RealClock{},
 		Nodes:               make(map[string]*schedulingapi.NodeInfo),
 		Queues:              make(map[schedulingapi.QueueID]*schedulingapi.QueueInfo),
 		PriorityClasses:     make(map[string]*schedulingv1.PriorityClass),
@@ -1305,6 +1323,7 @@ func (sc *SchedulerCache) processCleanupJob() {
 		klog.V(5).Infof("Just add pguid:%v, try to delete pguid:%v", newPgVersion, oldPgVersion)
 		if oldPgVersion == newPgVersion {
 			delete(sc.Jobs, currJob.UID)
+			delete(sc.candidateSnapshots, currJob.UID)
 			metrics.DeleteJobMetrics(currJob.Name, string(currJob.Queue), currJob.Namespace)
 			klog.V(3).Infof("Job <%v:%v/%v> was deleted.", currJob.UID, currJob.Namespace, currJob.Name)
 		}
@@ -1803,7 +1822,10 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 		sc.recordPodGroupEvent(job.PodGroup, v1.EventTypeNormal, string(scheduling.PodGroupScheduled), string(scheduling.PodGroupReady))
 	}
 
-	// Update podCondition for tasks Allocated and Pending before job discarded
+	// Freeze one Job-wide view of trial placements before updating any Pods.
+	candidates := sc.podStatusCandidates(job)
+
+	// Update conditions for unbound tasks before the Job is discarded.
 	for _, status := range []schedulingapi.TaskStatus{schedulingapi.Allocated, schedulingapi.Pending, schedulingapi.Pipelined} {
 		statusTasks := job.TaskStatusIndex[status]
 		taskInfos := make([]*schedulingapi.TaskInfo, 0, len(statusTasks))
@@ -1820,7 +1842,7 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 				return
 			}
 
-			reason, msg, nominatedNodeName := job.TaskSchedulingCondition(taskInfo.UID)
+			reason, msg, nominatedNodeName := job.TaskSchedulingConditionWithCandidate(taskInfo.UID, candidates[taskInfo.UID])
 
 			if err := sc.taskUnschedulable(taskInfo, reason, msg, nominatedNodeName); err != nil {
 				klog.ErrorS(err, "Failed to update unschedulable task status", "task", klog.KRef(taskInfo.Namespace, taskInfo.Name),
@@ -1828,6 +1850,95 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 			}
 		})
 	}
+}
+
+// podStatusCandidates selects a complete session view for all of a Job's Pod
+// messages. A different trial node is published at most once per interval;
+// a newly found candidate, a definite failure, or a real nomination may
+// publish a new view immediately.
+func (sc *SchedulerCache) podStatusCandidates(job *schedulingapi.JobInfo) map[schedulingapi.TaskID]schedulingapi.SchedulingCandidate {
+	tasks := make(map[schedulingapi.TaskID]struct{})
+	current := make(map[schedulingapi.TaskID]schedulingapi.SchedulingCandidate)
+	nominationChanged := false
+	for _, status := range []schedulingapi.TaskStatus{schedulingapi.Allocated, schedulingapi.Pending, schedulingapi.Pipelined} {
+		for uid, task := range job.TaskStatusIndex[status] {
+			if task.SchGated {
+				continue
+			}
+			tasks[uid] = struct{}{}
+			if candidate := job.TaskSchedulingCandidate(uid); candidate.NodeName != "" {
+				current[uid] = candidate
+			}
+			_, _, nominated := job.TaskSchedulingReason(uid)
+			if nominated != "" && task.Pod != nil && task.Pod.Status.NominatedNodeName != nominated {
+				nominationChanged = true
+			}
+		}
+	}
+
+	now := time.Now()
+	if sc.candidateClock != nil {
+		now = sc.candidateClock.Now()
+	}
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	previous, exists := sc.candidateSnapshots[job.UID]
+	newCandidate := false
+	definiteFailure := false
+	complete := true
+	for uid := range current {
+		if _, published := previous.candidates[uid]; !published {
+			_, seen := previous.everSeen[uid]
+			_, failed := previous.failures[uid]
+			newCandidate = newCandidate || !seen || failed
+		}
+	}
+	failures := make(map[schedulingapi.TaskID]struct{})
+	for uid := range previous.candidates {
+		if _, active := tasks[uid]; !active {
+			continue
+		}
+		if _, found := current[uid]; found {
+			continue
+		}
+		if failure := job.NodesFitErrors[uid]; failure == nil || failure.Error() == "" {
+			// An untried task is not evidence that its last observed node
+			// became invalid. Wait for a session that evaluated it.
+			complete = false
+		} else {
+			definiteFailure = true
+			failures[uid] = struct{}{}
+		}
+	}
+	for uid := range tasks {
+		if _, hasCandidate := current[uid]; hasCandidate {
+			continue
+		}
+		if failure := job.NodesFitErrors[uid]; failure != nil && failure.Error() != "" {
+			failures[uid] = struct{}{}
+		}
+	}
+	changed := !maps.Equal(previous.candidates, current)
+	if !exists || previous.pgUID != string(job.PgUID) || !maps.Equal(previous.tasks, tasks) ||
+		nominationChanged || newCandidate || definiteFailure ||
+		(complete && changed && now.Sub(previous.observedAt) >= candidateRefreshInterval) {
+		var everSeen map[schedulingapi.TaskID]struct{}
+		if previous.pgUID == string(job.PgUID) {
+			everSeen = maps.Clone(previous.everSeen)
+		}
+		if everSeen == nil {
+			everSeen = make(map[schedulingapi.TaskID]struct{})
+		}
+		for uid := range current {
+			everSeen[uid] = struct{}{}
+		}
+		previous = candidateSnapshot{observedAt: now, pgUID: string(job.PgUID), tasks: tasks, candidates: current, everSeen: everSeen, failures: failures}
+		if sc.candidateSnapshots == nil {
+			sc.candidateSnapshots = make(map[schedulingapi.JobID]candidateSnapshot)
+		}
+		sc.candidateSnapshots[job.UID] = previous
+	}
+	return maps.Clone(previous.candidates)
 }
 
 // UpdateJobStatus update the status of job and its tasks.

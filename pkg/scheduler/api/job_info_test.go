@@ -576,10 +576,10 @@ func TestTaskSchedulingCondition(t *testing.T) {
 			jobError: hyperNodeError, wantReason: PodReasonUnschedulable, wantMessage: hyperNodeMessage,
 		},
 		{
-			name: "rolled-back pipeline retains job and task errors", live: TransactionContext{Status: Pending},
+			name: "rolled-back pipeline retains candidate and job error", live: TransactionContext{Status: Pending},
 			last:     &TransactionContext{Status: Pipelined, NodeName: "node1", EvictionOccurred: true},
 			jobError: hyperNodeError, nodeError: "insufficient cpu", wantReason: PodReasonUnschedulable,
-			wantMessage: hyperNodeMessage + "; Node: insufficient cpu",
+			wantMessage: "Pod ns1/task-1 last observed candidate node node1; scheduling requires resource release and minAvailable; " + hyperNodeMessage,
 		},
 		{
 			name: "pending retains the same job and task errors", live: TransactionContext{Status: Pending},
@@ -591,14 +591,14 @@ func TestTaskSchedulingCondition(t *testing.T) {
 			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable; Pending: 1 Unschedulable",
 		},
 		{
-			name: "rolled-back pipeline uses the same fallback", live: TransactionContext{Status: Pending},
+			name: "rolled-back pipeline keeps its candidate", live: TransactionContext{Status: Pending},
 			last:       &TransactionContext{Status: Pipelined, NodeName: "node2"},
-			wantReason: PodReasonUnschedulable, wantMessage: "pod group is not ready, 1 Pending, 4 minAvailable; Pending: 1 Unschedulable",
+			wantReason: PodReasonUnschedulable, wantMessage: "Pod ns1/task-1 last observed candidate node node2; scheduling requires resource release and minAvailable",
 		},
 		{
-			name: "live pipeline without eviction hides its trial node", live: TransactionContext{Status: Pipelined, NodeName: "node1"},
+			name: "live pipeline without eviction keeps its trial node", live: TransactionContext{Status: Pipelined, NodeName: "node1"},
 			jobError: hyperNodeError, wantReason: PodReasonUnschedulable,
-			wantMessage: hyperNodeMessage,
+			wantMessage: "Pod ns1/task-1 last observed candidate node node1; scheduling requires resource release and minAvailable; " + hyperNodeMessage,
 		},
 		{
 			name: "live preemption retains its nomination", live: TransactionContext{Status: Pipelined, NodeName: "node1", EvictionOccurred: true},
@@ -632,7 +632,7 @@ func TestTaskSchedulingCondition(t *testing.T) {
 			name: "allocated trial retains schedulable reason", live: TransactionContext{Status: Pending},
 			last:        &TransactionContext{Status: Allocated, NodeName: "node1"},
 			wantReason:  PodReasonSchedulable,
-			wantMessage: "Pod ns1/task-1 can possibly be assigned to node1, once minAvailable is satisfied",
+			wantMessage: "Pod ns1/task-1 last observed candidate node node1; scheduling requires minAvailable",
 		},
 	}
 	for _, tt := range tests {
@@ -711,11 +711,14 @@ func TestTaskSchedulingConditionPreservesGangReasonCounts(t *testing.T) {
 	}
 
 	check := func() {
-		reason, message, nomination := job.TaskSchedulingCondition(tasks[4].UID)
+		reason, message, nomination := job.TaskSchedulingCondition(tasks[5].UID)
 		assert.Equal(t, PodReasonUnschedulable, reason)
 		assert.Equal(t, "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable", message)
 		assert.Empty(t, nomination)
-		assert.NotContains(t, message, "trial-node")
+		if candidate := job.TaskSchedulingCandidate(tasks[4].UID); candidate.NodeName != "" {
+			_, candidateMessage, _ := job.TaskSchedulingCondition(tasks[4].UID)
+			assert.Contains(t, candidateMessage, "last observed candidate node "+candidate.NodeName)
+		}
 	}
 
 	check()
@@ -741,11 +744,14 @@ func TestTaskSchedulingConditionKeepsGangNodeFailure(t *testing.T) {
 	job.NodesFitErrors[tasks[0].UID] = fitError
 
 	check := func() {
-		reason, message, nomination := job.TaskSchedulingCondition(tasks[7].UID)
+		reason, message, nomination := job.TaskSchedulingCondition(tasks[6].UID)
 		assert.Equal(t, PodReasonUnschedulable, reason)
 		assert.Equal(t, "pod group is not ready, 6 minAvailable, 8 Pending; Pending: 8 Unschedulable. Node: task-1: 0/6 nodes are unavailable: 6 Insufficient cpu", message)
 		assert.Empty(t, nomination)
-		assert.NotContains(t, message, "trial-node")
+		if candidate := job.TaskSchedulingCandidate(tasks[7].UID); candidate.NodeName != "" {
+			_, candidateMessage, _ := job.TaskSchedulingCondition(tasks[7].UID)
+			assert.Contains(t, candidateMessage, "last observed candidate node "+candidate.NodeName)
+		}
 	}
 
 	check()
@@ -768,7 +774,8 @@ func TestTaskSchedulingConditionUnnominatedPipelineFallback(t *testing.T) {
 	job.UpdateTaskStatus(task, Pipelined)
 	task.NodeName = "node1"
 	_, pipelineMessage, nomination := job.TaskSchedulingCondition(task.UID)
-	assert.Equal(t, pendingMessage, pipelineMessage)
+	assert.NotEqual(t, pendingMessage, pipelineMessage)
+	assert.Contains(t, pipelineMessage, "last observed candidate node node1")
 	assert.Empty(t, nomination)
 	assert.Contains(t, job.FitError(), "Pipelined", "job diagnostics still report the live trial")
 }
