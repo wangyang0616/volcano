@@ -1803,10 +1803,6 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 		sc.recordPodGroupEvent(job.PodGroup, v1.EventTypeNormal, string(scheduling.PodGroupScheduled), string(scheduling.PodGroupReady))
 	}
 
-	baseErrorMessage := fitErrStr
-	if baseErrorMessage == "" {
-		baseErrorMessage = schedulingapi.AllNodeUnavailableMsg
-	}
 	// Update podCondition for tasks Allocated and Pending before job discarded
 	for _, status := range []schedulingapi.TaskStatus{schedulingapi.Allocated, schedulingapi.Pending, schedulingapi.Pipelined} {
 		statusTasks := job.TaskStatusIndex[status]
@@ -1824,10 +1820,7 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 				return
 			}
 
-			reason, msg, nominatedNodeName := job.TaskSchedulingReason(taskInfo.UID)
-			if len(msg) == 0 {
-				msg = baseErrorMessage
-			}
+			reason, msg, nominatedNodeName := job.TaskSchedulingCondition(taskInfo.UID)
 
 			if err := sc.taskUnschedulable(taskInfo, reason, msg, nominatedNodeName); err != nil {
 				klog.ErrorS(err, "Failed to update unschedulable task status", "task", klog.KRef(taskInfo.Namespace, taskInfo.Name),

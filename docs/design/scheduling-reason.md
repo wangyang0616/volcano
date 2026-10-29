@@ -41,8 +41,63 @@
     | Task2     | **Schedulable**    | **Pod ns1/task-2 can possibly be assigned to node2, once minAvailable is satisfied**                                                                                                            |
     | Task3     | **Schedulable**    | **Pod ns1/task-3 can possibly be assigned to node3, once minAvailable is satisfied**                                                                                                            |
     | Task4     | Unschedulable      | all nodes are unavailable: 1 plugin InterPodAffinity predicates failed node(s) didn't match pod affinity/anti-affinity, node(s) didn't match pod affinity rules, 2 node(s) resource fit failed. |
-    | Task5 ~ 6 | Unschedulable      | **3/6** tasks in gang unschedulable: pod group is not ready, 6 Pending, 6 minAvailable; **Pending: 3 Unschedulable, 3 Schedulable**                                                             |
+    | Task5 ~ 6 | Unschedulable      | pod group is not ready, 6 Pending, 6 minAvailable                                                                                                                                             |
 
     - Note: Task5 ~ 6 are `Unschedulable` maybe because that this two locate after task4 by `TaskOrderFn`;
 
 - In improved information, we can easily find the one that breaks the whole scheduling cycle and why dose that happen. Additionally,  we can find the histogram of reason why there are some tasks whose status is pending.
+
+### Rolled-back Pipeline attempts
+
+`LastTransaction` preserves a task's context before a statement is discarded.
+`TaskSchedulingReason` continues to expose that attempt for diagnostics and gang
+statistics, including its candidate node. `TaskSchedulingCondition` shares the
+same formatting logic but reports a rolled-back Pipeline as Pending when the
+live context is Pending with no node. This prevents candidate-node changes, or
+alternating between a Pipeline attempt and no attempt, from changing the Pod
+condition when the failure diagnostics are otherwise unchanged.
+
+Pending conditions include the Job's HyperNode diagnosis and the task's own
+node-fit errors. Without either, they fall back to the current Job state, without
+trial-result counts or another task's errors. For Pod conditions, a Pipeline
+without a nomination counts as Pending in this fallback summary; Job diagnostics
+still report its live Pipeline status. The `Schedulable` reason for
+Allocated attempts retains its behavior.
+
+A live Pipeline is only a trial placement until it actually evicts a victim.
+The Pod condition includes a candidate node only when that eviction has produced
+a nomination. In later sessions, the victim may still be terminating and no new
+eviction may occur. The condition continues to show the nomination stored in
+`Pod.Status.NominatedNodeName`, even if the current session has no Pipeline or
+tries a different node without evicting. A new eviction may replace the
+nomination. When the existing scheduling fallback invalidates a nomination,
+the condition follows the nomination value visible on the task's Pod. This
+change leaves nomination creation, invalidation, and scheduling decisions as
+they were.
+
+Changes to HyperNode or task fit errors still update the Pod condition; this
+separation does not cache old errors or suppress newly observed failures.
+
+The `scheduling-condition` E2E cases run as part of the existing scheduling
+actions suite. They use two workers, preemptible reservations, and a blocked
+gang member to force Pipeline rollback. Changing only a soft node-affinity
+label selects each candidate deterministically; Pod specs and resources stay
+unchanged during observation. The cases separately watch candidate-node changes
+and Pipeline presence/absence, and require at least three completed trial and
+rollback sessions per selection using existing scheduler V(3) logs. A Pod watch
+starts at the baseline List resourceVersion and rejects any status change or
+watch error. Finally, releasing reservations and unblocking the gang must let
+the same Pods run. A third case performs a real eviction with a long terminating
+victim, then checks that the Pod status remains unchanged for several complete
+sessions and that the nominated Pod ultimately binds.
+
+On an existing test cluster with one scheduler (verbosity >= 3) and two ready
+workers with at least 800m CPU free each, run only these cases with:
+
+```sh
+KUBECONFIG=/path/to/kubeconfig go test ./test/e2e/schedulingaction \
+  -run TestE2E -count=1 -ginkgo.label-filter=scheduling-condition
+```
+
+The fixture restores scheduler configuration and temporary node labels, and
+deletes only its own namespace and PriorityClass. Existing HyperNodes are kept.

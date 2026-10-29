@@ -1087,6 +1087,94 @@ func TestTaskUnschedulable_DoesNotSyncWhenNominatedNodeNameEmpty(t *testing.T) {
 		"previously written NominatedNodeName must remain intact")
 }
 
+func TestRecordJobStatusEventPipelineAttempts(t *testing.T) {
+	tests := []struct {
+		name     string
+		jobError string
+	}{
+		{name: "HyperNode diagnosis", jobError: "0/7 hyperNodes available (minResource)"},
+		{name: "job state fallback"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := buildPod("ns1", "task-1", "", v1.PodPending, api.BuildResourceList("1", "1G"),
+				[]metav1.OwnerReference{buildOwnerReference("job1")}, nil)
+			task := api.NewTaskInfo(pod)
+			job := api.NewJobInfo(task.Job, task)
+			job.MinAvailable = 4
+			job.JobFitErrors = tt.jobError
+			client := kubefake.NewClientset(pod)
+			sc := &SchedulerCache{
+				Jobs:          map[api.JobID]*api.JobInfo{task.Job: job},
+				StatusUpdater: &defaultStatusUpdater{kubeclient: client},
+				Recorder:      record.NewFakeRecorder(32),
+			}
+			updates := 0
+			client.PrependReactor("update", "pods", func(action kubetesting.Action) (bool, runtime.Object, error) {
+				assert.Equal(t, "status", action.GetSubresource())
+				updates++
+				return false, nil, nil
+			})
+			publish := func() {
+				sc.RecordJobStatusEvent(job, false)
+				updated, err := client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+				if !assert.NoError(t, err) {
+					t.FailNow()
+				}
+				// Model the informer update seen by the next scheduling session.
+				task.Pod = updated
+			}
+
+			for _, candidate := range []string{"node1", "node2", "", "node1", ""} {
+				task.ClearLastTxContext()
+				if candidate != "" {
+					task.LastTransaction = &api.TransactionContext{Status: api.Pipelined, NodeName: candidate, EvictionOccurred: true}
+				}
+				publish()
+				assert.Equal(t, 1, updates, "only the first condition should be published, candidate=%q", candidate)
+				assert.Empty(t, task.Pod.Status.NominatedNodeName)
+				assert.Equal(t, v1.ConditionFalse, task.Pod.Status.Conditions[0].Status)
+			}
+
+			job.JobFitErrors = "0/7 hyperNodes available (networkTopology)"
+			publish()
+			assert.Equal(t, 2, updates, "a changed HyperNode failure must be published")
+			fitError := api.NewFitErrors()
+			fitError.SetError("insufficient memory")
+			job.NodesFitErrors[task.UID] = fitError
+			publish()
+			assert.Equal(t, 3, updates, "a changed task failure must be published")
+			assert.Contains(t, task.Pod.Status.Conditions[0].Message, "Node: insufficient memory")
+
+			job.JobFitErrors = ""
+			delete(job.NodesFitErrors, task.UID)
+			publish()
+			assert.Equal(t, 4, updates, "cleared diagnostics must not leave stale errors on the Pod")
+			assert.Equal(t, "pod group is not ready, 1 Pending, 4 minAvailable", task.Pod.Status.Conditions[0].Message)
+
+			job.UpdateTaskStatus(task, api.Pipelined)
+			task.NodeName = "node3"
+			task.EvictionOccurred = true
+			publish()
+			assert.Equal(t, 5, updates, "a live Pipeline must still be published")
+			assert.Equal(t, "node3", task.Pod.Status.NominatedNodeName)
+			task.EvictionOccurred = false
+			task.NodeName = "node4"
+			publish()
+			assert.Equal(t, 5, updates, "another Pipeline candidate must not replace the existing nomination")
+			assert.Equal(t, "node3", task.Pod.Status.NominatedNodeName)
+			assert.Contains(t, task.Pod.Status.Conditions[0].Message, "assigned to node3")
+
+			job.UpdateTaskStatus(task, api.Pending)
+			task.NodeName = ""
+			publish()
+			assert.Equal(t, 5, updates, "a session without Pipeline must retain the prior eviction nomination")
+			assert.Contains(t, task.Pod.Status.Conditions[0].Message, "assigned to node3")
+
+		})
+	}
+}
+
 // addDRAResource accumulates a user-controlled device count. A pod with two
 // same-deviceClass requests each near math.MaxInt64 (both individually valid:
 // the apiserver only rejects count <= 0) must not wrap the aggregate Count to a

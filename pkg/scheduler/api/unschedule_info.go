@@ -58,6 +58,14 @@ const (
 	PodReasonSchedulerError = "SchedulerError"
 )
 
+// schedulingReasonPurpose distinguishes attempt diagnostics from persisted Pod conditions.
+type schedulingReasonPurpose int
+
+const (
+	schedulingReasonForAttempt schedulingReasonPurpose = iota
+	schedulingReasonForCondition
+)
+
 // FormatSchedulingDimensions joins HyperNode-tier and node-level diagnostics.
 func FormatSchedulingDimensions(hyperNodeSummary, nodeSummary string) string {
 	parts := make([]string, 0, maxSchedulingDimensions)
