@@ -58,6 +58,146 @@ def status_managers(pod):
             "f:status" in m.get("fieldsV1", {})]
 
 
+def owned_status_paths(entry):
+    """FieldsV1 leaves; '.' owns membership, not every descendant's value."""
+    def walk(tree, path):
+        if not isinstance(tree, dict):
+            return
+        if not tree:
+            yield path
+        for token, child in tree.items():
+            if token == ".":
+                yield path + (".",)
+            else:
+                yield from walk(child, path + (token,))
+
+    fields = entry.get("fieldsV1", {})
+    if "f:status" in fields and entry.get("fieldsType", "FieldsV1") == "FieldsV1":
+        yield from walk(fields["f:status"], ("f:status",))
+
+
+_MISSING = object()
+_UNRESOLVED = object()
+
+
+def owned_value(pod, path):
+    """Resolve associative list entries by their keys, never by condition order."""
+    value = pod
+    try:
+        for token in path:
+            if token == ".":
+                return value is not _MISSING
+            if value is _MISSING:
+                continue
+            if token.startswith("f:"):
+                value = value.get(token[2:], _MISSING) if isinstance(value, dict) else _MISSING
+            elif token.startswith("k:"):
+                keys = json.loads(token[2:])
+                if not isinstance(keys, dict):
+                    return _UNRESOLVED
+                value = next((item for item in value if isinstance(item, dict) and
+                              all(k in item and not json_diff(item[k], v) for k, v in keys.items())),
+                             _MISSING) if isinstance(value, list) else _MISSING
+            elif token.startswith("v:"):
+                member = json.loads(token[2:])
+                value = next((item for item in value if not json_diff(item, member)),
+                             _MISSING) if isinstance(value, list) else _MISSING
+            elif token.startswith("i:"):
+                position = int(token[2:])
+                value = (value[position] if isinstance(value, list) and 0 <= position < len(value)
+                         else _MISSING)
+            else:
+                return _UNRESOLVED
+        return value
+    except (ValueError, TypeError):
+        return _UNRESOLVED
+
+
+def owned_path_label(path):
+    result = ""
+    for token in path:
+        if token.startswith("f:"):
+            result += "/" + token[2:].replace("~", "~0").replace("/", "~1")
+        elif token == ".":
+            result += "/@membership"
+        elif token.startswith("k:"):
+            result += "[" + ",".join(k + "=" + json.dumps(v, ensure_ascii=False)
+                                     for k, v in sorted(json.loads(token[2:]).items())) + "]"
+        else:
+            result += "[" + token + "]"
+    return result
+
+
+def changed_owned_paths(entry, before, after):
+    paths = []
+    for path in owned_status_paths(entry):
+        old, new = owned_value(before, path), owned_value(after, path)
+        if old is _UNRESOLVED or new is _UNRESOLVED:
+            continue
+        if old is _MISSING or new is _MISSING:
+            changed = old is not new
+        else:
+            changed = bool(json_diff(old, new))
+        if changed:
+            paths.append(owned_path_label(path))
+    return sorted(set(paths))
+
+
+def component_hints(before, after, kind):
+    """Heuristic field-manager attribution, deliberately independent of audit proof."""
+    result = {
+        "state": "unknown", "scope": "status", "notProofOfWriter": True,
+        "inferredManagers": [], "candidates": [], "previousOwners": [],
+        "note": ("manager 是客户端声明/推导的字段管理标识，不是经过认证的组件身份。"
+                 "time 和字段归属变化仅作推测依据；同秒更新可能没有时间差。"
+                 "schedulerName/ownerReferences 仅表示调度配置和控制关系。"),
+    }
+    if before is None or kind != "MODIFIED":
+        result["state"] = "not_a_comparable_update"
+        return result
+    if not json_diff(before.get("status", {}), after.get("status", {})):
+        result["state"] = "no_status_change"
+        return result
+
+    def identity(entry):
+        return tuple(entry.get(k, "") for k in ("manager", "operation", "apiVersion", "subresource"))
+
+    previous = {identity(entry): entry for entry in status_managers(before)}
+    current = {identity(entry): entry for entry in status_managers(after)}
+    for key, entry in current.items():
+        paths = changed_owned_paths(entry, before, after)
+        if not paths or not entry.get("manager"):
+            continue
+        old = previous.get(key, {})
+        old_paths = changed_owned_paths(old, before, after)
+        new_paths = sorted(set(paths) - set(old_paths))
+        time_changed = bool(entry.get("time") and entry.get("time") != old.get("time"))
+        result["candidates"].append({
+            "manager": entry["manager"], "operation": entry.get("operation"),
+            "subresource": entry.get("subresource", ""), "apiVersion": entry.get("apiVersion"),
+            "time": entry.get("time"), "previousTime": old.get("time"),
+            "timeChanged": time_changed, "entryAdded": key not in previous,
+            "fieldsChanged": entry.get("fieldsV1") != old.get("fieldsV1"),
+            "changedOwnedPaths": paths, "newlyOwnedChangedPaths": new_paths,
+            "evidence": "managed_fields_delta" if time_changed or new_paths else "field_ownership_only",
+        })
+    # Losing ownership is evidence about the previous owner, not about the writer.
+    for key, entry in previous.items():
+        lost = sorted(set(changed_owned_paths(entry, before, after)) -
+                      set(changed_owned_paths(current.get(key, {}), before, after)))
+        if lost:
+            result["previousOwners"].append({"manager": entry.get("manager"),
+                                            "subresource": entry.get("subresource", ""),
+                                            "lostChangedPaths": lost})
+    strong = [c for c in result["candidates"] if c["evidence"] == "managed_fields_delta"]
+    inferred = sorted({c["manager"] for c in strong or result["candidates"]})
+    result["inferredManagers"] = inferred
+    result["state"] = ("likely" if strong and len(inferred) == 1 else
+                       "possible" if len(inferred) == 1 else
+                       "ambiguous" if inferred else "unknown")
+    return result
+
+
 def audit_record(event):
     """Extract successful Pod writes; never use request.resourceVersion as response RV."""
     ref = event.get("objectRef", {})
@@ -291,6 +431,8 @@ class Collector:
                 "creationTimestamp": m.get("creationTimestamp"),
                 "deletionTimestamp": m.get("deletionTimestamp"),
                 "podGroup": m.get("annotations", {}).get("scheduling.k8s.io/group-name"),
+                "schedulerName": pod.get("spec", {}).get("schedulerName", ""),
+                "ownerReferences": m.get("ownerReferences", []),
                 "nodeName": pod.get("spec", {}).get("nodeName", ""),
                 "nominatedNodeName": after.get("nominatedNodeName", ""),
                 "statusChanged": bool(changes), "statusDiff": changes,
@@ -303,8 +445,10 @@ class Collector:
                 "managedFieldsHints": {
                     "notProofOfWriter": True,
                     "statusEntries": status_managers(pod),
+                    "previousStatusEntries": status_managers(old) if old else [],
                     "changed": old is not None and status_managers(old) != status_managers(pod),
                 },
+                "componentHints": component_hints(old, pod, kind),
                 "writer": writer,
             }
             self.output.emit("pod-updates.jsonl", record, console=True)
@@ -631,7 +775,8 @@ def run_watch(args):
         for pod in sorted(scheduler_pods):
             start(scheduler_logs, kube, stop, output, args.scheduler_namespace,
                   pod, args.scheduler_container)
-        output.diagnostic("开始只读采集；Ctrl-C 停止。审计可延迟到达，ATTRIBUTION 行会补充更新者。",
+        output.diagnostic("开始只读采集；Ctrl-C 停止。componentHints 提供无审计的组件推测。"
+                          "如接入审计，ATTRIBUTION 行会补充调用者证据。",
                           output=str(directory.resolve()))
         while not stop.wait(0.2):
             if args.duration and time.monotonic() - started >= args.duration:

@@ -4,6 +4,7 @@ Pod status 变化采集与更新者关联
 依赖：Python 3.8+、kubectl，以及能访问目标集群的 kubeconfig；不需要安装 pip 包。
 单独复制 watch_pod_status.py 到有 kubectl 的机器即可运行。
 脚本只执行 LIST/WATCH/GET 和可选的日志读取，不修改 Pod、调度器或审计配置。
+审计日志完全可选；默认根据连续 Pod 版本的 managedFields 给出组件候选和推测依据。
 
 1. 针对当前 Volcano/Kthena 问题启动采集
 
@@ -45,8 +46,10 @@ Pod status 变化采集与更新者关联
    podScheduled / previousPodScheduled   PodScheduled condition 的完整新旧内容
    messageChanged                        PodScheduled.message 是否变化
    nodeName / nominatedNodeName           实际绑定节点、提名节点
-   managedFieldsHints                    status 字段管理者线索，不作为本次更新者证明
-   writer                                审计关联结果，详见下面说明
+   schedulerName / ownerReferences        调度配置和所属控制器，仅为上下文
+   managedFieldsHints                    新旧 status 字段管理条目，不作为本次更新者证明
+   componentHints                        无审计的字段管理者/组件推测及依据
+   writer                                审计关联结果，与 componentHints 分开保存
 
    例如：同一 Pod 的 message 从含 HyperNode 变成不含 HyperNode，或者其中的
    Pipeline 节点 IP 改变，将记录 messageChanged=true，以及 message 的完整新旧值。
@@ -57,10 +60,52 @@ Pod status 变化采集与更新者关联
 
 3. 如何确认“谁触发了这次更新”
 
+   没有审计日志时，不传 --audit-log 即可，脚本不会要求或访问审计日志。
+   默认从 API 的原始 Pod JSON 读取 managedFields（内容与 YAML 对象相同），比较连续
+   版本中的 status 值和字段管理记录，输出 componentHints。它不额外 GET 最新 Pod，
+   避免把后续版本的 managedFields 错配到当前 watch 事件。
+
+   如需手动查看相同信息，kubectl 默认隐藏 managedFields，需显式显示：
+
+   kubectl get pod YOUR_POD -n YOUR_NAMESPACE -o yaml --show-managed-fields
+
+   重点查看 metadata.managedFields 中的 manager、operation、subresource、time、
+   fieldsV1。例如 fieldsV1.f:status.f:conditions.k:{"type":"PodScheduled"}.f:message
+   表示该 manager 管理 PodScheduled.message。operation=Update 也可能对应普通 PATCH，
+   不能用它区别 PUT/PATCH；manager 可由客户端 fieldManager 指定，否则可由 User-Agent
+   推导，所以它不是经过认证的身份，也不能区分同名 manager 的不同副本。
+
+   componentHints 的含义：
+   - inferredManagers：本次 status 变化的候选字段管理者，如 volcano-scheduler。
+   - likely：唯一候选具有本轮 managedFields 时间变化或新取得变更字段归属等线索。
+   - possible：唯一候选管理发生变化的字段，但条目没有可观察的同步变化；线索更弱。
+   - ambiguous：存在多个候选，保留全部候选及证据。
+   - unknown：没有可用的匹配线索；不会仅凭 schedulerName 或 ownerReferences 猜测。
+   - no_status_change：仅 metadata/spec 等变化，本次不推测 status 更新组件。
+   - not_a_comparable_update：初始快照、新建/删除或重新 LIST，没有可比较的单次 MODIFIED。
+   - candidates[].changedOwnedPaths：本轮真正发生值变化、且该 manager 当前管理的字段。
+   - candidates[].time / previousTime / timeChanged：此条目的新旧时间及是否变化。
+   - candidates[].newlyOwnedChangedPaths：本轮新取得归属、同时值发生变化的字段。
+   - previousOwners：失去变更字段归属的原 manager，仅保留历史线索，不据此指认更新者。
+
+   例如：message 内容变了，当前归属 volcano-scheduler，并且该条目 time 也变化，
+   会输出 state=likely、inferredManagers=["volcano-scheduler"]。如果同一秒连续更新
+   message，time 可能不变，此时仍保留字段归属线索，输出 possible。
+   条目因别的 manager 接管字段而丢失归属时，时间不一定更新，所以不能仅比较谁的
+   time 最大。条件列表按 type（例如 PodScheduled/Ready）匹配，避免列表排序、增加
+   Ready 条件、或某个 manager 只管理列表成员资格时误认 message 的更新者。
+   changedOwnedPaths 使用字段选择器表示列表项，属于可读路径而不是 JSON Pointer。
+
+   对于本次排查：inferredManagers 一直相同而 message 在交替，支持“同一字段管理者
+   反复改写”的判断；若 manager/字段归属也交替，则支持“多个字段管理者轮流写”的
+   判断。二者都是证据线索，无法直接区分 scheduler 的 allocate/preempt 等内部路径。
+   managedFields 缺失、被重置、共用 manager 名称或观察到版本缺口时，判断能力会下降。
+
    Kubernetes Pod watch 不包含经过认证的请求者身份。
    managedFields.manager 表示字段管理关系，可以由客户端指定，不能证明某一次更新
    的身份；Event 的 reportingController/source 也不能证明谁写了 Pod status。
-   因此，没有可匹配审计证据时 writer.state=unknown，脚本不会猜测是 scheduler。
+   因此，没有可匹配审计证据时 writer.state=unknown；组件推测请看 componentHints，
+   其 notProofOfWriter 始终为 true，即使 state=likely 也不表示审计确认。
 
    精确关联需要 API Server 的审计事件，最好使用 RequestResponse 级别，同时保留
    requestObject、responseObject、user、userAgent、objectRef 和 ResponseComplete 阶段。
@@ -169,7 +214,11 @@ Pod status 变化采集与更新者关联
 
    覆盖差异计算、晚到审计关联、同名 Pod 重建、no-op/失败/代理线索处理、版本匹配
    歧义、watch 批量事件/断线续接/410 重建、审计半行读取和文件轮转。
+   同时覆盖无审计字段归属推测、同秒更新、manager 切换、条件列表增删/排序、成员
+   归属与值归属的区别，以及 metadata 更新/快照不误报 status 更新者。
 
 参考：
 https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/
 https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes
+https://kubernetes.io/docs/reference/using-api/server-side-apply/
+https://kubernetes.io/docs/reference/kubernetes-api/definitions/managed-fields-entry-v1-meta/

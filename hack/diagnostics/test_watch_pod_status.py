@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Offline regression tests: python3 -m unittest discover -s hack/diagnostics -v."""
 
+import copy
 import io
 import json
 from pathlib import Path
@@ -43,6 +44,100 @@ class MemoryOutput:
 
     def diagnostic(self, message, **extra):
         self.diagnostics.append((message, extra))
+
+
+def status_manager(manager="volcano-scheduler", condition="PodScheduled", stamp="2026-10-29T00:00:00Z"):
+    return {"manager": manager, "operation": "Update", "apiVersion": "v1", "subresource": "status",
+            "time": stamp, "fieldsType": "FieldsV1", "fieldsV1": {"f:status": {"f:conditions": {
+                ".": {}, 'k:{"type":"' + condition + '"}': {".": {}, "f:message": {}, "f:status": {}}
+            }}}}
+
+
+class ComponentHintTests(unittest.TestCase):
+    def setUp(self):
+        self.before = pod()
+        self.before["metadata"]["managedFields"] = [status_manager()]
+        self.after = copy.deepcopy(self.before)
+        self.after["metadata"]["resourceVersion"] = "11"
+        self.after["status"]["conditions"][0]["message"] = "pod group is not ready"
+
+    def hints(self, kind="MODIFIED"):
+        return recorder.component_hints(self.before, self.after, kind)
+
+    def test_changed_message_and_manager_time_give_likely_component(self):
+        self.after["metadata"]["managedFields"][0]["time"] = "2026-10-29T00:00:01Z"
+        result = self.hints()
+        self.assertEqual(result["state"], "likely")
+        self.assertEqual(result["inferredManagers"], ["volcano-scheduler"])
+        self.assertEqual(result["candidates"][0]["changedOwnedPaths"], ['/status/conditions[type="PodScheduled"]/message'])
+        self.assertTrue(result["notProofOfWriter"])
+
+    def test_same_second_message_changes_still_have_ownership_hint(self):
+        result = self.hints()
+        self.assertEqual(result["state"], "possible")
+        self.assertFalse(result["candidates"][0]["timeChanged"])
+        self.assertEqual(result["candidates"][0]["evidence"], "field_ownership_only")
+
+    def test_ownership_transfer_does_not_blame_previous_owner(self):
+        self.after["metadata"]["managedFields"] = [status_manager("other-status-writer")]
+        result = self.hints()
+        self.assertEqual(result["inferredManagers"], ["other-status-writer"])
+        self.assertEqual(result["previousOwners"][0]["manager"], "volcano-scheduler")
+
+    def test_latest_timestamp_without_matching_changed_field_is_excluded(self):
+        self.after["metadata"]["managedFields"].append(status_manager("kubelet", "Ready", "2026-10-29T12:00:00Z"))
+        result = self.hints()
+        self.assertEqual(result["inferredManagers"], ["volcano-scheduler"])
+        self.assertEqual(len(result["candidates"]), 1)
+
+    def test_new_ready_condition_does_not_implicate_scheduled_condition_owner(self):
+        self.after["status"] = copy.deepcopy(self.before["status"])
+        self.after["status"]["conditions"].append({"type": "Ready", "status": "False"})
+        self.after["metadata"]["managedFields"].append(status_manager("kubelet", "Ready"))
+        self.assertEqual(self.hints()["inferredManagers"], ["kubelet"])
+
+    def test_condition_order_does_not_change_field_identity(self):
+        self.before["status"]["conditions"].append({"type": "Ready", "status": "False"})
+        self.after["status"]["conditions"].insert(0, {"type": "Ready", "status": "False"})
+        result = self.hints()
+        self.assertEqual(result["inferredManagers"], ["volcano-scheduler"])
+        self.assertEqual(len(result["candidates"][0]["changedOwnedPaths"]), 1)
+
+    def test_condition_order_only_does_not_infer_a_writer(self):
+        self.before["status"]["conditions"].append({"type": "Ready", "status": "False"})
+        self.after["status"]["conditions"] = list(reversed(self.before["status"]["conditions"]))
+        self.assertEqual(self.hints()["state"], "unknown")
+
+    def test_field_removal_preserves_previous_owner_without_claiming_writer(self):
+        del self.after["status"]["conditions"][0]["message"]
+        del self.after["metadata"]["managedFields"][0]["fieldsV1"]["f:status"]["f:conditions"]['k:{"type":"PodScheduled"}']["f:message"]
+        result = self.hints()
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["previousOwners"][0]["manager"], "volcano-scheduler")
+
+    def test_multiple_matching_managers_remain_ambiguous(self):
+        for item in (self.before, self.after):
+            item["metadata"]["managedFields"].append(status_manager("shared-owner"))
+        self.assertEqual(self.hints()["state"], "ambiguous")
+
+    def test_scheduler_and_owner_reference_are_not_writer_evidence(self):
+        for item in (self.before, self.after):
+            item["metadata"]["managedFields"] = []
+            item["spec"]["schedulerName"] = "volcano"
+            item["metadata"]["ownerReferences"] = [{"kind": "ModelServing", "name": "kthena-model"}]
+        self.assertEqual(self.hints()["state"], "unknown")
+        self.assertEqual(self.hints()["inferredManagers"], [])
+
+    def test_metadata_only_and_snapshots_not_attributed(self):
+        self.assertEqual(self.hints("RESYNC")["state"], "not_a_comparable_update")
+        self.after["status"] = copy.deepcopy(self.before["status"])
+        self.after["metadata"]["managedFields"][0]["time"] = "2026-10-29T12:00:00Z"
+        self.assertEqual(self.hints()["state"], "no_status_change")
+
+    def test_legacy_main_resource_status_owner_is_supported(self):
+        for item in (self.before, self.after):
+            del item["metadata"]["managedFields"][0]["subresource"]
+        self.assertEqual(self.hints()["inferredManagers"], ["volcano-scheduler"])
 
 
 class AuditTests(unittest.TestCase):
@@ -118,6 +213,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(updates), 2)
         self.assertTrue(updates[1]["messageChanged"])
         self.assertEqual(updates[1]["previousStatus"], pod()["status"])
+        self.assertEqual(updates[1]["componentHints"]["state"], "unknown")
         self.assertEqual(len(attrs), 1)
         self.assertEqual(attrs[0]["eventID"], updates[1]["eventID"])
         self.assertEqual(attrs[0]["writer"]["state"], "confirmed_version_advanced")
