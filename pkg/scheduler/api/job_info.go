@@ -883,21 +883,25 @@ func (ji JobInfo) String() string {
 		ji.UID, ji.Namespace, ji.Queue, ji.Name, ji.MinAvailable, ji.PodGroup, ji.Preemptable, ji.RevocableZone, ji.Budget) + res
 }
 
-// FitError returns detailed information on why a job's task failed to fit on
-// each available node
-func (ji *JobInfo) FitError() string {
-	sortReasonsHistogram := func(reasons map[string]int) []string {
-		reasonStrings := []string{}
-		for k, v := range reasons {
-			reasonStrings = append(reasonStrings, fmt.Sprintf("%v %v", v, k))
-		}
-		sort.Strings(reasonStrings)
-		return reasonStrings
+func formatReasonsHistogram(reasons map[string]int) string {
+	reasonStrings := make([]string, 0, len(reasons))
+	for reason, count := range reasons {
+		reasonStrings = append(reasonStrings, fmt.Sprintf("%v %v", count, reason))
 	}
+	sort.Strings(reasonStrings)
+	return strings.Join(reasonStrings, ", ")
+}
 
+// taskStatusSummary describes the current job state without individual trial outcomes.
+// A Pod condition treats an uncommitted Pipeline as Pending, while job diagnostics
+// retain the actual scheduling status.
+func (ji *JobInfo) taskStatusSummary(pipelineAsPending bool) string {
 	// Stat histogram for all tasks of the job
 	reasons := make(map[string]int)
 	for status, taskMap := range ji.TaskStatusIndex {
+		if pipelineAsPending && status == Pipelined {
+			status = Pending
+		}
 		reasons[status.String()] += len(taskMap)
 	}
 	reasons["minAvailable"] = int(ji.MinAvailable)
@@ -906,16 +910,22 @@ func (ji *JobInfo) FitError() string {
 	if ji.IsReady() {
 		podGroupStatus = scheduling.PodGroupReady
 	}
-	reasonMsg := fmt.Sprintf("%v, %v", podGroupStatus, strings.Join(sortReasonsHistogram(reasons), ", "))
+	return fmt.Sprintf("%v, %v", podGroupStatus, formatReasonsHistogram(reasons))
+}
+
+// FitError returns detailed information on why a job's task failed to fit on
+// each available node
+func (ji *JobInfo) FitError() string {
+	reasonMsg := ji.taskStatusSummary(false)
 
 	// Stat histogram for pending tasks only
-	reasons = make(map[string]int)
+	reasons := make(map[string]int)
 	for uid := range ji.TaskStatusIndex[Pending] {
 		reason, _, _ := ji.TaskSchedulingReason(uid)
 		reasons[reason]++
 	}
 	if len(reasons) > 0 {
-		reasonMsg += "; " + fmt.Sprintf("%s: %s", Pending.String(), strings.Join(sortReasonsHistogram(reasons), ", "))
+		reasonMsg += "; " + fmt.Sprintf("%s: %s", Pending.String(), formatReasonsHistogram(reasons))
 	}
 
 	if dimensions := ji.schedulingDimensions(""); dimensions != "" {
@@ -960,44 +970,93 @@ func (ji *JobInfo) schedulingDimensions(taskID TaskID) string {
 // TaskSchedulingReason get detailed reason and message of the given task
 // It returns detailed reason and message for tasks based on last scheduling transaction.
 func (ji *JobInfo) TaskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeName string) {
+	return ji.taskSchedulingReason(tid, schedulingReasonForAttempt)
+}
+
+// TaskSchedulingCondition returns the reason, message and nomination to publish on a Pod.
+// A Pipeline candidate is reported only when it produces the same nomination
+// as TaskSchedulingReason, or a previous nomination remains on the Pod.
+func (ji *JobInfo) TaskSchedulingCondition(tid TaskID) (reason, msg, nominatedNodeName string) {
+	task, exists := ji.Tasks[tid]
+	if !exists {
+		return "", "", ""
+	}
+
+	live := task.GetTransactionContext()
+	if live.Status == Pending || live.Status == Pipelined {
+		if live.Status == Pipelined && live.NodeName != "" && live.EvictionOccurred {
+			_, _, nominatedNodeName = ji.TaskSchedulingReason(tid)
+			if nominatedNodeName != "" {
+				return PodReasonUnschedulable, ji.pipelinedTaskMessage(task, nominatedNodeName), nominatedNodeName
+			}
+		}
+		if task.Pod != nil && task.Pod.Status.NominatedNodeName != "" {
+			return PodReasonUnschedulable, ji.pipelinedTaskMessage(task, task.Pod.Status.NominatedNodeName), ""
+		}
+		if live.Status == Pipelined {
+			msg = ji.schedulingDimensions(tid)
+			if msg == "" {
+				msg = ji.taskStatusSummary(true)
+			}
+			return PodReasonUnschedulable, msg, ""
+		}
+	}
+	reason, msg, _ = ji.taskSchedulingReason(tid, schedulingReasonForCondition)
+	return reason, msg, ""
+}
+
+func (ji *JobInfo) pipelinedTaskMessage(task *TaskInfo, nodeName string) string {
+	return AppendSchedulingDimensions(
+		fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once resource is released and minAvailable is satisfied", task.Namespace, task.Name, nodeName),
+		ji.JobFitErrors, "",
+	)
+}
+
+func (ji *JobInfo) taskSchedulingReason(tid TaskID, purpose schedulingReasonPurpose) (reason, msg, nominatedNodeName string) {
 	taskInfo, exists := ji.Tasks[tid]
 	if !exists {
 		return "", "", ""
 	}
 
-	// Get detailed scheduling reason based on LastTransaction
+	// Preserve trial outcomes for diagnostics. A rolled-back Pipeline is still
+	// Pending for condition reporting, regardless of its temporary candidate node.
 	ctx := taskInfo.GetTransactionContext()
-	if taskInfo.LastTransaction != nil {
-		ctx = *taskInfo.LastTransaction
+	if last := taskInfo.LastTransaction; last != nil {
+		rolledBackPipeline := ctx.Status == Pending && ctx.NodeName == "" && last.Status == Pipelined
+		if purpose == schedulingReasonForAttempt || !rolledBackPipeline {
+			ctx = *last
+		}
 	}
 
 	switch status := ctx.Status; status {
 	case Allocated:
+		reason = PodReasonSchedulable
 		msg = AppendSchedulingDimensions(
 			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
 			ji.JobFitErrors, "",
 		)
-		return PodReasonSchedulable, msg, ""
 	case Pipelined:
-		msg = AppendSchedulingDimensions(
-			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once resource is released and minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
-			ji.JobFitErrors, "",
-		)
+		reason = PodReasonUnschedulable
+		msg = ji.pipelinedTaskMessage(taskInfo, ctx.NodeName)
 		// Derive the nomination from the live transaction, not the LastTransaction snapshot used for the message above.
 		liveCtx := taskInfo.GetTransactionContext()
 		if liveCtx.Status == Pipelined && liveCtx.NodeName != "" && liveCtx.EvictionOccurred {
 			nominatedNodeName = liveCtx.NodeName
 		}
-		return PodReasonUnschedulable, msg, nominatedNodeName
 	case Pending:
-		var nodeSummary string
-		if fe := ji.NodesFitErrors[tid]; fe != nil {
-			nodeSummary = fe.Error()
-		}
-		return PodReasonUnschedulable, FormatSchedulingDimensions(ji.JobFitErrors, nodeSummary), ""
+		reason = PodReasonUnschedulable
+		msg = ji.schedulingDimensions(tid)
 	default:
-		return status.String(), FormatSchedulingDimensions(ji.JobFitErrors, ""), ""
+		reason = status.String()
+		msg = FormatSchedulingDimensions(ji.JobFitErrors, "")
 	}
+
+	if purpose == schedulingReasonForCondition && msg == "" {
+		// FitError also includes trial statistics and another task's fit errors.
+		// Use only the current job state when this task has no specific diagnosis.
+		msg = ji.taskStatusSummary(true)
+	}
+	return reason, msg, nominatedNodeName
 }
 
 // ReadyTaskNum returns the number of tasks that are ready or that is best-effort.
