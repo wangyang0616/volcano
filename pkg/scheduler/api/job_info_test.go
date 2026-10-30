@@ -339,9 +339,9 @@ func TestTaskSchedulingReason(t *testing.T) {
 				"pg":   "pod group is not ready, 6 Pending, 6 minAvailable; Pending: 3 Schedulable, 3 Unschedulable" + originReason1,
 				t1.UID: "",
 				t2.UID: "",
-				t3.UID: "Pod ns1/task-3 can possibly be assigned to node1, once minAvailable is satisfied",
-				t4.UID: "Pod ns1/task-4 can possibly be assigned to node2, once minAvailable is satisfied",
-				t5.UID: "Pod ns1/task-5 can possibly be assigned to node3, once minAvailable is satisfied",
+				t3.UID: "Pod ns1/task-3 can possibly be assigned, once minAvailable is satisfied",
+				t4.UID: "Pod ns1/task-4 can possibly be assigned, once minAvailable is satisfied",
+				t5.UID: "Pod ns1/task-5 can possibly be assigned, once minAvailable is satisfied",
 				t6.UID: "Node: 0/3 nodes are unavailable: 1 node(s) pod number exceeded, 2 node(s) resource fit failed.",
 			},
 		},
@@ -434,6 +434,49 @@ func TestTaskSchedulingReasonNomination(t *testing.T) {
 			_, _, nominated := job.TaskSchedulingReason(ti.UID)
 			if nominated != tt.wantNomination {
 				t.Errorf("nominatedNodeName = %q, want %q", nominated, tt.wantNomination)
+			}
+		})
+	}
+}
+
+func TestTaskSchedulingReasonHidesAssignedNode(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     TaskStatus
+		live       bool
+		eviction   bool
+		wantReason string
+		wantMsg    string
+	}{
+		{"allocated trial", Allocated, false, false, PodReasonSchedulable,
+			"Pod ns1/task-1 can possibly be assigned, once minAvailable is satisfied; HyperNode: 0/7 hyperNodes available (minResource)"},
+		{"rolled-back pipelined trial", Pipelined, false, false, PodReasonUnschedulable,
+			"HyperNode: 0/7 hyperNodes available (minResource)"},
+		{"live pipeline", Pipelined, true, false, PodReasonUnschedulable,
+			"Pod ns1/task-1 can possibly be assigned, once resource is released and minAvailable is satisfied; HyperNode: 0/7 hyperNodes available (minResource)"},
+		{"live preemption", Pipelined, true, true, PodReasonUnschedulable,
+			"Pod ns1/task-1 can possibly be assigned, once resource is released and minAvailable is satisfied; HyperNode: 0/7 hyperNodes available (minResource)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := NewTaskInfo(buildPod("ns1", "task-1", "", v1.PodPending, BuildResourceList("1", "1G"), nil, nil))
+			job := NewJobInfo("job1", task)
+			job.JobFitErrors = "0/7 hyperNodes available (minResource)"
+			for _, node := range []string{"node-a", "node-b"} {
+				ctx := TransactionContext{Status: tc.status, NodeName: node, EvictionOccurred: tc.eviction}
+				if tc.live {
+					task.TransactionContext = ctx
+				} else {
+					task.LastTransaction = &ctx
+				}
+				reason, msg, nominated := job.TaskSchedulingReason(task.UID)
+				assert.Equal(t, tc.wantReason, reason)
+				assert.Equal(t, tc.wantMsg, msg)
+				assert.NotContains(t, msg, node)
+				if tc.eviction {
+					assert.Equal(t, node, nominated, "the nomination field must remain unchanged")
+				} else {
+					assert.Empty(t, nominated)
+				}
 			}
 		})
 	}

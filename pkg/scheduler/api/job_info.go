@@ -961,13 +961,13 @@ func (ji *JobInfo) TaskSchedulingReason(tid TaskID) (reason, msg, nominatedNodeN
 	switch status := ctx.Status; status {
 	case Allocated:
 		msg = AppendSchedulingDimensions(
-			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
+			fmt.Sprintf("Pod %s/%s can possibly be assigned, once minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name),
 			ji.JobFitErrors, "",
 		)
 		return PodReasonSchedulable, msg, ""
 	case Pipelined:
 		msg = AppendSchedulingDimensions(
-			fmt.Sprintf("Pod %s/%s can possibly be assigned to %s, once resource is released and minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name, ctx.NodeName),
+			fmt.Sprintf("Pod %s/%s can possibly be assigned, once resource is released and minAvailable is satisfied", taskInfo.Namespace, taskInfo.Name),
 			ji.JobFitErrors, "",
 		)
 		// Derive the nomination from the live transaction, not the LastTransaction snapshot used for the message above.
