@@ -1087,6 +1087,40 @@ func TestTaskUnschedulable_DoesNotSyncWhenNominatedNodeNameEmpty(t *testing.T) {
 		"previously written NominatedNodeName must remain intact")
 }
 
+func TestRecordJobStatusEventAssignedNodeChangeDoesNotUpdatePod(t *testing.T) {
+	for _, status := range []api.TaskStatus{api.Allocated, api.Pipelined} {
+		t.Run(status.String(), func(t *testing.T) {
+			pod := buildPod("ns1", "task-1", "", v1.PodPending, api.BuildResourceList("1", "1G"),
+				[]metav1.OwnerReference{buildOwnerReference("job1")}, nil)
+			task := api.NewTaskInfo(pod)
+			job := api.NewJobInfo(task.Job, task)
+			job.JobFitErrors = "0/7 hyperNodes available (minResource)"
+			client := kubefake.NewClientset(pod)
+			sc := &SchedulerCache{
+				StatusUpdater: &defaultStatusUpdater{kubeclient: client},
+				Recorder:      record.NewFakeRecorder(4),
+			}
+			updates := 0
+			client.PrependReactor("update", "pods", func(action kubetesting.Action) (bool, runtime.Object, error) {
+				assert.Equal(t, "status", action.GetSubresource())
+				updates++
+				return false, nil, nil
+			})
+			for _, node := range []string{"node-a", "node-b"} {
+				task.LastTransaction = &api.TransactionContext{Status: status, NodeName: node}
+				sc.RecordJobStatusEvent(job, false)
+				updated, err := client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+				if !assert.NoError(t, err) {
+					t.FailNow()
+				}
+				task.Pod = updated
+				assert.Equal(t, 1, updates, "changing only the candidate node must not write pods/status")
+				assert.NotContains(t, updated.Status.Conditions[0].Message, node)
+			}
+		})
+	}
+}
+
 // addDRAResource accumulates a user-controlled device count. A pod with two
 // same-deviceClass requests each near math.MaxInt64 (both individually valid:
 // the apiserver only rejects count <= 0) must not wrap the aggregate Count to a
